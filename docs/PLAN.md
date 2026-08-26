@@ -44,6 +44,25 @@ m 可変一括検証、受理適応深度、厳密棄却サンプリング（tem
 依存関係: A → B は直列。C と D は A/B と並行可。E は最後。
 GPU を使う計測は同時に 1 プロセスだけ（結果が壊れる）。実装・単体正しさ確認は並列可。
 
+### Phase 0: レビュー指摘の修正（最初にやる。A より先）
+
+docs/REVIEW-2026-08-26.md（Codex Sol による ca9dc7f のレビュー）の指摘を処理する。
+「壊れる」は全件修正、「怪しい」は修正または根拠つきで見送り判断を残す。特に:
+
+- convert.py の norm 二重シフト（最重篤）: MTP 入り成果物の再ロード時に本体
+  RMSNorm へ +1 が二重適用される。保存時に shift 対象 norm を raw 規約へ戻し、
+  source-loaded と output-reloaded の logit 一致テストを必ず追加する
+- spec.py の session 例外安全性: reuse 中の失敗で cache と processed が
+  食い違う。成功時のみ一括 publish に変える
+- max_tokens 超過・受理列中 EOS の consumed/fed_gen/巻き戻しの整合
+- gated_delta_states の形状ガード（Dk%32、Hv%Hk、state/mask 形状）と
+  非対応形状の ops fallback、mask=false 分岐の 32 lane 同一アドレス書き込み
+- 契約の明文化: n_draft=0 かつ lookup_len=0 が非投機 baseline（bench/gate.py は
+  これを固定）。sharded model は capture 入口で明示拒否。rollback は
+  isinstance でなく is_trimmable()/trim() プロトコル経由
+- _mlx_compat.py の新設: mlx-lm 内部依存（レビュー末尾に列挙あり）を集約し、
+  mlx / mlx-lm の上限を pyproject に固定、起動時 contract test を置く
+
 ### Phase A: カーネル（検証税の解消）
 
 - A1: qmv_wide 上限解除カーネルの完成と統合
