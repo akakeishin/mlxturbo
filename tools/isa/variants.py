@@ -11,6 +11,15 @@ Hypothesis mapping (docs/HYPOTHESES-A2.md):
   v_uint4_sgload H4  both of the above
   v_bstage       H1  dequant the whole 64-wide group into a threadgroup B slab
                      once, then simdgroup_load it (this is fast_qmm's shape)
+
+E120 lineage (docs/ISA-DIFF.md).  These are not MMA kernels at all; they are
+the register-only vec4 QMV that ``fastmlx.kernels`` ships, flattened for one
+width so its m=8 hot loop can be counted against the MMA ones:
+  v_e120_notable     v4 with USE_TABLE off (sums recomputed per 4-row block)
+  v_e120_table       v4 as dispatched at m>=4 (sums read from the xsums table)
+  v_e120_na8         inputs-per-group 8 -> one weight read at m=8, 4 out rows
+  v_e120_r2na8       inputs-per-group 8 with 2 out rows, to halve the register
+                     cost of the wider input group
 """
 
 from __future__ import annotations
@@ -18,6 +27,10 @@ from __future__ import annotations
 GROUP_SIZE = 64
 BITS = 4
 SPLIT_K = 8
+
+# fastmlx/kernels/_qmm_skinny_mma_source.py, kept in step by hand so this file
+# stays importable without fastmlx on the path.
+E120_INPUTS_PER_GROUP = {2: 2, 3: 3, 4: 4, 5: 5, 6: 3, 7: 4, 8: 4, 9: 3}
 
 
 def _prologue(c_tiles: int, m: int) -> str:
@@ -357,9 +370,182 @@ def bstage_body(m: int) -> str:
     )
 
 
+def _e120_body(m: int, *, na: int, rows_per_simd: int, table: bool) -> str:
+    """The E120 register-only QMV, flattened for one width.
+
+    Transcribed from ``fastmlx/kernels/_qmm_skinny_mma_source.py``
+    (Layr-Labs/qwen-3.8-mtp-challenge, MIT; LICENSE vendored under
+    ``tools/reference/e120/``).  Two deliberate departures from the shipped
+    source, neither of which touches the loop body being counted:
+
+    * the templates are expanded by hand, because ``qmm_metal_file`` passes no
+      ``header`` and Metal has no function templates inside a function body;
+    * ``xsums`` is aliased onto ``x`` instead of arriving in its own buffer,
+      because the harness signature is fixed at four inputs.  Both are
+      read-only ``device`` buffers carrying ``air-buffer-no-alias``, so the
+      table read compiles to the same load it does in the shipped kernel; only
+      the base register differs.
+    """
+
+    groups = -(-m // na)  # ceil: how many times the weight column is re-read
+    stride = 8 if m <= 8 else 16
+    if table:
+        sums_setup = f"""
+        VF sums;
+        const device float* e_st = e_xsums
+            + ((k / block_size) * 32 + int(simd_lid)) * {stride} + first_m;
+        #pragma unroll
+        for (int mi = 0; mi < NA; mi++) {{
+            sums[mi] = e_st[mi];
+        }}"""
+        sums_accum = ""
+        xsums_decl = (
+            "\n    const device float* e_xsums "
+            "= reinterpret_cast<const device float*>(x);"
+        )
+    else:
+        sums_setup = """
+        VF sums = VF(0.0f);"""
+        sums_accum = """
+                sums[mi] += xv[0] + xv[1] + xv[2] + xv[3];"""
+        xsums_decl = ""
+
+    return f"""
+    // E120 QMV, width {m}: inputs-per-group {na}, {rows_per_simd} output rows
+    // per simdgroup, so the weight column is read {groups}x for this width.
+    constexpr int NA = {na};
+    constexpr int rows_per_simd = {rows_per_simd};
+    constexpr int values_per_thread = 16;
+    constexpr int block_size = values_per_thread * 32;
+    constexpr int bytes_per_lane = 8;
+    typedef vec<float, NA> VF;
+
+    const int in_vec_size = x_shape[x_ndim - 1];
+    const int out_vec_size = w_shape[0];
+    const int in_vec_size_w = in_vec_size / 2;
+    const int in_vec_size_g = in_vec_size / 64;
+
+    const uint simd_lid = thread_index_in_simdgroup;
+    const uint sgid = simdgroup_index_in_threadgroup;
+    const uint3 e_tid = threadgroup_position_in_grid;
+    const int out_row = int(e_tid.y) * (rows_per_simd * 2)
+        + int(sgid) * rows_per_simd;
+    const int first_m = int(e_tid.x) * NA;{xsums_decl}
+    if (first_m >= {m}) {{
+        return;
+    }}
+
+    VF acc[rows_per_simd];
+    for (int r = 0; r < rows_per_simd; r++) {{
+        acc[r] = VF(0.0f);
+    }}
+
+    for (int k = 0; k < in_vec_size; k += block_size) {{
+        thread uint16_t packed[rows_per_simd][4];
+        thread float scale_local[rows_per_simd];
+        thread float bias_local[rows_per_simd];
+        #pragma unroll
+        for (int r = 0; r < rows_per_simd; r++) {{
+            const int row = out_row + r;
+            const device uint16_t* ws =
+                reinterpret_cast<const device uint16_t*>(
+                    reinterpret_cast<const device uint8_t*>(w) +
+                    row * in_vec_size_w + k / 2 +
+                    simd_lid * bytes_per_lane);
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {{
+                packed[r][i] = ws[i];
+            }}
+            const int group_index =
+                row * in_vec_size_g + k / 64 + int(simd_lid) / 4;
+            scale_local[r] = (float)scales[group_index];
+            bias_local[r] = (float)biases[group_index];
+        }}
+{sums_setup}
+        VF partial[rows_per_simd];
+        #pragma unroll
+        for (int r = 0; r < rows_per_simd; r++) {{
+            partial[r] = VF(0.0f);
+        }}
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {{
+            VF a0, a1, a2, a3;
+            #pragma unroll
+            for (int mi = 0; mi < NA; mi++) {{
+                const device bfloat16_t* xm =
+                    (const device bfloat16_t*)x
+                    + (first_m + mi) * in_vec_size + k
+                    + simd_lid * values_per_thread + 4 * i;
+                const vec<bfloat16_t, 4> xv =
+                    *reinterpret_cast<const device vec<bfloat16_t, 4>*>(xm);
+                a0[mi] = static_cast<float>(xv[0]);
+                a1[mi] = static_cast<float>(xv[1]);
+                a2[mi] = static_cast<float>(xv[2]);
+                a3[mi] = static_cast<float>(xv[3]);{sums_accum}
+            }}
+            #pragma unroll
+            for (int r = 0; r < rows_per_simd; r++) {{
+                partial[r] += (a0 * (packed[r][i] & 0x000f) +
+                               a1 * ((packed[r][i] >> 4) & 0x000f) +
+                               a2 * ((packed[r][i] >> 8) & 0x000f) +
+                               a3 * ((packed[r][i] >> 12) & 0x000f));
+            }}
+        }}
+        #pragma unroll
+        for (int r = 0; r < rows_per_simd; r++) {{
+            acc[r] += scale_local[r] * partial[r] + sums * bias_local[r];
+        }}
+    }}
+
+    for (int r = 0; r < rows_per_simd; r++) {{
+        for (int mi = 0; mi < NA; mi++) {{
+            const float reduced = simd_sum(acc[r][mi]);
+            if (simd_lid == 0) {{
+                y[(first_m + mi) * out_vec_size + out_row + r] =
+                    static_cast<T>(reduced);
+            }}
+        }}
+    }}
+"""
+
+
+def _e120_na(m: int) -> int:
+    """The shipped inputs-per-group for this width, 4 outside E120's table."""
+
+    return E120_INPUTS_PER_GROUP.get(m, 4)
+
+
+def e120_notable_body(m: int) -> str:
+    """v4 with the xsums table off: sums recomputed for every 4-row block."""
+
+    return _e120_body(m, na=_e120_na(m), rows_per_simd=4, table=False)
+
+
+def e120_table_body(m: int) -> str:
+    """v4 as dispatched at m>=4: one xsums read replaces the sums recompute."""
+
+    return _e120_body(m, na=_e120_na(m), rows_per_simd=4, table=True)
+
+
+def e120_na8_body(m: int) -> str:
+    """One weight read at m=8, at 32 accumulators per thread."""
+
+    return _e120_body(m, na=8, rows_per_simd=4, table=True)
+
+
+def e120_r2na8_body(m: int) -> str:
+    """One weight read at m=8 with the accumulator count halved instead."""
+
+    return _e120_body(m, na=8, rows_per_simd=2, table=True)
+
+
 VARIANTS = {
     "v_uint4": uint4_body,
     "v_sgload_a": sgload_a_body,
     "v_uint4_sgload": uint4_sgload_body,
     "v_bstage": bstage_body,
+    "v_e120_notable": e120_notable_body,
+    "v_e120_table": e120_table_body,
+    "v_e120_na8": e120_na8_body,
+    "v_e120_r2na8": e120_r2na8_body,
 }

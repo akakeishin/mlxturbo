@@ -113,7 +113,10 @@ docs/REVIEW-2026-08-26.md（Codex Sol による ca9dc7f のレビュー）の指
 
 ### Phase D: アルゴリズム（受理率の分子側）
 
-設計根拠は docs/RESEARCH.md（必読）。効き順:
+設計根拠は docs/RESEARCH.md（必読）。二層構成:
+**汎用パック (D1+D3+D4+bf16 MTP+KLD quant) = 訓練ゼロで全モデルに効く底上げ、
+目標 tokens/step 2.5-2.8**。D2 (訓練) は看板モデル専用のターボで別セッション。
+効き順:
 
 - D0: 診断計測（半日、最初にやる）
   (a) 位置別受理率 α_k の分解出力（accept_trace から集計可能）。
