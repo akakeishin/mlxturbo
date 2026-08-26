@@ -178,24 +178,24 @@ KERNEL-INTEL.md の Phase C 初期レシピが引用している MTPLX Optimized
 
 ## 既知の注意点（実測前に把握しておくこと）
 
-- **TTFT の定義がエンジンごとに微妙に違う**: 3 エンジンとも「prefill（プロンプト
-  処理）にかかった時間」を代理指標として使っている
-  （mlx-lm: `prompt_tokens/prompt_tps`、fastmlx: CLI が出す `ttft_s` そのもの、
-  MTPLX: JSON の `prompt_eval_time_s`）。プロセス起動〜モデルロード完了までの
-  時間は含まない。3 エンジンともモデルロードは毎回コールドスタート
-  （subprocess 分離のため）なので、壁時計合計 (`wall_time_s`) と TTFT は別物として見ること。
-- **fastmlx の `generated_tokens` は推定値**: `fastmlx/cli.py`
-  （既存ファイル、変更禁止）は生成トークン総数を出力しない。
-  `wall_time_s - load_s - ttft_s` を `decode_tok_s` で割り戻す粗い概算を
-  `generated_tokens_estimate` として JSON に入れている。正確な値が要るなら
-  fastmlx/cli.py 側に `--json` 出力を足す別タスクが要る（今回は着手していない）。
-- **MTPLX の same-quant 行は「AR-only」比較**: lmstudio 4bit には MTPLX が
-  認識する MTP ヘッドが同梱されていない（README/KERNEL-INTEL.md にある通り、
-  mlx-lm の sanitize がロード時に `mtp.*` を捨てる。lmstudio 配布にも
-  入っていない）。そのため same-quant 行の MTPLX は `--no-mtp` 固定で走る。
-  これは「MTPLX の投機デコード機能」ではなく「MTPLX の AR カーネル実装」の
-  比較になる点に注意。投機込みの MTPLX を見たいなら recommended 行
-  （Optimized-Speed, `--depth 3 --mtp`）を見ること。
+- TTFT として JSON に入れている値は、3 エンジンとも実体は prefill（プロンプト
+  処理）にかかった時間で揃えた。mlx-lm は `prompt_tokens/prompt_tps` の商、
+  fastmlx は CLI がそのまま出す `ttft_s`、MTPLX は JSON の `prompt_eval_time_s`
+  を使っている。ただしこの値にプロセス起動からモデルロード完了までの時間は
+  入らない。subprocess で毎回コールドスタートするぶん `wall_time_s`（壁時計
+  合計）のほうが長く出るので、TTFT と壁時計合計は別の数字として読むこと。
+- fastmlx 側の生成トークン数は実測ではなく概算になる。`fastmlx/cli.py`
+  （既存ファイルなので今回は変更していない）が生成トークン総数を出力しない
+  ため、`wall_time_s - load_s - ttft_s` を `decode_tok_s` で割り戻した値を
+  `generated_tokens_estimate` として JSON に入れた。正確な数を取りたければ
+  fastmlx/cli.py に `--json` 出力を足す作業が別途要る。
+- same-quant 行の MTPLX は投機デコードを比較していない。lmstudio 4bit には
+  MTPLX が認識する MTP ヘッドが同梱されていない（mlx-lm の sanitize がロード
+  時に `mtp.*` を捨てる件、README/KERNEL-INTEL.md に記載のとおり）ため、この
+  行の MTPLX は `--no-mtp` 固定で走らせている。ここで比べているのは MTPLX の
+  AR カーネル実装であって、MTPLX の看板機能である投機デコードではない。投機
+  込みの MTPLX を見るなら recommended 行（Optimized-Speed, `--depth 3 --mtp`）
+  を見る。
 - **mlx-lm の `stream_generate` は既知の非決定 quirk がある**
   （`docs/STATUS.md` Phase B2 実測）: 手動 greedy ループとは位置 49 あたりで
   準同点 argmax が入れ替わることがあり、原因は `stream_generate` 側の
@@ -206,9 +206,10 @@ KERNEL-INTEL.md の Phase C 初期レシピが引用している MTPLX Optimized
   （fastmlx/cli.py の既定と同じ）。同一 checkpoint を 3 エンジンに揃えるための
   選択で、この ID は既にローカル HF キャッシュに存在することを確認済み
   （`~/.cache/huggingface/hub/models--lmstudio-community--Qwen3.8-27B-MLX-4bit`）。
-- **温度は既定 0（greedy）**: 3 エンジンとも `--temp 0.0` で決定的に揃えている。
-  `--temp` で上書き可能だが、MTPLX の厳密棄却サンプリングの主張を見たいなら
-  `--temp 0.6`（MTPLX README の推奨値）に変えて比較すること。
+- 温度は 3 エンジンとも `--temp 0.0` の greedy に揃えてある。決定的な出力で
+  比較したいのでこれを既定にしたが、MTPLX の厳密棄却サンプリングの主張
+  （temp>0 でも分布厳密同一）を確かめたいなら `--temp 0.6`（MTPLX README の
+  推奨値）に変えて流す。
 
 ## ライセンス
 
