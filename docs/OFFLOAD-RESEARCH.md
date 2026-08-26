@@ -38,3 +38,15 @@ PowerInfer-2 (2406.06282) / Not All Models Suit Expert Offloading (2505.16056) /
 DraftExpert (2607.24434) / EcoSpec (2607.12696) / SpecOffload (2505.10259) /
 flash-moe (github.com/danveloper/flash-moe, M3 Max 実測) /
 DeepSeek-R1 671B on 96GB (unsloth discussion)
+
+## 追記: FreeToken (arXiv:2608.16157) の検討
+
+GLM-5.2 753B を 14.9 tok/s で動かした報告だが、実体は SSD offload ではなく
+DRAM offload。expert 全量は 512GB のシステム DRAM (178GB/s) に常駐し、SSD は
+初回ロードのみ。DRAM に収まらない場合は pure-CPU 落ちで SSD サービング経路は
+無い。核心の適応分割 (q*=m·BP/BH) は PCIe と host の 2 帯域ドメインの裁定で、
+unified memory (1 ドメイン) には適用不能。よって 128GB Mac での判定は不変。
+含意はむしろ逆方向で、M3 Ultra 512GB なら GLM-5.2 が unified memory に常駐し
+(帯域は彼らの DDR5 比 4.5 倍)、FreeToken 機を大差で超える理論位置にある。
+router 分割・弾性 expert キャッシュ等の実行構造は将来の別バックエンド設計の
+参考になる (llama.cpp 比 2 倍の実証)。
