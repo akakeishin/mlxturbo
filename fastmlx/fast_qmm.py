@@ -79,25 +79,38 @@ _SRC = r"""
         int j  = (int)(lane & 7);
         int kq = (int)(lane >> 3);
         int n  = n0 + j;
+        // B スラブは列メジャー bt[j*64 + k]。1 レーンの 16 要素が連続になり
+        // vec4 store 4 本で書ける (ストライド 8 のスカラー store 16 本を廃止)。
+        threadgroup bfloat16_t* bc = bt + j * 64 + kq * 16;
         if (n < N) {
             int g = ka >> 6;
             float s  = (float)sc[(size_t)n * (K / 64) + g];
             float bb = (float)bi[(size_t)n * (K / 64) + g];
             const device uint* wr = w + (size_t)n * (K / 8) + (ka >> 3) + kq * 2;
             uint p0 = wr[0], p1 = wr[1];
-            for (int t = 0; t < 8; ++t)
-                bt[(kq * 16 + t) * 8 + j] = (bfloat16_t)((float)((p0 >> (4 * t)) & 15u) * s + bb);
-            for (int t = 0; t < 8; ++t)
-                bt[(kq * 16 + 8 + t) * 8 + j] = (bfloat16_t)((float)((p1 >> (4 * t)) & 15u) * s + bb);
+            vec<bfloat16_t, 4> v0, v1, v2, v3;
+            for (int t = 0; t < 4; ++t)
+                v0[t] = (bfloat16_t)((float)((p0 >> (4 * t)) & 15u) * s + bb);
+            for (int t = 0; t < 4; ++t)
+                v1[t] = (bfloat16_t)((float)((p0 >> (4 * (t + 4))) & 15u) * s + bb);
+            for (int t = 0; t < 4; ++t)
+                v2[t] = (bfloat16_t)((float)((p1 >> (4 * t)) & 15u) * s + bb);
+            for (int t = 0; t < 4; ++t)
+                v3[t] = (bfloat16_t)((float)((p1 >> (4 * (t + 4))) & 15u) * s + bb);
+            ((threadgroup vec<bfloat16_t, 4>*)bc)[0] = v0;
+            ((threadgroup vec<bfloat16_t, 4>*)bc)[1] = v1;
+            ((threadgroup vec<bfloat16_t, 4>*)bc)[2] = v2;
+            ((threadgroup vec<bfloat16_t, 4>*)bc)[3] = v3;
         } else {
-            for (int t = 0; t < 16; ++t) bt[(kq * 16 + t) * 8 + j] = (bfloat16_t)0;
+            vec<bfloat16_t, 4> z = vec<bfloat16_t, 4>(bfloat16_t(0));
+            for (int t = 0; t < 4; ++t) ((threadgroup vec<bfloat16_t, 4>*)bc)[t] = z;
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
         simdgroup_matrix<bfloat16_t, 8, 8> A, B;
         for (int kt = 0; kt < 8; ++kt) {
             simdgroup_load(A, x + ka + kt * 8, K);   // x[0:8, ka+8kt ..] — 패딩된 8행
-            simdgroup_load(B, bt + kt * 64, 8);
+            simdgroup_load(B, bt + kt * 8, 64, ulong2(0, 0), true);  // 列メジャーを transpose で読む
             simdgroup_multiply_accumulate(C, A, B, C);
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -148,24 +161,37 @@ _SRC_WIDE = r"""
         int j  = (int)(lane & 7);
         int kq = (int)(lane >> 3);
         int n  = n0 + j;
+        // B スラブは列メジャー bt[j*64 + k]。1 レーンの 16 要素が連続になり
+        // vec4 store 4 本で書ける (ストライド 8 のスカラー store 16 本を廃止)。
+        threadgroup bfloat16_t* bc = bt + j * 64 + kq * 16;
         if (n < N) {
             int g = ka >> 6;
             float s  = (float)sc[(size_t)n * (K / 64) + g];
             float bb = (float)bi[(size_t)n * (K / 64) + g];
             const device uint* wr = w + (size_t)n * (K / 8) + (ka >> 3) + kq * 2;
             uint p0 = wr[0], p1 = wr[1];
-            for (int t = 0; t < 8; ++t)
-                bt[(kq * 16 + t) * 8 + j] = (bfloat16_t)((float)((p0 >> (4 * t)) & 15u) * s + bb);
-            for (int t = 0; t < 8; ++t)
-                bt[(kq * 16 + 8 + t) * 8 + j] = (bfloat16_t)((float)((p1 >> (4 * t)) & 15u) * s + bb);
+            vec<bfloat16_t, 4> v0, v1, v2, v3;
+            for (int t = 0; t < 4; ++t)
+                v0[t] = (bfloat16_t)((float)((p0 >> (4 * t)) & 15u) * s + bb);
+            for (int t = 0; t < 4; ++t)
+                v1[t] = (bfloat16_t)((float)((p0 >> (4 * (t + 4))) & 15u) * s + bb);
+            for (int t = 0; t < 4; ++t)
+                v2[t] = (bfloat16_t)((float)((p1 >> (4 * t)) & 15u) * s + bb);
+            for (int t = 0; t < 4; ++t)
+                v3[t] = (bfloat16_t)((float)((p1 >> (4 * (t + 4))) & 15u) * s + bb);
+            ((threadgroup vec<bfloat16_t, 4>*)bc)[0] = v0;
+            ((threadgroup vec<bfloat16_t, 4>*)bc)[1] = v1;
+            ((threadgroup vec<bfloat16_t, 4>*)bc)[2] = v2;
+            ((threadgroup vec<bfloat16_t, 4>*)bc)[3] = v3;
         } else {
-            for (int t = 0; t < 16; ++t) bt[(kq * 16 + t) * 8 + j] = (bfloat16_t)0;
+            vec<bfloat16_t, 4> z = vec<bfloat16_t, 4>(bfloat16_t(0));
+            for (int t = 0; t < 4; ++t) ((threadgroup vec<bfloat16_t, 4>*)bc)[t] = z;
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
 
         simdgroup_matrix<bfloat16_t, 8, 8> A0, A1, B;
         for (int kt = 0; kt < 8; ++kt) {
-            simdgroup_load(B,  bt + kt * 64, 8);
+            simdgroup_load(B, bt + kt * 8, 64, ulong2(0, 0), true);  // 列メジャーを transpose で読む
             simdgroup_load(A0, x + ka + kt * 8, K);              // 행 0-7
             simdgroup_multiply_accumulate(C0, A0, B, C0);
             simdgroup_load(A1, x + (size_t)8 * K + ka + kt * 8, K);  // 행 8-15
@@ -191,6 +217,25 @@ _SRC_WIDE = r"""
         }
     }
 """
+
+_ZPAD: dict = {}
+
+
+def _zpad(rows: int, k: int):
+    """ゼロ埋め用の定数配列。毎回 mx.zeros を dispatch しないためのキャッシュ。
+
+    カーネル内で実在しない行をレーン側マスクで作る案は依存チェーン実測で
+    棄却済み (per-lane スカラー A 構築が発行コストを 20-45% 増やし、
+    nocap にも負ける)。ホスト側パディング維持が現状の勝ち筋。
+    """
+    key = (rows, k)
+    z = _ZPAD.get(key)
+    if z is None:
+        z = mx.zeros((rows, k), dtype=mx.bfloat16)
+        mx.eval(z)
+        _ZPAD[key] = z
+    return z
+
 
 _KERNEL_WIDE = mx.fast.metal_kernel(
     name="qmm_mma4_wide",
@@ -244,7 +289,7 @@ def _wide_qmm(x, w, scales, biases, *, M: int, K: int, N: int):
     """M in (8, 16] — 두 행-타일. 창 안 경로와 동일한 형상 규약을 쓴다."""
     flat = x.reshape(-1, K)
     if M < 16:                       # 커널은 16행 타일을 device 에서 직접 읽는다
-        flat = mx.concatenate([flat, mx.zeros((16 - M, K), dtype=flat.dtype)], axis=0)
+        flat = mx.concatenate([flat, _zpad(16 - M, K)], axis=0)
     (out,) = _KERNEL_WIDE(
         inputs=[flat, w, scales, biases],
         template=[("KD", K), ("ND", N), ("MD", M)],
@@ -294,7 +339,7 @@ def fast_qmm(x, w, scales, biases, *, group_size: int, bits: int):
         )
     flat = x.reshape(M, K)
     if M < 8:  # 커널이 8행 MMA 타일을 device 에서 직접 읽는다 — 경계 밖을 막는다
-        flat = mx.concatenate([flat, mx.zeros((8 - M, K), dtype=flat.dtype)], axis=0)
+        flat = mx.concatenate([flat, _zpad(8 - M, K)], axis=0)
     (out,) = _KERNEL(
         inputs=[flat, w, scales, biases],
         template=[("KD", K), ("ND", N), ("MD", M)],
