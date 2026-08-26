@@ -27,8 +27,11 @@ def _routes(*, mma_max: int = 16) -> tuple[str, ...]:
 
     del mma_max
     row = [STOCK] * 17
-    # nocap の勝ち域は実測で m=6..10 (m=11,12 は stock と互角〜劣後)。
-    for m in range(6, 11):
+    # 2026-08-26 静音窓の全点実測 (bench/results/dispatch-a3-quiet.json):
+    # 全 4 shape で一貫して M=6..9 は mma (v3)、M=10..11 は nocap、12+ は stock。
+    for m in range(6, 10):
+        row[m] = MMA
+    for m in range(10, 12):
         row[m] = NOCAP
     return tuple(row)
 
