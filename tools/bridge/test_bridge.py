@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import chain_kernels as ck  # noqa: E402
 from bridge import (  # noqa: E402
+    ORDER_CB,
     SPLIT_CB,
     SPLIT_ENCODER,
     WAIT,
@@ -180,7 +181,7 @@ def _check_split_variants(steps: int, n: int):
     for label, flags, want_cb in [
         ("1 CB / 1 encoder", WAIT, 1),
         ("1 CB / N encoder", WAIT | SPLIT_ENCODER, 1),
-        ("N CB", WAIT | SPLIT_CB, steps),
+        ("N CB + MTLEvent", WAIT | SPLIT_CB | ORDER_CB, steps),
     ]:
         y = mx.zeros((n,), dtype=mx.float32)
         mx.eval(y)
@@ -196,6 +197,77 @@ def _check_split_variants(steps: int, n: int):
 
 def test_chain_split_variants():
     _check_split_variants(16, 4096)
+
+
+def test_split_cb_needs_event():
+    """同一キューでも command buffer 同士は重なって走ることの記録。
+
+    依存のある連鎖を CB 分割で流すと、MTLEvent を挟まない限り dispatch が
+    取りこぼされる (「step 13 相当の値」などが返る)。ORDER_CB を付けた側は
+    毎回正しいことを assert し、付けない側は成功回数を出すだけに留める
+    (レースなので回数は環境と負荷で変わる)。
+    """
+    steps, n, trials = 16, 4096, 12
+    x = _make_x(n)
+    ref = ck.closed_form(_read(x).astype(np.float64), steps)
+    br = Bridge.for_array(x)
+    lib = br.add_library(ck.BRIDGE_MSL)
+    pipe = br.pipeline(lib, "chain_affine")
+
+    counts = {}
+    for label, flags in [("event なし", WAIT | SPLIT_CB), ("event あり", WAIT | SPLIT_CB | ORDER_CB)]:
+        ok = 0
+        for _ in range(trials):
+            y = mx.zeros((n,), dtype=mx.float32)
+            mx.eval(y)
+            _bridge_chain(br, pipe, x, y, steps, n, flags=flags)
+            if np.array_equal(_read(y).astype(np.float64), ref):
+                ok += 1
+        counts[label] = ok
+
+    assert counts["event あり"] == trials, (
+        f"ORDER_CB を付けても {trials - counts['event あり']}/{trials} 回ずれた"
+    )
+    print(
+        f"ok  split_cb_needs_event      N CB 分割の正答: "
+        f"event なし {counts['event なし']}/{trials}, event あり {counts['event あり']}/{trials}"
+    )
+    br.close()
+
+
+def test_split_cb_independent_ok():
+    """依存がなければ CB 分割でも event は要らない (書き込み先が互いに素)。"""
+    n, parts = 1024, 8
+    x = _make_x(n)
+    y = mx.zeros((n * parts,), dtype=mx.float32)
+    mx.eval(y)
+    br = Bridge.for_array(x)
+    lib = br.add_library(ck.BRIDGE_MSL)
+    pipe = br.pipeline(lib, "chain_affine")
+    consts = ck.bridge_constants(n)
+
+    buf_y, off_y = metal_buffer(y)
+    buf_x, off_x = metal_buffer(x)
+    from bridge import Dispatch  # noqa: PLC0415
+
+    ds = [
+        Dispatch(
+            pipe,
+            [(buf_x, off_x), (buf_y, off_y + k * n * 4)],
+            (n, 1, 1),
+            (TG, 1, 1),
+            constants=consts,
+            keep_alive=(x, y),
+        )
+        for k in range(parts)
+    ]
+    br.submit(ds, flags=WAIT | SPLIT_CB)
+    got = _read(y).astype(np.float64).reshape(parts, n)
+    ref = ck.closed_form(_read(x).astype(np.float64), 1)
+    for k in range(parts):
+        assert np.array_equal(got[k], ref), f"part {k} が不一致"
+    print(f"ok  split_cb_independent_ok  互いに素な {parts} 区画は CB 分割でも一致")
+    br.close()
 
 
 def test_chain_on_offset_view():
@@ -241,6 +313,38 @@ def test_mlx_reads_bridge_result():
     br.close()
 
 
+def test_mlx_metallib_loads():
+    """MLX 同梱の mlx.metallib を自前 device で開き、pipeline まで作れること。
+
+    B1 の続きで MLX 本体のカーネル (affine_qmv / sdpa_vector / rms) を
+    自前 encoder から名指しできるかの下見。
+    """
+    import mlx  # noqa: PLC0415
+
+    # mlx.__file__ は None (namespace package) なので __path__ を使う
+    path = os.path.join(mlx.__path__[0], "lib", "mlx.metallib")
+    if not os.path.exists(path):
+        print("skip mlx_metallib_loads     mlx.metallib が見つからない")
+        return
+    a = mx.zeros((1024,), dtype=mx.float32)
+    mx.eval(a)
+    br = Bridge.for_array(a)
+    lib = br.add_library_file(path)
+    names = br.function_names(lib)
+    assert len(names) > 1000, f"関数が少なすぎる: {len(names)}"
+    wanted = "affine_qmv_fast_bfloat16_t_gs_64_b_4_batch_0"
+    assert wanted in names, f"{wanted} が無い"
+    pipe = br.pipeline(lib, wanted)
+    assert br.max_threads(pipe) > 0
+    n_qmv = sum(1 for n in names if "affine_qmv" in n)
+    n_sdpa = sum(1 for n in names if "sdpa" in n)
+    print(
+        f"ok  mlx_metallib_loads       {len(names)} 関数 (affine_qmv {n_qmv} / sdpa {n_sdpa})、"
+        f"pipeline 生成まで到達"
+    )
+    br.close()
+
+
 def test_device_is_shared():
     a = mx.zeros((1024,), dtype=mx.float32)
     mx.eval(a)
@@ -261,8 +365,11 @@ TESTS = [
     test_chain_matches_mlx,
     test_chain_n32,
     test_chain_split_variants,
+    test_split_cb_needs_event,
+    test_split_cb_independent_ok,
     test_chain_on_offset_view,
     test_mlx_reads_bridge_result,
+    test_mlx_metallib_loads,
 ]
 
 

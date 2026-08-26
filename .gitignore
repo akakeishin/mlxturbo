@@ -5,3 +5,4 @@ __pycache__/
 tools/isa/applegpu/
 data/
 models/
+tools/bridge/*.dylib

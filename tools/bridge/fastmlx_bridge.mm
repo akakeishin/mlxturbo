@@ -135,6 +135,7 @@ FMB_EXPORT void fmb_context_destroy(FMBContext* ctx) {
   @autoreleasepool {
     ctx->libs.clear();
     ctx->pipes.clear();
+    ctx->order_event = nil;
     ctx->queue = nil;
     ctx->device = nil;
   }
@@ -194,6 +195,55 @@ FMB_EXPORT int fmb_library_from_source(FMBContext* ctx, const char* source, int 
     }
     ctx->libs.push_back(lib);
     return (int)ctx->libs.size() - 1;
+  }
+}
+
+// 既製の .metallib を読む。MLX の wheel が同梱する mlx.metallib
+// (~182MB / 17319 関数) をそのまま開けるので、affine_qmv / sdpa_vector /
+// rms / rope といった MLX 本体のカーネルを自前 encoder から名指しできる。
+FMB_EXPORT int fmb_library_from_file(FMBContext* ctx, const char* path, char* err,
+                                     int errlen) {
+  @autoreleasepool {
+    if (!ctx || !path) {
+      set_err(err, errlen, @"null ctx/path");
+      return -1;
+    }
+    NSError* e = nil;
+    NSURL* url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:path]];
+    id<MTLLibrary> lib = [ctx->device newLibraryWithURL:url error:&e];
+    if (!lib) {
+      set_err(err, errlen, e ? [e localizedDescription] : @"newLibraryWithURL failed");
+      return -1;
+    }
+    ctx->libs.push_back(lib);
+    return (int)ctx->libs.size() - 1;
+  }
+}
+
+FMB_EXPORT int fmb_library_function_count(FMBContext* ctx, int lib_id) {
+  if (!ctx || lib_id < 0 || lib_id >= (int)ctx->libs.size()) {
+    return -1;
+  }
+  return (int)[[ctx->libs[(size_t)lib_id] functionNames] count];
+}
+
+// index 番目の関数名を out へ書く。戻り値は書いた長さ (切り詰め時は -1)。
+FMB_EXPORT int fmb_library_function_name(FMBContext* ctx, int lib_id, int index, char* out,
+                                         int outlen) {
+  @autoreleasepool {
+    if (!ctx || lib_id < 0 || lib_id >= (int)ctx->libs.size() || !out || outlen <= 0) {
+      return -1;
+    }
+    NSArray<NSString*>* names = [ctx->libs[(size_t)lib_id] functionNames];
+    if (index < 0 || index >= (int)names.count) {
+      return -1;
+    }
+    const char* c = [names[(NSUInteger)index] UTF8String];
+    if (!c || (int)std::strlen(c) >= outlen) {
+      return -1;
+    }
+    std::strcpy(out, c);
+    return (int)std::strlen(out);
   }
 }
 

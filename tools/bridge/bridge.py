@@ -39,6 +39,7 @@ __all__ = [
     "SPLIT_CB",
     "SPLIT_ENCODER",
     "UNRETAINED",
+    "ORDER_CB",
 ]
 
 # fmb_submit のフラグ (fastmlx_bridge.mm と一致させること)
@@ -48,6 +49,9 @@ NO_BARRIER = 1 << 2
 SPLIT_CB = 1 << 3
 SPLIT_ENCODER = 1 << 4
 UNRETAINED = 1 << 5
+# SPLIT_CB で分けた command buffer 同士を MTLEvent で直列化する。
+# 同一キューでも CB は重なって走るので、依存のある連鎖には必須 (実測)。
+ORDER_CB = 1 << 6
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DYLIB = os.path.join(_HERE, "libfastmlx_bridge.dylib")
@@ -205,6 +209,23 @@ def _load():
         ctypes.c_char_p,
         ctypes.c_int,
         c_err,
+        ctypes.c_int,
+    ]
+    lib.fmb_library_from_file.restype = ctypes.c_int
+    lib.fmb_library_from_file.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        c_err,
+        ctypes.c_int,
+    ]
+    lib.fmb_library_function_count.restype = ctypes.c_int
+    lib.fmb_library_function_count.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.fmb_library_function_name.restype = ctypes.c_int
+    lib.fmb_library_function_name.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_char_p,
         ctypes.c_int,
     ]
     lib.fmb_pipeline.restype = ctypes.c_int
@@ -368,6 +389,30 @@ class Bridge:
         if lib_id < 0:
             raise BridgeError(err.value.decode())
         return lib_id
+
+    def add_library_file(self, path: str) -> int:
+        """既製の .metallib を読む。MLX 同梱の mlx.metallib もこれで開ける。"""
+        err = ctypes.create_string_buffer(_ERRLEN)
+        lib_id = self._lib.fmb_library_from_file(
+            self._ctx, os.fspath(path).encode(), err, _ERRLEN
+        )
+        if lib_id < 0:
+            raise BridgeError(err.value.decode())
+        return lib_id
+
+    def function_names(self, lib_id: int, contains: str | None = None) -> list[str]:
+        n = self._lib.fmb_library_function_count(self._ctx, lib_id)
+        if n < 0:
+            raise BridgeError(f"bad library id {lib_id}")
+        buf = ctypes.create_string_buffer(512)
+        out = []
+        for i in range(n):
+            if self._lib.fmb_library_function_name(self._ctx, lib_id, i, buf, 512) < 0:
+                continue
+            name = buf.value.decode()
+            if contains is None or contains in name:
+                out.append(name)
+        return out
 
     def pipeline(self, lib_id: int, fn_name: str) -> int:
         err = ctypes.create_string_buffer(_ERRLEN)
