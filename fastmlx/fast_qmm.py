@@ -197,6 +197,7 @@ _KERNEL_WIDE = mx.fast.metal_kernel(
     input_names=["x", "w", "sc", "bi"],
     output_names=["out"],
     source=_SRC_WIDE,
+    ensure_row_contiguous=True,
 )
 
 
@@ -205,10 +206,22 @@ _KERNEL = mx.fast.metal_kernel(
     input_names=["x", "w", "sc", "bi"],
     output_names=["out"],
     source=_SRC,
+    # raw linear indexing in the source requires contiguous rows; pin the
+    # guarantee instead of relying on the MLX default
+    ensure_row_contiguous=True,
 )
 
 
-def _eligible(x: mx.array, group_size: int, bits: int, K: int, N: int) -> bool:
+def _eligible(
+    x: mx.array,
+    w: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    group_size: int,
+    bits: int,
+    K: int,
+    N: int,
+) -> bool:
     return (
         bits == 4
         and group_size == 64
@@ -217,6 +230,12 @@ def _eligible(x: mx.array, group_size: int, bits: int, K: int, N: int) -> bool:
         and K % 512 == 0
         and N >= N_MIN
         and x.dtype == mx.bfloat16
+        # the kernel indexes packed operands with these exact layouts; anything
+        # else must fall back rather than read out of bounds
+        and w.dtype == mx.uint32
+        and w.shape == (N, K // 8)
+        and scales.shape == (N, K // 64)
+        and biases.shape == (N, K // 64)
         and mx.default_device() == mx.gpu
     )
 
@@ -263,10 +282,13 @@ def fast_qmm(x, w, scales, biases, *, group_size: int, bits: int):
     if (
         M_MAX < M <= M_WIDE_MAX
         and os.environ.get("MLXLM_FAST_QMM_WIDE") == "1"
-        and _eligible(x, group_size, bits, K, N)
+        and _eligible(x, w, scales, biases, group_size, bits, K, N)
     ):
         return _wide_qmm(x, w, scales, biases, M=M, K=K, N=N)
-    if not (M_MIN <= M <= M_MAX and _eligible(x, group_size, bits, K, N)):
+    if not (
+        M_MIN <= M <= M_MAX
+        and _eligible(x, w, scales, biases, group_size, bits, K, N)
+    ):
         return mx.quantized_matmul(
             x, w, scales, biases, transpose=True, group_size=group_size, bits=bits
         )

@@ -166,6 +166,15 @@ def main():
         speculative_check = _comparison(
             reference_tokens, speculative["tokens"], tokenizer
         )
+        if not speculative_check["identical"]:
+            # 合格基準は baseline のみ。spec の不一致は bf16 完全同点が
+            # バッチ形状の縮約順で割れる同点 flip でも起きる (bench/tie_flip_probe.py
+            # で実証、docs/STATUS.md の同点 flip 節)。ここの False 単体を
+            # バグの証拠として扱わないこと。
+            speculative_check["note"] = (
+                "not a gate criterion; may be bf16 tie flips from batched "
+                "verification (see docs/STATUS.md)"
+            )
         baseline_failed |= not baseline_check["identical"]
         results[name] = {
             "reference": {
