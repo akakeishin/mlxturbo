@@ -65,6 +65,7 @@ def diag_generate(engine, prompt_ids, max_tokens, n_draft, eos_ids, rescale):
     attempts = [0] * (n_draft + 1)
     match = [0] * (n_draft + 1)
     chain = [0] * (n_draft + 1)
+    top2_hit = 0
     accept_trace = []
     # RMS 記録: ステップごとに (rms_h_last, [rms_hat_k], [rms_true_k])
     rms_rows = []
@@ -84,9 +85,15 @@ def diag_generate(engine, prompt_ids, max_tokens, n_draft, eos_ids, rescale):
             h_mtp = engine._mtp_append(dtok, dh, mtp_cache)
             rms_hat.append(_rms(h_mtp[:, -1:]))
             hat_states.append(h_mtp[:, -1:])
-            d = mx.argmax(
-                engine._head(h_mtp[:, -1:], engine.mtp.norm), axis=-1
-            ).reshape(1)
+            mtp_logits = engine._head(h_mtp[:, -1:], engine.mtp.norm)
+            d = mx.argmax(mtp_logits, axis=-1).reshape(1)
+            if k == 0:
+                # ミニ木 (第 1 リンク幅) の採算判定用: MTP の第 2 候補。
+                # greedy の被覆は排反なので p(top1) + p(top2) がそのまま効く。
+                masked = mx.where(
+                    mx.arange(mtp_logits.shape[-1]) == d[0], -mx.inf, mtp_logits[0, -1]
+                )
+                second = mx.argmax(masked).reshape(1)
             drafts.append(d)
             dh, dtok = h_mtp[:, -1:], d
         window = mx.concatenate([y] + drafts) if drafts else y
@@ -103,7 +110,10 @@ def diag_generate(engine, prompt_ids, max_tokens, n_draft, eos_ids, rescale):
         rms_h_last = _rms(h_last)
         mx.eval(preds, window, *rms_hat, *rms_true, *cos_vals, rms_h_last)
 
+        mx.eval(second)
         preds_l, window_l = preds.tolist(), window.tolist()
+        if preds_l[0] == int(second.item()):
+            top2_hit += 1
         accepted_eos = None
         a = 0
         while a < depth and preds_l[a] == window_l[a + 1]:
@@ -149,6 +159,7 @@ def diag_generate(engine, prompt_ids, max_tokens, n_draft, eos_ids, rescale):
         "attempts": attempts,
         "match": match,
         "chain": chain,
+        "top2_hit": top2_hit,
         "accept_trace": accept_trace,
         "rms_rows": rms_rows,
     }
@@ -171,11 +182,13 @@ def summarize(per_prompt, n_draft):
     rms_hat_by_depth = [[] for _ in range(n_draft + 1)]
     rms_true_by_depth = [[] for _ in range(n_draft + 1)]
     cos_by_depth = [[] for _ in range(n_draft + 1)]
+    top2_hit = 0
     for r in per_prompt.values():
         for k in range(n_draft + 1):
             attempts[k] += r["attempts"][k]
             match[k] += r["match"][k]
             chain[k] += r["chain"][k]
+        top2_hit += r.get("top2_hit", 0)
         trace.extend(r["accept_trace"])
         for _, rms_hat, rms_true, cos_vals in r["rms_rows"]:
             for k, (h_hat, h_true, c) in enumerate(
@@ -209,8 +222,13 @@ def summarize(per_prompt, n_draft):
             "cos_std": cos_std,
         }
     mean_accepted = sum(trace) / steps if steps else 0.0
+    p1 = match[1] / attempts[1] if attempts[1] else None
+    p2 = top2_hit / attempts[1] if attempts[1] else None
     return {
         "steps": steps,
+        "top1_rate_k1": p1,
+        "top2_rate_k1": p2,
+        "top2_coverage_k1": (p1 + p2) if p1 is not None else None,
         "mean_accepted": mean_accepted,
         "tokens_per_step": 1.0 + mean_accepted,
         "depths": depths,

@@ -184,13 +184,10 @@ MLX 量子化の有無を確認してから固定する）:
   8bit(392)/2bit g128(86)/3bit g128(43)/4bit(9) の混合で実効 ~3.4bpw。
   3bit expert の 2bit 化 + 8bit 島の 4-6bit 化で ~105GB (実効 ~3.0) が狙い目。
   2bit 主力域なので KLD ゲート必須
-- M6: GLM-5.2（ユーザー指定の最難関 = RAM 超過モデルの SSD offload 課題）
-  最小 MLX quant でも 316GB（REAP25-4bit）で 128GB RAM の 2.5 倍、内蔵ディスク
-  空き 267GB にも収まらない。実行には外部ストレージが前提（本人確認待ち）。
-  技術方針: mmap ロード + RAM を hot expert キャッシュ化し、cold expert のみ
-  ストレージから。成否は expert ルーティングの局所性で決まるため、
-  着手前に M1 の道具で「トークン間 expert 再利用率」を実測して採算を判定する。
-  mlx-lm の glm_moe_dsa が対応 arch か要確認
+- M6: GLM-5.2 — 調査の結果 NO-GO で確定 (docs/OFFLOAD-RESEARCH.md、
+  docs/OFFLOAD-DESIGN-SOL.md)。予測 0.6-1.1 tok/s、投機との相乗も先行研究と
+  実機記録で否定。再訪条件は sol 設計書の閾値リスト (SSD p10>=4.5GB/s、
+  U_cold(4)<19 等) を満たすハード/モデルが現れたときのみ
 
 ### Phase E: 計測・比較・公開準備
 
