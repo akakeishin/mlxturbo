@@ -49,6 +49,7 @@ import argparse
 import json
 import platform
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -176,7 +177,7 @@ def build_mtplx_command(args: argparse.Namespace, prompt: str, mode: str) -> lis
         cmd.append("--no-mtp")
     else:
         cmd += ["--depth", str(args.depth), "--mtp"]
-    cmd += list(args.mtplx_extra_args)
+    cmd += shlex.split(args.mtplx_extra_args)
     return cmd
 
 
@@ -489,9 +490,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--no-mtplx-inspect", dest="mtplx_inspect", action="store_false")
     ap.add_argument(
         "--mtplx-extra-args",
-        nargs="*",
-        default=[],
-        help="mtplx ask にそのまま追加する引数（例: --unsafe-force-unverified）",
+        default="",
+        help="mtplx ask に追加する引数の空白区切り文字列"
+        "（例: '--cache-dir /path --unsafe-force-unverified'。"
+        "nargs='*' だと後続の -- で始まるトークンを argparse が自分の"
+        "オプションと誤認するため、単一文字列で受けて shlex で分割する）",
     )
 
     ap.add_argument("--gpu-note", required=True, help="直前の GPU 使用状況の注記（例: '直前5分アイドル'）")
