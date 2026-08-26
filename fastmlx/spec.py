@@ -17,7 +17,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 from mlx_lm.models.cache import KVCache
-from mlx_lm.models.gated_delta import gated_delta_update
+
+from .kernels.gated_delta_states import gated_delta_update_with_states
 
 
 class ChatSession:
@@ -97,28 +98,14 @@ class SpecEngine:
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        state = cache[1]
-        outs, states = [], []
-        for p in range(S):
-            o, state = gated_delta_update(
-                q[:, p : p + 1],
-                k[:, p : p + 1],
-                v[:, p : p + 1],
-                a[:, p : p + 1],
-                b[:, p : p + 1],
-                la.A_log,
-                la.dt_bias,
-                state,
-                None,
-            )
-            outs.append(o)
-            states.append(state)
-        out = outs[0] if S == 1 else mx.concatenate(outs, axis=1)
+        out, states_all = gated_delta_update_with_states(
+            q, k, v, a, b, la.A_log, la.dt_bias, cache[1], None
+        )
 
         n_keep = la.conv_kernel_size - 1
         cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
-        cache[1] = state
-        sink.append((cache, states, conv_input, la.conv_kernel_size))
+        cache[1] = states_all[:, -1]
+        sink.append((cache, states_all, conv_input, la.conv_kernel_size))
 
         r = la.out_proj(la.norm(out, z).reshape(B, S, -1))
         h = x + r
@@ -130,8 +117,8 @@ class SpecEngine:
         for c in caches:
             if isinstance(c, KVCache):
                 c.trim(total - consumed)
-        for cache, states, conv_input, kernel in sink:
-            cache[1] = states[consumed - 1]
+        for cache, states_all, conv_input, kernel in sink:
+            cache[1] = states_all[:, consumed - 1]
             cache[0] = mx.contiguous(conv_input[:, consumed : consumed + kernel - 1, :])
 
     # ---------- MTP ----------
