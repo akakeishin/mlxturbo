@@ -1,8 +1,0 @@
-# Derived artifacts.  build/metal/*.metal is generated too but is already
-# tracked, and it is the text the whole analysis is about, so it stays visible.
-air/
-agx/
-metallib/
-gpu/
-pipeline_probe
-*.json

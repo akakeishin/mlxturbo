@@ -6,3 +6,4 @@ tools/isa/applegpu/
 data/
 models/
 tools/bridge/*.dylib
+tools/isa/build/
