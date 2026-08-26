@@ -437,3 +437,23 @@ decode tok/s 中央値:
   残る必要があり、深さ 3 前後の MTP 連鎖では窓が入らない (lookup 長ドラフト
   限定)。既定 off のまま維持。lookup 支配が強まるか深いドラフトが実現したら
   再評価。RESEARCH.md の「θ->0 で厳密」は逆だったので本文確認の上訂正済み
+
+## Phase Q 開始: Qwen3.8-Flash-Next 最高品質量子化 (2026-08-27)
+
+対象は Qwen/Qwen3.8-Flash-Next (qwen4_exp、実総数 180B / 活性 6B、
+bf16 360GB、GDN:QSA=3:1 ハイブリッド + 512-expert MoE + n-gram 51B +
+multi-step 訓練済み MTP 2.6B)。既存公開量子化は 113GB (重すぎ) か
+n-gram 欠落品のみで、128GB Mac 向け決定版は空席。
+
+- bf16 アーカイブを外付け (Mobile SSD) へ取得中。レシピ試行錯誤は
+  再ダウンロード不要になる
+- 動作環境: mlx-lm PR #1788 の qwen4_exp.py を tools/vendor/ へ取り込み
+  (MIT、fastmlx 変更は sanitize の mtp.* drop のみ)。実 config で
+  ModelArgs 構築確認済み。MTP モジュールは fastmlx 側で自作する
+  (27B の mtp.py の再演。mtp.layers.0 は QSA+512expert MoE のフル 1 層、
+  hyper-connections 4 レーン)
+- 変換系: fastmlx/convert_flash.py (install-arch / estimate / extract-mtp /
+  convert)。クラス別 quant_predicate によるレシピ:
+  v0-95 = experts 4bit + ngram 3bit + 制御系 8bit = 95.7GB (実台帳から算出)
+  v0-105 = ngram 4bit = 102.1GB。感度スキャンで配分を更新する
+- ライセンス qwen-community-1.0 の再配布条件は公開前に精読すること
