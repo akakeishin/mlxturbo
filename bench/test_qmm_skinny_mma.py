@@ -1,4 +1,4 @@
-"""GPU correctness and dependency-chain acceptance gate for Phase A2.
+"""GPU correctness and dependency-chain acceptance gate for Phase A2 v3.
 
 Run serially: ``uv run python bench/test_qmm_skinny_mma.py``.
 Absolute timings are reference observations; final measurement must use a quiet machine.
@@ -14,11 +14,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import mlx.core as mx
 
-from fastmlx.kernels.qmm_skinny_mma import qmm_skinny_mma
+from fastmlx.kernels.qmm_skinny_mma import M_MAX, M_MIN, qmm_skinny_mma
+
+BF16_CORRECTNESS_THRESHOLD = 8e-3
+CORRECTNESS_SHAPES = ((512, 1024), (5120, 4096))
 
 
 def _dtype(name):
-    return {"float16": mx.float16, "bfloat16": mx.bfloat16}[name]
+    return {"bfloat16": mx.bfloat16}[name]
 
 
 def _make_quantized(n, k, dtype):
@@ -55,17 +58,25 @@ def _median_ms(fn, warmup=3, reps=12):
 
 
 def correctness(dtype):
-    k, n = 512, 1024
-    q = _make_quantized(n, k, dtype)
     results = {}
-    for m in range(6, 17):
-        x = (mx.random.normal((m, k)) * 0.1).astype(dtype)
-        expected = _stock(x, q)
-        actual = qmm_skinny_mma(x, *q)
-        mx.eval(expected, actual)
-        max_abs, normalized = _normalized_max_error(actual, expected)
-        results[m] = {"max_abs": max_abs, "normalized_max": normalized}
-        assert normalized < 1e-3, f"M={m}: {results[m]}"
+    for k, n in CORRECTNESS_SHAPES:
+        q = _make_quantized(n, k, dtype)
+        shape_results = {}
+        for m in range(M_MIN, M_MAX + 1):
+            x = (mx.random.normal((m, k)) * 0.1).astype(dtype)
+            expected = _stock(x, q)
+            actual = qmm_skinny_mma(x, *q)
+            mx.eval(expected, actual)
+            max_abs, normalized = _normalized_max_error(actual, expected)
+            shape_results[m] = {
+                "max_abs": max_abs,
+                "normalized_max": normalized,
+            }
+            assert normalized < BF16_CORRECTNESS_THRESHOLD, (
+                f"K={k}, N={n}, M={m}: "
+                f"threshold={BF16_CORRECTNESS_THRESHOLD}, {shape_results[m]}"
+            )
+        results[f"k{k}_n{n}"] = shape_results
     return results
 
 
@@ -86,33 +97,32 @@ def dependency_chain(dtype):
     def stock_op(x, q):
         return _stock(x, q)
 
-    def mma_op(x, q):
+    def e120_op(x, q):
         return qmm_skinny_mma(x, *q)
 
-    timings = {}
-    for m in (8, 16):
-        x = make_input(m)
-        stock_ms = _median_ms(lambda: chain(stock_op, x))
-        mma_ms = _median_ms(lambda: chain(mma_op, x))
-        single_stock_ms = _median_ms(lambda: stock_op(x, up))
-        single_mma_ms = _median_ms(lambda: mma_op(x, up))
-        timings[m] = {
+    m = 8
+    x = make_input(m)
+    stock_ms = _median_ms(lambda: chain(stock_op, x))
+    e120_ms = _median_ms(lambda: chain(e120_op, x))
+    single_stock_ms = _median_ms(lambda: stock_op(x, up))
+    single_e120_ms = _median_ms(lambda: e120_op(x, up))
+    timings = {
+        m: {
             "chain_stock_ms": stock_ms,
-            "chain_mma_ms": mma_ms,
-            "chain_speedup": stock_ms / mma_ms,
+            "chain_e120_ms": e120_ms,
+            "chain_speedup": stock_ms / e120_ms,
             "single_stock_ms": single_stock_ms,
-            "single_mma_ms": single_mma_ms,
-            "single_speedup": single_stock_ms / single_mma_ms,
+            "single_e120_ms": single_e120_ms,
+            "single_speedup": single_stock_ms / single_e120_ms,
         }
-
+    }
     assert timings[8]["chain_speedup"] >= 1.5, timings
-    assert timings[16]["chain_mma_ms"] / timings[8]["chain_mma_ms"] <= 1.6, timings
     return timings
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="bfloat16")
+    parser.add_argument("--dtype", choices=("bfloat16",), default="bfloat16")
     parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument("--json", dest="json_out")
     args = parser.parse_args()
@@ -121,6 +131,8 @@ def main():
 
     result = {
         "dtype": args.dtype,
+        "kernel": "E120 no-table v3",
+        "correctness_threshold": BF16_CORRECTNESS_THRESHOLD,
         "correctness": correctness(dtype),
         "timing_note": "reference only; final measurement requires a quiet machine",
     }

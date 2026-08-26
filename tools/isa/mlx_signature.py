@@ -82,11 +82,31 @@ def build_metal_file(
     for n, t in zip(input_names, input_types):
         params.append(f"  const device {t}* {n} [[buffer({buf})]]")
         buf += 1
+        # MLX appends a shape / strides / ndim buffer for an input only when the
+        # body mentions it by name.
+        if f"{n}_shape" in body:
+            params.append(f"  const constant int* {n}_shape [[buffer({buf})]]")
+            buf += 1
+        if f"{n}_strides" in body:
+            params.append(f"  const constant int64_t* {n}_strides [[buffer({buf})]]")
+            buf += 1
+        if f"{n}_ndim" in body:
+            params.append(f"  const constant int& {n}_ndim [[buffer({buf})]]")
+            buf += 1
     for n, t in zip(output_names, output_types):
         params.append(f"  device {t}* {n} [[buffer({buf})]]")
         buf += 1
     for attr, ty in _used_attributes(body):
         params.append(f"  {ty} {attr} [[{attr}]]")
+
+    signature = f"""[[kernel]] void {func}(
+{",\n".join(params)}) {{
+{body}
+}}
+"""
+    if not template_params:
+        # MLX emits a plain kernel when the call site passes no template args.
+        return f"{MLX_PREAMBLE}\n{header}\n{signature}"
 
     tdef = ", ".join(f"{kind} {pname}" for kind, pname in template_params)
     targs = ", ".join(template_args)
@@ -96,11 +116,7 @@ def build_metal_file(
     return f"""{MLX_PREAMBLE}
 {header}
 template <{tdef}>
-[[kernel]] void {func}(
-{",\n".join(params)}) {{
-{body}
-}}
-
+{signature}
 template [[host_name("{host}")]] [[kernel]] decltype({inst}) {inst};
 """
 

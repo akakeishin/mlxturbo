@@ -1,24 +1,23 @@
-"""Clean-room 8x8 MMA kernel for skinny affine-4bit quantized matmul.
-
-The implementation follows only ``docs/PLAN.md`` Phase A2 and the public
-Metal SIMD-group matrix contract.  It does not copy or depend on
-``fastmlx.fast_qmm``.
-"""
+# Ported from Layr-Labs/qwen-3.8-mtp-challenge Qwen35.swift E120 QMV.
+# Copyright (c) 2026 Layr Labs, Inc. Licensed under the MIT License; see
+# tools/reference/e120/LICENSE.
+"""E120 register-only QMV for skinny BF16 affine-4/group-64 matmul."""
 
 from typing import Any
 
 from ._qmm_skinny_mma_source import (
     BITS,
     GROUP_SIZE,
+    METAL_HEADER,
     M_MAX,
     M_MIN,
-    SPLIT_K,
+    THREADGROUP,
+    active_input_groups,
     build_source,
     eligible_layout,
 )
 
-_KERNELS: dict[tuple[int, bool], Any] = {}
-_METAL_HEADER = "#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n"
+_KERNEL: Any | None = None
 
 
 def _load_mx():
@@ -30,7 +29,9 @@ def _load_mx():
 def _eligible(mx, x, w, scales, biases, group_size: int, bits: int) -> bool:
     if mx.default_device() != mx.gpu or not mx.metal.is_available():
         return False
-    if x.dtype not in (mx.float16, mx.bfloat16):
+    # E120's arithmetic and vector loads are explicitly bfloat16_t.  Other
+    # dtypes remain on the exact stock path rather than instantiating a variant.
+    if x.dtype != mx.bfloat16:
         return False
     if w.dtype != mx.uint32 or scales.dtype != x.dtype or biases.dtype != x.dtype:
         return False
@@ -50,19 +51,18 @@ def _eligible(mx, x, w, scales, biases, group_size: int, bits: int) -> bool:
     )
 
 
-def _get_kernel(mx, m: int, fp16_input: bool):
-    key = (m, fp16_input)
-    kernel = _KERNELS.get(key)
-    if kernel is None:
-        kernel = mx.fast.metal_kernel(
-            name=f"fastmlx_qmm_skinny_mma_m{m}_{'f16' if fp16_input else 'bf16'}",
-            input_names=["x", "w", "scales", "biases"],
+def _get_kernel(mx):
+    global _KERNEL
+    if _KERNEL is None:
+        _KERNEL = mx.fast.metal_kernel(
+            name="fastmlx_e120_affine4_g64_qmv_v3",
+            input_names=["w", "scales", "biases", "x"],
             output_names=["y"],
-            source=build_source(m, fp16_input=fp16_input),
-            header=_METAL_HEADER,
+            source=build_source(),
+            header=METAL_HEADER,
+            ensure_row_contiguous=True,
         )
-        _KERNELS[key] = kernel
-    return kernel
+    return _KERNEL
 
 
 def qmm_skinny_mma(
@@ -87,16 +87,15 @@ def qmm_skinny_mma(
             bits=bits,
         )
 
-    m, k = x.shape
+    m = x.shape[0]
     n = w.shape[0]
-    kernel = _get_kernel(mx, m, x.dtype == mx.float16)
+    kernel = _get_kernel(mx)
     (y,) = kernel(
-        inputs=[x, w, scales, biases],
-        template=[("T", x.dtype), ("K", k), ("N", n)],
-        grid=(32, SPLIT_K, n // 8),
-        threadgroup=(32, SPLIT_K, 1),
+        inputs=[w, scales, biases, x],
+        grid=(active_input_groups(m) * 32, (n // 8) * 2, 1),
+        threadgroup=THREADGROUP,
         output_shapes=[(m, n)],
-        output_dtypes=[x.dtype],
+        output_dtypes=[mx.bfloat16],
     )
     return y
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import pathlib
+import re
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -17,10 +18,9 @@ ROOT = HERE.parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(HERE))
 
-from fastmlx.kernels._qmm_skinny_mma_source import build_source  # noqa: E402
-
 import variants  # noqa: E402
-from mlx_signature import qmm_metal_file  # noqa: E402
+from mlx_signature import build_metal_file, qmm_metal_file  # noqa: E402
+from snapshots.qmm_skinny_mma_a2 import build_source  # noqa: E402
 
 # mlp_up of the benchmarked model (docs/GATE-RESULTS-A2.md).
 DEFAULT_K = 5120
@@ -59,6 +59,74 @@ def _cases(k: int, n: int) -> dict[str, str]:
                 n=n,
             )
 
+    out.update(_fastqmm_reference(k, n))
+    out.update(_current_kernel())
+    return out
+
+
+def _current_kernel() -> dict[str, str]:
+    """Whatever fastmlx.kernels currently builds, on the same pipeline.
+
+    The A2 kernels above come from a snapshot so their numbers stay comparable;
+    this entry tracks the working tree so a new design can be measured against
+    them without editing this script.
+    """
+
+    try:
+        from fastmlx.kernels import _qmm_skinny_mma_source as cur
+    except Exception as exc:  # noqa: BLE001 - a broken working tree is not fatal
+        print(f"current kernel skipped: {exc}")
+        return {}
+    try:
+        body = cur.build_source()
+    except TypeError:
+        return {}
+    header = getattr(cur, "METAL_HEADER", "")
+    return {
+        "current_qmm_skinny": build_metal_file(
+            name="current_qmm_skinny",
+            body=body,
+            input_names=["w", "scales", "biases", "x"],
+            input_types=["uint32_t", "bfloat16_t", "bfloat16_t", "bfloat16_t"],
+            output_names=["y"],
+            output_types=["bfloat16_t"],
+            template_params=[],
+            template_args=[],
+            header=header,
+        )
+    }
+
+
+_SRC_RE = re.compile(r"^(_SRC(?:_WIDE)?) = r\"\"\"(.*?)^\"\"\"", re.S | re.M)
+
+
+def _fastqmm_reference(k: int, n: int) -> dict[str, str]:
+    """The vendored fast_qmm bodies, wrapped in their own MLX signature.
+
+    fast_qmm is the 1.57x reference in docs/GATE-RESULTS-A2.md, so it belongs
+    on the same disassembly pipeline.  Its source is lifted textually rather
+    than imported so this script never has to load mlx.
+    """
+
+    path = ROOT / "fastmlx" / "fast_qmm.py"
+    if not path.exists():
+        return {}
+    bodies = dict(_SRC_RE.findall(path.read_text()))
+    out: dict[str, str] = {}
+    for key, name, m in (("_SRC", "ref_fastqmm_m8", 8), ("_SRC_WIDE", "ref_fastqmm_m16", 16)):
+        body = bodies.get(key)
+        if body is None:
+            continue
+        out[name] = build_metal_file(
+            name=name,
+            body=body,
+            input_names=["x", "w", "sc", "bi"],
+            input_types=["bfloat16_t", "uint32_t", "bfloat16_t", "bfloat16_t"],
+            output_names=["out"],
+            output_types=["bfloat16_t"],
+            template_params=[("int", "KD"), ("int", "ND"), ("int", "MD")],
+            template_args=[str(k), str(n), str(m)],
+        )
     return out
 
 

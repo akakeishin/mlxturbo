@@ -1,5 +1,6 @@
-"""Metal-free structural, eligibility, and fallback tests for Phase A2."""
+"""Metal-free source, host-geometry, eligibility, and fallback tests for A2 v3."""
 
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,65 +8,133 @@ from types import SimpleNamespace
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastmlx.kernels._qmm_skinny_mma_source import (
+    ACTIVE_INPUT_GROUPS,
     BITS,
+    BLOCK_SIZE,
     GROUP_SIZE,
+    INPUTS_PER_GROUP,
+    METAL_HEADER,
     M_MAX,
     M_MIN,
+    ROWS_PER_SIMD,
+    THREADGROUP,
+    VALUES_PER_THREAD,
+    active_input_groups,
     build_source,
     eligible_layout,
 )
-from fastmlx.kernels import qmm_skinny_mma as mma_module
+from fastmlx.kernels import qmm_skinny_mma as qmv_module
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SWIFT_REFERENCE = REPO_ROOT / "tools/reference/e120/Qwen35.swift"
 
 
-def test_all_m_specializations_have_required_structure():
-    for m in range(M_MIN, M_MAX + 1):
-        source = build_source(m)
-        assert "simdgroup_matrix<float, 8, 8> c0" in source
-        assert "group += SPLITS" in source
-        assert "constexpr int SPLITS = 8" in source
-        assert "constexpr int QGROUP = 64" in source
-        assert "simdgroup_matrix<half, 8, 8> bmat" in source
-        assert "threadgroup T b_tiles" not in source
-        assert "scale0 = simd_shuffle" in source
-        assert "packed0 = simd_shuffle" in source
-        assert "threadgroup float partials" in source
-        assert "for (int split = 0; split < SPLITS; ++split)" in source
-
-
-def test_partial_m_tiles_are_guarded_device_loads():
-    m6 = build_source(6)
-    assert "a0.thread_elements()[0]" in m6
-    assert "frag_row < 6" in m6
-    assert "simdgroup_matrix<float, 8, 8> c1" not in m6
-
-    m8 = build_source(8)
-    assert "a0.thread_elements()[0]" in m8
-    m8_fp16 = build_source(8, fp16_input=True)
-    assert "simdgroup_load(a0, x + (size_t)0 * K + k_base, K)" in m8_fp16
-
-    m9 = build_source(9)
-    assert "a0.thread_elements()[0]" in m9
-    assert "a1.thread_elements()[0]" in m9
-    assert "frag_row < 1" in m9
-    assert m9.count("simdgroup_multiply_accumulate") == 2
-
-    m16 = build_source(16, fp16_input=True)
-    assert "simdgroup_load(a0" in m16
-    assert "simdgroup_load(a1" in m16
-    assert m16.count("simdgroup_multiply_accumulate") == 2
-
-
-def test_fragment_lane_mapping_covers_each_matrix_element_once():
-    coordinates = []
-    for lane in range(32):
-        quad = lane // 4
-        row = (quad & 4) + (lane // 2) % 4
-        col = (quad & 2) * 2 + (lane % 2) * 2
-        coordinates.extend(((row, col), (row, col + 1)))
-    assert len(coordinates) == 64
-    assert set(coordinates) == {
-        (row, col) for row in range(8) for col in range(8)
+def test_host_constants_and_width_plan_match_e120():
+    assert ROWS_PER_SIMD == 4
+    assert VALUES_PER_THREAD == 16
+    assert BLOCK_SIZE == 512
+    assert THREADGROUP == (32, 2, 1)
+    assert (M_MIN, M_MAX) == (2, 9)
+    assert INPUTS_PER_GROUP == {
+        2: 2,
+        3: 3,
+        4: 4,
+        5: 5,
+        6: 3,
+        7: 4,
+        8: 4,
+        9: 3,
     }
+    assert ACTIVE_INPUT_GROUPS == {
+        2: 1,
+        3: 1,
+        4: 1,
+        5: 1,
+        6: 2,
+        7: 2,
+        8: 2,
+        9: 3,
+    }
+    for m, groups in ACTIVE_INPUT_GROUPS.items():
+        assert active_input_groups(m) == groups
+    for m in (1, 10):
+        try:
+            active_input_groups(m)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"M={m} must not have an E120 width plan")
+
+
+def test_python_constants_are_witnessed_in_vendored_swift():
+    swift = SWIFT_REFERENCE.read_text()
+    license_text = (SWIFT_REFERENCE.parent / "LICENSE").read_text()
+    for relative in (
+        "fastmlx/kernels/_qmm_skinny_mma_source.py",
+        "fastmlx/kernels/qmm_skinny_mma.py",
+    ):
+        port = (REPO_ROOT / relative).read_text()
+        assert "Layr-Labs/qwen-3.8-mtp-challenge" in port
+        assert "Copyright (c) 2026 Layr Labs" in port
+        assert "MIT License" in port
+    assert "MIT License" in license_text
+    assert "Copyright (c) 2026 Layr Labs, Inc." in license_text
+    assert "constexpr int rows_per_simd = 4;" in swift
+    assert "constexpr int values_per_thread = 16;" in swift
+    assert "constexpr int block_size = values_per_thread * 32;" in swift
+    assert "threadGroup: (32, 2, 1)" in swift
+    assert "grid: (Self.activeInputGroups(cell.m) * 32, (cell.n / 8) * 2, 1)" in swift
+    for m, inputs_per_group in INPUTS_PER_GROUP.items():
+        assert f"case {m}: inputsPerGroup = {inputs_per_group}" in swift
+
+
+def test_source_is_e120_no_table_and_respects_prohibitions():
+    header = METAL_HEADER
+    source = build_source()
+    joined = header + source
+
+    assert "Copyright (c) 2026 Layr Labs" in header
+    assert "MIT License" in header
+    assert "typedef vec<float, NA> VF" in header
+    assert "constexpr int rows_per_simd = 4" in header
+    assert "constexpr int values_per_thread = 16" in header
+    assert "constexpr int block_size = values_per_thread * 32" in header
+    assert "simd_sum(acc[r][m])" in header
+
+    # Runtime K/N contract. M/NA/IPG may be template constants; K and N may not.
+    assert "qmv_k = x_shape[x_ndim - 1]" in source
+    assert "qmv_n = w_shape[0]" in source
+    template_lists = re.findall(r"template\s*<([^>]*)>", joined)
+    assert all(not re.search(r"\b[KN]\b", params) for params in template_lists)
+
+    # Phase 2 and every empirically failed design stay absent.
+    assert "USE_TABLE" not in joined
+    assert "xsums" not in joined
+    assert "simdgroup_matrix" not in joined
+    assert "threadgroup_barrier" not in joined
+    assert "threadgroup float" not in joined
+    assert "split_k" not in joined.lower()
+    assert "SPLITS" not in joined
+
+    # The widest specialization is NA=5, hence 4*5=20 accumulators/thread.
+    assert ROWS_PER_SIMD * max(INPUTS_PER_GROUP.values()) == 20
+    assert ROWS_PER_SIMD * max(INPUTS_PER_GROUP.values()) <= 24
+
+
+def test_runtime_width_switch_matches_active_group_plan():
+    source = build_source()
+    for m, inputs_per_group in INPUTS_PER_GROUP.items():
+        assert f"case {m}:" in source
+        assert f"fastmlx_e120_qmv_m<{m}, {inputs_per_group}>" in source
+    assert source.count("fastmlx_e120_qmv_m<") == len(INPUTS_PER_GROUP)
+
+
+def test_gpu_gate_has_v3_acceptance_thresholds():
+    gate = (REPO_ROOT / "bench/test_qmm_skinny_mma.py").read_text()
+    assert "BF16_CORRECTNESS_THRESHOLD = 8e-3" in gate
+    assert "CORRECTNESS_SHAPES = ((512, 1024), (5120, 4096))" in gate
+    assert 'timings[8]["chain_speedup"] >= 1.5' in gate
+    assert "range(M_MIN, M_MAX + 1)" in gate
 
 
 def test_layout_eligibility_boundaries():
@@ -81,13 +150,13 @@ def test_layout_eligibility_boundaries():
             bits,
         )
 
-    assert eligible(m=6)
-    assert eligible(m=16)
-    assert not eligible(m=5)
-    assert not eligible(m=17)
+    assert eligible(m=2)
+    assert eligible(m=9)
+    assert not eligible(m=1)
+    assert not eligible(m=10)
     assert not eligible(group=128)
     assert not eligible(bits=8)
-    assert not eligible(k=5100)
+    assert not eligible(k=5184)
     assert not eligible(n=17409)
     assert not eligible_layout(
         8,
@@ -135,67 +204,93 @@ class _FakeMX:
 
         def kernel(**call_kwargs):
             self.kernel_calls.append(call_kwargs)
-            return ("mma-output",)
+            return ("e120-output",)
 
         return kernel
 
 
-def test_non_metal_path_calls_stock_exactly_once():
-    fake_mx = _FakeMX()
-    old_loader = mma_module._load_mx
-    mma_module._load_mx = lambda: fake_mx
-    try:
-        x = _FakeArray((8, 5120), fake_mx.bfloat16)
-        w = _FakeArray((17408, 640), fake_mx.uint32)
-        scales = _FakeArray((17408, 80), fake_mx.bfloat16)
-        biases = _FakeArray((17408, 80), fake_mx.bfloat16)
-        out = mma_module.qmm_skinny_mma(x, w, scales, biases)
-    finally:
-        mma_module._load_mx = old_loader
-
-    assert out == "stock-fallback"
-    assert len(fake_mx.fallback_calls) == 1
-    args, kwargs = fake_mx.fallback_calls[0]
-    assert args == (x, w, scales, biases)
-    assert kwargs == {"transpose": True, "group_size": 64, "bits": 4}
+def _arrays(fake_mx, m=8, k=5120, n=17408, dtype=None):
+    dtype = dtype or fake_mx.bfloat16
+    return (
+        _FakeArray((m, k), dtype),
+        _FakeArray((n, k // 8), fake_mx.uint32),
+        _FakeArray((n, k // 64), dtype),
+        _FakeArray((n, k // 64), dtype),
+    )
 
 
-def test_eligible_path_builds_and_launches_expected_grid():
+def test_non_metal_and_non_bf16_paths_call_stock_exactly_once():
+    for fake_mx, dtype in (
+        (_FakeMX(), None),
+        (_FakeMX(gpu_available=True), "float16"),
+    ):
+        old_loader = qmv_module._load_mx
+        qmv_module._load_mx = lambda fake_mx=fake_mx: fake_mx
+        try:
+            chosen_dtype = fake_mx.float16 if dtype == "float16" else None
+            x, w, scales, biases = _arrays(fake_mx, dtype=chosen_dtype)
+            out = qmv_module.qmm_skinny_mma(x, w, scales, biases)
+        finally:
+            qmv_module._load_mx = old_loader
+
+        assert out == "stock-fallback"
+        assert len(fake_mx.fallback_calls) == 1
+        args, kwargs = fake_mx.fallback_calls[0]
+        assert args == (x, w, scales, biases)
+        assert kwargs == {"transpose": True, "group_size": 64, "bits": 4}
+
+
+def test_eligible_path_builds_once_and_launches_e120_geometry():
     fake_mx = _FakeMX(gpu_available=True)
-    old_loader = mma_module._load_mx
-    mma_module._load_mx = lambda: fake_mx
-    mma_module._KERNELS.clear()
+    old_loader = qmv_module._load_mx
+    qmv_module._load_mx = lambda: fake_mx
+    qmv_module._KERNEL = None
     try:
-        x = _FakeArray((9, 5120), fake_mx.bfloat16)
-        w = _FakeArray((17408, 640), fake_mx.uint32)
-        scales = _FakeArray((17408, 80), fake_mx.bfloat16)
-        biases = _FakeArray((17408, 80), fake_mx.bfloat16)
-        out = mma_module.qmm_skinny_mma(x, w, scales, biases)
+        outputs = []
+        arrays_by_m = {}
+        for m in (8, 9):
+            x, w, scales, biases = _arrays(fake_mx, m=m)
+            arrays_by_m[m] = (x, w, scales, biases)
+            outputs.append(qmv_module.qmm_skinny_mma(x, w, scales, biases))
     finally:
-        mma_module._load_mx = old_loader
-        mma_module._KERNELS.clear()
+        qmv_module._load_mx = old_loader
+        qmv_module._KERNEL = None
 
-    assert out == "mma-output"
+    assert outputs == ["e120-output", "e120-output"]
     assert not fake_mx.fallback_calls
     assert len(fake_mx.kernel_builds) == 1
-    assert fake_mx.kernel_builds[0]["header"] == (
-        "#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n"
-    )
-    assert len(fake_mx.kernel_calls) == 1
-    launch = fake_mx.kernel_calls[0]
-    assert launch["grid"] == (32, 8, 2176)
-    assert launch["threadgroup"] == (32, 8, 1)
-    assert launch["output_shapes"] == [(9, 17408)]
+    build = fake_mx.kernel_builds[0]
+    assert build["input_names"] == ["w", "scales", "biases", "x"]
+    assert build["header"] == METAL_HEADER
+    assert build["source"] == build_source()
+    assert build["ensure_row_contiguous"] is True
+
+    assert len(fake_mx.kernel_calls) == 2
+    m8, m9 = fake_mx.kernel_calls
+    x8, w8, scales8, biases8 = arrays_by_m[8]
+    assert m8["inputs"] == [w8, scales8, biases8, x8]
+    assert m8["grid"] == (64, 4352, 1)
+    assert m8["threadgroup"] == (32, 2, 1)
+    assert m8["output_shapes"] == [(8, 17408)]
+    assert "template" not in m8
+    x9, w9, scales9, biases9 = arrays_by_m[9]
+    assert m9["inputs"] == [w9, scales9, biases9, x9]
+    assert m9["grid"] == (96, 4352, 1)
+    assert m9["threadgroup"] == (32, 2, 1)
+    assert m9["output_shapes"] == [(9, 17408)]
+    assert "template" not in m9
 
 
 def main():
     tests = [
-        test_all_m_specializations_have_required_structure,
-        test_partial_m_tiles_are_guarded_device_loads,
-        test_fragment_lane_mapping_covers_each_matrix_element_once,
+        test_host_constants_and_width_plan_match_e120,
+        test_python_constants_are_witnessed_in_vendored_swift,
+        test_source_is_e120_no_table_and_respects_prohibitions,
+        test_runtime_width_switch_matches_active_group_plan,
+        test_gpu_gate_has_v3_acceptance_thresholds,
         test_layout_eligibility_boundaries,
-        test_non_metal_path_calls_stock_exactly_once,
-        test_eligible_path_builds_and_launches_expected_grid,
+        test_non_metal_and_non_bf16_paths_call_stock_exactly_once,
+        test_eligible_path_builds_once_and_launches_e120_geometry,
     ]
     for test in tests:
         test()

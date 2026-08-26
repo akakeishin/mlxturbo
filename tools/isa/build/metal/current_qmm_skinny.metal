@@ -1,73 +1,12 @@
-# Ported from Layr-Labs/qwen-3.8-mtp-challenge Qwen35.swift E120 QMV.
-# Copyright (c) 2026 Layr Labs, Inc. Licensed under the MIT License; see
-# tools/reference/e120/LICENSE.
-"""Metal source and host geometry for the E120 affine-4/group-64 QMV."""
+#include <metal_stdlib>
+#include <metal_simdgroup>
+#include <metal_simdgroup_matrix>
 
-GROUP_SIZE = 64
-BITS = 4
-M_MIN = 2
-M_MAX = 9
-ROWS_PER_SIMD = 4
-VALUES_PER_THREAD = 16
-BLOCK_SIZE = VALUES_PER_THREAD * 32
-THREADGROUP = (32, 2, 1)
+using namespace metal;
 
-# Faithful transcription of Qwen35CustomQMV.activeInputGroups.  M is split
-# across independent input groups; each SIMD group still owns four output rows.
-INPUTS_PER_GROUP = {
-    2: 2,
-    3: 3,
-    4: 4,
-    5: 5,
-    6: 3,
-    7: 4,
-    8: 4,
-    9: 3,
-}
-ACTIVE_INPUT_GROUPS = {
-    m: (m + inputs_per_group - 1) // inputs_per_group
-    for m, inputs_per_group in INPUTS_PER_GROUP.items()
-}
+typedef bfloat bfloat16_t;
 
 
-def active_input_groups(m: int) -> int:
-    """Return the exact E120 X-grid threadgroup count for one width."""
-
-    try:
-        return ACTIVE_INPUT_GROUPS[m]
-    except KeyError as exc:
-        raise ValueError(f"E120 QMV has no width plan for M={m}") from exc
-
-
-def eligible_layout(
-    m: int,
-    k: int,
-    n: int,
-    w_shape: tuple[int, ...],
-    scales_shape: tuple[int, ...],
-    biases_shape: tuple[int, ...],
-    group_size: int,
-    bits: int,
-) -> bool:
-    """Check the E120 shape/packing contract without importing MLX."""
-
-    if group_size != GROUP_SIZE or bits != BITS:
-        return False
-    if m not in INPUTS_PER_GROUP or k <= 0 or n <= 0:
-        return False
-    if k % BLOCK_SIZE != 0 or n % 8 != 0:
-        return False
-    if w_shape != (n, k * bits // 32):
-        return False
-    groups = k // group_size
-    return scales_shape == (n, groups) and biases_shape == (n, groups)
-
-
-# The activation chunk-sum table is intentionally absent in v3 phase 1.  K and
-# N are also absent from every template parameter list: the body reads both
-# from runtime shape metadata because E120 recorded a compiler miscompile when
-# K was templated.
-METAL_HEADER = r"""
 // Port of Layr-Labs/qwen-3.8-mtp-challenge E120 QMV.
 // Copyright (c) 2026 Layr Labs, Inc. MIT License; see vendored LICENSE.
 template <int NA>
@@ -187,21 +126,20 @@ inline void fastmlx_e120_qmv_m(
             first_m, out_row, simd_lid);
     }
 }
-"""
 
+[[kernel]] void custom_kernel_current_qmm_skinny(
+  const device uint32_t* w [[buffer(0)]],
+  const constant int* w_shape [[buffer(1)]],
+  const device bfloat16_t* scales [[buffer(2)]],
+  const device bfloat16_t* biases [[buffer(3)]],
+  const device bfloat16_t* x [[buffer(4)]],
+  const constant int* x_shape [[buffer(5)]],
+  const constant int& x_ndim [[buffer(6)]],
+  device bfloat16_t* y [[buffer(7)]],
+  uint simdgroup_index_in_threadgroup [[simdgroup_index_in_threadgroup]],
+  uint thread_index_in_simdgroup [[thread_index_in_simdgroup]],
+  uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]]) {
 
-def build_source() -> str:
-    """Return the shared no-table body for every E120-supported M."""
-
-    cases = "\n".join(
-        f"""        case {m}:
-            fastmlx_e120_qmv_m<{m}, {inputs_per_group}>(
-                w, scales, biases, x, y, qmv_k, qmv_n,
-                qmv_gx, qmv_out_row, qmv_lid);
-            break;"""
-        for m, inputs_per_group in INPUTS_PER_GROUP.items()
-    )
-    return f"""
     const int qmv_m = x_shape[x_ndim - 2];
     const int qmv_k = x_shape[x_ndim - 1];
     const int qmv_n = w_shape[0];
@@ -210,27 +148,49 @@ def build_source() -> str:
     const uint qmv_sgid = simdgroup_index_in_threadgroup;
     const int qmv_out_row = int(qmv_tid.y) * 8 + int(qmv_sgid) * 4;
     const int qmv_gx = int(qmv_tid.x);
-    switch (qmv_m) {{
-{cases}
+    switch (qmv_m) {
+        case 2:
+            fastmlx_e120_qmv_m<2, 2>(
+                w, scales, biases, x, y, qmv_k, qmv_n,
+                qmv_gx, qmv_out_row, qmv_lid);
+            break;
+        case 3:
+            fastmlx_e120_qmv_m<3, 3>(
+                w, scales, biases, x, y, qmv_k, qmv_n,
+                qmv_gx, qmv_out_row, qmv_lid);
+            break;
+        case 4:
+            fastmlx_e120_qmv_m<4, 4>(
+                w, scales, biases, x, y, qmv_k, qmv_n,
+                qmv_gx, qmv_out_row, qmv_lid);
+            break;
+        case 5:
+            fastmlx_e120_qmv_m<5, 5>(
+                w, scales, biases, x, y, qmv_k, qmv_n,
+                qmv_gx, qmv_out_row, qmv_lid);
+            break;
+        case 6:
+            fastmlx_e120_qmv_m<6, 3>(
+                w, scales, biases, x, y, qmv_k, qmv_n,
+                qmv_gx, qmv_out_row, qmv_lid);
+            break;
+        case 7:
+            fastmlx_e120_qmv_m<7, 4>(
+                w, scales, biases, x, y, qmv_k, qmv_n,
+                qmv_gx, qmv_out_row, qmv_lid);
+            break;
+        case 8:
+            fastmlx_e120_qmv_m<8, 4>(
+                w, scales, biases, x, y, qmv_k, qmv_n,
+                qmv_gx, qmv_out_row, qmv_lid);
+            break;
+        case 9:
+            fastmlx_e120_qmv_m<9, 3>(
+                w, scales, biases, x, y, qmv_k, qmv_n,
+                qmv_gx, qmv_out_row, qmv_lid);
+            break;
         default:
             break;
-    }}
-"""
+    }
 
-
-__all__ = [
-    "ACTIVE_INPUT_GROUPS",
-    "BITS",
-    "BLOCK_SIZE",
-    "GROUP_SIZE",
-    "INPUTS_PER_GROUP",
-    "METAL_HEADER",
-    "M_MAX",
-    "M_MIN",
-    "ROWS_PER_SIMD",
-    "THREADGROUP",
-    "VALUES_PER_THREAD",
-    "active_input_groups",
-    "build_source",
-    "eligible_layout",
-]
+}

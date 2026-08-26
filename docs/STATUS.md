@@ -60,31 +60,27 @@
   bench/gate.py はこの定義で実装すること）。stream_generate との差は準同点
   記録として残す
 
-## Phase A2 — v2 実装完了、再 GPU gate 待ち
+## Phase A2 — v3 実装完了、GPU gate 待ち
 
-- `fastmlx/kernels/_qmm_skinny_mma_source.py`: PLAN の確定設計だけを入力にした
-  clean-room Metal source builder を実装。8x8 `simdgroup_matrix`、group64 単位 dequant、
-  8 simdgroup split-K、device `x` 直接 load、M=9..16 の2枚 C tile で B fragment を共有する。
-- `fastmlx/kernels/qmm_skinny_mma.py`: M=6..16、4bit/group64、対応 layout/dtype の
-  launch と、非対応時の stock `mx.quantized_matmul` fallback を実装。
-- `bench/test_qmm_skinny_mma_static.py`: M別 source 構造、partial tile の guarded device
-  load、layout eligibility、fallback、launch grid を Metal 非依存で検証。
-- `bench/test_qmm_skinny_mma.py`: M=6..16 の stock 比較と、実 MLP shape の依存チェーン
-  性能 gate を実装。絶対性能値は参考記録とし、静かなマシンでの最終計測は別途行う。
-- 初回 GPU gate は `docs/GATE-RESULTS-A2.md` のとおり不合格。header 改行を修正後、
-  M=13 の normalized error `1.95e-3` と M=8 の `1.04x` が基準未達だった。
-- v2 は B の threadgroup staging を廃止し、scale/bias と packed word を lane shuffle で
-  共有、half A/B fragment と lane-native split-K reduction を採用。fp32 accumulator は維持。
-- `docs/HYPOTHESES-A2.md` は Claude/Fable 側の独立仮説として保全。v2 は H4/H5 と
-  scale/bias 再読を先に除去しており、再 gate が未達なら PLAN の split-K=8 不変条件を
-  保ったまま group64 dequant 配置（H1）を次に切り分ける。
+- v2 は GPU 実測で M=8 が stock 比 `0.82x` へ回帰したため不採用。
+- `fastmlx/kernels/_qmm_skinny_mma_source.py`: MIT の E120 を no-table 形で移植。
+  rows/simd=4、values/thread=16、block=512、threadgroup `(32,2,1)`、M=2..9 の
+  `activeInputGroups` を忠実に実装。K/N は runtime shape から読み、M=8 は4行×2 group。
+- `fastmlx/kernels/qmm_skinny_mma.py`: BF16 affine-4/group64 の単一 runtime-shape pipeline、
+  E120 grid、row-contiguous input、非対応時の stock fallback を実装。
+- `USE_TABLE` は Phase 2 へ分離。v3 Phase 1 は activation chunk-sum をカーネル内で計算する。
+- 禁止事項を静的 gate 化: K/N template、8 rows/thread、24超 accumulator、
+  split-K/threadgroup partial、`simdgroup_matrix`、barrier はすべて不在。
+- `bench/test_qmm_skinny_mma.py`: BF16 normalized error `<8e-3` を K=512 smoke と
+  K=5120 live-K の M=2..9 で比較し、M=8 dependent chain の stock 比 `>=1.5x` を
+  acceptance とする v3 gate に更新。
 
 ### 非GPU検証結果
 
-- PASS: `python3 bench/test_qmm_skinny_mma_static.py`（6件）。
+- PASS: `python3 bench/test_qmm_skinny_mma_static.py`（8件）。
 - PASS: A2 の4ファイルに対する `python3 -m py_compile` と `git diff --check`。
 
-## Phase A3 — 実装完了、GPU gate 待ち
+## Phase A3 — 完了（GPU gate 通過、`947972c`）
 
 - `fastmlx/kernels/dispatch.py`: 実測対象の `(K,N)` と flatten 後 M をキーに
   stock/nocap/MMA を選ぶ明示表を実装。未知 shape、非 affine、非対応 M は stock 固定。
@@ -99,8 +95,11 @@
 
 - PASS: `python3 bench/test_dispatch_static.py`（4件）。
 - PASS: A3 の Python ファイルに対する `python3 -m py_compile` と `git diff --check`。
+- A2 v3 最終監査時点では `bench/test_dispatch_static.py:33` の旧 `MMA` 期待だけが、
+  `947972c` で確定した現行 nocap M=6..10 表と不一致。A2 v3 の範囲では routing table と
+  A3 test を変更せず、v3 GPU gate 後の route table 再測定・更新時に同時同期する。
 
-## Phase B1 — 実装完了、GPU gate 待ち
+## Phase B1 — 完了（GPU gate 通過、`947972c`）
 
 - `fastmlx/spec.py`: target model の `QuantizedLinear` を verification-only mode で差し替え、
   `_hidden_forward(capture=True)` と `_head` だけを dispatcher scope に接続。prefill と draft は
@@ -115,7 +114,7 @@
 - PASS: `python3 bench/test_spec_dispatch_static.py`（1件）。
 - PASS: `fastmlx/spec.py` と B1 test の `python3 -m py_compile`、`git diff --check`。
 
-## Phase B2 — 実装完了、GPU gate 待ち
+## Phase B2 — 完了（GPU gate 通過、`947972c`）
 
 - `bench/gate.py`: raw model の `make_cache → model(...) → argmax` 手動 greedy loop を
   correctness reference とし、`n_draft=0/max_draft=0/lookup_len=0` baseline の完全一致と、
@@ -131,60 +130,26 @@
 
 ## GPU gate queue（必ず1プロセスずつ直列実行）
 
-### A2-v2-1 bfloat16 correctness / dependency-chain acceptance
+### A2-v3-1 E120 no-table BF16 correctness / M=8 dependency-chain acceptance
 
-- 正確なコマンド: `uv run python bench/test_qmm_skinny_mma.py --dtype bfloat16 --json bench/results/qmm-skinny-mma-a2-v2.json`
-- 期待結果: M=6..16 の normalized max error がすべて `1e-3` 未満、M=8 の依存チェーンが
-  stock `mx.quantized_matmul` 比 `1.5x` 以上、M=16/M=8 の MMA chain time 比が `1.6` 以下で、
-  JSON が保存される。絶対値は参考記録であり、静かなマシンでの最終計測は別途行う。
-- 失敗時に最初に疑う箇所: Metal compile なら half fragment への BF16 device load/cast、
-  数値不一致なら lane fragment と packed nibble の対応、性能不足なら split-K reduction。
-
-### A2-v2-2 float16 correctness
-
-- 正確なコマンド: `uv run python bench/test_qmm_skinny_mma.py --dtype float16 --correctness-only --json bench/results/qmm-skinny-mma-a2-v2-fp16.json`
-- 期待結果: M=6..16 の normalized max error がすべて `1e-3` 未満で JSON が保存される。
-- 失敗時に最初に疑う箇所: full tile の float16 device `simdgroup_load` と partial tile の
-  手動 fragment mapping の差。
-
-### A3-1 dispatcher correctness / table calibration
-
-- 正確なコマンド: `uv run python bench/test_dispatch.py --json bench/results/dispatch-a3.json`
-- 期待結果: real `QuantizedLinear` の `enable` 前後 normalized max error が `1e-3` 未満、
-  全対象 shape×M の dispatch error が MMA は `1e-3`、nocap は `2e-3` 未満で、選択 route が
-  stock/nocap/MMA の最速候補から `10%` 以内に入り JSON が保存される。絶対値は参考記録で、
-  静かなマシンでの最終計測は別途行う。
-- 失敗時に最初に疑う箇所: correctness なら 3D flatten/restore または layer bias 加算、
-  性能だけなら該当 `(K,N,M)` の route table entry。
-
-### B1-1 SpecEngine route reachability
-
-- 正確なコマンド: `uv run python bench/test_spec_dispatch.py --json bench/results/spec-dispatch-b1.json`
-- 期待結果: M=8 の prefill event はすべて verification inactive、capture には1件以上の
-  custom route、head には `(K,N,M)=(5120,248320,8)` の custom route が記録され、JSON が
-  保存される。
-- 失敗時に最初に疑う箇所: `enable(..., active=False)` で差し替えた class と
-  `_hidden_forward` / `_head` の `dispatch_scope` 境界。
-
-### B2-1 one-shot manual-loop identity / speculative mismatch gate
-
-- 正確なコマンド: `uv run python bench/gate.py --max-tokens 96 --n-draft 3 --max-draft 0 --lookup-len 16 --json bench/results/gate-b2.json`
-- 期待結果: 3 prompt すべてで raw model manual loop と非投機 baseline が token 列完全一致し
-  `baseline_all_identical=true`、speculative-on は一致/不一致のどちらでも `n_mismatch` と先頭
-  mismatch の位置・token・context を記録し、JSON が保存される。
-- 失敗時に最初に疑う箇所: baseline mismatch なら verification-only dispatch の prefill 漏れ、
-  speculative mismatch なら最初の不一致 M に対応する dispatcher route と rollback/consumed。
+- 正確なコマンド: `uv run python bench/test_qmm_skinny_mma.py --dtype bfloat16 --json bench/results/qmm-skinny-mma-a2-v3.json`
+- 期待結果: K=512/N=1024 と K=5120/N=4096 の両方で E120 対応 M=2..9 の
+  normalized max error がすべて `8e-3` 未満、M=8 の dependent chain が stock
+  `mx.quantized_matmul` 比 `1.5x` 以上で、JSON が保存される。
+  絶対性能値は参考記録であり、静かなマシンでの最終計測は別途行う。
+- 失敗時に最初に疑う箇所: Metal compile なら `bfloat16_t` vector load と runtime shape metadata、
+  数値不一致なら uint16 pack-interleave/nibble と group64 scale/bias index、性能不足なら
+  `activeInputGroups`/IPG に対応する grid volume。禁止済みの K/N template、8 rows/thread、
+  split-K/threadgroup partial へは戻さない。
 
 ### 次にやること
 
-1. GPU gate queue を A2-v2 → A3 → B1 → B2 の順に1プロセスずつ実行する。
-2. A2-v2 が性能基準未達なら split-K reduction、A3 が性能基準未達なら該当 table entry を修正する。
-3. 全 gate 通過後の性能絶対値は別途、静かなマシンで最終計測する。
+1. A2 v3 no-table GPU gate を1プロセスで実行する。
+2. v3 通過後、dispatcher route table は Claude 側の shape×M 実測で別途更新する。
+3. `USE_TABLE` は no-table gate 通過後の Phase 2 とし、この gate には混ぜない。
 
 ## コミット状況
 
 - この Codex sandbox では `.git/index.lock: Operation not permitted`（`.git` read-only）のため
   `git add` 自体が拒否され、フェーズ別コミットを作成できない。実装は上記ファイル単位で分離済み。
-- hardware gate 待ちの想定メッセージ: `A2: MMA skinny qmm v2（GPU gate待ち）`、
-  `A3: shape×M dispatcher を統合（GPU gate待ち）`、`B1: SpecEngine 検証経路を接続（GPU gate待ち）`、
-  `B2: manual loop identity gate を追加（GPU gate待ち）`。
+- hardware gate 待ちの想定メッセージ: `A2: E120 no-table QMV v3（GPU gate待ち）`。
