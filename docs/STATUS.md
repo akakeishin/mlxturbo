@@ -381,3 +381,19 @@ TV 距離が 0.013〜0.019（閾値 0.03 未満）であることを確認、別
   `git stash` 等破壊的操作は使わずに旧実装との A/B を行った）。この
   節を追記する前に `docs/STATUS.md` を読み直し、既存の追記内容を保持した
   まま末尾に追加している。
+
+## spec 出力の同点 flip — 調査完了、バグではないと判定 (2026-08-26)
+
+gate の spec 行が prose で baseline と不一致になる件 (B2 時代から存在) の決着。
+`bench/tie_flip_probe.py` の決定実験: spec エンジンを一切通さず、同一の逐次
+cache 状態 (index 77) から最後の4トークンを (a) 1つずつ (b) m=4 一括で forward
+すると、index 81 で `,` と `.` の logit が bf16 完全同点 (21.875) になり、
+一括側だけ `.` が 1 目盛り (0.125) 浮いて argmax が flip する。
+
+- 原因はバッチ形状による縮約順の数値差 x bf16 logit 粒度の完全同点。
+  4bit/bf16 モデルでは同点が普通に起きる (96 step 中 gap 0.0 が 1 回、
+  0.125-0.25 が 6 回)。m=1 と m>1 のビット同一は成立しない契約
+- fast_qmm / lookup / D パックは全て無罪 (経路 stock 化・lookup 無効化でも
+  同一 idx で同一 flip、かつ上記の通りエンジン抜きで再現)
+- 品質主張は「greedy 同点 flip を除き一致 + KLD 等価」で行う。gate の
+  合格基準は従来どおり baseline_all_identical のみ
