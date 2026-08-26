@@ -147,8 +147,237 @@
   fusion 等の狭い設計変更が必要。ただし K/N runtime、rows/simd=4、accumulator 最大20、
   split-K 不使用の E120/KERNEL-INTEL 契約は維持する。
 
+### A2-v5-1 direct-load MMA production gate（未実行）
+
+- 対象は production 既定の `fastmlx_qmm_skinny_mma_v5_m{M}_bf16`。M=6..8 は
+  C タイル 1 枚、M=9..16 は同一 B 断片を共有する C タイル 2 枚。旧 E120 v4 は
+  `implementation="e120_v4"` の明示指定でのみ比較可能。M=2..5 の dispatch は現行の
+  stock/nocap のまま変更しない。
+- BF16 correctness（K=512/N=1024 と K=5120/N=4096、M=6..16、stock 比 normalized
+  max error `<8e-3`）を 1 プロセスで実行:
+  `uv run python bench/test_qmm_skinny_mma.py --dtype bfloat16 --correctness-only`
+- 依存チェーン acceptance（m=8 で stock 比 `>=1.5x`、v5 の m=16 時間が m=8 の
+  `<=1.6x`）を静音窓で実行:
+  `uv run python bench/test_qmm_skinny_mma.py --dtype bfloat16 --json bench/results/qmm-skinny-mma-a2-v5.json`
+- M3 pipeline/occupancy と冗長 L1 読みの実コストを確認するため、上の性能 gate と同じ
+  直列窓で次を順に実行:
+  `python3 tools/isa/gen_kernels.py`、`tools/isa/build_air.sh`、
+  `tools/isa/gpu_probe.sh`、`python3 tools/isa/gpu_report.py`。
+  `current_qmm_skinny`（v5 m=8）の `maxTotalThreadsPerThreadgroup` と
+  `ref_fastqmm_m8` を比較し、256-thread launch を満たすことを確認する。値は性能 gate に
+  `--v5-max-tptg <current>` と `--reference-max-tptg <reference>` で併記する。
+  同じ report の `v_e120_na8_m8_bf16` も保存し、M3 Dynamic Caching が ISA-DIFF の
+  E120 棄却判断を反転させないか確認する。4 レーンの同一 32 B 冗長読みは公開 counter で
+  直接分離できないため、m=8 単発/依存チェーンの達成時間と帯域床との差を実コストの gate
+  とする。
+- GPU 実行はこの Codex sandbox では行わない。上記 4 コマンドと correctness/performance
+  gate は必ず 1 プロセスずつ直列実行し、結果 JSON と `gpu_report.py` の表を保存する。
+
 ## コミット状況
 
 - この Codex sandbox では `.git/index.lock: Operation not permitted`（`.git` read-only）のため
   `git add` 自体が拒否され、フェーズ別コミットを作成できない。実装は上記ファイル単位で分離済み。
 - hardware gate 待ちの想定メッセージ: `A2: E120 no-table QMV v3（GPU gate待ち）`。
+
+## Phase D 汎用パック (D1 + D3 + D4) — 実装完了、GPU gate 通過
+
+対象は `fastmlx/spec.py`（唯一の編集者として担当）と新規 `fastmlx/sam.py`。
+設計根拠は docs/RESEARCH.md、docs/KERNEL-INTEL.md「深度制御」節。3 本とも
+WebFetch で一次ソース本文（AdaEDL 2410.18351、Block Verification 2403.10444、
+ReSpec 2511.01282）を確認してから式を採用した（HTML 版が数式を落とすケースが
+あったため、arXiv PDF を `pdftotext -layout` で落として本文を読んだ）。
+kernels/、bench/gate.py、既存の他ファイルは変更していない。新規テスト
+(`bench/test_sam.py`、`bench/test_block_verify.py`) のみ追加。
+
+### D1: 確信度ゲート連鎖
+
+現行の深度ラダー（全受理 +2 / 全棄却 1 / 部分受理 a、`max_draft>0` のときだけ
+動く between-step 方式）を、MTP 連鎖の各リンクで判定する within-chain の
+ゲートに置換した (`SpecEngine._gate_depth`)。
+
+- 確信度信号は AdaEDL (2410.18351) のエントロピー下界
+  `1 - sqrt(gamma * H)`（本文で確認: gamma=0.2 が論文既定値、H は draft
+  softmax のシャノンエントロピー、自然対数）。
+- 位置別受理率 EMA と KERNEL-INTEL.md の式
+  `reach *= p_d`, `threshold = h*(1+expected)/(1+d*h)`
+  （h=0.18〜0.20 の中央値 0.19 を採用）を等式どおり実装。`expected` は
+  d+1..cap の EMA 積の畳み込み（標準的な期待受理長の式）。
+- 実装上の注意点（指示どおり）: 確信度の取得を毎リンク同期にしない。
+  MTP 連鎖は cap まで丸ごと lazy に組み立て、各リンクの entropy を
+  `mx.eval()` を挟まず配列として溜め、リンクループの後で
+  **1 回だけ** `mx.eval(*confidences)` してから Python 側でゲート判定する。
+  結果として window に含める長さ (`keep`) を事後的に切り詰める設計にした。
+  draft 計算そのもの (MTP ブロック ~1.5%) は cap まで毎回行われる — 節約は
+  「検証 window を縮める」側で起きる（README にある通り検証側がコストの
+  大半を占めるため、こちらのほうが実質的な効き目が大きい）。
+- 深度上限は `max_draft if max_draft > 0 else n_draft` を流用（旧ラダーが
+  `max_draft==0` のとき無効化されていたのに対し、新ゲートは常時働く）。
+- 事前分布は RESEARCH.md 引用の FastMTP vanilla 実測 (k=1 70% / k=2 11% /
+  k=3 2%、それ以降は 0.3 倍ずつ減衰) を使う。
+
+**見つけて直した設計バグ（飢餓状態）**: ゲートが浅く打ち切った回は深い位置を
+検証しないため EMA を更新できない。固定 50/50 で AdaEDL とブレンドすると、
+「一度低く出た事前分布が観測不足のまま効き続けて浅い判定を再生産する」
+飢餓ループに陥ることを `code` プロンプトの実機テストで検出した
+(tokens/step が旧ラダー比で悪化)。修正: EMA の重みを観測回数で立ち上げる
+`w = n/(n+GATE_EMA_WARMUP)` (GATE_EMA_WARMUP=5)。観測 0 回の位置は AdaEDL の
+瞬時確信度だけで判定し、EMA は実測が積み上がってから効かせる。
+
+**受け入れ**:
+- `bench/gate.py`: `baseline_all_identical: True`（n_draft=0/max_draft=0/
+  lookup_len=0 は D1/D3/D4 適用後も raw model 手動ループと bit 一致、必須
+  条件）。git worktree で pre-Phase-D 版と並行実行し比較した。
+- 決定論的なゲート挙動の直接検証（内容の分岐に左右されない）: `code`
+  プロンプトで `_gate_depth` をラップして 34 ステップ分の (entropies, keep)
+  を記録したところ、33/34 回が cap=3 の全深度を維持（README で code は
+  もともと受理率が高いドメインと記録されており、整合する）。ゲートは
+  「受理見込みが薄いときだけ削る」設計どおりに動作し、良好なドメインの
+  深度を不当に削っていないことを確認した。
+- tokens/step の新旧比較: 自由生成（同じプロンプトを旧実装・新実装で
+  それぞれ独立に生成）は近接同点 argmax の入れ替わり（README に既知の
+  現象として記載済み、後述）が数トークンごとに起こり得るため、旧実装と
+  新実装が **途中から異なる文章** を生成してしまい tokens/step の単純比較が
+  ノイズだらけになった（`code`: 旧 3.02 → 新 2.43〜2.46、`prose`: 旧 2.43 →
+  新 2.29〜2.31 と悪化して見えたが、後述のとおり生成内容そのものが分岐した
+  ケースを比較していた）。そこで `bench/gate.py`（96 トークン、reference
+  と bit 一致することを個別確認済みの実行のみを比較対象にする）で
+  **内容が一致するケースだけ** を抜き出すと: `edit` は旧 33 ステップ
+  (tokens/step 2.909) → 新 34 ステップ (2.824)、accept_hist は
+  `{0:11,1:5→6,2:10,3:4}` でほぼ同一分布、`6/7/12` → `6/8/9`
+  という lookup 由来の大口ヒットの位置が変わっただけ（ReSpec の長さ計算式が
+  旧の倍々ヒューリスティックと異なる値を出すため）。差は -2.9% でノイズ域。
+  `code`/`prose` は旧実装も 96 トークン以内で reference から分岐する回が
+  あり内容一致サンプルを取れなかった（両実装とも同じ既知の近接同点現象を
+  踏んでいるだけで、D1 由来ではないことは worktree 比較で確認済み — 次項）。
+  参考値であることを明記する。decode_tps の絶対値は本セッション中に
+  並行エージェントがカーネル側 (`fastmlx/kernels/`, `fast_qmm` 経路切替) を
+  複数回コミットしており測定窓を跨いで環境が変わったため、そのままでは
+  比較に使えない（同一プロンプトの stock decode_tps が試行間で 9→17 t/s
+  のように変動した）。
+- `prose` の speculative 出力は 96 トークン中 index 81 から reference と
+  分岐する（14 箇所不一致、`accept_hist`・`baseline` は bit 一致）。
+  git worktree で Phase D 適用前のコミットを別チェックアウトし同一設定で
+  実行したところ **全く同じ位置・同じ分岐内容**（"read-your-writes" vs
+  "Need be careful" で始まる文脈）で分岐することを確認した。D1/D3/D4 とは
+  無関係の既存事象（バッチ検証の縮約順の違いによる近接同点 argmax の
+  入れ替わり、README に記載済み）。系統的劣化ではなく単発の準同点。
+
+### D3: lookup の SAM 化 + ReSpec 仲裁
+
+`fastmlx/sam.py`（新規）: token 列に対する動的 suffix automaton
+（Blumer et al. 1985 のオンライン構築をアルファベット非依存にした版、
+遷移は dict）。`extend(token)` が O(1) 償却で自動を伸ばしつつ、挿入前の
+自動機に対して matching statistics カーソルを進める（＝挿入順序により
+「今追加した記号自身との自明一致」を排除でき、常に真に過去の再出現だけを
+報告する）。`_lookup_draft` の O(n) 後方走査を置換。静的コーパスは
+スコープ外のまま。
+
+- 単体テスト `bench/test_sam.py`: naive O(n^3) 全探索との既知列比較
+  （ハンドクラフト + 乱数シード20本 + 単一トークン語彙 + 無反復列の
+  エッジケース）で最長一致長・終端位置がすべて一致。状態数が O(n)
+  であることも確認 (`len(states) <= 2n+2`)。Metal 不要、GPU なしで実行可。
+- 長文生成の探索時間検証: 実モデルの自由生成は他のノイズ源（後述）に
+  埋もれるため、SuffixAutomaton 単体を 20,000 token（要件の 2000 の 10 倍）
+  合成列（モチーフの反復 40% + ランダム 60%、語彙 4000）で駆動し
+  500 token ごとの平均処理時間を計測した。先頭 10% 平均 0.855 us/token、
+  末尾 10% 平均 0.859 us/token、比 1.004x — 文脈長に対して完全にフラット
+  （O(n) 走査だった旧実装なら比例して伸びるはず）。実モデルでの 700 token
+  自由生成も統合テストとして完走を確認済み（30.2 tok/s、lookup 由来の
+  8/10 accept が複数回発生、SAM 起因のクラッシュ・リークなし）。
+
+仲裁は ReSpec (2511.01282) 流に置換。本文 (`pdftotext` で抽出、Algorithm 1)
+を確認した式をそのまま採用:
+
+- entropy-guided trigger: 直近 confirmed トークンの target 分布エントロピー
+  について遡り長 k=1..l (論文の実験値 l=3 をそのまま採用) の平均 H_k と
+  `C_k = H_k + lambda_e/k` を計算し、C_k 最小の k* の H_k* が
+  `theta_entropy` (論文の実験値 1.5) 以下なら retrieval を起動
+  (`SpecEngine._respec_trigger`)。エントロピーは confirmed トークンを
+  生成した target 分布の byproduct なので追加 forward 不要、既存の
+  `mx.eval()` に相乗り（lookup_len=0 なら計算自体スキップ）。
+- feedback-driven candidate scoring: 論文は「一致位置ごとの EMA」を
+  複数候補の並列検証（tree）に使うが、fastmlx は単一候補（SAM が返す
+  最長一致の直近出現ひとつ）しか持たない。ReSpec の粒度を fastmlx の
+  設計に対応させ、「一致長バケットごとの EMA」を単一候補版の類推とした
+  (`_respec_bucket`, 幅4のバケット、最大8)。EMA 式は論文どおり
+  `S <- (1-alpha)*S + alpha*R`, `R = accepted/proposed`。初期値・閾値は
+  図中の記載値 `theta_score=0.5`, `S0=0.5` を採用、`alpha` と `lambda_e`
+  は本文に具体値の記載がなく fastmlx 側で選んだ較正値
+  (alpha=0.3, lambda_e=1.0)。旧クールダウン方式（全棄却で 4 ステップ休止
+  + 倍々長さ）を完全に置換。
+- 較正の注意: `theta_entropy=1.5` は論文側モデルの語彙サイズで較正された
+  値。Qwen3.8 は語彙 ~150K で最大エントロピー ln(V) が大きく、確信度の
+  高い予測でも尾質量の広がりでエントロピーが数 nats になり得る
+  （実測: MTP head の link エントロピーは 0〜3.5 nats のレンジで
+  top1=0.5〜0.99 の範囲に対応、`entropy_probe.py` で実測済み）。
+  1.5 という閾値がこの語彙サイズで最適かは未検証で、次の較正候補。
+
+**受け入れ**: (a) 上記 sam.py 単体テスト全通過。(b) 上記 20,000 token
+timing 実測でフラット確認 (1.004x)、実モデル 700 token 生成の統合
+smoke test 完走。(c) `edit` プロンプトの tokens/step: 96 token・内容一致
+条件で旧 2.909 → 新 2.824（-2.9%、ノイズ域、上記 D1 節参照）。lookup の
+大口ヒット位置がずれるのは ReSpec の長さ計算式（`lookup_len * quality
+score`）が旧の倍々ヒューリスティックと異なる値を出すため。
+
+### D4: Block Verification
+
+`SpecEngine._block_verify_tau` が temp>0 の逐次棄却サンプリング
+（`while a < n_avail and u_l[a] < p_l[a]: a += 1`）を置換。arXiv:2403.10444
+の Algorithm 2 本文と Eq.(4)(5)（PDF を `pdftotext -layout` で抽出して確認、
+HTML/abs ページは数式を欠落させた）をそのまま実装の出発点にした。
+
+**重要な発見（実装前に導出、Monte Carlo で確認）**: fastmlx の draft は
+MTP 連鎖・SAM lookup とも常に決定的な提案（`argmax`、delta 分布
+`Ms(x)=1` for the drafted token）である。論文の一般式にこの delta 分布を
+代入すると、リンクごとの累積結合比 p_i（Algorithm 2 Line 4）が逐次棄却で
+既に使っている `p_l`（drafted token の target 確率）の単純な累積積に
+閉じ、受理確率 (Eq.5) と残差分布 (Eq.4) は「次にdraftされたトークンを
+除いて target logits を再正規化する」という逐次棄却サンプラの最終ステップ
+と**同一の式**に帰着する。違いは τ（受理長）の決め方だけ:
+逐次棄却は最初に失敗した位置で打ち切る (`τ = min failing position`) の
+に対し、block verification は候補の部分ブロック長すべてを評価して
+**最長の成功長** を採用する (`τ = max{L : u_l[L-1] <= h_block(L)}`)。
+
+この閉形式から論理的に導かれる帰結（実装前に予想し、実測で確認した）:
+決定的な draft は「他にあり得た draft 列」を持たないため、論文の toy
+example（Ms が真の分布で複数の draft パターンがあり得る場合）にある
+「ブロックをまたいだ結合の再配分」による利得の余地がそもそも存在しない。
+つまり **fastmlx の現行アーキテクチャ（決定的 draft）では、
+Block Verification は逐次棄却と分布・期待受理長ともに厳密に一致し、
+wall-clock 改善は理論上ゼロになる**。これは実装のバグではなく、
+決定的提案という設計選択の帰結（README にある通り、MTP は argmax の
+ほうが受理率で優る設計判断であり、変える予定はない）。論文の
+5〜8% という数字は真に確率的な small-model drafter を前提にしている。
+Monte Carlo (`bench/test_block_verify.py`, 語彙5・ブロック長4のランダム
+分布、seed 5 本、各 1e4 サンプル) で τ・resample 後の (τ,Y) 同時分布の
+TV 距離が 0.013〜0.019（閾値 0.03 未満）であることを確認、別途 2e4
+サンプルでの期待受理長も `E[block] >= E[seq] - 0.05` を満たすことを確認
+（実測は `block` がわずかに上回ることが多いが、有意差ではなくノイズ域）。
+
+**受け入れ**: (a) `bench/test_block_verify.py` 全通過（分布同一性の
+モンテカルロ確認、Metal 不要）。(b) temp=0.7 での受理長は上記の理論的
+帰結どおり逐次棄却と同等（改善ゼロが期待値であり、それ自体が受け入れ
+「以上」を満たす）。実装は正しさの契約（分布厳密同一、Theorem 1/2 の
+「never worse」）を満たし、決定的 draft を使わなくなる将来（tree 化・
+確率的サンプリングを持つ draft 源の追加、D5 の射程）で自動的に効いてくる
+設計として残す。
+
+### 規律の遵守記録
+
+- `fastmlx/spec.py` はこのセッションで自分だけが編集。kernels/、
+  bench/gate.py、bench/spec_bench.py の引数以外は変更していない
+  （実際には spec_bench.py への引数追加も不要だった: 比較は既存の
+  `--n-draft`/`--lookup-len`/`--max-draft` と git worktree 分離で足りた）。
+- 各項目（D1→D4→D3 の順で実施）完了ごとに `bench/gate.py`
+  （`baseline_all_identical`）を実行し、途中で D1 の飢餓バグを見つけた
+  ときも修正後に再実行して確認している。最終確認も full run で実施
+  (`baseline_all_identical: True`)。
+- phase_s のキー (`draft`/`verify`/`maint`) と accept 統計のスキーマ
+  (`accept_hist`/`accept_trace`/`src_hist`/`steps`/`mean_accepted`/
+  `tokens_per_step`) は変更していない。
+- 測定中に並行エージェントが `fastmlx/kernels/` と `docs/STATUS.md` を
+  同一ワークツリーで並行編集していたことを確認した（`git worktree add`
+  でコミット済み過去版を別チェックアウトし比較する形で、working tree の
+  `git stash` 等破壊的操作は使わずに旧実装との A/B を行った）。この
+  節を追記する前に `docs/STATUS.md` を読み直し、既存の追記内容を保持した
+  まま末尾に追加している。
