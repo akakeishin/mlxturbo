@@ -16,36 +16,35 @@ MMA = "mma"
 _ROUTES = frozenset((STOCK, NOCAP, MMA))
 
 
-def _routes(*, mma_max: int = 16) -> tuple[str, ...]:
+def _routes(overrides: dict[int, str] | None = None) -> tuple[str, ...]:
     """Build an M-indexed route row; indices outside 6..16 are stock.
 
-    2026-08-26 の依存チェーン実測 (docs/GATE-RESULTS-A2.md) で MMA v2 は
-    m=8 で 0.82x、m=16 で 0.99x と全域で最速にならなかったため、
-    現行表は nocap (bit-exact、m=6..12 で 1.0-1.1x) を採り、MMA は
-    経路として残すが v3 が実測で勝つまで表からは外す。
+    基本形: M=6..8 MMA (fast_qmm、m=8 で stock 比 1.2-1.6x)、M=9..11 nocap、
+    12+ stock (dispatch-fastq.json / dispatch-a3-quiet.json)。形状ごとの
+    上書きは 2026-08-27 静音較正 (calib-quiet-a/b.json、両ラン 5% 超一致行のみ
+    採用) による: 広い M=14..16 は wide MMA が 16 行タイルを使い切って最大
+    1.25x、M=6..7 の一部はゼロ埋めコピー税で nocap が勝つ。
     """
 
-    del mma_max
     row = [STOCK] * 17
-    # 2026-08-26 更新: MMA 経路の実体を fast_qmm (MIT) に変更。実測で勝つのは
-    # M=6..8 (m=8 で stock 比 1.2-1.6x)。M=9 の wide は M3 で負けるため nocap、
-    # M=10..11 も nocap、12+ は stock (dispatch-fastq.json / dispatch-a3-quiet.json)。
     for m in range(6, 9):
         row[m] = MMA
     for m in range(9, 12):
         row[m] = NOCAP
+    if overrides:
+        for m, route in overrides.items():
+            row[m] = route
     return tuple(row)
 
 
 # Explicit candidate table for the real model shapes recorded by
-# bench/op_curve.py.  The wide lm_head retains stock for M=13..16 because its
-# output dimension makes the second MMA tile a distinct regime.  A3's GPU gate
-# compares every selected entry with both alternatives before acceptance.
+# bench/op_curve.py.  A3's GPU gate compares every selected entry with both
+# alternatives before acceptance.
 DEFAULT_ROUTE_TABLE: dict[tuple[int, int], tuple[str, ...]] = {
-    (5120, 17408): _routes(),       # MLP up/gate
-    (17408, 5120): _routes(),       # MLP down
-    (5120, 12288): _routes(),       # attention q
-    (5120, 248320): _routes(mma_max=12),  # lm_head
+    (5120, 17408): _routes({6: NOCAP, 7: NOCAP, 16: MMA}),        # MLP up/gate
+    (17408, 5120): _routes({6: NOCAP, 15: MMA, 16: MMA}),         # MLP down
+    (5120, 12288): _routes({14: MMA, 15: MMA, 16: MMA}),          # attention q
+    (5120, 248320): _routes({6: NOCAP, 12: MMA, 16: MMA}),        # lm_head
 }
 
 _DISPATCHED_CLASS = None
