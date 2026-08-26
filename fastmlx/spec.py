@@ -489,6 +489,8 @@ class SpecEngine:
         eos_ids=(),
         on_tokens=None,
         session: ChatSession | None = None,
+        fly_theta: float = 0.0,
+        fly_window: int = 6,
     ):
         """MTP 連鎖の深度は確信度ゲートで、lookup 起動は ReSpec 流の
         エントロピー閾値で、それぞれステップごとに決める (Phase D1/D3)。
@@ -596,6 +598,10 @@ class SpecEngine:
         fed_gen = []
         src_hist = {"lookup": Counter(), "mtp": Counter()}
         lookup_ext_hits = 0
+        # D6 (FLy) は明示 opt-in (fly_theta > 0)。温度付きは D4 の閉形式が
+        # 分布厳密性を担保しているので greedy 限定で適用する。
+        fly_active = fly_theta > 0.0 and temp == 0
+        fly_defer_accepts = 0
         phase = {"draft": 0.0, "verify": 0.0, "maint": 0.0}
         t1 = time.perf_counter()
 
@@ -726,7 +732,7 @@ class SpecEngine:
             ent_l = None
             if temp == 0:
                 preds = mx.argmax(logits, axis=-1)[0]
-                if track_lookup:
+                if track_lookup or fly_active:
                     ent_probs = mx.softmax(logits[0].astype(mx.float32), axis=-1)
                     ent_row = -mx.sum(
                         ent_probs * mx.log(mx.maximum(ent_probs, 1e-12)), axis=-1
@@ -740,8 +746,35 @@ class SpecEngine:
                 a = 0
                 while a < n_avail and preds_l[a] == window_l[a + 1]:
                     a += 1
-                    if window_l[a] in eos:
-                        accepted_eos = a
+                if fly_active and ent_l is not None:
+                    # D6 (FLy, arXiv:2511.22972 二段機構の greedy 適用、opt-in):
+                    # 最初の不一致 j で target の正規化エントロピー h_j >= theta
+                    # (= target 自身が迷っている) なら即棄却せず遅延し、後続
+                    # fly_window トークンが全て一致する (= モデルが代替表現に
+                    # 合意して続きが発散しない) 場合だけ j の draft トークンを
+                    # 受理する。h_j < theta の不一致は真のエラーとして即棄却。
+                    # 出力分布は厳密ではなくなる (既定 off、gate/正式ベンチは
+                    # 厳密のまま)。
+                    log_v = math.log(logits.shape[-1])
+                    while a < n_avail:
+                        if ent_l[a] / log_v < fly_theta:
+                            break
+                        end = a + 1 + fly_window
+                        if end > n_avail:
+                            break
+                        if any(
+                            preds_l[i] != window_l[i + 1]
+                            for i in range(a + 1, end)
+                        ):
+                            break
+                        fly_defer_accepts += 1
+                        a = end
+                        while a < n_avail and preds_l[a] == window_l[a + 1]:
+                            a += 1
+                for i in range(1, a + 1):
+                    if window_l[i] in eos:
+                        a = i
+                        accepted_eos = i
                         break
                 if accepted_eos is None:
                     next_tok = preds_l[a]
@@ -861,6 +894,7 @@ class SpecEngine:
             "accept_trace": accept_trace,
             "src_hist": {k: dict(sorted(v.items())) for k, v in src_hist.items()},
             "lookup_ext_hits": lookup_ext_hits,
+            "fly_defer_accepts": fly_defer_accepts,
             "phase_s": phase,
             "steps": steps,
             "mean_accepted": (

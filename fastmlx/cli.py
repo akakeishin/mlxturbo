@@ -33,6 +33,15 @@ def main() -> None:
     ap.add_argument("--n-draft", type=int, default=3)
     ap.add_argument("--max-draft", type=int, default=8)
     ap.add_argument("--mtp-bits", type=int, default=4)
+    ap.add_argument(
+        "--fly-theta",
+        type=float,
+        default=0.0,
+        help="D6 (FLy) 緩和検証の正規化エントロピー閾値。0 で無効 (既定、"
+        "厳密検証)。論文既定は 0.3。有効にすると greedy 出力は厳密で"
+        "なくなる (品質 >=99% 主張は論文値、うちの計測レーンでは未検証)",
+    )
+    ap.add_argument("--fly-window", type=int, default=6)
     ap.add_argument("--prompt", default=None)
     ap.add_argument(
         "--no-think",
@@ -82,13 +91,19 @@ def main() -> None:
             eos_ids=eos_ids,
             on_tokens=on_tokens,
             session=session,
+            fly_theta=args.fly_theta,
+            fly_window=args.fly_window,
         )
         detok.finalize()
         print(detok.last_segment, flush=True)
+        fly_note = (
+            f" | fly {res.get('fly_defer_accepts', 0)}" if args.fly_theta > 0 else ""
+        )
         print(
             f"\n[{res['decode_tps']:.1f} tok/s | {res['tokens_per_step']:.2f} tok/step"
             f" | ttft {res['ttft_s']:.2f}s"
-            f" | prefill 再利用 {res['prefill_reused']} / 新規 {res['prefill_new']}]"
+            f" | prefill 再利用 {res['prefill_reused']} / 新規 {res['prefill_new']}"
+            f"{fly_note}]"
         )
         return tokenizer.decode(
             [t for t in res["tokens"] if t not in eos_ids]
