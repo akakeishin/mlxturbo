@@ -27,11 +27,12 @@ def _routes(*, mma_max: int = 16) -> tuple[str, ...]:
 
     del mma_max
     row = [STOCK] * 17
-    # 2026-08-26 静音窓の全点実測 (bench/results/dispatch-a3-quiet.json):
-    # 全 4 shape で一貫して M=6..9 は mma (v3)、M=10..11 は nocap、12+ は stock。
-    for m in range(6, 10):
+    # 2026-08-26 更新: MMA 経路の実体を fast_qmm (MIT) に変更。実測で勝つのは
+    # M=6..8 (m=8 で stock 比 1.2-1.6x)。M=9 の wide は M3 で負けるため nocap、
+    # M=10..11 も nocap、12+ は stock (dispatch-fastq.json / dispatch-a3-quiet.json)。
+    for m in range(6, 9):
         row[m] = MMA
-    for m in range(10, 12):
+    for m in range(9, 12):
         row[m] = NOCAP
     return tuple(row)
 
@@ -82,10 +83,19 @@ def _load_nn():
 
 
 def _load_kernels():
-    from .qmm_skinny_mma import qmm_skinny_mma
+    import os
+
+    # fast_qmm (MIT、ライセンス確認済み 2026-08-26) が依存チェーン実測で
+    # m=8: 1.57x と自作 v3/v4/v5 (1.16-1.18x) を上回るため、MMA 経路の実体は
+    # fast_qmm にする。wide (m=9..16) も有効化。適格外は内部で stock へ落ちる。
+    os.environ.setdefault("MLXLM_FAST_QMM_WIDE", "1")
+    from ..fast_qmm import fast_qmm
     from .qmv_wide_nocap import qmv_wide_nocap
 
-    return qmv_wide_nocap, qmm_skinny_mma
+    def mma(flat, w, scales, biases, *, group_size, bits):
+        return fast_qmm(flat, w, scales, biases, group_size=group_size, bits=bits)
+
+    return qmv_wide_nocap, mma
 
 
 def quantized_matmul(

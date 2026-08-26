@@ -1,7 +1,8 @@
-"""GPU correctness and dependency-chain acceptance gate for Phase A2 v4.
+"""GPU correctness, occupancy-record, and performance gates for A2 v5.
 
 Run serially: ``uv run python bench/test_qmm_skinny_mma.py``.
-Absolute timings are reference observations; final measurement must use a quiet machine.
+Absolute timings are reference observations; final measurement needs a quiet
+machine.
 """
 
 import argparse
@@ -14,10 +15,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import mlx.core as mx
 
+from fastmlx.kernels._qmm_skinny_mma_source import SPLIT_K
 from fastmlx.kernels.qmm_skinny_mma import M_MAX, M_MIN, qmm_skinny_mma
 
 BF16_CORRECTNESS_THRESHOLD = 8e-3
+M8_DEPENDENCY_CHAIN_SPEEDUP = 1.5
+M16_OVER_M8_LIMIT = 1.6
 CORRECTNESS_SHAPES = ((512, 1024), (5120, 4096))
+THREADGROUP_THREADS = 32 * SPLIT_K
+GPU_QUEUE_COMMANDS = (
+    "uv run python bench/test_qmm_skinny_mma.py --dtype bfloat16 "
+    "--correctness-only",
+    "uv run python bench/test_qmm_skinny_mma.py --dtype bfloat16 "
+    "--json bench/results/qmm-skinny-mma-a2-v5.json",
+    "python3 tools/isa/gen_kernels.py",
+    "tools/isa/build_air.sh",
+    "tools/isa/gpu_probe.sh",
+    "python3 tools/isa/gpu_report.py",
+)
 
 
 def _dtype(name):
@@ -59,17 +74,14 @@ def _median_ms(fn, warmup=3, reps=12):
 
 def correctness(dtype):
     results = {}
-    table_equivalence = {}
     for k, n in CORRECTNESS_SHAPES:
         q = _make_quantized(n, k, dtype)
         shape_results = {}
-        shape_table_equivalence = {}
         for m in range(M_MIN, M_MAX + 1):
             x = (mx.random.normal((m, k)) * 0.1).astype(dtype)
             expected = _stock(x, q)
             actual = qmm_skinny_mma(x, *q)
-            no_table = qmm_skinny_mma(x, *q, use_table=False)
-            mx.eval(expected, actual, no_table)
+            mx.eval(expected, actual)
             max_abs, normalized = _normalized_max_error(actual, expected)
             shape_results[m] = {
                 "max_abs": max_abs,
@@ -79,13 +91,8 @@ def correctness(dtype):
                 f"K={k}, N={n}, M={m}: "
                 f"threshold={BF16_CORRECTNESS_THRESHOLD}, {shape_results[m]}"
             )
-            if m >= 4:
-                exact = bool(mx.array_equal(actual, no_table))
-                shape_table_equivalence[m] = exact
-                assert exact, f"K={k}, N={n}, M={m}: table ON/OFF differ"
         results[f"k{k}_n{n}"] = shape_results
-        table_equivalence[f"k{k}_n{n}"] = shape_table_equivalence
-    return results, table_equivalence
+    return results
 
 
 def dependency_chain(dtype):
@@ -105,27 +112,67 @@ def dependency_chain(dtype):
     def stock_op(x, q):
         return _stock(x, q)
 
-    def e120_op(x, q):
+    def v5_op(x, q):
         return qmm_skinny_mma(x, *q)
 
-    m = 8
-    x = make_input(m)
-    stock_ms = _median_ms(lambda: chain(stock_op, x))
-    e120_ms = _median_ms(lambda: chain(e120_op, x))
-    single_stock_ms = _median_ms(lambda: stock_op(x, up))
-    single_e120_ms = _median_ms(lambda: e120_op(x, up))
-    timings = {
-        m: {
+    timings = {}
+    for m in (8, 16):
+        x = make_input(m)
+        stock_ms = _median_ms(lambda: chain(stock_op, x))
+        v5_ms = _median_ms(lambda: chain(v5_op, x))
+        timings[m] = {
             "chain_stock_ms": stock_ms,
-            "chain_e120_ms": e120_ms,
-            "chain_speedup": stock_ms / e120_ms,
-            "single_stock_ms": single_stock_ms,
-            "single_e120_ms": single_e120_ms,
-            "single_speedup": single_stock_ms / single_e120_ms,
+            "chain_v5_ms": v5_ms,
+            "chain_speedup": stock_ms / v5_ms,
         }
+        if m == 8:
+            single_stock_ms = _median_ms(lambda: stock_op(x, up))
+            single_v5_ms = _median_ms(lambda: v5_op(x, up))
+            timings[m].update(
+                {
+                    "single_stock_ms": single_stock_ms,
+                    "single_v5_ms": single_v5_ms,
+                    "single_speedup": single_stock_ms / single_v5_ms,
+                }
+            )
+
+    m16_over_m8 = timings[16]["chain_v5_ms"] / timings[8]["chain_v5_ms"]
+    assert timings[8]["chain_speedup"] >= M8_DEPENDENCY_CHAIN_SPEEDUP, timings
+    assert m16_over_m8 <= M16_OVER_M8_LIMIT, {
+        "m16_over_m8": m16_over_m8,
+        "limit": M16_OVER_M8_LIMIT,
+        "timings": timings,
     }
-    assert timings[8]["chain_speedup"] >= 1.5, timings
-    return timings
+    return {
+        "by_m": timings,
+        "m16_over_m8": m16_over_m8,
+        "m8_speedup_minimum": M8_DEPENDENCY_CHAIN_SPEEDUP,
+        "m16_over_m8_limit": M16_OVER_M8_LIMIT,
+    }
+
+
+def occupancy_record(v5_max_tptg, reference_max_tptg):
+    if v5_max_tptg is None and reference_max_tptg is None:
+        return {
+            "status": "queued",
+            "required_threads_per_threadgroup": THREADGROUP_THREADS,
+            "commands": GPU_QUEUE_COMMANDS[2:],
+        }
+    if v5_max_tptg is None or reference_max_tptg is None:
+        raise ValueError(
+            "both --v5-max-tptg and --reference-max-tptg are required"
+        )
+    assert v5_max_tptg >= THREADGROUP_THREADS, {
+        "v5_max_tptg": v5_max_tptg,
+        "required": THREADGROUP_THREADS,
+    }
+    return {
+        "status": "recorded",
+        "v5_max_tptg": v5_max_tptg,
+        "reference_max_tptg": reference_max_tptg,
+        "v5_over_reference": v5_max_tptg / reference_max_tptg,
+        "required_threads_per_threadgroup": THREADGROUP_THREADS,
+    }
 
 
 def main():
@@ -133,17 +180,21 @@ def main():
     parser.add_argument("--dtype", choices=("bfloat16",), default="bfloat16")
     parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument("--json", dest="json_out")
+    parser.add_argument("--v5-max-tptg", type=int)
+    parser.add_argument("--reference-max-tptg", type=int)
     args = parser.parse_args()
     dtype = _dtype(args.dtype)
     mx.random.seed(0)
-    correctness_results, table_equivalence = correctness(dtype)
 
     result = {
         "dtype": args.dtype,
-        "kernel": "E120 USE_TABLE v4",
+        "kernel": "A2 v5 direct-load 8x8 MMA",
         "correctness_threshold": BF16_CORRECTNESS_THRESHOLD,
-        "correctness": correctness_results,
-        "table_on_off_bit_exact": table_equivalence,
+        "correctness": correctness(dtype),
+        "occupancy": occupancy_record(
+            args.v5_max_tptg, args.reference_max_tptg
+        ),
+        "gpu_queue_commands": GPU_QUEUE_COMMANDS,
         "timing_note": "reference only; final measurement requires a quiet machine",
     }
     if not args.correctness_only:

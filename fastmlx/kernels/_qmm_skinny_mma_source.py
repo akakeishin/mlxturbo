@@ -1,50 +1,18 @@
-# Ported from Layr-Labs/qwen-3.8-mtp-challenge Qwen35.swift E120 QMV.
-# Copyright (c) 2026 Layr Labs, Inc. Licensed under the MIT License; see
-# tools/reference/e120/LICENSE.
-"""Metal source and host geometry for the E120 affine-4/group-64 QMV."""
+"""Production source builder for the clean-room A2 v5 skinny MMA kernel.
+
+The implementation follows ``docs/ISA-DIFF.md`` and the ``v_direct`` probe in
+``tools/isa/variants.py``.  It is independent of ``fastmlx.fast_qmm``.
+"""
 
 GROUP_SIZE = 64
 BITS = 4
-M_MIN = 2
-M_MAX = 9
-MINIMUM_TABLE_WIDTH = 4
-ROWS_PER_SIMD = 4
-VALUES_PER_THREAD = 16
-BLOCK_SIZE = VALUES_PER_THREAD * 32
-THREADGROUP = (32, 2, 1)
-XSUMS_THREADGROUP = (32, 1, 1)
+M_MIN = 6
+M_MAX = 16
+MMA_TILE = 8
+SPLIT_K = 8
+THREADGROUP = (32, SPLIT_K, 1)
 
-# Faithful transcription of Qwen35CustomQMV.activeInputGroups.  M is split
-# across independent input groups; each SIMD group still owns four output rows.
-INPUTS_PER_GROUP = {
-    2: 2,
-    3: 3,
-    4: 4,
-    5: 5,
-    6: 3,
-    7: 4,
-    8: 4,
-    9: 3,
-}
-ACTIVE_INPUT_GROUPS = {
-    m: (m + inputs_per_group - 1) // inputs_per_group
-    for m, inputs_per_group in INPUTS_PER_GROUP.items()
-}
-
-
-def active_input_groups(m: int) -> int:
-    """Return the exact E120 X-grid threadgroup count for one width."""
-
-    try:
-        return ACTIVE_INPUT_GROUPS[m]
-    except KeyError as exc:
-        raise ValueError(f"E120 QMV has no width plan for M={m}") from exc
-
-
-def sums_stride(m: int) -> int:
-    """Return E120's cache-line-padded xsums row stride, in floats."""
-
-    return 8 if m <= 8 else 16
+METAL_HEADER = "#include <metal_simdgroup>\n#include <metal_simdgroup_matrix>\n"
 
 
 def eligible_layout(
@@ -57,13 +25,13 @@ def eligible_layout(
     group_size: int,
     bits: int,
 ) -> bool:
-    """Check the E120 shape/packing contract without importing MLX."""
+    """Check the BF16 affine-4/group-64 v5 layout without importing MLX."""
 
     if group_size != GROUP_SIZE or bits != BITS:
         return False
-    if m not in INPUTS_PER_GROUP or k <= 0 or n <= 0:
+    if not (M_MIN <= m <= M_MAX) or k <= 0 or n <= 0:
         return False
-    if k % BLOCK_SIZE != 0 or n % 8 != 0:
+    if k % GROUP_SIZE != 0 or n % MMA_TILE != 0:
         return False
     if w_shape != (n, k * bits // 32):
         return False
@@ -71,363 +39,182 @@ def eligible_layout(
     return scales_shape == (n, groups) and biases_shape == (n, groups)
 
 
-# The v3 no-table source stays byte-for-byte independent of the v4 table
-# source.  K and N are absent from every template parameter list: E120 recorded
-# a compiler miscompile when K was templated.
-METAL_HEADER = r"""
-// Port of Layr-Labs/qwen-3.8-mtp-challenge E120 QMV.
-// Copyright (c) 2026 Layr Labs, Inc. MIT License; see vendored LICENSE.
-template <int NA>
-inline void fastmlx_e120_qmv_wide(
-    const device uint32_t* w,
-    const device bfloat16_t* scales,
-    const device bfloat16_t* biases,
-    const device bfloat16_t* x,
-    device bfloat16_t* y,
-    const int in_vec_size,
-    const int out_vec_size,
-    int first_m,
-    int out_row,
-    uint simd_lid
-) {
-    typedef vec<float, NA> VF;
-    constexpr int rows_per_simd = 4;
-    constexpr int values_per_thread = 16;
-    constexpr int block_size = values_per_thread * 32;
-    constexpr int bytes_per_lane = 8;
-    const int in_vec_size_w = in_vec_size / 2;
-    const int in_vec_size_g = in_vec_size / 64;
+def _fragment_load(name: str, m: int, row_base: int) -> str:
+    """Load one A tile directly from device, guarding only a partial M tile."""
 
-    VF acc[rows_per_simd];
-    for (int r = 0; r < rows_per_simd; r++) {
-        acc[r] = VF(0.0f);
-    }
-
-    for (int k = 0; k < in_vec_size; k += block_size) {
-        thread uint16_t packed[rows_per_simd][4];
-        thread float scale_local[rows_per_simd];
-        thread float bias_local[rows_per_simd];
-        for (int r = 0; r < rows_per_simd; r++) {
-            const int row = out_row + r;
-            const device uint16_t* ws =
-                reinterpret_cast<const device uint16_t*>(
-                    reinterpret_cast<const device uint8_t*>(w) +
-                    row * in_vec_size_w + k / 2 +
-                    simd_lid * bytes_per_lane);
-            for (int i = 0; i < 4; i++) {
-                packed[r][i] = ws[i];
-            }
-            const int group_index =
-                row * in_vec_size_g + k / 64 + int(simd_lid) / 4;
-            scale_local[r] = scales[group_index];
-            bias_local[r] = biases[group_index];
-        }
-
-        VF sums = VF(0.0f);
-        VF partial[rows_per_simd];
-        for (int r = 0; r < rows_per_simd; r++) {
-            partial[r] = VF(0.0f);
-        }
-        for (int i = 0; i < 4; i++) {
-            VF a0, a1, a2, a3;
-            for (int m = 0; m < NA; m++) {
-                const device bfloat16_t* xm =
-                    x + (first_m + m) * in_vec_size + k +
-                    simd_lid * values_per_thread + 4 * i;
-                const vec<bfloat16_t, 4> xv =
-                    *reinterpret_cast<const device vec<bfloat16_t, 4>*>(xm);
-                a0[m] = static_cast<float>(xv[0]);
-                a1[m] = static_cast<float>(xv[1]);
-                a2[m] = static_cast<float>(xv[2]);
-                a3[m] = static_cast<float>(xv[3]);
-                sums[m] += xv[0] + xv[1] + xv[2] + xv[3];
-            }
-            for (int r = 0; r < rows_per_simd; r++) {
-                partial[r] += (a0 * (packed[r][i] & 0x000f) +
-                               a1 * ((packed[r][i] >> 4) & 0x000f) +
-                               a2 * ((packed[r][i] >> 8) & 0x000f) +
-                               a3 * ((packed[r][i] >> 12) & 0x000f));
-            }
-        }
-        for (int r = 0; r < rows_per_simd; r++) {
-            acc[r] += scale_local[r] * partial[r] + sums * bias_local[r];
-        }
-    }
-
-    for (int r = 0; r < rows_per_simd; r++) {
-        for (int m = 0; m < NA; m++) {
-            const float reduced = simd_sum(acc[r][m]);
-            if (simd_lid == 0) {
-                y[(first_m + m) * out_vec_size + out_row + r] =
-                    static_cast<bfloat16_t>(reduced);
-            }
-        }
-    }
-}
-
-template <int M, int IPG>
-inline void fastmlx_e120_qmv_m(
-    const device uint32_t* w,
-    const device bfloat16_t* scales,
-    const device bfloat16_t* biases,
-    const device bfloat16_t* x,
-    device bfloat16_t* y,
-    const int in_vec_size,
-    const int out_vec_size,
-    int group_x,
-    int out_row,
-    uint simd_lid
-) {
-    static_assert(M % IPG != 1, "a one-input tail group is not built");
-    constexpr int TAIL = M % IPG;
-    const int first_m = group_x * IPG;
-    if (first_m >= M) {
-        return;
-    }
-    if (TAIL == 0 || M - first_m >= IPG) {
-        fastmlx_e120_qmv_wide<IPG>(
-            w, scales, biases, x, y, in_vec_size, out_vec_size,
-            first_m, out_row, simd_lid);
-    } else {
-        fastmlx_e120_qmv_wide<(TAIL >= 2 ? TAIL : 2)>(
-            w, scales, biases, x, y, in_vec_size, out_vec_size,
-            first_m, out_row, simd_lid);
-    }
-}
-"""
-
-
-# E120 USE_TABLE path.  Its only arithmetic difference from METAL_HEADER is
-# that each lane's activation sum is loaded from xsums instead of recomputed
-# once for every four-output-row block.
-TABLE_METAL_HEADER = r"""
-// Port of Layr-Labs/qwen-3.8-mtp-challenge E120 QMV USE_TABLE path.
-// Copyright (c) 2026 Layr Labs, Inc. MIT License; see vendored LICENSE.
-template <int NA>
-inline void fastmlx_e120_qmv_wide_table(
-    const device uint32_t* w,
-    const device bfloat16_t* scales,
-    const device bfloat16_t* biases,
-    const device bfloat16_t* x,
-    const device float* xsums,
-    device bfloat16_t* y,
-    const int in_vec_size,
-    const int out_vec_size,
-    const int sums_stride,
-    int first_m,
-    int out_row,
-    uint simd_lid
-) {
-    typedef vec<float, NA> VF;
-    constexpr int rows_per_simd = 4;
-    constexpr int values_per_thread = 16;
-    constexpr int block_size = values_per_thread * 32;
-    constexpr int bytes_per_lane = 8;
-    const int in_vec_size_w = in_vec_size / 2;
-    const int in_vec_size_g = in_vec_size / 64;
-
-    VF acc[rows_per_simd];
-    for (int r = 0; r < rows_per_simd; r++) {
-        acc[r] = VF(0.0f);
-    }
-
-    for (int k = 0; k < in_vec_size; k += block_size) {
-        thread uint16_t packed[rows_per_simd][4];
-        thread float scale_local[rows_per_simd];
-        thread float bias_local[rows_per_simd];
-        for (int r = 0; r < rows_per_simd; r++) {
-            const int row = out_row + r;
-            const device uint16_t* ws =
-                reinterpret_cast<const device uint16_t*>(
-                    reinterpret_cast<const device uint8_t*>(w) +
-                    row * in_vec_size_w + k / 2 +
-                    simd_lid * bytes_per_lane);
-            for (int i = 0; i < 4; i++) {
-                packed[r][i] = ws[i];
-            }
-            const int group_index =
-                row * in_vec_size_g + k / 64 + int(simd_lid) / 4;
-            scale_local[r] = scales[group_index];
-            bias_local[r] = biases[group_index];
-        }
-
-        VF sums = VF(0.0f);
-        const device float* st =
-            xsums + ((k / block_size) * 32 + int(simd_lid)) *
-            sums_stride + first_m;
-        for (int m = 0; m < NA; m++) {
-            sums[m] = st[m];
-        }
-        VF partial[rows_per_simd];
-        for (int r = 0; r < rows_per_simd; r++) {
-            partial[r] = VF(0.0f);
-        }
-        for (int i = 0; i < 4; i++) {
-            VF a0, a1, a2, a3;
-            for (int m = 0; m < NA; m++) {
-                const device bfloat16_t* xm =
-                    x + (first_m + m) * in_vec_size + k +
-                    simd_lid * values_per_thread + 4 * i;
-                const vec<bfloat16_t, 4> xv =
-                    *reinterpret_cast<const device vec<bfloat16_t, 4>*>(xm);
-                a0[m] = static_cast<float>(xv[0]);
-                a1[m] = static_cast<float>(xv[1]);
-                a2[m] = static_cast<float>(xv[2]);
-                a3[m] = static_cast<float>(xv[3]);
-            }
-            for (int r = 0; r < rows_per_simd; r++) {
-                partial[r] += (a0 * (packed[r][i] & 0x000f) +
-                               a1 * ((packed[r][i] >> 4) & 0x000f) +
-                               a2 * ((packed[r][i] >> 8) & 0x000f) +
-                               a3 * ((packed[r][i] >> 12) & 0x000f));
-            }
-        }
-        for (int r = 0; r < rows_per_simd; r++) {
-            acc[r] += scale_local[r] * partial[r] + sums * bias_local[r];
-        }
-    }
-
-    for (int r = 0; r < rows_per_simd; r++) {
-        for (int m = 0; m < NA; m++) {
-            const float reduced = simd_sum(acc[r][m]);
-            if (simd_lid == 0) {
-                y[(first_m + m) * out_vec_size + out_row + r] =
-                    static_cast<bfloat16_t>(reduced);
-            }
-        }
-    }
-}
-
-template <int M, int IPG>
-inline void fastmlx_e120_qmv_m_table(
-    const device uint32_t* w,
-    const device bfloat16_t* scales,
-    const device bfloat16_t* biases,
-    const device bfloat16_t* x,
-    const device float* xsums,
-    device bfloat16_t* y,
-    const int in_vec_size,
-    const int out_vec_size,
-    const int sums_stride,
-    int group_x,
-    int out_row,
-    uint simd_lid
-) {
-    static_assert(M % IPG != 1, "a one-input tail group is not built");
-    constexpr int TAIL = M % IPG;
-    const int first_m = group_x * IPG;
-    if (first_m >= M) {
-        return;
-    }
-    if (TAIL == 0 || M - first_m >= IPG) {
-        fastmlx_e120_qmv_wide_table<IPG>(
-            w, scales, biases, x, xsums, y, in_vec_size, out_vec_size,
-            sums_stride, first_m, out_row, simd_lid);
-    } else {
-        fastmlx_e120_qmv_wide_table<(TAIL >= 2 ? TAIL : 2)>(
-            w, scales, biases, x, xsums, y, in_vec_size, out_vec_size,
-            sums_stride, first_m, out_row, simd_lid);
-    }
-}
-"""
-
-
-XSUMS_SOURCE = r"""
-    const int xs_m = x_shape[x_ndim - 2];
-    const int xs_k = x_shape[x_ndim - 1];
-    const int xs_stride = xs_m <= 8 ? 8 : 16;
-    const uint3 xs_gid = thread_position_in_grid;
-    const int xs_lane = int(xs_gid.x);
-    const int xs_kb = int(xs_gid.y);
-    const int xs_row = int(xs_gid.z);
-    const device bfloat16_t* xm =
-        x + xs_row * xs_k + xs_kb * 512 + xs_lane * 16;
-    float s = 0.0f;
-    for (int i = 0; i < 4; i++) {
-        const vec<bfloat16_t, 4> xv =
-            *reinterpret_cast<const device vec<bfloat16_t, 4>*>(xm + 4 * i);
-        s += xv[0] + xv[1] + xv[2] + xv[3];
-    }
-    xsums[(xs_kb * 32 + xs_lane) * xs_stride + xs_row] = s;
-"""
-
-
-def build_source() -> str:
-    """Return the shared no-table body for every E120-supported M."""
-
-    cases = "\n".join(
-        f"""        case {m}:
-            fastmlx_e120_qmv_m<{m}, {inputs_per_group}>(
-                w, scales, biases, x, y, qmv_k, qmv_n,
-                qmv_gx, qmv_out_row, qmv_lid);
-            break;"""
-        for m, inputs_per_group in INPUTS_PER_GROUP.items()
-    )
+    rows = min(MMA_TILE, max(0, m - row_base))
+    if rows == MMA_TILE:
+        return (
+            f"            simdgroup_load({name}, "
+            f"x + (size_t){row_base} * qmm_k + k_base, qmm_k);"
+        )
     return f"""
-    const int qmv_m = x_shape[x_ndim - 2];
-    const int qmv_k = x_shape[x_ndim - 1];
-    const int qmv_n = w_shape[0];
-    const uint3 qmv_tid = threadgroup_position_in_grid;
-    const uint qmv_lid = thread_index_in_simdgroup;
-    const uint qmv_sgid = simdgroup_index_in_threadgroup;
-    const int qmv_out_row = int(qmv_tid.y) * 8 + int(qmv_sgid) * 4;
-    const int qmv_gx = int(qmv_tid.x);
-    switch (qmv_m) {{
-{cases}
-        default:
-            break;
+            {name}.thread_elements()[0] = frag_row < {rows}
+                ? x[(size_t)({row_base} + frag_row) * qmm_k + k_base + frag_col]
+                : bfloat16_t(0.0f);
+            {name}.thread_elements()[1] = frag_row < {rows}
+                ? x[(size_t)({row_base} + frag_row) * qmm_k + k_base + frag_col + 1]
+                : bfloat16_t(0.0f);"""
+
+
+def _mma_step(kt: int, m: int, c_tiles: int) -> str:
+    """Emit one fully scalarized K tile with direct uint4 component access."""
+
+    vector = "pa_lo" if kt < 4 else "pa_hi"
+    vector_b = "pb_lo" if kt < 4 else "pb_hi"
+    component = ("x", "y", "z", "w")[kt % 4]
+    a0_load = _fragment_load("a0", m, 0)
+    a1 = ""
+    if c_tiles == 2:
+        a1_load = _fragment_load("a1", m, MMA_TILE)
+        a1 = f"""
+            simdgroup_matrix<bfloat16_t, 8, 8> a1;
+{a1_load}
+            simdgroup_multiply_accumulate(c1, a1, bmat, c1);"""
+    return f"""
+        {{
+            const int k_base = group * QGROUP + {kt * MMA_TILE};
+            const uint packed0 = {vector}.{component};
+            const uint packed1 = {vector_b}.{component};
+            simdgroup_matrix<bfloat16_t, 8, 8> bmat;
+            bmat.thread_elements()[0] = bfloat16_t(
+                scale0 * (float)((packed0 >> (QBITS * frag_row)) & 0xFu)
+                + bias0);
+            bmat.thread_elements()[1] = bfloat16_t(
+                scale1 * (float)((packed1 >> (QBITS * frag_row)) & 0xFu)
+                + bias1);
+
+            simdgroup_matrix<bfloat16_t, 8, 8> a0;
+{a0_load}
+            simdgroup_multiply_accumulate(c0, a0, bmat, c0);{a1}
+        }}"""
+
+
+def _epilogue(m: int, c_tiles: int) -> str:
+    c1_store = ""
+    c1_reduce = ""
+    if c_tiles == 2:
+        c1_store = """
+    partials[((sg * C_TILES + 1) * 64) + lane * 2] =
+        c1.thread_elements()[0];
+    partials[((sg * C_TILES + 1) * 64) + lane * 2 + 1] =
+        c1.thread_elements()[1];"""
+        c1_reduce = f"""
+        const uint row1 = MMA_TILE + frag_row;
+        if (row1 < {m}) {{
+            float total0 = 0.0f;
+            float total1 = 0.0f;
+            #pragma unroll
+            for (int split = 0; split < SPLITS; ++split) {{
+                total0 += partials[
+                    ((split * C_TILES + 1) * 64) + lane * 2];
+                total1 += partials[
+                    ((split * C_TILES + 1) * 64) + lane * 2 + 1];
+            }}
+            y[(size_t)row1 * qmm_n + n0 + frag_col] = bfloat16_t(total0);
+            y[(size_t)row1 * qmm_n + n0 + frag_col + 1] = bfloat16_t(total1);
+        }}"""
+    return f"""
+    partials[(sg * C_TILES * 64) + lane * 2] = c0.thread_elements()[0];
+    partials[(sg * C_TILES * 64) + lane * 2 + 1] =
+        c0.thread_elements()[1];{c1_store}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg == 0) {{
+        if (frag_row < {min(m, MMA_TILE)}) {{
+            float total0 = 0.0f;
+            float total1 = 0.0f;
+            #pragma unroll
+            for (int split = 0; split < SPLITS; ++split) {{
+                total0 += partials[(split * C_TILES * 64) + lane * 2];
+                total1 += partials[(split * C_TILES * 64) + lane * 2 + 1];
+            }}
+            y[(size_t)frag_row * qmm_n + n0 + frag_col] = bfloat16_t(total0);
+            y[(size_t)frag_row * qmm_n + n0 + frag_col + 1] =
+                bfloat16_t(total1);
+        }}{c1_reduce}
     }}
 """
 
 
-def build_table_source() -> str:
-    """Return the E120 body that consumes one precomputed xsums table."""
+def build_source(m: int = MMA_TILE) -> str:
+    """Return a Metal body specialized for one M in [6, 16].
 
-    cases = "\n".join(
-        f"""        case {m}:
-            fastmlx_e120_qmv_m_table<{m}, {inputs_per_group}>(
-                w, scales, biases, x, xsums, y, qmv_k, qmv_n, qmv_stride,
-                qmv_gx, qmv_out_row, qmv_lid);
-            break;"""
-        for m, inputs_per_group in INPUTS_PER_GROUP.items()
-    )
+    The default M=8 keeps the existing ISA tooling's ``build_source()`` probe
+    useful without making K or N compile-time constants.
+    """
+
+    if not M_MIN <= m <= M_MAX:
+        raise ValueError(f"M must be in [{M_MIN}, {M_MAX}], got {m}")
+    c_tiles = 1 if m <= MMA_TILE else 2
+    c1 = ""
+    if c_tiles == 2:
+        c1 = """
+    simdgroup_matrix<float, 8, 8> c1;
+    c1.thread_elements()[0] = 0.0f;
+    c1.thread_elements()[1] = 0.0f;"""
+    mma_steps = "".join(_mma_step(kt, m, c_tiles) for kt in range(8))
     return f"""
-    const int qmv_m = x_shape[x_ndim - 2];
-    const int qmv_k = x_shape[x_ndim - 1];
-    const int qmv_n = w_shape[0];
-    const int qmv_stride = qmv_m <= 8 ? 8 : 16;
-    const uint3 qmv_tid = threadgroup_position_in_grid;
-    const uint qmv_lid = thread_index_in_simdgroup;
-    const uint qmv_sgid = simdgroup_index_in_threadgroup;
-    const int qmv_out_row = int(qmv_tid.y) * 8 + int(qmv_sgid) * 4;
-    const int qmv_gx = int(qmv_tid.x);
-    switch (qmv_m) {{
-{cases}
-        default:
-            break;
+    constexpr int QGROUP = {GROUP_SIZE};
+    constexpr int QBITS = {BITS};
+    constexpr int SPLITS = {SPLIT_K};
+    constexpr int MMA_TILE = {MMA_TILE};
+    constexpr int C_TILES = {c_tiles};
+
+    const int qmm_k = x_shape[x_ndim - 1];
+    const int qmm_n = w_shape[0];
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint n0 = threadgroup_position_in_grid.z * MMA_TILE;
+
+    threadgroup float partials[SPLITS * C_TILES * 64];
+
+    simdgroup_matrix<float, 8, 8> c0;
+    c0.thread_elements()[0] = 0.0f;
+    c0.thread_elements()[1] = 0.0f;{c1}
+
+    const ushort quad = lane / 4;
+    const ushort frag_row = (quad & 4) + (lane / 2) % 4;
+    const ushort frag_col = (quad & 2) * 2 + (lane % 2) * 2;
+
+    const int groups = qmm_k / QGROUP;
+    const int packed_stride = qmm_k / 8;
+    const int scale_stride = groups;
+
+    for (int group = (int)sg; group < groups; group += SPLITS) {{
+        const uint col_a = n0 + frag_col;
+        const uint col_b = col_a + 1;
+        const device uint4* wa = reinterpret_cast<const device uint4*>(
+            w + (size_t)col_a * packed_stride + group * (QGROUP / 8));
+        const device uint4* wb = reinterpret_cast<const device uint4*>(
+            w + (size_t)col_b * packed_stride + group * (QGROUP / 8));
+        const uint4 pa_lo = wa[0];
+        const uint4 pa_hi = wa[1];
+        const uint4 pb_lo = wb[0];
+        const uint4 pb_hi = wb[1];
+        const float scale0 =
+            (float)scales[(size_t)col_a * scale_stride + group];
+        const float scale1 =
+            (float)scales[(size_t)col_b * scale_stride + group];
+        const float bias0 =
+            (float)biases[(size_t)col_a * scale_stride + group];
+        const float bias1 =
+            (float)biases[(size_t)col_b * scale_stride + group];
+{mma_steps}
     }}
+{_epilogue(m, c_tiles)}
 """
 
 
 __all__ = [
-    "ACTIVE_INPUT_GROUPS",
     "BITS",
-    "BLOCK_SIZE",
     "GROUP_SIZE",
-    "INPUTS_PER_GROUP",
     "METAL_HEADER",
+    "MMA_TILE",
     "M_MAX",
     "M_MIN",
-    "MINIMUM_TABLE_WIDTH",
-    "ROWS_PER_SIMD",
-    "TABLE_METAL_HEADER",
+    "SPLIT_K",
     "THREADGROUP",
-    "VALUES_PER_THREAD",
-    "XSUMS_SOURCE",
-    "XSUMS_THREADGROUP",
-    "active_input_groups",
     "build_source",
-    "build_table_source",
     "eligible_layout",
-    "sums_stride",
 ]

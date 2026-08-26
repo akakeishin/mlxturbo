@@ -42,7 +42,8 @@ def _cos(a, b):
     return mx.sum(af * bf) / mx.maximum(denom, 1e-12)
 
 
-def diag_generate(engine, prompt_ids, max_tokens, n_draft, eos_ids, rescale):
+def diag_generate(engine, prompt_ids, max_tokens, n_draft, eos_ids, rescale,
+                  base_variant="pre", chain_variant="pre"):
     """固定深度 greedy ループ。spec.py generate() の mtp 経路を写して計測する。"""
     import mlx.core as mx
 
@@ -53,9 +54,14 @@ def diag_generate(engine, prompt_ids, max_tokens, n_draft, eos_ids, rescale):
     mtp_cache = KVCache()
     prompt = mx.array(list(prompt_ids))
 
+    def _base(h):
+        return engine.inner.norm(h) if base_variant == "post" else h
+    def _chain(h):
+        return engine.mtp.norm(h) if chain_variant == "post" else h
+
     h_all, _ = engine._hidden_forward(prompt, caches, capture=False)
     if prompt.shape[0] > 1:
-        engine._mtp_append(prompt[1:], h_all[:, :-1], mtp_cache)
+        engine._mtp_append(prompt[1:], _base(h_all[:, :-1]), mtp_cache)
     h_last = h_all[:, -1:]
     y = mx.argmax(engine._head(h_last, engine.inner.norm), axis=-1).reshape(1)
     mx.eval(y)
@@ -78,7 +84,7 @@ def diag_generate(engine, prompt_ids, max_tokens, n_draft, eos_ids, rescale):
         drafts = []
         rms_hat = []
         hat_states = []
-        dh, dtok = h_last, y
+        dh, dtok = _base(h_last), y
         for k in range(depth):
             if k > 0 and rescale is not None:
                 dh = dh * rescale[k - 1]
@@ -95,7 +101,7 @@ def diag_generate(engine, prompt_ids, max_tokens, n_draft, eos_ids, rescale):
                 )
                 second = mx.argmax(masked).reshape(1)
             drafts.append(d)
-            dh, dtok = h_mtp[:, -1:], d
+            dh, dtok = _chain(h_mtp[:, -1:]), d
         window = mx.concatenate([y] + drafts) if drafts else y
 
         hs, sink = engine._hidden_forward(
@@ -143,7 +149,7 @@ def diag_generate(engine, prompt_ids, max_tokens, n_draft, eos_ids, rescale):
             engine._rollback(caches, sink, len(window_l), consumed)
         mtp_cache.trim(mtp_cache.offset - mtp_off0)
         true_hiddens = mx.concatenate([h_last, hs[:, : consumed - 1]], axis=1)
-        engine._mtp_append(window[:consumed], true_hiddens, mtp_cache)
+        engine._mtp_append(window[:consumed], _base(true_hiddens), mtp_cache)
         h_last = hs[:, consumed - 1 : consumed]
 
         if accepted_eos is not None:
@@ -251,6 +257,8 @@ def main():
     parser.add_argument("--n-draft", type=int, default=3)
     parser.add_argument("--mtp-bits", type=int, default=0)
     parser.add_argument("--prompts", default="code,prose,edit")
+    parser.add_argument("--base-variant", default="pre", choices=["pre", "post"])
+    parser.add_argument("--chain-variant", default="pre", choices=["pre", "post"])
     parser.add_argument(
         "--rescale",
         default=None,
@@ -296,6 +304,8 @@ def main():
             args.n_draft,
             eos_ids,
             rescale,
+            base_variant=args.base_variant,
+            chain_variant=args.chain_variant,
         )
 
     summary = summarize(per_prompt, args.n_draft)

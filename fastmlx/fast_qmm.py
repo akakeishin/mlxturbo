@@ -1,7 +1,6 @@
 # vendored from https://github.com/avlp12/mlx-lm/blob/main/mlx_lm/fast_qmm.py
-# 注意: ファイル内に Copyright (c) 2026 Apple Inc. の表示がある (mlx-lm 派生)。
-# mlx-lm 本体は MIT だが、この fork のライセンス表記は未確認。公開・再配布の前に
-# 要確認。現状はローカル実験用。
+# ライセンス確認済み (2026-08-26): fork の LICENSE は MIT (Copyright Apple Inc.)。
+# MIT 条件 (ライセンス文の保持) の下で利用・改変・再配布可。
 # M3 Max 実測: 依存チェーンで m=8 が mx.quantized_matmul の 1.57 倍、m=6 で 1.25 倍。
 # m カーブ税の真因 (qmv_wide の 5 本上限による ceil(M/5) 回の重み再読) を
 # 8x8 MMA タイル + 量子化グループ単位 dequant + split-K で回避する。
