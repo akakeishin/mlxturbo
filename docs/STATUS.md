@@ -397,3 +397,31 @@ cache 状態 (index 77) から最後の4トークンを (a) 1つずつ (b) m=4 �
   同一 idx で同一 flip、かつ上記の通りエンジン抜きで再現)
 - 品質主張は「greedy 同点 flip を除き一致 + KLD 等価」で行う。gate の
   合格基準は従来どおり baseline_all_identical のみ
+
+## 正式ベンチ v1 (2026-08-27 静音窓、3 反復中央値、512 tok、no-think)
+
+環境: M3 Max 128GB、load < 3、render/学習ジョブなし。3 エンジン直列 subprocess、
+クールダウン 60s。生データは bench/results/compare-official-rep{1,2,3}.json
+(+rep1-mtplx)。fastmlx 構成 = D パック + fast_qmm 経路 + post/post +
+静音較正済み経路表 (n_draft 3 / max_draft 8 / lookup 16 / mtp 4bit)。
+
+decode tok/s 中央値:
+
+| | code | prose | edit |
+|---|---|---|---|
+| mlx-lm 素 | 23.2 | 23.1 | 22.9 |
+| MTPLX same-quant (AR-only) | 21.3 | 21.4 | 21.2 |
+| fastmlx (同一 ckpt、訓練不要) | 37.5-39.9 | 27.3-28.8 | 34.1-34.3 |
+| MTPLX recommended (専用 quant + 訓練 MTP) | 44.2 | 33.0 | 49.8 |
+
+判定:
+- 同一 checkpoint 勝負: fastmlx が stock 比 1.2-1.7x、MTPLX エンジン
+  (AR-only 21 台 = stock 以下) 比 1.3-1.9x で勝ち
+- MTPLX recommended (44.2) への訓練不要チャレンジ: 未達。code -10% /
+  prose -13% / edit -31%
+- ギャップの所在: 彼らの edit 49.8 は訓練済み再帰 MTP の深い受理
+  (depth=3 常用) に由来。うちの edit は tok/step 3.19 で頭打ち。
+  訓練不要の残レバー: カーネル (fast_qmm PERF 7 件、B ステージングが最大)、
+  D6 (FLy、品質トレード opt-in)、D7 (LogitSpec)、検証コスト削減
+- fastmlx の反復間ばらつき ±12% (32.3-40.5)。tok/step は完全に決定的
+  (4.44/2.65/3.19)。ばらつきは全て per-step 時間 = 熱/ページキャッシュ由来
