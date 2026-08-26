@@ -11,6 +11,9 @@ Hypothesis mapping (docs/HYPOTHESES-A2.md):
   v_uint4_sgload H4  both of the above
   v_bstage       H1  dequant the whole 64-wide group into a threadgroup B slab
                      once, then simdgroup_load it (this is fast_qmm's shape)
+  v_direct       H1+H4  each lane loads the packed words for its own two
+                     fragment columns, so neither the shuffle nor the
+                     threadgroup slab is needed to place the B fragment
 
 E120 lineage (docs/ISA-DIFF.md).  These are not MMA kernels at all; they are
 the register-only vec4 QMV that ``fastmlx.kernels`` ships, flattened for one
@@ -370,6 +373,82 @@ def bstage_body(m: int) -> str:
     )
 
 
+def direct_body(m: int) -> str:
+    """H1+H4 together: build the B fragment in registers with no broadcast.
+
+    The A2 baseline has lanes 0-7 read the packed words and hand them to the
+    rest of the simdgroup through ``simd_shuffle``; fast_qmm instead dequants a
+    whole group into threadgroup memory and reads it back.  Both pay to move a
+    word from the lane that read it to the lane that needs it.
+
+    A ``simdgroup_matrix<T,8,8>`` lane owns exactly ``(frag_row, frag_col)``
+    and ``(frag_row, frag_col+1)``, and for one k-tile every row of a column
+    comes from a single packed word.  So a lane can just load the two words for
+    its own two columns and index the nibble by ``frag_row``: no shuffle, no
+    threadgroup slab, no barrier.  Four lanes then load the same word, which is
+    redundant traffic against L1 but costs no data movement instructions.
+    """
+
+    c_tiles = 1 if m <= 8 else 2
+    a1 = (
+        """            simdgroup_matrix<bfloat16_t, 8, 8> a1;
+            simdgroup_load(a1, x + (size_t)8 * K + k_base, K);
+            simdgroup_multiply_accumulate(c1, a1, bmat, c1);"""
+        if c_tiles == 2
+        else ""
+    )
+    return (
+        _prologue(c_tiles, m)
+        + f"""
+    for (int group = (int)sg; group < groups; group += SPLITS) {{
+        const uint col_a = n0 + frag_col;
+        const uint col_b = n0 + frag_col + 1;
+        const device uint4* wa = (const device uint4*)(
+            w + (size_t)col_a * packed_stride + group * (QGROUP / 8));
+        const device uint4* wb = (const device uint4*)(
+            w + (size_t)col_b * packed_stride + group * (QGROUP / 8));
+        const uint4 pa_lo = wa[0];
+        const uint4 pa_hi = wa[1];
+        const uint4 pb_lo = wb[0];
+        const uint4 pb_hi = wb[1];
+        const float scale0 = (float)scales[(size_t)col_a * scale_stride + group];
+        const float scale1 = (float)scales[(size_t)col_b * scale_stride + group];
+        const float bias0 = (float)biases[(size_t)col_a * scale_stride + group];
+        const float bias1 = (float)biases[(size_t)col_b * scale_stride + group];
+
+        uint wa_words[8];
+        wa_words[0] = pa_lo.x; wa_words[1] = pa_lo.y;
+        wa_words[2] = pa_lo.z; wa_words[3] = pa_lo.w;
+        wa_words[4] = pa_hi.x; wa_words[5] = pa_hi.y;
+        wa_words[6] = pa_hi.z; wa_words[7] = pa_hi.w;
+        uint wb_words[8];
+        wb_words[0] = pb_lo.x; wb_words[1] = pb_lo.y;
+        wb_words[2] = pb_lo.z; wb_words[3] = pb_lo.w;
+        wb_words[4] = pb_hi.x; wb_words[5] = pb_hi.y;
+        wb_words[6] = pb_hi.z; wb_words[7] = pb_hi.w;
+
+        #pragma unroll
+        for (int kt = 0; kt < QGROUP / 8; ++kt) {{
+            const int k_base = group * QGROUP + kt * 8;
+            simdgroup_matrix<bfloat16_t, 8, 8> bmat;
+            bmat.thread_elements()[0] = bfloat16_t(
+                scale0 * (float)((wa_words[kt] >> (QBITS * frag_row)) & 0xF)
+                + bias0);
+            bmat.thread_elements()[1] = bfloat16_t(
+                scale1 * (float)((wb_words[kt] >> (QBITS * frag_row)) & 0xF)
+                + bias1);
+
+            simdgroup_matrix<bfloat16_t, 8, 8> a0;
+            simdgroup_load(a0, x + k_base, K);
+            simdgroup_multiply_accumulate(c0, a0, bmat, c0);
+{a1}
+        }}
+    }}
+"""
+        + _epilogue(c_tiles, m)
+    )
+
+
 def _e120_body(m: int, *, na: int, rows_per_simd: int, table: bool) -> str:
     """The E120 register-only QMV, flattened for one width.
 
@@ -544,6 +623,7 @@ VARIANTS = {
     "v_sgload_a": sgload_a_body,
     "v_uint4_sgload": uint4_sgload_body,
     "v_bstage": bstage_body,
+    "v_direct": direct_body,
     "v_e120_notable": e120_notable_body,
     "v_e120_table": e120_table_body,
     "v_e120_na8": e120_na8_body,

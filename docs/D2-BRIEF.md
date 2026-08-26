@@ -1,5 +1,8 @@
 # D2 セッション キックオフ（MTP ヘッド微調整）
 
+**2026-08-26: 中止。学習は行わない (ユーザー判断)。D0 診断結果 (D2-RESULTS.md) は
+汎用パックの設計材料として引き続き有効。**
+
 新セッションはこのファイルから読み始めること。背景の正本は
 docs/PLAN.md (Phase D)、docs/RESEARCH.md、docs/KERNEL-INTEL.md、README.md。
 
