@@ -170,7 +170,11 @@ MLX 量子化の有無を確認してから固定する）:
   (b) 128GB への搭載試験: iogpu.wired_limit_mb を上げ、素の mlx-lm で
   ロード・decode 実測（期待値: active ~12GB/token 読みで 25-30 tok/s）
   (c) DeepSeek 純正 MTP ヘッドでの自己投機対応（MTP の本家。ヘッド構造は
-  qwen3_5 と別なので M2 のローダ抽象化に含める）
+  qwen3_5 と別なので M2 のローダ抽象化に含める)
+  (d) 保留中の将来項目: OS 余裕確保のための軽量化再量子化。既存 115.3GB は
+  8bit(392)/2bit g128(86)/3bit g128(43)/4bit(9) の混合で実効 ~3.4bpw。
+  3bit expert の 2bit 化 + 8bit 島の 4-6bit 化で ~105GB (実効 ~3.0) が狙い目。
+  2bit 主力域なので KLD ゲート必須
 - M6: GLM-5.2（ユーザー指定の最難関 = RAM 超過モデルの SSD offload 課題）
   最小 MLX quant でも 316GB（REAP25-4bit）で 128GB RAM の 2.5 倍、内蔵ディスク
   空き 267GB にも収まらない。実行には外部ストレージが前提（本人確認待ち）。
