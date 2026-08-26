@@ -31,15 +31,24 @@ import shutil
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.models.qwen3_5 import TextModelArgs
 
-from fastmlx.convert import convert, load_quantized_mtp
+from fastmlx._mlx_compat import QWEN35_SHIFTED_NORM_SUFFIXES
+from fastmlx.convert import (
+    convert,
+    load_quantized_mtp,
+    normalize_quantization,
+    validate_dry_run_layers,
+)
 from fastmlx.mtp import find_snapshot, load_mtp
+import fastmlx.cli as cli_module
 
 HF_PATH = "Qwen/Qwen3.8-27B"
 # full_attention_interval (Qwen3.8-27B では 4) 以上が必須。qwen3_5 の forward は
@@ -121,6 +130,7 @@ def _dry_run(group_size: int) -> dict:
     )
     elapsed = time.perf_counter() - t0
     config = result["config"]
+    source_loaded_model = result["model"]
 
     assert config["fastmlx_mtp"] is True
     assert config["mtp_quantization"] == {
@@ -134,14 +144,44 @@ def _dry_run(group_size: int) -> dict:
     assert len(config["text_config"]["layer_types"]) == DRY_RUN_LAYERS
 
     # 1) mlx_lm.load がそのまま読めて forward できる（mtp.* は本体 sanitize が捨てる）
-    model, _tokenizer = mlx_lm_load(str(out_dir))
-    assert len(model.language_model.model.layers) == DRY_RUN_LAYERS
+    output_reloaded_model, _tokenizer = mlx_lm_load(str(out_dir))
+    assert (
+        len(output_reloaded_model.language_model.model.layers) == DRY_RUN_LAYERS
+    )
     toks = mx.array([[1, 2, 3, 4, 5, 6]])
-    out = model(toks)
-    mx.eval(out)
-    assert out.shape == (1, 6, config["text_config"]["vocab_size"])
-    assert not bool(mx.any(mx.isnan(out)).item())
-    assert not bool(mx.any(mx.isinf(out)).item())
+    source_logits = source_loaded_model(toks)
+    reloaded_logits = output_reloaded_model(toks)
+    mx.eval(source_logits, reloaded_logits)
+    assert source_logits.shape == (
+        1,
+        6,
+        config["text_config"]["vocab_size"],
+    )
+    assert not bool(mx.any(mx.isnan(reloaded_logits)).item())
+    assert not bool(mx.any(mx.isinf(reloaded_logits)).item())
+    assert bool(mx.array_equal(source_logits, reloaded_logits)), (
+        "source-loaded and output-reloaded logits must match exactly; "
+        f"max_abs={mx.abs(source_logits.astype(mx.float32) - reloaded_logits.astype(mx.float32)).max().item()}"
+    )
+
+    source_norms = {
+        k: v
+        for k, v in tree_flatten(source_loaded_model.parameters())
+        if v.ndim == 1
+        and any(k.endswith(s) for s in QWEN35_SHIFTED_NORM_SUFFIXES)
+    }
+    reloaded_norms = {
+        k: v
+        for k, v in tree_flatten(output_reloaded_model.parameters())
+        if k in source_norms
+    }
+    assert source_norms, "the qwen3_5 RMSNorm contract matched no source weights"
+    assert source_norms.keys() == reloaded_norms.keys()
+    mx.eval(*source_norms.values(), *reloaded_norms.values())
+    assert all(
+        bool(mx.array_equal(value, reloaded_norms[name]))
+        for name, value in source_norms.items()
+    ), "source-loaded and output-reloaded RMSNorm weights differ"
 
     # 2) mtp.* が量子化済みとしてそのまま読める（fastmlx.mtp.load_mtp 相当の量子化版）
     text_args = TextModelArgs.from_dict(config["text_config"])
@@ -158,7 +198,7 @@ def _dry_run(group_size: int) -> dict:
     raw_model, _, _ = mlx_lm_load(snap, return_config=True, lazy=True)
     ref_down_proj = raw_model.language_model.model.layers[0].mlp.down_proj.weight
     mx.eval(ref_down_proj)
-    quant_down_proj = model.language_model.model.layers[0].mlp.down_proj
+    quant_down_proj = output_reloaded_model.language_model.model.layers[0].mlp.down_proj
     down_proj_err = _dequant_error(quant_down_proj, ref_down_proj)
 
     sizes = _tensor_sizes(out_dir)
@@ -205,6 +245,64 @@ def test_group128_smaller_than_group64():
     )
 
 
+def test_dry_run_layer_bounds():
+    class Inner:
+        layers = [object()] * FULL_NUM_LAYERS
+
+    class LanguageModel:
+        model = Inner()
+
+    class Model:
+        language_model = LanguageModel()
+
+    config = {"text_config": {"full_attention_interval": 4}}
+    validate_dry_run_layers(Model(), config, 4)
+    validate_dry_run_layers(Model(), config, FULL_NUM_LAYERS)
+    for invalid in (3, FULL_NUM_LAYERS + 1):
+        try:
+            validate_dry_run_layers(Model(), config, invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"dry_run_layers={invalid} should be rejected")
+
+
+def test_quantization_preflight_and_effective_defaults():
+    assert normalize_quantization(0, 0, 0) == (64, 4, 4)
+    assert normalize_quantization(128, 4, None) == (128, 4, 4)
+    for args in ((16, 4, None), (64, 7, None), (64, 4, 7)):
+        try:
+            normalize_quantization(*args)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"unsupported quantization should fail: {args}")
+
+
+def test_cli_prefers_bundled_mtp_artifact():
+    bundled = object()
+    with (
+        mock.patch.object(
+            cli_module, "resolve_local_model_path", return_value=Path("/artifact")
+        ) as resolve,
+        mock.patch.object(
+            cli_module, "load_quantized_mtp", return_value=bundled
+        ) as load_bundled,
+        mock.patch.object(cli_module, "find_snapshot") as find_original,
+    ):
+        actual = cli_module.load_cli_mtp(
+            "artifact-repo",
+            {"fastmlx_mtp": True},
+            object(),
+            "raw-repo",
+            4,
+        )
+    assert actual is bundled
+    resolve.assert_called_once_with("artifact-repo")
+    load_bundled.assert_called_once()
+    find_original.assert_not_called()
+
+
 def _fmt_bytes(n: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024:
@@ -249,32 +347,49 @@ def main() -> None:
 
         uv run python bench/test_convert.py
     """
-    tests = [
+    quick_tests = [
+        ("test_dry_run_layer_bounds", test_dry_run_layer_bounds),
+        (
+            "test_quantization_preflight_and_effective_defaults",
+            test_quantization_preflight_and_effective_defaults,
+        ),
+        (
+            "test_cli_prefers_bundled_mtp_artifact",
+            test_cli_prefers_bundled_mtp_artifact,
+        ),
+    ]
+    snapshot_tests = [
         ("test_dry_run_group64", test_dry_run_group64),
         ("test_dry_run_group128", test_dry_run_group128),
         ("test_group128_smaller_than_group64", test_group128_smaller_than_group64),
     ]
     failures = []
+    snapshot_skips = 0
     try:
-        for name, fn in tests:
+        for name, fn in quick_tests + snapshot_tests:
             print(f"[test_convert] running {name} ...")
             try:
                 fn()
             except unittest.SkipTest as e:
                 print(f"[test_convert] SKIP {name}: {e}")
-                return
+                if (name, fn) in snapshot_tests:
+                    snapshot_skips += 1
             except AssertionError as e:
                 print(f"[test_convert] FAIL {name}: {e}")
                 failures.append(name)
             else:
                 print(f"[test_convert] PASS {name}")
 
-        results = {gs: _dry_run(gs) for gs in (64, 128)}
-        _print_report(results)
+        if snapshot_skips == 0:
+            results = {gs: _dry_run(gs) for gs in (64, 128)}
+            _print_report(results)
 
         if failures:
             raise SystemExit(f"{len(failures)} test(s) failed: {failures}")
-        print("\n[test_convert] all tests passed")
+        print(
+            f"\n[test_convert] quick tests passed; "
+            f"snapshot tests skipped={snapshot_skips}"
+        )
     finally:
         _cleanup_tmp_root()
 

@@ -8,11 +8,20 @@ import argparse
 import time
 
 import mlx.core as mx
-from mlx_lm import load
-from mlx_lm.models.qwen3_5 import TextModelArgs
 
+from ._mlx_compat import TextModelArgs, mlx_lm_load, resolve_local_model_path
+from .convert import load_quantized_mtp
 from .mtp import find_snapshot, load_mtp
 from .spec import ChatSession, SpecEngine
+
+
+def load_cli_mtp(model_path, config, text_args, original, mtp_bits):
+    """Load bundled MTP when present, otherwise use the raw source checkpoint."""
+
+    if config.get("fastmlx_mtp"):
+        return load_quantized_mtp(resolve_local_model_path(model_path), text_args)
+    quant = {"bits": mtp_bits, "group_size": 64} if mtp_bits else None
+    return load_mtp(find_snapshot(original), text_args, quantize=quant)
 
 
 def main() -> None:
@@ -33,10 +42,11 @@ def main() -> None:
     args = ap.parse_args()
 
     t0 = time.perf_counter()
-    model, tokenizer = load(args.model)
-    quant = {"bits": args.mtp_bits, "group_size": 64} if args.mtp_bits else None
+    model, tokenizer, config = mlx_lm_load(args.model, return_config=True)
     text_args = TextModelArgs.from_dict(model.args.text_config)
-    mtp = load_mtp(find_snapshot(args.original), text_args, quantize=quant)
+    mtp = load_cli_mtp(
+        args.model, config, text_args, args.original, args.mtp_bits
+    )
     mx.eval(mtp.parameters())
     engine = SpecEngine(model, mtp)
     print(f"[fastmlx] loaded in {time.perf_counter() - t0:.1f}s: {args.model}")

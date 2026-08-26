@@ -6,8 +6,8 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "huggingface-hub>=1.28.0",
-    "mlx>=0.32.2",
-    "mlx-lm>=0.31.3",
+    "mlx>=0.32.2,<0.33",
+    "mlx-lm>=0.31.3,<0.32",
 ]
 
 [project.scripts]

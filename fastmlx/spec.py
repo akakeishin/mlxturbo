@@ -15,9 +15,13 @@ from collections import Counter
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import create_attention_mask, create_ssm_mask
-from mlx_lm.models.cache import KVCache
 
+from ._mlx_compat import (
+    KVCache,
+    create_attention_mask,
+    create_ssm_mask,
+    validate_spec_model_contract,
+)
 from .kernels.gated_delta_states import gated_delta_update_with_states
 
 
@@ -32,12 +36,32 @@ class ChatSession:
     def __init__(self):
         self.caches = None
         self.mtp_cache = None
+        self.mtp_valid = False
         self.processed = []
         self.h_last = None
+
+    def invalidate(self):
+        """Drop every published field before aliased caches are mutated."""
+
+        self.caches = None
+        self.mtp_cache = None
+        self.mtp_valid = False
+        self.processed = []
+        self.h_last = None
+
+    def publish(self, caches, mtp_cache, mtp_valid, processed, h_last):
+        """Publish one internally consistent session snapshot after success."""
+
+        self.caches = caches
+        self.mtp_cache = mtp_cache
+        self.mtp_valid = mtp_valid
+        self.processed = processed
+        self.h_last = h_last
 
 
 class SpecEngine:
     def __init__(self, model, mtp):
+        validate_spec_model_contract(model)
         self.text = model.language_model
         self.inner = self.text.model
         self.mtp = mtp
@@ -52,6 +76,13 @@ class SpecEngine:
 
     def _hidden_forward(self, tokens: mx.array, caches, capture: bool):
         """tokens: (S,)。戻り値: (最終 norm 前 hidden (1,S,D), 線形層の巻き戻し情報)"""
+        if capture and any(
+            layer.is_linear and layer.linear_attn.sharding_group is not None
+            for layer in self.inner.layers
+        ):
+            raise NotImplementedError(
+                "SpecEngine capture does not support sharded GatedDeltaNet layers"
+            )
         x = self.inner.embed_tokens(tokens[None])
         fa_mask = create_attention_mask(x, caches[self.inner.fa_idx])
         ssm_mask = create_ssm_mask(x, caches[self.inner.ssm_idx])
@@ -60,16 +91,20 @@ class SpecEngine:
         for layer, c in zip(self.inner.layers, caches):
             if layer.is_linear:
                 if capture:
-                    h = self._linear_capture(layer, h, c, sink)
+                    h = self._linear_capture(layer, h, c, sink, ssm_mask)
                 else:
                     h = layer(h, mask=ssm_mask, cache=c)
             else:
                 h = layer(h, mask=fa_mask, cache=c)
         return h, sink
 
-    def _linear_capture(self, layer, x, cache, sink):
+    def _linear_capture(self, layer, x, cache, sink, mask=None):
         """GatedDeltaNet と同じ計算を、位置ごとの再帰状態を残しながら行う。"""
         la = layer.linear_attn
+        if la.sharding_group is not None:
+            raise NotImplementedError(
+                "SpecEngine capture does not support sharded GatedDeltaNet layers"
+            )
         xin = layer.input_layernorm(x)
         B, S, _ = xin.shape
 
@@ -83,6 +118,8 @@ class SpecEngine:
             conv_state = mx.zeros(
                 (B, la.conv_kernel_size - 1, la.conv_dim), dtype=xin.dtype
             )
+        if mask is not None:
+            qkv = mx.where(mask[..., None], qkv, 0)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
         conv_out = nn.silu(la.conv1d(conv_input))
 
@@ -99,13 +136,30 @@ class SpecEngine:
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
         out, states_all = gated_delta_update_with_states(
-            q, k, v, a, b, la.A_log, la.dt_bias, cache[1], None
+            q, k, v, a, b, la.A_log, la.dt_bias, cache[1], mask
         )
 
         n_keep = la.conv_kernel_size - 1
-        cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+        old_lengths = cache.lengths
+        old_left_padding = cache.left_padding
+        if old_lengths is not None:
+            ends = mx.clip(old_lengths, 0, S)
+            positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+            cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+        else:
+            cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
         cache[1] = states_all[:, -1]
-        sink.append((cache, states_all, conv_input, la.conv_kernel_size))
+        cache.advance(S)
+        sink.append(
+            (
+                cache,
+                states_all,
+                conv_input,
+                la.conv_kernel_size,
+                old_lengths,
+                old_left_padding,
+            )
+        )
 
         r = la.out_proj(la.norm(out, z).reshape(B, S, -1))
         h = x + r
@@ -114,12 +168,53 @@ class SpecEngine:
     def _rollback(self, caches, sink, total: int, consumed: int):
         if consumed == total:
             return
+        if not 0 < consumed < total:
+            raise ValueError(
+                f"rollback requires 0 < consumed < total; got {consumed}/{total}"
+            )
+        linear_cache_ids = {id(item[0]) for item in sink}
         for c in caches:
-            if isinstance(c, KVCache):
-                c.trim(total - consumed)
-        for cache, states_all, conv_input, kernel in sink:
+            if id(c) in linear_cache_ids:
+                continue
+            is_trimmable = getattr(c, "is_trimmable", None)
+            trim = getattr(c, "trim", None)
+            if not callable(is_trimmable) or not callable(trim) or not is_trimmable():
+                raise TypeError(
+                    f"verification cache {type(c).__name__} does not implement "
+                    "the trimmable cache protocol"
+                )
+            requested = total - consumed
+            trimmed = trim(requested)
+            if trimmed != requested:
+                raise RuntimeError(
+                    f"verification cache trimmed {trimmed} tokens, expected {requested}"
+                )
+        for (
+            cache,
+            states_all,
+            conv_input,
+            kernel,
+            old_lengths,
+            old_left_padding,
+        ) in sink:
             cache[1] = states_all[:, consumed - 1]
-            cache[0] = mx.contiguous(conv_input[:, consumed : consumed + kernel - 1, :])
+            n_keep = kernel - 1
+            if old_lengths is not None:
+                ends = mx.clip(old_lengths, 0, consumed)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+            else:
+                cache[0] = mx.contiguous(
+                    conv_input[:, consumed : consumed + n_keep, :]
+                )
+            cache.lengths = (
+                old_lengths - consumed if old_lengths is not None else None
+            )
+            cache.left_padding = (
+                old_left_padding - consumed
+                if old_left_padding is not None
+                else None
+            )
 
     # ---------- MTP ----------
 
@@ -171,49 +266,86 @@ class SpecEngine:
         draft 源は 2 系統: 文脈 lookup (suffix 再出現の続き、深さ lookup_len) が
         当たればそれを優先し、外れたら MTP 連鎖。lookup が全棄却だったら
         数ステップ休ませる。
+
+        ``n_draft=0, max_draft=0, lookup_len=0`` is the non-speculative
+        baseline contract used by ``bench/gate.py``.
         """
+        if min(max_tokens, n_draft, max_draft, lookup_len, lookup_ngram) < 0:
+            raise ValueError("generation limits must be non-negative")
         eos = set(eos_ids)
         prompt_ids = list(prompt_ids)
+        use_mtp = n_draft > 0 or max_draft > 0
 
         caches = mtp_cache = None
         reused = 0
+        reused_h_last = None
         if session is not None and session.caches is not None:
             pl = session.processed
             n = min(len(pl), len(prompt_ids))
             lcp = 0
             while lcp < n and pl[lcp] == prompt_ids[lcp]:
                 lcp += 1
-            if lcp == len(pl) and lcp < len(prompt_ids):
+            mtp_reusable = not use_mtp or session.mtp_valid
+            if lcp == len(pl) and lcp < len(prompt_ids) and mtp_reusable:
                 caches, mtp_cache = session.caches, session.mtp_cache
+                reused_h_last = session.h_last
                 reused = lcp
+                # The local variables now own these mutable caches.  Any error,
+                # including KeyboardInterrupt or a callback failure, leaves the
+                # public session invalid instead of half-published.
+                session.invalidate()
         if caches is None:
             caches = self.text.make_cache()
+            mtp_cache = KVCache()
+        elif mtp_cache is None:
             mtp_cache = KVCache()
 
         prompt = mx.array(prompt_ids[reused:])
 
         t0 = time.perf_counter()
         h_all, _ = self._hidden_forward(prompt, caches, capture=False)
-        y_logits = self._head(h_all[:, -1:], self.inner.norm)
+        if use_mtp:
+            if reused:
+                mtp_hiddens = mx.concatenate(
+                    [reused_h_last, h_all[:, :-1]], axis=1
+                )
+                self._mtp_append(prompt, mtp_hiddens, mtp_cache)
+            elif prompt.shape[0] > 1:
+                self._mtp_append(prompt[1:], h_all[:, :-1], mtp_cache)
+        h_last = h_all[:, -1:]
+
+        if max_tokens == 0:
+            mx.eval(h_last)
+            ttft = time.perf_counter() - t0
+            if session is not None:
+                session.publish(
+                    caches, mtp_cache, use_mtp, list(prompt_ids), h_last
+                )
+            return {
+                "prefill_reused": reused,
+                "prefill_new": len(prompt_ids) - reused,
+                "tokens": [],
+                "ttft_s": ttft,
+                "decode_tps": 0.0,
+                "accept_hist": {},
+                "accept_trace": [],
+                "src_hist": {"lookup": {}, "mtp": {}},
+                "phase_s": {"draft": 0.0, "verify": 0.0, "maint": 0.0},
+                "steps": 0,
+                "mean_accepted": 0.0,
+                "tokens_per_step": 0.0,
+            }
+
+        y_logits = self._head(h_last, self.inner.norm)
         if temp > 0:
             y = mx.random.categorical(
                 y_logits[0].astype(mx.float32) / temp
             ).reshape(1)
         else:
             y = mx.argmax(y_logits, axis=-1).reshape(1)
-        if n_draft > 0 or max_draft > 0:
-            if reused:
-                mtp_hiddens = mx.concatenate(
-                    [session.h_last, h_all[:, :-1]], axis=1
-                )
-                self._mtp_append(prompt, mtp_hiddens, mtp_cache)
-            elif prompt.shape[0] > 1:
-                self._mtp_append(prompt[1:], h_all[:, :-1], mtp_cache)
-        h_last = h_all[:, -1:]
         mx.eval(y)
         ttft = time.perf_counter() - t0
 
-        use_mtp = n_draft > 0 or max_draft > 0
         out_tokens = [int(y.item())]
         if on_tokens:
             on_tokens(out_tokens[:])
@@ -232,8 +364,11 @@ class SpecEngine:
             ts = time.perf_counter()
             mtp_off0 = mtp_cache.offset
             lk = None
-            if lookup_len > 0 and lookup_cool == 0:
-                lk = self._lookup_draft(ctx, lookup_ngram, lookup_cur)
+            proposal_cap = max_tokens - len(out_tokens) - 1
+            if proposal_cap > 0 and lookup_len > 0 and lookup_cool == 0:
+                lk = self._lookup_draft(
+                    ctx, lookup_ngram, min(lookup_cur, proposal_cap)
+                )
             if lk:
                 source = "lookup"
                 window = mx.concatenate([y, mx.array(lk)])
@@ -242,7 +377,7 @@ class SpecEngine:
                 lookup_cool = max(0, lookup_cool - 1)
                 drafts = []
                 dh, dtok = h_last, y
-                for _ in range(depth):
+                for _ in range(min(depth, proposal_cap)):
                     h_mtp = self._mtp_append(dtok, dh, mtp_cache)
                     d = mx.argmax(
                         self._head(h_mtp[:, -1:], self.mtp.norm), axis=-1
@@ -254,8 +389,13 @@ class SpecEngine:
             phase["draft"] += time.perf_counter() - ts
 
             ts = time.perf_counter()
-            hs, sink = self._hidden_forward(window, caches, capture=True)
+            # A one-token window cannot require rollback.  Use the native path
+            # so n_draft=0 + lookup_len=0 is a true non-speculative baseline.
+            hs, sink = self._hidden_forward(
+                window, caches, capture=window.shape[0] > 1
+            )
             logits = self._head(hs, self.inner.norm)
+            accepted_eos = None
             if temp == 0:
                 preds = mx.argmax(logits, axis=-1)[0]
                 mx.eval(preds, window)
@@ -264,7 +404,11 @@ class SpecEngine:
                 a = 0
                 while a < n_avail and preds_l[a] == window_l[a + 1]:
                     a += 1
-                next_tok = preds_l[a]
+                    if window_l[a] in eos:
+                        accepted_eos = a
+                        break
+                if accepted_eos is None:
+                    next_tok = preds_l[a]
             else:
                 # 棄却サンプリング (draft は決定的提案 = delta 分布)。
                 # 受理確率 p_target(d)、棄却時は d を除いた残差から引き直す。
@@ -283,12 +427,19 @@ class SpecEngine:
                 a = 0
                 while a < n_avail and u_l[a] < p_l[a]:
                     a += 1
-                row = lg[a]
-                if a < n_avail:
-                    rejected = mx.arange(row.shape[-1]) == window_l[a + 1]
-                    row = mx.where(rejected, -mx.inf, row)
-                next_tok = int(mx.random.categorical(row).item())
-            consumed = 1 + a
+                    if window_l[a] in eos:
+                        accepted_eos = a
+                        break
+                if accepted_eos is None:
+                    row = lg[a]
+                    if a < n_avail:
+                        rejected = mx.arange(row.shape[-1]) == window_l[a + 1]
+                        row = mx.where(rejected, -mx.inf, row)
+                    next_tok = int(mx.random.categorical(row).item())
+            if accepted_eos is not None:
+                consumed = a
+            else:
+                consumed = 1 + a
             phase["verify"] += time.perf_counter() - ts
 
             ts = time.perf_counter()
@@ -318,12 +469,11 @@ class SpecEngine:
                 self._mtp_append(window[:consumed], true_hiddens, mtp_cache)
 
             h_last = hs[:, consumed - 1 : consumed]
-            y = mx.array([next_tok])
-            step_tokens = []
-            for t in window_l[1:consumed] + [next_tok]:
-                step_tokens.append(t)
-                if t in eos:
-                    break
+            if accepted_eos is not None:
+                step_tokens = window_l[1 : a + 1]
+            else:
+                y = mx.array([next_tok])
+                step_tokens = window_l[1:consumed] + [next_tok]
             out_tokens.extend(step_tokens)
             ctx.extend(step_tokens)
             fed_gen.extend(window_l[:consumed])
@@ -335,10 +485,13 @@ class SpecEngine:
         n_decode = len(out_tokens) - 1
         steps = sum(accept_hist.values())
         if session is not None:
-            session.caches = caches
-            session.mtp_cache = mtp_cache
-            session.processed = prompt_ids + fed_gen
-            session.h_last = h_last
+            session.publish(
+                caches,
+                mtp_cache,
+                use_mtp,
+                prompt_ids + fed_gen,
+                h_last,
+            )
         return {
             "prefill_reused": reused,
             "prefill_new": len(prompt_ids) - reused,

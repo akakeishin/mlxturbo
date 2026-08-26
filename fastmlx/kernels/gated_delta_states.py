@@ -25,7 +25,7 @@ from typing import Optional, Tuple
 
 import mlx.core as mx
 
-from mlx_lm.models.gated_delta import compute_g
+from .._mlx_compat import compute_g
 
 
 def _make_gated_delta_states_kernel(has_mask: bool = False, vectorized: bool = False):
@@ -103,7 +103,9 @@ def _make_gated_delta_states_kernel(has_mask: bool = False, vectorized: bool = F
               y[dv_idx] = static_cast<InT>(out);
             }}
           }} else {{
-            y[dv_idx] = static_cast<InT>(0);
+            if (thread_index_in_simdgroup == 0) {{
+              y[dv_idx] = static_cast<InT>(0);
+            }}
           }}
           // Record the state right after this position was processed, for
           // every position (this is the only substantive addition vs.
@@ -167,8 +169,14 @@ def gated_delta_kernel_with_states(
     state: mx.array,
     mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array, mx.array]:
+    _validate_kernel_shapes(q, k, v, g, beta, state, mask)
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
+    if Dk % 32 != 0 or mx.default_device() != mx.gpu or not mx.metal.is_available():
+        out, states_all = _gated_delta_ops_with_states(
+            q, k, v, g, beta, state, mask
+        )
+        return out, states_all[:, -1], states_all
     input_type = q.dtype
     state_type = state.dtype
     if g.ndim == 4:
@@ -201,6 +209,70 @@ def gated_delta_kernel_with_states(
     )
 
 
+def _validate_kernel_shapes(q, k, v, g, beta, state, mask) -> None:
+    if q.ndim != 4 or k.ndim != 4 or q.shape != k.shape:
+        raise ValueError(
+            f"q and k must have the same [B,T,Hk,Dk] shape; "
+            f"got {q.shape}, {k.shape}"
+        )
+    B, T, Hk, Dk = q.shape
+    if min(B, T, Hk, Dk) <= 0:
+        raise ValueError(f"q/k dimensions must be positive; got {q.shape}")
+    if v.ndim != 4 or v.shape[:2] != (B, T):
+        raise ValueError(f"v must have shape [B,T,Hv,Dv]; got {v.shape}")
+    Hv, Dv = v.shape[2:]
+    if Hv < Hk or Hv % Hk != 0:
+        raise ValueError(
+            f"Hv must be a positive multiple of Hk; got Hk={Hk}, Hv={Hv}"
+        )
+    if beta.shape != (B, T, Hv):
+        raise ValueError(f"beta must have shape {(B, T, Hv)}; got {beta.shape}")
+    valid_g_shapes = ((B, T, Hv), (B, T, Hv, Dk))
+    if g.shape not in valid_g_shapes:
+        raise ValueError(
+            f"g must have shape {valid_g_shapes[0]} or {valid_g_shapes[1]}; "
+            f"got {g.shape}"
+        )
+    expected_state = (B, Hv, Dv, Dk)
+    if state.shape != expected_state:
+        raise ValueError(f"state must have shape {expected_state}; got {state.shape}")
+    if state.dtype != mx.float32:
+        raise ValueError(f"state must use float32 accumulation; got {state.dtype}")
+    if mask is not None and mask.shape != (B, T):
+        raise ValueError(f"mask must have shape {(B, T)}; got {mask.shape}")
+    if mask is not None and mask.dtype != mx.bool_:
+        raise ValueError(f"mask must use bool dtype; got {mask.dtype}")
+
+
+def _gated_delta_ops_with_states(q, k, v, g, beta, state, mask=None):
+    """Shape-general MLX-ops fallback that also records every recurrent state."""
+
+    Hk = q.shape[2]
+    Hv = v.shape[2]
+    if (repeat_factor := Hv // Hk) > 1:
+        q = mx.repeat(q, repeat_factor, -2)
+        k = mx.repeat(k, repeat_factor, -2)
+
+    outputs = []
+    states = []
+    for t in range(q.shape[1]):
+        old_state = state
+        gt = g[:, t]
+        decay = gt[..., None, None] if gt.ndim == 2 else gt[..., None, :]
+        state = state * decay
+        kv_mem = (state * k[:, t, :, None, :]).sum(axis=-1)
+        delta = (v[:, t] - kv_mem) * beta[:, t, :, None]
+        state = state + k[:, t, :, None, :] * delta[..., None]
+        out = (state * q[:, t, :, None, :]).sum(axis=-1)
+        if mask is not None:
+            mt = mask[:, t]
+            state = mx.where(mt[:, None, None, None], state, old_state)
+            out = mx.where(mt[:, None, None], out, 0)
+        outputs.append(out.astype(q.dtype))
+        states.append(state.astype(mx.float32))
+    return mx.stack(outputs, axis=1), mx.stack(states, axis=1)
+
+
 def gated_delta_update_with_states(
     q: mx.array,
     k: mx.array,
@@ -227,16 +299,26 @@ def gated_delta_update_with_states(
         states_all[:, t] は位置 t を処理し終えた直後の状態。
         states_all[:, -1] は一括呼び出しの最終状態 (state_out) と一致する。
     """
-    if mx.default_device() != mx.gpu or not mx.metal.is_available():
-        raise NotImplementedError(
-            "gated_delta_update_with_states requires the Metal GPU backend"
+    if q.ndim != 4 or k.ndim != 4 or q.shape != k.shape:
+        raise ValueError(
+            f"q and k must have the same [B,T,Hk,Dk] shape; got {q.shape}, {k.shape}"
         )
-
+    B, T, _Hk, Dk = q.shape
+    if v.ndim != 4 or v.shape[:2] != (B, T):
+        raise ValueError(f"v must have shape [B,T,Hv,Dv]; got {v.shape}")
+    Hv, Dv = v.shape[-2:]
+    if a.shape != (B, T, Hv) or b.shape != (B, T, Hv):
+        raise ValueError(
+            f"a and b must have shape {(B, T, Hv)}; got {a.shape}, {b.shape}"
+        )
+    if A_log.shape != (Hv,) or dt_bias.shape != (Hv,):
+        raise ValueError(
+            f"A_log and dt_bias must have shape {(Hv,)}; "
+            f"got {A_log.shape}, {dt_bias.shape}"
+        )
     beta = mx.sigmoid(b)
     g = compute_g(A_log, a, dt_bias)
     if state is None:
-        B, _, _, Dk = q.shape
-        Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
     out, _state_out, states_all = gated_delta_kernel_with_states(

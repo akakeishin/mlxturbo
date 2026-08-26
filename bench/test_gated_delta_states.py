@@ -153,6 +153,119 @@ def check_mask_branch(T: int) -> None:
     assert diff_state < 1e-3
 
 
+def check_shape_guards_and_ops_fallback() -> None:
+    """Unsupported tile widths fall back; inconsistent shapes fail before launch."""
+
+    B_, T_, Hk_, Hv_, Dk_, Dv_ = 1, 3, 2, 4, 80, 8
+    q = mx.random.normal((B_, T_, Hk_, Dk_)).astype(DTYPE)
+    k = mx.random.normal((B_, T_, Hk_, Dk_)).astype(DTYPE)
+    v = mx.random.normal((B_, T_, Hv_, Dv_)).astype(DTYPE)
+    a = mx.random.normal((B_, T_, Hv_)).astype(DTYPE)
+    b = mx.random.normal((B_, T_, Hv_)).astype(DTYPE)
+    A_log = mx.log(mx.random.uniform(low=0.1, high=2.0, shape=(Hv_,)))
+    dt_bias = mx.ones((Hv_,))
+    mask = mx.array([[True, False, True]])
+
+    out, states = gated_delta_update_with_states(
+        q, k, v, a, b, A_log, dt_bias, None, mask
+    )
+    state_ref = None
+    out_ref = []
+    states_ref = []
+    for t in range(T_):
+        yt, state_ref = gated_delta_update(
+            q[:, t : t + 1],
+            k[:, t : t + 1],
+            v[:, t : t + 1],
+            a[:, t : t + 1],
+            b[:, t : t + 1],
+            A_log,
+            dt_bias,
+            state_ref,
+            mask[:, t : t + 1],
+            use_kernel=False,
+        )
+        # mlx-lm 0.31.3's ops path restores masked state but does not zero y;
+        # the Metal contract does, so normalize the reference output here.
+        yt = mx.where(mask[:, t : t + 1, None, None], yt, 0)
+        out_ref.append(yt)
+        states_ref.append(state_ref)
+    out_ref = mx.concatenate(out_ref, axis=1)
+    states_ref = mx.stack(states_ref, axis=1)
+    mx.eval(out, states, out_ref, states_ref)
+    assert max_abs_diff(out, out_ref) < 1e-2
+    assert max_abs_diff(states, states_ref) < 1e-3
+
+    bad_state = mx.zeros((B_, Hv_, Dv_, Dk_ - 1), dtype=mx.float32)
+    bad_mask = mx.ones((B_, T_ + 1), dtype=mx.bool_)
+    bad_state_dtype = mx.zeros((B_, Hv_, Dv_, Dk_), dtype=mx.float16)
+    bad_mask_dtype = mx.ones((B_, T_), dtype=mx.int32)
+    for kwargs in (
+        {"state": bad_state, "mask": mask},
+        {"state": None, "mask": bad_mask},
+        {"state": bad_state_dtype, "mask": mask},
+        {"state": None, "mask": bad_mask_dtype},
+    ):
+        try:
+            gated_delta_update_with_states(
+                q, k, v, a, b, A_log, dt_bias, kwargs["state"], kwargs["mask"]
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid recurrent shape should fail: {kwargs}")
+
+    bad_v = v[:, :, :1]
+    bad_a = a[:, :, :1]
+    bad_b = b[:, :, :1]
+    try:
+        gated_delta_update_with_states(
+            q,
+            k,
+            bad_v,
+            bad_a,
+            bad_b,
+            A_log[:1],
+            dt_bias[:1],
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Hv < Hk should fail before Metal launch")
+
+    try:
+        gated_delta_update_with_states(
+            q,
+            k,
+            v[:, :, :3],
+            a[:, :, :3],
+            b[:, :, :3],
+            A_log[:3],
+            dt_bias[:3],
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Hv % Hk != 0 should fail before Metal launch")
+
+
+def check_mask_false_is_deterministic(T: int = 4) -> None:
+    q, k, v, a, b, A_log, dt_bias = make_inputs(T)
+    mask = mx.zeros((B, T), dtype=mx.bool_)
+    first_out, first_states = gated_delta_update_with_states(
+        q, k, v, a, b, A_log, dt_bias, None, mask
+    )
+    mx.eval(first_out, first_states)
+    assert not bool(mx.any(first_out).item())
+    for _ in range(8):
+        out, states = gated_delta_update_with_states(
+            q, k, v, a, b, A_log, dt_bias, None, mask
+        )
+        mx.eval(out, states)
+        assert bool(mx.array_equal(out, first_out))
+        assert bool(mx.array_equal(states, first_states))
+
+
 def bench_once(fn, iters: int = 10, warmup: int = 3) -> float:
     for _ in range(warmup):
         mx.eval(fn())
@@ -207,6 +320,10 @@ def main() -> None:
         check_out_matches_batch(T)
         check_states_against_sequential(T)
         check_mask_branch(T)
+    print("-- shape guards / ops fallback --")
+    check_shape_guards_and_ops_fallback()
+    print("-- mask=false deterministic writes --")
+    check_mask_false_is_deterministic()
 
     print()
     print("=== 検証2: 性能 (参考値、単発比較) ===")

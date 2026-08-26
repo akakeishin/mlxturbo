@@ -71,6 +71,32 @@ PROMPTS = {
 }
 
 
+def mismatch_records(stock_tokens, spec_tokens, positions, tokenizer, radius=8):
+    """Serialize the first mismatch positions with enough context to diagnose them."""
+
+    records = []
+    for index in positions[:5]:
+        start = max(0, index - radius)
+        stock_context = stock_tokens[start : index + radius + 1]
+        spec_context = spec_tokens[start : index + radius + 1]
+        records.append(
+            {
+                "index": index,
+                "stock_token": (
+                    stock_tokens[index] if index < len(stock_tokens) else None
+                ),
+                "spec_token": (
+                    spec_tokens[index] if index < len(spec_tokens) else None
+                ),
+                "stock_context_tokens": stock_context,
+                "spec_context_tokens": spec_context,
+                "stock_context": tokenizer.decode(stock_context),
+                "spec_context": tokenizer.decode(spec_context),
+            }
+        )
+    return records
+
+
 def stock_generate(model, tokenizer, prompt_ids, max_tokens):
     sampler = make_sampler(temp=0.0)
     tokens = []
@@ -96,6 +122,12 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--n-draft", default="3", help="comma separated sweep, e.g. 3,5,7")
     ap.add_argument("--max-draft", type=int, default=0, help="adaptive depth cap")
+    ap.add_argument(
+        "--lookup-len",
+        type=int,
+        default=16,
+        help="lookup draft cap; set to 0 with n_draft=0 for the baseline contract",
+    )
     ap.add_argument("--mtp-bits", type=int, default=0, help="quantize MTP (0=bf16)")
     ap.add_argument("--prompts", default="", help="comma separated subset of prompt names")
     ap.add_argument("--fast-qmm", action="store_true", help="route small-M qmm through fast_qmm")
@@ -131,17 +163,22 @@ def main():
                 max_tokens=args.max_tokens,
                 n_draft=nd,
                 max_draft=args.max_draft,
+                lookup_len=args.lookup_len,
                 eos_ids=eos_ids,
             )
             n = min(len(stock["tokens"]), len(spec["tokens"]))
             diffs = [i for i in range(n) if stock["tokens"][i] != spec["tokens"][i]]
+            if len(stock["tokens"]) != len(spec["tokens"]):
+                diffs.extend(range(n, max(len(stock["tokens"]), len(spec["tokens"]))))
             results[name]["sweep"][nd] = {
                 "spec_decode_tps": spec["decode_tps"],
                 "speedup": spec["decode_tps"] / stock["decode_tps"],
                 "identical": not diffs,
-                "compared": n,
+                "compared": max(len(stock["tokens"]), len(spec["tokens"])),
                 "n_mismatch": len(diffs),
-                "first_mismatches": diffs[:5],
+                "first_mismatches": mismatch_records(
+                    stock["tokens"], spec["tokens"], diffs, tokenizer
+                ),
                 "phase_s": spec["phase_s"],
                 "steps": spec["steps"],
                 "mean_accepted": spec["mean_accepted"],

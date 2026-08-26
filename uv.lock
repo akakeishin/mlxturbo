@@ -66,8 +66,8 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "huggingface-hub", specifier = ">=1.28.0" },
-    { name = "mlx", specifier = ">=0.32.2" },
-    { name = "mlx-lm", specifier = ">=0.31.3" },
+    { name = "mlx", specifier = ">=0.32.2,<0.33" },
+    { name = "mlx-lm", specifier = ">=0.31.3,<0.32" },
 ]
 
 [[package]]

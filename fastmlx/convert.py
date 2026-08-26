@@ -30,14 +30,17 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map_with_path
-from mlx_lm.models.qwen3_5 import TextModelArgs
-from mlx_lm.utils import (
+
+from ._mlx_compat import (
+    QWEN35_SHIFTED_NORM_SUFFIXES,
+    TextModelArgs,
     create_model_card,
     get_total_parameters,
-    load as mlx_lm_load,
+    mlx_lm_load,
     make_shards,
     quantize_model,
     save_config,
+    validate_affine_quantization,
 )
 
 from .mtp import MTPModule, find_snapshot, load_mtp
@@ -99,6 +102,33 @@ def truncate_layers(model: nn.Module, num_layers: int) -> None:
     model.language_model.model.layers = layers[:num_layers]
 
 
+def validate_dry_run_layers(model: nn.Module, config: dict, num_layers: int) -> None:
+    """Reject dry-run artifacts whose config and physical layer tree would differ."""
+
+    total_layers = len(model.language_model.model.layers)
+    min_layers = config["text_config"]["full_attention_interval"]
+    if not min_layers <= num_layers <= total_layers:
+        raise ValueError(
+            "dry_run_layers must satisfy "
+            f"{min_layers} <= dry_run_layers <= {total_layers}; got {num_layers}"
+        )
+
+
+def normalize_quantization(
+    group_size: int, bits: int, mtp_bits: Optional[int]
+) -> tuple[int, int, int]:
+    """Resolve MLX affine defaults and validate values before loading weights."""
+
+    effective_group_size = group_size or 64
+    effective_bits = bits or 4
+    effective_mtp_bits = (
+        mtp_bits if mtp_bits is not None else effective_bits
+    ) or 4
+    validate_affine_quantization(effective_group_size, effective_bits)
+    validate_affine_quantization(effective_group_size, effective_mtp_bits)
+    return effective_group_size, effective_bits, effective_mtp_bits
+
+
 def flatten_mtp_weights(mtp: nn.Module) -> dict:
     """MTPModule のパラメータを 'mtp.' プレフィックス付きでフラット化する。
 
@@ -107,6 +137,30 @@ def flatten_mtp_weights(mtp: nn.Module) -> dict:
     fastmlx.mtp.load_mtp と同じキー規約のまま量子化済みとして保存できる。
     """
     return {f"mtp.{k}": v for k, v in tree_flatten(mtp.parameters())}
+
+
+def base_weights_for_mtp_artifact(model: nn.Module) -> dict:
+    """Return base weights in qwen3_5's raw, zero-centred norm convention.
+
+    ``mlx_lm_load`` has already applied +1 to these norms because the source
+    checkpoint contains mtp.*.  The output also contains mtp.*, so its reload
+    sanitizer will apply +1 again.  Reverse the first shift only in the saved
+    weight view; the live converted model remains unchanged.
+    """
+
+    weights = dict(tree_flatten(model.parameters()))
+    shifted = 0
+    for name, value in list(weights.items()):
+        if value.ndim == 1 and any(
+            name.endswith(suffix) for suffix in QWEN35_SHIFTED_NORM_SUFFIXES
+        ):
+            weights[name] = value - 1.0
+            shifted += 1
+    if shifted == 0:
+        raise RuntimeError(
+            "no qwen3_5 RMSNorm weights matched the raw-save contract"
+        )
+    return weights
 
 
 def load_quantized_mtp(out_dir, text_args: TextModelArgs) -> MTPModule:
@@ -155,7 +209,7 @@ def save_with_mtp(
     """mlx_lm.utils.save 相当。本体の重みに mtp.* を同じシャード集合へ混ぜて保存する。"""
     dst_path.mkdir(parents=True, exist_ok=True)
 
-    weights = dict(tree_flatten(model.parameters()))
+    weights = base_weights_for_mtp_artifact(model)
     weights.update(flatten_mtp_weights(mtp))
 
     shards = make_shards(weights)
@@ -229,12 +283,17 @@ def convert(
         )
 
     snapshot = resolve_hf_path(hf_path)
-    mtp_bits = mtp_bits if mtp_bits is not None else bits
+    # mlx affine treats zero as "use the default".  Resolve it before any
+    # module is quantized so config metadata records the effective values.
+    group_size, bits, mtp_bits = normalize_quantization(
+        group_size, bits, mtp_bits
+    )
 
     print(f"[fastmlx.convert] loading base model from {snapshot}")
     model, tokenizer, config = mlx_lm_load(snapshot, return_config=True, lazy=True)
 
     if dry_run:
+        validate_dry_run_layers(model, config, dry_run_layers)
         print(
             f"[fastmlx.convert] dry-run: truncating base model to first "
             f"{dry_run_layers} layer(s)"

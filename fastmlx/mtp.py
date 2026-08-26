@@ -14,8 +14,14 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.base import create_attention_mask
-from mlx_lm.models.qwen3_5 import DecoderLayer, TextModelArgs
+from mlx.utils import tree_flatten
+
+from ._mlx_compat import (
+    DecoderLayer,
+    TextModelArgs,
+    create_attention_mask,
+    validate_affine_quantization,
+)
 
 
 class MTPModule(nn.Module):
@@ -78,10 +84,27 @@ def load_mtp(
     mtp = MTPModule(args)
     mtp.load_weights(list(weights.items()))
     if quantize:
+        group_size = quantize.get("group_size", 64)
+        bits = quantize.get("bits", 4)
+        validate_affine_quantization(group_size, bits)
+        incompatible = [
+            (name, value.shape[-1])
+            for name, value in tree_flatten(mtp.parameters())
+            if name.endswith(".weight")
+            and value.ndim == 2
+            and value.shape[-1] % group_size
+        ]
+        if incompatible:
+            details = ", ".join(f"{name}:K={size}" for name, size in incompatible)
+            raise ValueError(
+                f"MTP Linear input dimensions must be divisible by group_size="
+                f"{group_size}: {details}"
+            )
         nn.quantize(
             mtp,
-            group_size=quantize.get("group_size", 64),
-            bits=quantize.get("bits", 4),
+            group_size=group_size,
+            bits=bits,
+            mode="affine",
             class_predicate=lambda _, m: isinstance(m, nn.Linear),
         )
     mtp.eval()
