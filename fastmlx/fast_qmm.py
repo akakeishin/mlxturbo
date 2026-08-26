@@ -212,7 +212,9 @@ def _eligible(x: mx.array, group_size: int, bits: int, K: int, N: int) -> bool:
     return (
         bits == 4
         and group_size == 64
-        and K % KC == 0
+        # split-K carves K into 8 simdgroup regions walked in 64-wide groups,
+        # so K must divide by 512 (K%128 alone lets regions overlap, e.g. K=640)
+        and K % 512 == 0
         and N >= N_MIN
         and x.dtype == mx.bfloat16
         and mx.default_device() == mx.gpu
