@@ -86,15 +86,32 @@ GPU を使う計測は同時に 1 プロセスだけ（結果が壊れる）。�
 
 ### Phase D: アルゴリズム（受理率の分子側）
 
-最新研究調査の結果を docs/RESEARCH.md に反映してから着手（調査完了待ち。
-完了後この節を具体化する）。現時点で確度の高い順:
+設計根拠は docs/RESEARCH.md（必読）。効き順:
 
-- D1: 確信度ゲート連鎖。深度をラダーでなく MTP softmax 確率の逐次判定で決める。
-  停止則は期待利得（受理確率の積 × 追加トークン − 検証税の増分）の最大化。
-- D2: 連鎖品質。2 リンク目以降の近似 hidden ĥ の劣化対策（研究調査の結果を反映）。
-- D3: lookup の suffix automaton 化（O(n) 走査の除去、長文生成対策）。
-- D4: 木投機。gated_delta_states の states_all が状態フォークの前提部品。
-  A 完了（検証税の解消）後にのみ着手。それまでは chain が優位。
+- D0: 診断計測（半日、最初にやる）
+  (a) 位置別受理率 α_k の分解出力（accept_trace から集計可能）。
+  FastMTP の vanilla 値（70%/11%/2%）と比較し、同じ崩壊カーブか確認。
+  (b) 連鎖位置ごとの ĥ の RMS と真の h の RMS の比較（Attention Drift 診断）。
+  膨張していれば推論時スカラー再スケールを試す（訓練ゼロの応急処置）。
+- D1: 停止則の刷新（訓練不要、即日）
+  AdaEDL のエントロピー打ち切りを draft 連鎖に入れる。深度・m の大枠は
+  Sequoia の式に実測 t(m) を代入して解く（Leviathan 閉形式は使用禁止。
+  検証コスト線形仮定が m カーブと矛盾）。式の校正が難しければ BanditSpec
+  （深度=腕、報酬=実測 tok/s の UCB）に切り替え。
+- D2: FastMTP レシピで MTP ヘッド微調整（本命。受理 1.0-1.5 → 2.5-3.0 期待）
+  位置減衰 CE（α_k ∝ 0.6^(k-1)、K=3）、position-shared 再帰適用、backbone 凍結。
+  データは実使用分布の自己生成（一般ドメインは無効果、RESEARCH.md 参照）。
+  MTP ヘッドは ~0.4B なので M3 Max で射程内。学習スクリプトは
+  fastmlx/train_mtp.py としてエンジン付帯に置く（backbone 学習はやらない）。
+  伸び悩んだら HASS の top-K 蒸留と EAGLE のノイズ注入 U(-0.1,0.1) を追加。
+- D3: lookup の SAM 化と ReSpec 仲裁
+  SAM-Decoding の二重 suffix automaton（静的+動的）で O(n) 走査を置換。
+  仲裁は ReSpec 方式: エントロピー閾値で retrieval 起動、一致位置ごとの
+  受理率 EMA、source-aware verification。CPU 側は 20-30µs/token を予算に。
+- D4: Block Verification（分布厳密のまま +5-8%。棄却サンプラ差し替えのみ）
+- D5: 木投機（着手条件: A2 完了 + D2 完了後も受理が頭打ちの場合のみ）
+  GOOSE の異方的 spine から。GDN 48 層は chain 据え置き、full attention 16 層
+  のみ木マスク。4bit×木検証の相殺警告（RESEARCH.md）を先に実測で確認。
 
 ### Phase M: マルチモデル対応（B 完了後。C/D と並行可）
 
