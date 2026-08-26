@@ -3,6 +3,10 @@
 新セッションはこのファイルから読み始めること。背景の正本は
 docs/PLAN.md (Phase D)、docs/RESEARCH.md、docs/KERNEL-INTEL.md、README.md。
 
+**2026-08-26 追記: D0 実測で本ファイルの前提が複数崩れた。vanilla 崩壊カーブに
+乗っていない・再スケールは無効果・3.5 tok/step は K=3 で構造的に不可。
+docs/D2-RESULTS.md の D0 節を先に読み、目標値はそちらを正とすること。**
+
 ## 目的
 
 MTP ヘッド（~0.4B、backbone 凍結）を FastMTP レシピで微調整し、
