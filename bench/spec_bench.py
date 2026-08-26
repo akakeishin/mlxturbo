@@ -20,11 +20,54 @@ from mlx_lm.sample_utils import make_sampler
 from fastmlx.mtp import find_snapshot, load_mtp
 from fastmlx.spec import SpecEngine
 
+_EDIT_SNIPPET = '''
+import json
+import sqlite3
+from pathlib import Path
+
+
+def load_records(db_path: str) -> list[dict]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, name, score, created_at FROM records ORDER BY created_at"
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def summarize(records: list[dict]) -> dict:
+    if not records:
+        return {"count": 0, "mean": None, "best": None}
+    scores = [r["score"] for r in records]
+    best = max(records, key=lambda r: r["score"])
+    return {
+        "count": len(records),
+        "mean": sum(scores) / len(scores),
+        "best": {"id": best["id"], "name": best["name"], "score": best["score"]},
+    }
+
+
+def export_summary(db_path: str, out_path: str) -> None:
+    records = load_records(db_path)
+    summary = summarize(records)
+    Path(out_path).write_text(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    import sys
+    export_summary(sys.argv[1], sys.argv[2])
+'''
+
 PROMPTS = {
     "code": "Pythonで、ディレクトリ以下の全ファイルをSHA-256でハッシュ化して"
     "重複ファイルを検出するスクリプトを書いてください。",
     "prose": "分散システムにおける結果整合性と強整合性の違いを、具体例を"
     "挙げながら詳しく説明してください。",
+    "edit": "次のPythonコードの各関数にエラーハンドリングを追加して、"
+    "全体を書き直してください。他は変えないでください。\n```python"
+    + _EDIT_SNIPPET
+    + "```",
 }
 
 
@@ -54,6 +97,7 @@ def main():
     ap.add_argument("--n-draft", default="3", help="comma separated sweep, e.g. 3,5,7")
     ap.add_argument("--max-draft", type=int, default=0, help="adaptive depth cap")
     ap.add_argument("--mtp-bits", type=int, default=0, help="quantize MTP (0=bf16)")
+    ap.add_argument("--prompts", default="", help="comma separated subset of prompt names")
     ap.add_argument("--json", dest="json_out", default=None)
     args = ap.parse_args()
 
@@ -65,8 +109,11 @@ def main():
     engine = SpecEngine(model, mtp)
 
     eos_ids = {tokenizer.eos_token_id}
+    selected = (
+        {k: PROMPTS[k] for k in args.prompts.split(",")} if args.prompts else PROMPTS
+    )
     results = {}
-    for name, prompt in PROMPTS.items():
+    for name, prompt in selected.items():
         prompt_ids = tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}], add_generation_prompt=True
         )
@@ -93,6 +140,7 @@ def main():
                 "mean_accepted": spec["mean_accepted"],
                 "tokens_per_step": spec["tokens_per_step"],
                 "accept_hist": spec["accept_hist"],
+                "src_hist": spec["src_hist"],
             }
         print(name, json.dumps(results[name], indent=2))
 
