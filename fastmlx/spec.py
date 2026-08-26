@@ -595,6 +595,7 @@ class SpecEngine:
         accept_trace = []
         fed_gen = []
         src_hist = {"lookup": Counter(), "mtp": Counter()}
+        lookup_ext_hits = 0
         phase = {"draft": 0.0, "verify": 0.0, "maint": 0.0}
         t1 = time.perf_counter()
 
@@ -622,8 +623,15 @@ class SpecEngine:
             mtp_off0 = mtp_cache.offset
             lk = None
             lookup_bucket = None
+            chain_head = None
             proposal_cap = max_tokens - len(out_tokens) - 1
-            if proposal_cap > 0 and track_lookup and self._respec_trigger(entropy_hist):
+            cap = min(cap_base, proposal_cap)
+            triggered = (
+                proposal_cap > 0
+                and track_lookup
+                and self._respec_trigger(entropy_hist)
+            )
+            if triggered:
                 match_len, _ = sam.longest_match()
                 if match_len >= lookup_ngram:
                     lookup_bucket = self._respec_bucket(match_len)
@@ -633,17 +641,56 @@ class SpecEngine:
                         lk = sam.draft(
                             min(cand_len, proposal_cap), min_len=lookup_ngram
                         )
+                if lk is None:
+                    lookup_bucket = None
+            if lk is None and triggered and cap >= 1 and proposal_cap >= 2:
+                # D7 (LogitSpec arXiv:2507.01449 の適応): 直接照合がミスした
+                # ときだけ、MTP 第 1 リンクの予測トークンで検索キーを 1 つ
+                # 延長して SAM を引き直す。第 1 リンクはミス時に MTP 連鎖の
+                # 1 本目へそのまま再利用するので、追加 GPU コストは同期 1 回。
+                # 品質 EMA は直接キーと母集団が違うため ("ext", bucket) で
+                # 別学習する (ReSpec の source-aware verification の類推)。
+                dh, dtok = self._mtp_base(h_last), y
+                h_mtp = self._mtp_append(dtok, dh, mtp_cache)
+                d_logits = self._head(h_mtp[:, -1:], self.mtp.norm)[0, -1]
+                d_probs = mx.softmax(d_logits.astype(mx.float32), axis=-1)
+                conf1 = -mx.sum(d_probs * mx.log(mx.maximum(d_probs, 1e-12)))
+                d1 = mx.argmax(d_logits, axis=-1).reshape(1)
+                mx.eval(d1)
+                m1 = int(d1.item())
+                ext_len, _ = sam.peek_match(m1)
+                if ext_len >= lookup_ngram:
+                    ext_bucket = ("ext", self._respec_bucket(ext_len))
+                    score = quality_ema.get(ext_bucket, RESPEC_SCORE_PRIOR)
+                    if score >= RESPEC_SCORE_THETA:
+                        cand_len = max(1, round(lookup_len * score))
+                        _, cont = sam.draft_after(
+                            m1,
+                            min(cand_len, proposal_cap - 1),
+                            min_len=lookup_ngram,
+                        )
+                        if cont:
+                            lk = [m1] + cont
+                            lookup_bucket = ext_bucket
+                            lookup_ext_hits += 1
+                if lk is None:
+                    chain_head = (conf1, d1, self.mtp.norm(h_mtp[:, -1:]))
             if lk:
                 source = "lookup"
                 window = mx.concatenate([y, mx.array(lk)])
             else:
                 source = "mtp"
                 lookup_bucket = None
-                cap = min(cap_base, proposal_cap)
                 drafts = []
                 confidences = []
-                dh, dtok = self._mtp_base(h_last), y
-                for _ in range(max(cap, 0)):
+                if chain_head is not None:
+                    conf1, d1, dh = chain_head
+                    confidences.append(conf1)
+                    drafts.append(d1)
+                    dtok = d1
+                else:
+                    dh, dtok = self._mtp_base(h_last), y
+                for _ in range(max(cap - len(drafts), 0)):
                     h_mtp = self._mtp_append(dtok, dh, mtp_cache)
                     d_logits = self._head(h_mtp[:, -1:], self.mtp.norm)[0, -1]
                     d_probs = mx.softmax(d_logits.astype(mx.float32), axis=-1)
@@ -813,6 +860,7 @@ class SpecEngine:
             "accept_hist": dict(sorted(accept_hist.items())),
             "accept_trace": accept_trace,
             "src_hist": {k: dict(sorted(v.items())) for k, v in src_hist.items()},
+            "lookup_ext_hits": lookup_ext_hits,
             "phase_s": phase,
             "steps": steps,
             "mean_accepted": (

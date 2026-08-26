@@ -143,3 +143,38 @@ class SuffixAutomaton:
             return None
         cont = self._seq[end + 1 : end + 1 + max_len]
         return cont or None
+
+    def peek_match(self, token: int) -> tuple[int, int | None]:
+        """``extend(token)`` 後に ``longest_match()`` が返す値を、状態を
+        一切変えずに計算する (LogitSpec 流の拡張キー照合、docs/RESEARCH.md D7)。
+
+        健全性: 返る一致は「現在列の suffix + token」の実出現に限られる。
+        現在列は token でまだ終わっていないので、suffix の末尾出現 (列の
+        終端) に token が続くことはあり得ず、遷移が示す出現は必ず終端より
+        前で完結している = draft の続きが実履歴から読める。
+        """
+
+        states = self._states
+        state, length = self._match_state, self._match_len
+        while state != 0 and token not in states[state].trans:
+            state = states[state].link
+            length = states[state].length
+        nxt = states[state].trans.get(token)
+        if nxt is None:
+            return 0, None
+        return length + 1, states[nxt].endpos
+
+    def draft_after(
+        self, token: int, max_len: int, min_len: int = 1
+    ) -> tuple[int, list[int] | None]:
+        """(仮に token が次に来るとした場合の一致長, その続きのドラフト)。
+
+        一致長が ``min_len`` 未満・出現が無い・続きが空なら (match_len, None)。
+        返るドラフトは token 自身を含まない (呼び出し側が [token] + cont を組む)。
+        """
+
+        match_len, end = self.peek_match(token)
+        if max_len <= 0 or match_len < min_len or end is None:
+            return match_len, None
+        cont = self._seq[end + 1 : end + 1 + max_len]
+        return match_len, (cont or None)

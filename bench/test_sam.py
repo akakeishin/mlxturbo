@@ -114,6 +114,48 @@ def test_extend_o1_amortized_state_growth_is_linear():
     assert len(sam._states) <= 2 * len(seq) + 2
 
 
+def test_peek_match_equals_real_extend_without_mutation():
+    # peek_match(token) は extend(token) 後の longest_match() と一致し、
+    # かつ状態を一切変えない。全 token でランダム列に対して照合する。
+    import random
+
+    rng = random.Random(7)
+    for _ in range(30):
+        seq = [rng.randrange(5) for _ in range(rng.randrange(2, 60))]
+        sam = SuffixAutomaton()
+        sam.extend_all(seq)
+        before = (sam._match_state, sam._match_len, len(sam._states))
+        for token in range(5):
+            peek_len, peek_end = sam.peek_match(token)
+            assert (sam._match_state, sam._match_len, len(sam._states)) == before
+            twin = SuffixAutomaton()
+            twin.extend_all(seq)
+            twin.extend(token)
+            real_len, _ = twin.longest_match()
+            assert peek_len == real_len, (seq, token, peek_len, real_len)
+            if peek_len:
+                # endpos は「その一致がかつて終わった位置」なので、そこから
+                # 遡った peek_len トークンが suffix+token と一致する。
+                ext = seq + [token]
+                occurrence = seq[peek_end - peek_len + 1 : peek_end + 1]
+                assert occurrence == ext[-peek_len:], (seq, token)
+
+
+def test_draft_after_reads_genuine_continuation():
+    # [9, 1, 2, 3, 8, ... 1, 2] で token=3 の仮延長: 一致 [1,2,3] の続き 8 が返る。
+    sam = SuffixAutomaton()
+    sam.extend_all([9, 1, 2, 3, 8, 7, 6, 1, 2])
+    match_len, cont = sam.draft_after(3, max_len=2, min_len=3)
+    assert match_len == 3
+    assert cont == [8, 7]
+    # min_len に届かない場合は None
+    match_len, cont = sam.draft_after(3, max_len=2, min_len=4)
+    assert cont is None
+    # 出現しない延長は (0, None)
+    match_len, cont = sam.draft_after(5, max_len=2)
+    assert match_len == 0 and cont is None
+
+
 def main():
     tests = [
         test_known_sequence_matches_naive,
@@ -124,6 +166,8 @@ def main():
         test_draft_reads_a_genuine_continuation,
         test_draft_none_when_nothing_repeats,
         test_extend_o1_amortized_state_growth_is_linear,
+        test_peek_match_equals_real_extend_without_mutation,
+        test_draft_after_reads_genuine_continuation,
     ]
     for test in tests:
         test()
