@@ -298,6 +298,11 @@ class SpecEngine:
 
     # ---------- MTP ----------
 
+    def _mtp_base(self, hiddens: mx.array) -> mx.array:
+        """checkpoint 契約 base_hidden_variant=post_norm に合わせて本体最終 norm を適用。
+        2x2 実測 (bench/results/mtp-2x2-*.json): post/post が全深度で優位。"""
+        return self.inner.norm(hiddens)
+
     def _mtp_append(self, tok_ids: mx.array, hiddens: mx.array, mtp_cache) -> mx.array:
         """位置ごとの (embed(t_{i+1}), h_i) ペアを MTP に流し K/V を積む。"""
         e = self.inner.embed_tokens(tok_ids[None])
@@ -546,9 +551,9 @@ class SpecEngine:
                 mtp_hiddens = mx.concatenate(
                     [reused_h_last, h_all[:, :-1]], axis=1
                 )
-                self._mtp_append(prompt, mtp_hiddens, mtp_cache)
+                self._mtp_append(prompt, self._mtp_base(mtp_hiddens), mtp_cache)
             elif prompt.shape[0] > 1:
-                self._mtp_append(prompt[1:], h_all[:, :-1], mtp_cache)
+                self._mtp_append(prompt[1:], self._mtp_base(h_all[:, :-1]), mtp_cache)
         h_last = h_all[:, -1:]
 
         if max_tokens == 0:
@@ -637,7 +642,7 @@ class SpecEngine:
                 cap = min(cap_base, proposal_cap)
                 drafts = []
                 confidences = []
-                dh, dtok = h_last, y
+                dh, dtok = self._mtp_base(h_last), y
                 for _ in range(max(cap, 0)):
                     h_mtp = self._mtp_append(dtok, dh, mtp_cache)
                     d_logits = self._head(h_mtp[:, -1:], self.mtp.norm)[0, -1]
@@ -647,7 +652,7 @@ class SpecEngine:
                     )
                     d = mx.argmax(d_logits, axis=-1).reshape(1)
                     drafts.append(d)
-                    dh, dtok = h_mtp[:, -1:], d
+                    dh, dtok = self.mtp.norm(h_mtp[:, -1:]), d
                 if confidences:
                     # D1: one combined sync for the whole confidence vector
                     # (never per-link) decides how many of the already-
@@ -770,7 +775,7 @@ class SpecEngine:
                 true_hiddens = mx.concatenate(
                     [h_last, hs[:, : consumed - 1]], axis=1
                 )
-                self._mtp_append(window[:consumed], true_hiddens, mtp_cache)
+                self._mtp_append(window[:consumed], self._mtp_base(true_hiddens), mtp_cache)
 
             h_last = hs[:, consumed - 1 : consumed]
             if accepted_eos is not None:
