@@ -59,6 +59,8 @@ Apple Silicon で LLM 推論を速くするエンジン。既存の Mac 向け�
 - fastmlx/fast_qmm.py (vendored、ライセンス要確認): 8x8 MMA + グループ単位 dequant + split-K の公開カーネル。依存チェーン実測で m=8 が mlx の 1.57 倍、m=6 で 1.25 倍。m<6 と m>8 (wide 版は env で m<=16) はフォールバック
 - カーネル無改造の帯域レバー: scales/biases が量子化バイトの 11.1% (実効 4.50 bit/weight)。group128 か fp8 scale への再量子化で decode ~1.06 倍。MTP 保持の自前量子化と同時に検証する
 - 計測の規律: 独立呼び出しを積む計測は GPU が重ねて隠すため投機の依存チェーンを表さない (26% 劣化を 1.13 倍改善と誤読した先行事例あり)。単体 op はチェーン計測と単発計測を併記する。長時間ベンチ後はバックグラウンド (Spotlight 等) で帯域が半減しうるので、絶対値は静かなマシンで取り直す
+- カーネルの物理目標は m で分ける: m=8 は帯域律速に戻せる (mlp タイル 50MB → 0.145ms が床)。m=16 は演算床 (0.218ms) が帯域床を上回るため理想でも m=1 比 ~1.5 倍。「m=16 を帯域天井へ」は物理的に不可能で、目標は m∈{2..10} 帯域 roof / m∈{11..16} 演算 roof
+- 反証済みの仮説 (再訪しない): lm_head の 2D/3D ディスパッチ崖 (実測で差なし。op_curve の層単位絶対値が原因の誤検出)、GDN scan 犯人説、CPU+GPU 帯域ハーベスト、prefill 2 倍余地説
 - prefill は 219 tok/s（MFU ~42%）。長プロンプトの快適性は prefill 律速で、L3 と prefill カーネルの領分
 - Qwen3.8-27B は 64 層中 48 層が linear attention（full attention は 4 層に 1 層）。KV は full 側 16 層のみ
 - Qwen3.8 は MTP ヘッドを標準搭載するが、mlx-lm は読み込み時に捨てている（qwen3_5.py の sanitize）。lmstudio の 4bit 量子化にも入っていない。MTP を保持した自前量子化が L2 の前提作業
