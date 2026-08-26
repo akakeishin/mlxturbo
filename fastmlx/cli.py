@@ -12,7 +12,7 @@ from mlx_lm import load
 from mlx_lm.models.qwen3_5 import TextModelArgs
 
 from .mtp import find_snapshot, load_mtp
-from .spec import SpecEngine
+from .spec import ChatSession, SpecEngine
 
 
 def main() -> None:
@@ -25,6 +25,11 @@ def main() -> None:
     ap.add_argument("--max-draft", type=int, default=8)
     ap.add_argument("--mtp-bits", type=int, default=4)
     ap.add_argument("--prompt", default=None)
+    ap.add_argument(
+        "--no-think",
+        action="store_true",
+        help="思考モードを切る。履歴が追記のみになり、2ターン目以降の prefill が差分だけになる",
+    )
     args = ap.parse_args()
 
     t0 = time.perf_counter()
@@ -37,11 +42,17 @@ def main() -> None:
     print(f"[fastmlx] loaded in {time.perf_counter() - t0:.1f}s: {args.model}")
 
     eos_ids = {tokenizer.eos_token_id}
+    session = ChatSession()
 
     def run_turn(messages):
-        prompt_ids = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True
-        )
+        kwargs = {"add_generation_prompt": True}
+        if args.no_think:
+            kwargs["enable_thinking"] = False
+        try:
+            prompt_ids = tokenizer.apply_chat_template(messages, **kwargs)
+        except TypeError:
+            kwargs.pop("enable_thinking", None)
+            prompt_ids = tokenizer.apply_chat_template(messages, **kwargs)
         detok = tokenizer.detokenizer
         detok.reset()
 
@@ -60,12 +71,14 @@ def main() -> None:
             temp=args.temp,
             eos_ids=eos_ids,
             on_tokens=on_tokens,
+            session=session,
         )
         detok.finalize()
         print(detok.last_segment, flush=True)
         print(
             f"\n[{res['decode_tps']:.1f} tok/s | {res['tokens_per_step']:.2f} tok/step"
-            f" | ttft {res['ttft_s']:.1f}s]"
+            f" | ttft {res['ttft_s']:.2f}s"
+            f" | prefill 再利用 {res['prefill_reused']} / 新規 {res['prefill_new']}]"
         )
         return tokenizer.decode(
             [t for t in res["tokens"] if t not in eos_ids]

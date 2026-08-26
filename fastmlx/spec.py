@@ -20,6 +20,21 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.models.gated_delta import gated_delta_update
 
 
+class ChatSession:
+    """ターンをまたいで KV と線形状態を持ち越すための入れ物。
+
+    新プロンプトが処理済み列の純粋な追記なら差分だけ prefill する。
+    追記でなければ (テンプレートが履歴を書き換えた等) 全再構築に落ちる。
+    線形アテンションの状態は途中位置へ巻き戻せないため、この二択になる。
+    """
+
+    def __init__(self):
+        self.caches = None
+        self.mtp_cache = None
+        self.processed = []
+        self.h_last = None
+
+
 class SpecEngine:
     def __init__(self, model, mtp):
         self.text = model.language_model
@@ -158,6 +173,7 @@ class SpecEngine:
         temp: float = 0.0,
         eos_ids=(),
         on_tokens=None,
+        session: ChatSession | None = None,
     ):
         """max_draft > 0 で受理適応の可変深度になる。
 
@@ -170,9 +186,24 @@ class SpecEngine:
         数ステップ休ませる。
         """
         eos = set(eos_ids)
-        caches = self.text.make_cache()
-        mtp_cache = KVCache()
-        prompt = mx.array(prompt_ids)
+        prompt_ids = list(prompt_ids)
+
+        caches = mtp_cache = None
+        reused = 0
+        if session is not None and session.caches is not None:
+            pl = session.processed
+            n = min(len(pl), len(prompt_ids))
+            lcp = 0
+            while lcp < n and pl[lcp] == prompt_ids[lcp]:
+                lcp += 1
+            if lcp == len(pl) and lcp < len(prompt_ids):
+                caches, mtp_cache = session.caches, session.mtp_cache
+                reused = lcp
+        if caches is None:
+            caches = self.text.make_cache()
+            mtp_cache = KVCache()
+
+        prompt = mx.array(prompt_ids[reused:])
 
         t0 = time.perf_counter()
         h_all, _ = self._hidden_forward(prompt, caches, capture=False)
@@ -183,7 +214,10 @@ class SpecEngine:
             ).reshape(1)
         else:
             y = mx.argmax(y_logits, axis=-1).reshape(1)
-        if prompt.shape[0] > 1:
+        if reused:
+            mtp_hiddens = mx.concatenate([session.h_last, h_all[:, :-1]], axis=1)
+            self._mtp_append(prompt, mtp_hiddens, mtp_cache)
+        elif prompt.shape[0] > 1:
             self._mtp_append(prompt[1:], h_all[:, :-1], mtp_cache)
         h_last = h_all[:, -1:]
         mx.eval(y)
@@ -195,6 +229,7 @@ class SpecEngine:
         ctx = list(prompt_ids) + out_tokens
         accept_hist = Counter()
         accept_trace = []
+        fed_gen = []
         src_hist = {"lookup": Counter(), "mtp": Counter()}
         phase = {"draft": 0.0, "verify": 0.0, "maint": 0.0}
         t1 = time.perf_counter()
@@ -299,6 +334,7 @@ class SpecEngine:
                     break
             out_tokens.extend(step_tokens)
             ctx.extend(step_tokens)
+            fed_gen.extend(window_l[:consumed])
             if on_tokens:
                 on_tokens(step_tokens)
             phase["maint"] += time.perf_counter() - ts
@@ -306,7 +342,14 @@ class SpecEngine:
         decode_time = time.perf_counter() - t1
         n_decode = len(out_tokens) - 1
         steps = sum(accept_hist.values())
+        if session is not None:
+            session.caches = caches
+            session.mtp_cache = mtp_cache
+            session.processed = prompt_ids + fed_gen
+            session.h_last = h_last
         return {
+            "prefill_reused": reused,
+            "prefill_new": len(prompt_ids) - reused,
             "tokens": out_tokens,
             "ttft_s": ttft,
             "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
