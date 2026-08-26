@@ -214,15 +214,19 @@ class SpecEngine:
             ).reshape(1)
         else:
             y = mx.argmax(y_logits, axis=-1).reshape(1)
-        if reused:
-            mtp_hiddens = mx.concatenate([session.h_last, h_all[:, :-1]], axis=1)
-            self._mtp_append(prompt, mtp_hiddens, mtp_cache)
-        elif prompt.shape[0] > 1:
-            self._mtp_append(prompt[1:], h_all[:, :-1], mtp_cache)
+        if n_draft > 0 or max_draft > 0:
+            if reused:
+                mtp_hiddens = mx.concatenate(
+                    [session.h_last, h_all[:, :-1]], axis=1
+                )
+                self._mtp_append(prompt, mtp_hiddens, mtp_cache)
+            elif prompt.shape[0] > 1:
+                self._mtp_append(prompt[1:], h_all[:, :-1], mtp_cache)
         h_last = h_all[:, -1:]
         mx.eval(y)
         ttft = time.perf_counter() - t0
 
+        use_mtp = n_draft > 0 or max_draft > 0
         out_tokens = [int(y.item())]
         if on_tokens:
             on_tokens(out_tokens[:])
@@ -319,11 +323,12 @@ class SpecEngine:
                     depth = a
 
             self._rollback(caches, sink, len(window_l), consumed)
-            mtp_cache.trim(mtp_cache.offset - mtp_off0)
-            true_hiddens = mx.concatenate(
-                [h_last, hs[:, : consumed - 1]], axis=1
-            )
-            self._mtp_append(window[:consumed], true_hiddens, mtp_cache)
+            if use_mtp:
+                mtp_cache.trim(mtp_cache.offset - mtp_off0)
+                true_hiddens = mx.concatenate(
+                    [h_last, hs[:, : consumed - 1]], axis=1
+                )
+                self._mtp_append(window[:consumed], true_hiddens, mtp_cache)
 
             h_last = hs[:, consumed - 1 : consumed]
             y = mx.array([next_tok])

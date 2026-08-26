@@ -98,10 +98,15 @@ def main():
     ap.add_argument("--max-draft", type=int, default=0, help="adaptive depth cap")
     ap.add_argument("--mtp-bits", type=int, default=0, help="quantize MTP (0=bf16)")
     ap.add_argument("--prompts", default="", help="comma separated subset of prompt names")
+    ap.add_argument("--fast-qmm", action="store_true", help="route small-M qmm through fast_qmm")
     ap.add_argument("--json", dest="json_out", default=None)
     args = ap.parse_args()
 
     model, tokenizer = load(args.model)
+    if args.fast_qmm:
+        from fastmlx.fast_qmm import enable as enable_fast_qmm
+
+        enable_fast_qmm(model)
     text_args = TextModelArgs.from_dict(model.args.text_config)
     quant = {"bits": args.mtp_bits, "group_size": 64} if args.mtp_bits else None
     mtp = load_mtp(find_snapshot(args.original), text_args, quantize=quant)
@@ -129,14 +134,16 @@ def main():
                 eos_ids=eos_ids,
             )
             n = min(len(stock["tokens"]), len(spec["tokens"]))
-            match = next(
-                (i for i in range(n) if stock["tokens"][i] != spec["tokens"][i]), n
-            )
+            diffs = [i for i in range(n) if stock["tokens"][i] != spec["tokens"][i]]
             results[name]["sweep"][nd] = {
                 "spec_decode_tps": spec["decode_tps"],
                 "speedup": spec["decode_tps"] / stock["decode_tps"],
-                "identical": match == n,
+                "identical": not diffs,
                 "compared": n,
+                "n_mismatch": len(diffs),
+                "first_mismatches": diffs[:5],
+                "phase_s": spec["phase_s"],
+                "steps": spec["steps"],
                 "mean_accepted": spec["mean_accepted"],
                 "tokens_per_step": spec["tokens_per_step"],
                 "accept_hist": spec["accept_hist"],
