@@ -140,6 +140,11 @@ docs/REVIEW-2026-08-26.md（Codex Sol による ca9dc7f のレビュー）の指
   仲裁は ReSpec 方式: エントロピー閾値で retrieval 起動、一致位置ごとの
   受理率 EMA、source-aware verification。CPU 側は 20-30µs/token を予算に。
 - D4: Block Verification（分布厳密のまま +5-8%。棄却サンプラ差し替えのみ）
+- D6: FLy 型の緩和検証 opt-in（第 2 次調査）。m 不変で受理 +14-17%、品質 >=99%。
+  CACTUS / Mentored-dec と同一フラグ A/B、typical acceptance は不採用。
+  ストリーミングの 6 トークン留保の体感確認が先行条件。D1/D3/D4 着地後に実装
+- D7: LogitSpec の next-next-token を D3 の retrieval へ上積み（GPU コストゼロ）。
+  D1 のコストモデルは Sequoia 式でなく SMART (2604.09731) の指数フィットを正とする
 - D5: 木投機（着手条件: A2 完了 + D2 完了後も受理が頭打ちの場合のみ）
   GOOSE の異方的 spine から。GDN 48 層は chain 据え置き、full attention 16 層
   のみ木マスク。4bit×木検証の相殺警告（RESEARCH.md）を先に実測で確認。

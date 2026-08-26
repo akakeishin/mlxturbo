@@ -61,3 +61,29 @@ Phase D の設計根拠。全項目一次ソース確認済み（末尾の確度
 ## 確度の注記
 
 AdaEDL の下界式 1−√(γH) と Bole の細部数値は孫請け調査経由。実装前に本文確認。
+
+## 第 2 次調査 (2026-08-26): 訓練不要レバーの追補
+
+採用 3 本 (詳細はセッションログ、いずれも一次ソース確認済み):
+- FLy (2511.22972): 緩和検証の opt-in。target エントロピー θ=0.3 ゲート +
+  遅延窓 W=6。m を増やさず受理 +14-17%、品質 >=99%、θ->0 で厳密に退化。
+  MTP ドラフタでの失敗警告 (2607.08690) があるため CACTUS / Mentored-dec と
+  同一フラグ A/B が条件。typical acceptance は毒 (EAGLE-3 で MATH -7.2pp) で不採用
+- SMART (2604.09731): 木/深度展開の限界便益判定。C_verify をデバイス実測の
+  指数フィットで持つ = うちの m カーブがそのまま入力。D1 の Sequoia 式部分の
+  上位互換 (AdaEDL/EMA 停止則は併存)
+- LogitSpec (2507.01449): 直近 logit から t+2 を推測し retrieval キーを 2 本に。
+  GPU コストゼロ、D3 の直交上積み
+
+条件つき次点: Token Recycling の隣接行列 (4.9MB、MTP 無しモデルの汎用ドラフタ、
+L1 完了後は最安の幅供給源)。幅系 (ESP/LADE/木一般) は m カーブが均されるまで赤字。
+
+確定棄却: 層スキップ自己投機全系統 — sequential hybrid で α≈0.46 (2605.01106)、
+draft 単価が MTP の 5.5 倍、最良受理 0.958 を代入しても 1.33x < 現行 1.50x。
+draft 側の温度/logit 操作 — temp=0 では数学的に余地なし (argmax 不変)。
+
+外部裏づけ: 2607.17283 (M3 MacBook 実測) が量子化 Metal の「位置ごと matvec」
+挙動 = qmv_wide 5 本頭打ちを独立確認。mlx-lm discussion #890 が「Apple Silicon
+は木検証のバッチ償却が無い」「Tree verification is blocked by KVCache」。
+持ち帰り: 2605.01106 の perplexity 比予測子は Phase M の新モデル適性ゲートに使える。
+幅の理論式は p1+p2 (排反)。mtp_diag に top-2 一致を足せば 1 行で測れる。
