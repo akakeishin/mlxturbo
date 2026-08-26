@@ -1,4 +1,4 @@
-"""GPU correctness and dependency-chain acceptance gate for Phase A2 v3.
+"""GPU correctness and dependency-chain acceptance gate for Phase A2 v4.
 
 Run serially: ``uv run python bench/test_qmm_skinny_mma.py``.
 Absolute timings are reference observations; final measurement must use a quiet machine.
@@ -59,14 +59,17 @@ def _median_ms(fn, warmup=3, reps=12):
 
 def correctness(dtype):
     results = {}
+    table_equivalence = {}
     for k, n in CORRECTNESS_SHAPES:
         q = _make_quantized(n, k, dtype)
         shape_results = {}
+        shape_table_equivalence = {}
         for m in range(M_MIN, M_MAX + 1):
             x = (mx.random.normal((m, k)) * 0.1).astype(dtype)
             expected = _stock(x, q)
             actual = qmm_skinny_mma(x, *q)
-            mx.eval(expected, actual)
+            no_table = qmm_skinny_mma(x, *q, use_table=False)
+            mx.eval(expected, actual, no_table)
             max_abs, normalized = _normalized_max_error(actual, expected)
             shape_results[m] = {
                 "max_abs": max_abs,
@@ -76,8 +79,13 @@ def correctness(dtype):
                 f"K={k}, N={n}, M={m}: "
                 f"threshold={BF16_CORRECTNESS_THRESHOLD}, {shape_results[m]}"
             )
+            if m >= 4:
+                exact = bool(mx.array_equal(actual, no_table))
+                shape_table_equivalence[m] = exact
+                assert exact, f"K={k}, N={n}, M={m}: table ON/OFF differ"
         results[f"k{k}_n{n}"] = shape_results
-    return results
+        table_equivalence[f"k{k}_n{n}"] = shape_table_equivalence
+    return results, table_equivalence
 
 
 def dependency_chain(dtype):
@@ -128,12 +136,14 @@ def main():
     args = parser.parse_args()
     dtype = _dtype(args.dtype)
     mx.random.seed(0)
+    correctness_results, table_equivalence = correctness(dtype)
 
     result = {
         "dtype": args.dtype,
-        "kernel": "E120 no-table v3",
+        "kernel": "E120 USE_TABLE v4",
         "correctness_threshold": BF16_CORRECTNESS_THRESHOLD,
-        "correctness": correctness(dtype),
+        "correctness": correctness_results,
+        "table_on_off_bit_exact": table_equivalence,
         "timing_note": "reference only; final measurement requires a quiet machine",
     }
     if not args.correctness_only:

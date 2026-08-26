@@ -7,17 +7,26 @@ from typing import Any
 
 from ._qmm_skinny_mma_source import (
     BITS,
+    BLOCK_SIZE,
     GROUP_SIZE,
     METAL_HEADER,
     M_MAX,
     M_MIN,
+    MINIMUM_TABLE_WIDTH,
+    TABLE_METAL_HEADER,
     THREADGROUP,
+    XSUMS_SOURCE,
+    XSUMS_THREADGROUP,
     active_input_groups,
     build_source,
+    build_table_source,
     eligible_layout,
+    sums_stride,
 )
 
 _KERNEL: Any | None = None
+_TABLE_KERNEL: Any | None = None
+_XSUMS_KERNEL: Any | None = None
 
 
 def _load_mx():
@@ -65,6 +74,33 @@ def _get_kernel(mx):
     return _KERNEL
 
 
+def _get_table_kernel(mx):
+    global _TABLE_KERNEL
+    if _TABLE_KERNEL is None:
+        _TABLE_KERNEL = mx.fast.metal_kernel(
+            name="fastmlx_e120_affine4_g64_qmv_table_v4",
+            input_names=["w", "scales", "biases", "x", "xsums"],
+            output_names=["y"],
+            source=build_table_source(),
+            header=TABLE_METAL_HEADER,
+            ensure_row_contiguous=True,
+        )
+    return _TABLE_KERNEL
+
+
+def _get_xsums_kernel(mx):
+    global _XSUMS_KERNEL
+    if _XSUMS_KERNEL is None:
+        _XSUMS_KERNEL = mx.fast.metal_kernel(
+            name="fastmlx_e120_affine4_g64_xsums_v4",
+            input_names=["x"],
+            output_names=["xsums"],
+            source=XSUMS_SOURCE,
+            ensure_row_contiguous=True,
+        )
+    return _XSUMS_KERNEL
+
+
 def qmm_skinny_mma(
     x,
     w,
@@ -72,8 +108,15 @@ def qmm_skinny_mma(
     biases,
     group_size: int = GROUP_SIZE,
     bits: int = BITS,
+    *,
+    use_table: bool | None = None,
 ):
-    """Compute ``x[M,K] @ dequant(w[N,K]).T`` or use MLX stock fallback."""
+    """Compute ``x[M,K] @ dequant(w[N,K]).T`` or use MLX stock fallback.
+
+    The E120 xsums table is selected by default for M >= 4.  ``use_table`` is
+    an A/B gate for bit-exact GPU validation; requesting it below M=4 keeps the
+    reference no-table path.
+    """
 
     mx = _load_mx()
     if not _eligible(mx, x, w, scales, biases, group_size, bits):
@@ -87,11 +130,25 @@ def qmm_skinny_mma(
             bits=bits,
         )
 
-    m = x.shape[0]
+    m, k = x.shape
     n = w.shape[0]
-    kernel = _get_kernel(mx)
+    table_enabled = m >= MINIMUM_TABLE_WIDTH and use_table is not False
+    inputs = [w, scales, biases, x]
+    if table_enabled:
+        xsums_kernel = _get_xsums_kernel(mx)
+        (xsums,) = xsums_kernel(
+            inputs=[x],
+            grid=(32, k // BLOCK_SIZE, m),
+            threadgroup=XSUMS_THREADGROUP,
+            output_shapes=[(k // BLOCK_SIZE * 32 * sums_stride(m),)],
+            output_dtypes=[mx.float32],
+        )
+        inputs.append(xsums)
+        kernel = _get_table_kernel(mx)
+    else:
+        kernel = _get_kernel(mx)
     (y,) = kernel(
-        inputs=[w, scales, biases, x],
+        inputs=inputs,
         grid=(active_input_groups(m) * 32, (n // 8) * 2, 1),
         threadgroup=THREADGROUP,
         output_shapes=[(m, n)],
@@ -100,4 +157,4 @@ def qmm_skinny_mma(
     return y
 
 
-__all__ = ["M_MIN", "M_MAX", "qmm_skinny_mma"]
+__all__ = ["M_MIN", "M_MAX", "MINIMUM_TABLE_WIDTH", "qmm_skinny_mma"]

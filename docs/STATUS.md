@@ -130,23 +130,22 @@
 
 ## GPU gate queue（必ず1プロセスずつ直列実行）
 
-### A2-v3-1 E120 no-table BF16 correctness / M=8 dependency-chain acceptance
+### A2-v4-1 E120 USE_TABLE BF16 correctness / M=8 dependency-chain acceptance
 
-- 正確なコマンド: `uv run python bench/test_qmm_skinny_mma.py --dtype bfloat16 --json bench/results/qmm-skinny-mma-a2-v3.json`
-- 期待結果: K=512/N=1024 と K=5120/N=4096 の両方で E120 対応 M=2..9 の
-  normalized max error がすべて `8e-3` 未満、M=8 の dependent chain が stock
-  `mx.quantized_matmul` 比 `1.5x` 以上で、JSON が保存される。
-  絶対性能値は参考記録であり、静かなマシンでの最終計測は別途行う。
-- 失敗時に最初に疑う箇所: Metal compile なら `bfloat16_t` vector load と runtime shape metadata、
-  数値不一致なら uint16 pack-interleave/nibble と group64 scale/bias index、性能不足なら
-  `activeInputGroups`/IPG に対応する grid volume。禁止済みの K/N template、8 rows/thread、
-  split-K/threadgroup partial へは戻さない。
-
-### 次にやること
-
-1. A2 v3 no-table GPU gate を1プロセスで実行する。
-2. v3 通過後、dispatcher route table は Claude 側の shape×M 実測で別途更新する。
-3. `USE_TABLE` は no-table gate 通過後の Phase 2 とし、この gate には混ぜない。
+- 2026-08-26 GPU 実行済み: `uv run python bench/test_qmm_skinny_mma.py --dtype bfloat16 --correctness-only`
+  は PASS。K=512/N=1024 と K=5120/N=4096 の M=2..9 がすべて normalized max error
+  `<8e-3`（最大 `0.005859375`）。M=4..9 の table ON/OFF は両 shape の全セルで
+  `mx.array_equal == true`（bit-exact）。M=2/3 は参照どおり no-table のまま。
+- 2026-08-26 GPU 実行済み: `uv run python bench/test_qmm_skinny_mma.py --dtype bfloat16`
+  は性能 assertion で FAIL。M=8 dependent chain は stock `1.589666 ms`、v4
+  `1.345250 ms`、`1.181688x`（単発は `1.121643x`）で、acceptance `>=1.5x` に未達。
+  この実行結果から correctness/bit-exact は GPU 確認済みだが、v4 は性能 gate 未通過。
+- 次回の正確な再実行コマンド:
+  `uv run python bench/test_qmm_skinny_mma.py --dtype bfloat16 --json bench/results/qmm-skinny-mma-a2-v4.json`
+  acceptance は table ON/OFF bit-exact、stock normalized max error `<8e-3`、M=8 dependent
+  chain `>=1.5x`。現候補は再計測だけではなく、独立 xsums 起動の固定費を避ける producer
+  fusion 等の狭い設計変更が必要。ただし K/N runtime、rows/simd=4、accumulator 最大20、
+  split-K 不使用の E120/KERNEL-INTEL 契約は維持する。
 
 ## コミット状況
 
