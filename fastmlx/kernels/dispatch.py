@@ -17,13 +17,19 @@ _ROUTES = frozenset((STOCK, NOCAP, MMA))
 
 
 def _routes(*, mma_max: int = 16) -> tuple[str, ...]:
-    """Build an M-indexed route row; indices outside 6..16 are stock."""
+    """Build an M-indexed route row; indices outside 6..16 are stock.
 
+    2026-08-26 の依存チェーン実測 (docs/GATE-RESULTS-A2.md) で MMA v2 は
+    m=8 で 0.82x、m=16 で 0.99x と全域で最速にならなかったため、
+    現行表は nocap (bit-exact、m=6..12 で 1.0-1.1x) を採り、MMA は
+    経路として残すが v3 が実測で勝つまで表からは外す。
+    """
+
+    del mma_max
     row = [STOCK] * 17
-    for m in range(6, 8):
+    # nocap の勝ち域は実測で m=6..10 (m=11,12 は stock と互角〜劣後)。
+    for m in range(6, 11):
         row[m] = NOCAP
-    for m in range(8, mma_max + 1):
-        row[m] = MMA
     return tuple(row)
 
 
