@@ -111,6 +111,32 @@ def load_mtp(
     return mtp
 
 
+def load_mtp_file(
+    path: str, args: TextModelArgs, quantize: dict | None = None
+) -> MTPModule:
+    """学習済みヘッド (train_mtp.py の成果物) を読む。
+
+    保存時点で norm の +1 シフトは適用済みなので、load_mtp と違い
+    ここでは一切シフトしない (二重適用の地雷を踏まない)。
+    """
+    weights = dict(mx.load(str(path)).items())
+    mtp = MTPModule(args)
+    mtp.load_weights(list(weights.items()))
+    if quantize:
+        group_size = quantize.get("group_size", 64)
+        bits = quantize.get("bits", 4)
+        validate_affine_quantization(group_size, bits)
+        nn.quantize(
+            mtp,
+            group_size=group_size,
+            bits=bits,
+            mode="affine",
+            class_predicate=lambda _, m: isinstance(m, nn.Linear),
+        )
+    mtp.eval()
+    return mtp
+
+
 def find_snapshot(repo_id: str) -> str:
     pat = (
         Path.home()
