@@ -162,6 +162,22 @@ MLX 量子化の有無を確認してから固定する）:
   （RotatingKVCache は任意 prefix へ trim 不可）に対する投機巻き戻しの正しさを
   設計・検証。窓内 m トークンの trim で足りるかをまず確認する。
 - M4: マトリクス 4 モデルで identity gate + ベンチを通す。
+- M5: DeepSeek-V4-Flash（ユーザー指定の拡張ターゲット）
+  ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit (115.3GB、model_type
+  deepseek_v4、256 experts / 6 active / 43 層) を取得済み想定で:
+  (a) arch 対応: 固定中の mlx-lm には deepseek_v4.py が無い。上流の新版から
+  バックポートするか、mlx-lm を bump して _mlx_compat の contract test を通し直す
+  (b) 128GB への搭載試験: iogpu.wired_limit_mb を上げ、素の mlx-lm で
+  ロード・decode 実測（期待値: active ~12GB/token 読みで 25-30 tok/s）
+  (c) DeepSeek 純正 MTP ヘッドでの自己投機対応（MTP の本家。ヘッド構造は
+  qwen3_5 と別なので M2 のローダ抽象化に含める）
+- M6: GLM-5.2（ユーザー指定の最難関 = RAM 超過モデルの SSD offload 課題）
+  最小 MLX quant でも 316GB（REAP25-4bit）で 128GB RAM の 2.5 倍、内蔵ディスク
+  空き 267GB にも収まらない。実行には外部ストレージが前提（本人確認待ち）。
+  技術方針: mmap ロード + RAM を hot expert キャッシュ化し、cold expert のみ
+  ストレージから。成否は expert ルーティングの局所性で決まるため、
+  着手前に M1 の道具で「トークン間 expert 再利用率」を実測して採算を判定する。
+  mlx-lm の glm_moe_dsa が対応 arch か要確認
 
 ### Phase E: 計測・比較・公開準備
 
