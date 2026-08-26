@@ -12,6 +12,7 @@ m=2 の検証は m=1 の 1.04 倍しかかからない(実測)ので、受理さ
 
 import time
 from collections import Counter
+from contextlib import nullcontext
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -23,6 +24,11 @@ from ._mlx_compat import (
     validate_spec_model_contract,
 )
 from .kernels.gated_delta_states import gated_delta_update_with_states
+from .kernels.dispatch import (
+    dispatch_scope,
+    enable as enable_quantized_dispatch,
+    quantized_matmul as dispatched_quantized_matmul,
+)
 
 
 class ChatSession:
@@ -65,12 +71,31 @@ class SpecEngine:
         self.text = model.language_model
         self.inner = self.text.model
         self.mtp = mtp
+        # Install the replacement without touching prefill/draft behavior.
+        # Dispatch is activated only by the verification scopes below.
+        enable_quantized_dispatch(self.text, active=False)
 
     def _head(self, h_prenorm: mx.array, norm) -> mx.array:
         out = norm(h_prenorm)
         if self.text.args.tie_word_embeddings:
-            return self.inner.embed_tokens.as_linear(out)
-        return self.text.lm_head(out)
+            embedding = self.inner.embed_tokens
+            if (
+                hasattr(embedding, "group_size")
+                and hasattr(embedding, "bits")
+                and "scales" in embedding
+            ):
+                return dispatched_quantized_matmul(
+                    out,
+                    embedding["weight"],
+                    embedding["scales"],
+                    embedding.get("biases"),
+                    group_size=embedding.group_size,
+                    bits=embedding.bits,
+                    mode=embedding.mode,
+                )
+            return embedding.as_linear(out)
+        with dispatch_scope():
+            return self.text.lm_head(out)
 
     # ---------- 本体 forward ----------
 
@@ -88,14 +113,16 @@ class SpecEngine:
         ssm_mask = create_ssm_mask(x, caches[self.inner.ssm_idx])
         sink = []
         h = x
-        for layer, c in zip(self.inner.layers, caches):
-            if layer.is_linear:
-                if capture:
-                    h = self._linear_capture(layer, h, c, sink, ssm_mask)
+        scope = dispatch_scope() if capture else nullcontext()
+        with scope:
+            for layer, c in zip(self.inner.layers, caches):
+                if layer.is_linear:
+                    if capture:
+                        h = self._linear_capture(layer, h, c, sink, ssm_mask)
+                    else:
+                        h = layer(h, mask=ssm_mask, cache=c)
                 else:
-                    h = layer(h, mask=ssm_mask, cache=c)
-            else:
-                h = layer(h, mask=fa_mask, cache=c)
+                    h = layer(h, mask=fa_mask, cache=c)
         return h, sink
 
     def _linear_capture(self, layer, x, cache, sink, mask=None):
