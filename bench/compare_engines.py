@@ -253,31 +253,62 @@ def parse_fastmlx(stdout: str, wall_time_s: float) -> dict[str, Any]:
     return result
 
 
+def _extract_stats_json(stdout: str) -> dict[str, Any] | None:
+    """stdout 中の複数 JSON (prewarm 行 + 最終統計) から統計辞書を選ぶ。
+
+    mtplx は '[mtplx] ... {json}' 形式の進捗行と最終の統計 JSON を同じ
+    stdout に流すため、先頭 '{' から末尾 '}' までを一括 loads すると壊れる。
+    raw_decode で順に解読し、統計らしいキーを持つ最後の辞書を採用する。
+    """
+
+    decoder = json.JSONDecoder()
+    best: dict[str, Any] | None = None
+    last: dict[str, Any] | None = None
+    idx = 0
+    while True:
+        start = stdout.find("{", idx)
+        if start == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(stdout, start)
+        except json.JSONDecodeError:
+            idx = start + 1
+            continue
+        idx = end
+        if isinstance(obj, dict):
+            last = obj
+            if any(k in obj for k in ("decode_tok_s", "stats", "error")):
+                best = obj
+    return best if best is not None else last
+
+
 def parse_mtplx(stdout: str) -> dict[str, Any]:
-    start = stdout.find("{")
-    end = stdout.rfind("}")
-    if start == -1 or end == -1 or end < start:
+    payload = _extract_stats_json(stdout)
+    if payload is None:
         return {"parse_error": "JSON ブロックが見つからない", "raw_stdout_tail": stdout[-2000:]}
-    try:
-        payload = json.loads(stdout[start : end + 1])
-    except json.JSONDecodeError as exc:
-        return {"parse_error": f"JSON decode failed: {exc}", "raw_stdout_tail": stdout[-2000:]}
     if "error" in payload:
         return {"engine_error": payload, "raw_payload": payload}
     stats = payload.get("stats", {})
+
+    # mtplx 2.7 系は速度系フィールドをトップレベルに置く (旧版は stats 配下)。
+    # 両方を順に見る。
+    def field(name):
+        value = payload.get(name)
+        return value if value is not None else stats.get(name)
+
     return {
-        "generated_tokens": stats.get("generated_tokens"),
-        "decode_tok_s": stats.get("decode_tok_s"),
+        "generated_tokens": field("generated_tokens"),
+        "decode_tok_s": field("decode_tok_s"),
         # MTPLX の JSON に明示的な TTFT フィールドは無い。prompt_eval_time_s
         # (prefill 時間) を代理指標として扱う。他 2 エンジンと同じ定義。
-        "ttft_s": stats.get("prompt_eval_time_s"),
-        "generation_mode": stats.get("generation_mode"),
-        "mtp_depth": stats.get("mtp_depth"),
-        "verify_calls": stats.get("verify_calls"),
-        "verify_time_s": stats.get("verify_time_s"),
-        "draft_time_s": stats.get("draft_time_s"),
-        "accepted_by_depth": stats.get("accepted_by_depth"),
-        "drafted_by_depth": stats.get("drafted_by_depth"),
+        "ttft_s": field("prompt_eval_time_s"),
+        "generation_mode": field("generation_mode"),
+        "mtp_depth": field("mtp_depth"),
+        "verify_calls": field("verify_calls"),
+        "verify_time_s": field("verify_time_s"),
+        "draft_time_s": field("draft_time_s"),
+        "accepted_by_depth": field("accepted_by_depth"),
+        "drafted_by_depth": field("drafted_by_depth"),
         "raw_payload": payload,
     }
 
@@ -403,11 +434,17 @@ def run_all(args: argparse.Namespace) -> dict[str, Any]:
                 rec.wall_time_s = wall
                 rec.stdout_tail = out[-8000:]
                 rec.stderr_tail = err[-4000:]
-                if rc != 0:
+                # mtplx の exit code 4 は「出力品質の自己検査 (validations) 不合格」
+                # で、max-tokens 打ち切り時に普通に起きる。統計は出力済みなので
+                # 速度計測としては有効。それ以外の非ゼロだけをエラー扱いにする。
+                validation_only = engine == "mtplx" and rc == 4
+                if rc != 0 and not validation_only:
                     rec.error = f"exit code {rc}"
                 else:
                     try:
                         rec.parsed = parse_output(engine, out, wall)
+                        if validation_only:
+                            rec.parsed["mtplx_validation_failed"] = True
                     except Exception as exc:  # pragma: no cover - パーサの想定外入力
                         rec.error = f"parse failed: {exc}"
                 decode = rec.parsed.get("decode_tok_s")
