@@ -89,6 +89,24 @@ def main():
     after = [bench(model, ids, args.tokens) for _ in range(args.repeats)]
     print(f"変更後 {min(after):6.2f} ms/token ({1000 / min(after):5.2f} tok/s) "
           f"  全試行 {[round(v, 2) for v in after]}", flush=True)
+
+    # 融合は切り戻せるので、交互に測り直して裏を取る。前半と後半に分けて測ると
+    # 他セッションが途中で 98GB を読み始めただけで差が化ける (実際に化けた)。
+    # 交互なら遅くなった区間が両側に等しく乗る
+    if args.fused_hc and not args.rebit:
+        from fastmlx import fused
+
+        off, on = [], []
+        for _ in range(args.repeats):
+            fused.disable_hyper_connection_kernel()
+            off.append(bench(model, ids, args.tokens))
+            fused.enable_hyper_connection_kernel()
+            on.append(bench(model, ids, args.tokens))
+        print(f"\n  交互測定 (ドリフトを相殺)")
+        print(f"    融合なし {min(off):6.2f} ms/token  {[round(v, 2) for v in off]}")
+        print(f"    融合あり {min(on):6.2f} ms/token  {[round(v, 2) for v in on]}")
+        print(f"    差 {min(off) - min(on):+.2f} ms/token "
+              f"({1000 / min(on) - 1000 / min(off):+.2f} tok/s)")
     d = min(before) - min(after)
     print(f"\n  {' + '.join(what)}: {d:+.2f} ms/token "
           f"({1000 / min(after) - 1000 / min(before):+.2f} tok/s)")

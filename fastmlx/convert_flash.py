@@ -145,13 +145,20 @@ RECIPES: dict[str, dict] = {
         "gdn": {"bits": 4, "group_size": 64},
         "default": {"bits": 8, "group_size": 64},
     },
-    # 96GB Mac 向け (~71GB)。n-gram をディスクに追い出せる前提で、
-    # experts 4bit を維持したまま default を 8 -> 4bit に落として収める
+    # 96GB Mac 向け。n-gram をディスクに追い出せる前提で、experts 4bit を
+    # 維持したまま default を 8 -> 4bit に落として収める。
+    #
+    # ただし hc と gdn は 4bit にしない。掃引で hc 8->4 は KLD +0.01337 と
+    # 突出して高く (他の全部を足したより大きい)、格納は 0.7GB しかないので
+    # 容量で得るものが無い。gdn も 8->4 が +0.00663 に対し 8->6 は +0.00063 で、
+    # +0.55GB 払って 10 分の 1 に抑えられる
     "v-96": {
         "experts": {"bits": 4, "group_size": 64},
         "ngram": False,
         "ngram_disk": True,
         "router": False,
+        "hc": {"bits": 8, "group_size": 64},
+        "gdn": {"bits": 6, "group_size": 64},
         "default": {"bits": 4, "group_size": 64},
     },
     # 64GB Mac 向け (~48GB)。experts を半分 3bit / 半分 2bit にする。
