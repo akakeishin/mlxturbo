@@ -61,6 +61,12 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--tokens-per-sec", type=float, default=19.4,
                     help="現在の実測。帯域の使用率を出すのに使う")
+    ap.add_argument("--plan", default=None,
+                    help="レシピ候補の読み出し量を焼く前に見積もる。"
+                         "現在のビットからの差分で計算する (例 gdn=6,hc=6)。"
+                         "クラス名は rebit と同じ")
+    ap.add_argument("--from-bits", type=int, default=8,
+                    help="--plan で触るクラスの現在のビット数")
     args = ap.parse_args()
 
     by_group: dict[str, float] = defaultdict(float)
@@ -90,6 +96,39 @@ def main():
         print(f"  {group:26s} {stored[group] / 1e9:8.1f} {rd / 1e9:8.3f} "
               f"{pct:5.1f}% {rd / 1e9 / BW_HI * 1000:5.1f}ms "
               f"{rd / 1e9 / BW_LO * 1000:5.1f}ms")
+
+    if args.plan:
+        # クラス名 (rebit と同じ) → byte_budget の表示グループ
+        alias = {
+            "gdn": "GDN 投影/conv",
+            "hc": "hyper-connections",
+            "head": "lm_head",
+            "attn": "full attention (12 層)",
+            "shared": "MoE 共有エキスパート",
+            "router": "MoE ルータ",
+            "experts": "MoE experts (top_k/512)",
+        }
+        print("\n  -- レシピ候補の見積もり --")
+        saved = 0.0
+        for part in args.plan.split(","):
+            cls, _, bits = part.strip().partition("=")
+            group = alias.get(cls)
+            if group is None or group not in by_group:
+                print(f"  {cls}: 未知のクラス")
+                continue
+            cur = by_group[group]
+            new = cur * int(bits) / args.from_bits
+            saved += cur - new
+            print(f"  {cls:8s} {args.from_bits}bit -> {bits}bit  "
+                  f"{cur / 1e9:.3f} -> {new / 1e9:.3f} GB  "
+                  f"({(cur - new) / 1e9 / BW_HI * 1000:5.2f}~"
+                  f"{(cur - new) / 1e9 / BW_LO * 1000:.2f} ms)")
+        after = total_read - saved
+        print(f"\n  読み出し {total_read / 1e9:.3f} -> {after / 1e9:.3f} GB/token "
+              f"(-{saved / 1e9 / BW_HI * 1000:.2f}~"
+              f"{saved / 1e9 / BW_LO * 1000:.2f} ms)")
+        print(f"  帯域だけの下限 {after / 1e9 / BW_HI * 1000:.1f} ms/token "
+              f"({BW_HI / (after / 1e9) if after else 0:.0f} tok/s)")
 
     ms_now = 1000 / args.tokens_per_sec
     print(f"\n  帯域だけの下限   {total_read / 1e9 / BW_HI * 1000:5.1f} ms/token "
