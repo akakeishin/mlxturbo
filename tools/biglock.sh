@@ -16,35 +16,38 @@ set -e
 LOCK="${TMPDIR:-/tmp}/fastmlx-bigmodel.lock"
 WAITED=0
 
-# 1. 既存のロックが生きているか確認し、生きていれば待つ
-while [ -f "$LOCK" ]; do
-  OWNER=$(cat "$LOCK" 2>/dev/null | head -1)
-  if [ -z "$OWNER" ] || ! kill -0 "$OWNER" 2>/dev/null; then
-    echo "biglock: 死んだロック (pid=$OWNER) を掃除する" >&2
-    rm -f "$LOCK"
+# ロックを取るまで回る。取得は noclobber で不可分にする。`[ -f ]` で見てから
+# 書く形だと、同時に待っていた 2 本が両方通って両方 98GB を読みに行く
+while true; do
+  # 1. 既存のロックが生きているか。死んでいれば掃除する
+  if [ -f "$LOCK" ]; then
+    OWNER=$(head -1 "$LOCK" 2>/dev/null)
+    if [ -z "$OWNER" ] || ! kill -0 "$OWNER" 2>/dev/null; then
+      echo "biglock: 死んだロック (pid=$OWNER) を掃除する" >&2
+      rm -f "$LOCK"
+    else
+      [ "$WAITED" -eq 0 ] && \
+        echo "biglock: pid=$OWNER が 98GB を抱えている。空くまで待つ" >&2
+      sleep 15; WAITED=$((WAITED + 15)); continue
+    fi
+  fi
+
+  # 2. ロックを持たない相手 (まだこの仕組みを使っていない側) も見る
+  OTHER=$(pgrep -f "\.venv/bin/python3? (tools|bench)/" | head -1)
+  if [ -n "$OTHER" ]; then
+    [ "$WAITED" -eq 0 ] && \
+      echo "biglock: ロック無しの pid=$OTHER が走っている。空くまで待つ" >&2
+    sleep 15; WAITED=$((WAITED + 15)); continue
+  fi
+
+  # 3. 取得。既に誰かが作っていれば失敗するので、その場合は待ちに戻る
+  if (set -o noclobber; echo $$ > "$LOCK") 2>/dev/null; then
     break
   fi
-  if [ "$WAITED" -eq 0 ]; then
-    echo "biglock: pid=$OWNER が 98GB を抱えている。空くまで待つ" >&2
-  fi
-  sleep 15
-  WAITED=$((WAITED + 15))
-done
-
-# 2. ロックを持たない相手 (まだこの仕組みを使っていない側) も見る
-while true; do
-  OTHER=$(pgrep -f "\.venv/bin/python3? (tools|bench)/" | head -1)
-  [ -z "$OTHER" ] && break
-  if [ "$WAITED" -eq 0 ]; then
-    echo "biglock: ロック無しの pid=$OTHER が走っている。空くまで待つ" >&2
-  fi
-  sleep 15
-  WAITED=$((WAITED + 15))
+  sleep 5; WAITED=$((WAITED + 5))
 done
 
 [ "$WAITED" -gt 0 ] && echo "biglock: ${WAITED}s 待った。開始する" >&2
-
-echo $$ > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT INT TERM
 
 "$@"
