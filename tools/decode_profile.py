@@ -56,16 +56,21 @@ def bench_batch(model, ids, sizes=(1, 2, 4, 8, 16)):
     print(f"  {'S':>3s} {'ms/forward':>11s} {'ms/token':>9s} {'S=1 比':>8s}")
     base = None
     for s in sizes:
-        cache = model.make_cache()
-        model(mx.array(ids)[None], cache=cache)
         chunk = mx.array([[ids[-1]] * s])
+        # 温め
         for _ in range(2):
-            mx.eval(model(chunk, cache=model.make_cache()))
+            c = model.make_cache()
+            mx.eval(model(mx.array(ids)[None], cache=c))
+            mx.eval(model(chunk, cache=c))
         ts = []
         for _ in range(8):
             c = model.make_cache()
-            model(mx.array(ids)[None], cache=c)
-            mx.eval(mx.array(0))
+            # プロンプトの forward は**必ずここで評価しきる**。MLX は遅延評価
+            # なので、eval せずにタイマーを開始すると、次の eval がプロンプト
+            # ぶんまで巻き込んで計測区間に入る。それをやったせいで S=1 が
+            # 490ms (逐次デコードは 50ms/token) と出て、S=16/S=1 が 1.2 倍に
+            # 見えていた
+            mx.eval(model(mx.array(ids)[None], cache=c))
             t = time.perf_counter()
             mx.eval(model(chunk, cache=c))
             ts.append((time.perf_counter() - t) * 1000)
