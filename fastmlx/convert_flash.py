@@ -102,6 +102,19 @@ RECIPES: dict[str, dict] = {
         "router": False,
         "default": {"bits": 8, "group_size": 64},
     },
+    # v-stream の default クラス (GDN 投影/attention/lm_head/hyper-connections/
+    # 共有エキスパート) をまとめて 6bit に落とす。読み出しは 6.462 -> 5.346
+    # GB/token になり、帯域だけの下限が 60 -> 72 tok/s へ動く。
+    # 8bit を選んだ根拠は当時無く、experts 以外を一括で default に入れていただけ
+    "v-fast6": {
+        "experts": {"bits": 4, "group_size": 64},
+        "experts_hi": {"bits": 6, "group_size": 64},
+        "experts_hi_layers": _spread(40),
+        "ngram": False,
+        "ngram_disk": True,
+        "router": False,
+        "default": {"bits": 6, "group_size": 64},
+    },
     # v-stream から GDN 投影だけ 4bit に落とす。GDN 投影は 1 トークンあたりの
     # 読み出しの 34.3% を占める最大手で (tools/byte_budget.py)、限界コストは
     # 帯域そのものなので削った分がそのまま時間になる。rebit での事前判定は
