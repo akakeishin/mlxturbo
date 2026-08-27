@@ -113,19 +113,24 @@ class RMSNorm(nn.Module):
 
     def __init__(self, dim: int, group_size: Optional[int] = None, eps: float = 1e-6):
         super().__init__()
-        self.weight = mx.ones(dim)
+        # 参照実装 (Qwen4ExpTextRMSNorm) はゼロ初期化で、スケールを
+        # (1 + weight) として掛ける Gemma 系の規約
+        self.weight = mx.zeros(dim)
         self.eps = eps
         self.group_size = group_size
         if group_size is not None and dim % group_size:
             raise ValueError(f"dim {dim} non divisible par group_size {group_size}")
 
     def __call__(self, x: mx.array) -> mx.array:
+        # fastmlx: 元の port は x * weight で、+1 が抜けていた。学習済みの
+        # weight は 0 近傍の差分なので、掛けると信号が縮んで向きだけ残り、
+        # 活性の大きさはそれらしいまま情報だけ壊れる (生成が無意味な反復になる)
         if self.group_size is None:
-            return mx.fast.rms_norm(x, self.weight, self.eps)
+            return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
         shape = x.shape
         x = x.reshape(*shape[:-1], -1, self.group_size)
         x = mx.fast.rms_norm(x, None, self.eps).reshape(shape)
-        return x * self.weight
+        return x * (1.0 + self.weight)
 
 
 class RMSNormGated(nn.Module):

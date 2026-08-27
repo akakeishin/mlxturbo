@@ -547,3 +547,44 @@ PR の「実 checkpoint で生成を確認した」という記述は成立し�
 `scratchpad/ref-modeling_qwen4_exp.py` に取得済み。モジュール単位で突き合わせる。
 `GatedResidual` (hyper-connections) は照合済みで参照と一致。残りは
 `GatedDeltaNet` / `QSAIndexer` / `Attention` / `PLELayer` / 幹の配線。
+
+### 決着: RMSNorm の +1 欠落 (2026-08-27)
+
+参照実装 `Qwen4ExpTextRMSNorm` は Gemma 系の **(1.0 + weight)** 規約で、weight は
+ゼロ初期化。port は `x * weight` で **+1 が抜けていた**。学習済み weight は 0
+近傍の差分なので、掛けると信号が縮んで向きだけ残る。活性の大きさはそれらしい
+まま情報だけ壊れる、という観測した症状と一致する。
+
+効く範囲が広い: 全 GatedResidual の `hc_norm` (2/層 × 48 + 最終 mixer)、PLE の
+`norm_key` / `norm_query` / `norm_conv`、QSA indexer の q/k norm。
+`RMSNormGated` (GDN の出力側) は ones 初期化の `x * weight` 規約で、port は元から
+正しい。直したのは非 gated の方だけ。
+
+修正後、実モデルで正常に生成する:
+
+```
+日本の首都はどこですか。一文で答えてください。
+-> (think) ... 日本の首都は東京です。
+21.3 t/s / prompt 154 t/s / peak 99.2GB
+```
+
+### 見つけ方: ランダム重みの小モデルで参照と数値比較
+
+180B を PyTorch で走らせるのは無理なので、**構造は同じで小さいモデル**を作って
+突き合わせた。GPU も速度測定も要らないので電力が不安定でも回せる。
+
+- `scratchpad/refenv` に torch(CPU) + transformers git main を入れる (本体の venv
+  は触らない)
+- `gen_ref.py`: hidden 128 / 4 層 (GDN 3 + full 1) / PLE 1 層 / experts 8 /
+  GQA 比 3 / hc 4 レーンのランダムモデルを参照実装で作り、**公開 ckpt と同じ
+  レイアウト** (`model.language_model.*`、融合 `gate_up_proj`、n-gram は
+  shard_i に分割) で保存。層出力とサブモジュールの入出力を npz に落とす
+- `cmp_mlx.py`: port に同じ重みを読ませて層ごとに相対誤差を出す
+- `cmp_sub.py`: 参照側で記録した入力をそのまま port のモジュールへ流す。
+  上流の誤差が混ざらないので、どのモジュールが違うかが一発で出る
+
+これで層0 → `attn_hyper_connection` → `hc_norm` の出力がゼロ、と 3 手で降りられた。
+
+現状の一致度: hyper-connection と MoE は完全一致、GDN が 0.006、logits で 0.014。
+GDN の差は chunked delta rule と MLX の逐次実装の数値差と見ているが未確認。
+生成は正常なので、Phase Q の計測を止める理由にはしない。
