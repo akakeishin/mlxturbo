@@ -26,6 +26,24 @@
    の合成だった。(b) はユーザー承認の上で修正済み (bench/test_dispatch.py)。
    以後の較正は依存チェーン 2 ラン (calib-chain-a/b.json の手順) を推奨。
 
+4. **実経路の phase 実測 (バッテリー駆動、相対値は有効)。** spec_bench
+   (edit、k=3、mtp-bits 4、fast-qmm) で 32.1 tok/s vs stock 23.5 (1.37x)、
+   ステップ 99ms = draft 24.2 + verify 74.4 + maint 0.3、tok/step 3.17。
+   m=1 decode は 45.6ms @ 332GB/s でほぼ飽和 (bench/decompose.py)。
+   気づき:
+   - draft 24.2ms のうち積み上げで説明できるのは 12-14ms (lm_head m=1
+     2.75ms x 3-4 本 + MTP 層 + entropy)。残り ~10ms は Python グラフ構築
+     または同期の疑い。draft は親側 (spec.py) の構造に依存する部分が大きい。
+   - lm_head (5120→248320) m=1 が 2.75ms @ 260GB/s と天井の 75% 止まり。
+     ここはカーネル側で調査中 (sol に反証依頼中)。
+   - GDN capture 税 (states_all 全書き出し) は層単体実測で T=7 1.69x、
+     48 層換算 2.3ms/step、T=16 で 5.6ms。rollback が読むのは 1 スライス
+     のみなので、「検証は素の fused カーネル + 受理長確定後に受理分だけ
+     再走して状態を得る 2 パス」なら丸ごと消せる。spec.py の構造変更を
+     伴うため親側判断。カーネル側は既存 stock カーネルで足りる見込み。
+   - 同期は greedy 2 回/step (draft ゲート + verify)、D7 発火時 3 回。
+     同期税 ~0.4-0.6ms/step で小さい。
+
 ### カーネル側の確定事項 (親は前提にしてよい)
 
 - fast_qmm が M=6..16 のほぼ全域で最速 (残 nocap は (17408,5120) M=9 のみ)。
