@@ -25,6 +25,9 @@ def _routes(overrides: dict[int, str] | None = None) -> tuple[str, ...]:
     反転)。B ステージングのベクトル化と _zpad キャッシュ後の fast_qmm は
     M=6..16 のほぼ全域で nocap/stock に勝つ (勝ち幅 1.06-1.59x)。
     単発レイテンシではなく依存チェーンで判定している (BRIEF の規律)。
+    M=5 は 2026-08-27 の追加 2 ラン (bench/results/smallm-a/b.json) で
+    up/gate・q・lm_head の 3 形状が MMA 勝ち (5.6-8.8%)。down は 4.0-5.0% で
+    バー未達につき stock 維持。M=2..4 は stock 維持 (qmv が優位)。
     """
 
     row = [STOCK] * 17
@@ -42,11 +45,11 @@ def _routes(overrides: dict[int, str] | None = None) -> tuple[str, ...]:
 # bench/op_curve.py.  A3's GPU gate compares every selected entry with both
 # alternatives before acceptance.
 DEFAULT_ROUTE_TABLE: dict[tuple[int, int], tuple[str, ...]] = {
-    (5120, 17408): _routes({m: MMA for m in range(9, 17)}),   # MLP up/gate
+    (5120, 17408): _routes({5: MMA} | {m: MMA for m in range(9, 17)}),   # MLP up/gate
     # M=9 は 2 ラン較正で勝者が割れたため nocap (基本形) を維持
     (17408, 5120): _routes({m: MMA for m in range(10, 17)}),  # MLP down
-    (5120, 12288): _routes({m: MMA for m in range(9, 17)}),   # attention q
-    (5120, 248320): _routes({m: MMA for m in range(9, 17)}),  # lm_head
+    (5120, 12288): _routes({5: MMA} | {m: MMA for m in range(9, 17)}),   # attention q
+    (5120, 248320): _routes({5: MMA} | {m: MMA for m in range(9, 17)}),  # lm_head
 }
 
 _DISPATCHED_CLASS = None

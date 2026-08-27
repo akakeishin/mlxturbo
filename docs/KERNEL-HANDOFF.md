@@ -44,6 +44,25 @@
    - 同期は greedy 2 回/step (draft ゲート + verify)、D7 発火時 3 回。
      同期税 ~0.4-0.6ms/step で小さい。
 
+5. **sol (codex) の反証レビュー結果 (詳細は本人出力、要点のみ)。**
+   - draft 24.2ms の「未説明 10ms」は誤りだった。既定 max_draft=8 では
+     ゲート判定の前に最大 8 リンク分の MTP+lm_head を構築する
+     (spec.py:699-719)。lm_head 2.75ms x 8 = 22ms で draft はほぼ説明が付く。
+     **ゲートで捨てるリンクの lm_head を先に全生成しているのが今日見つけた
+     最大の浪費** (捨て 5 リンクなら ~14ms/step)。逐次/チャンク式ゲート
+     (リンク 2-3 本ごとに同期 0.2ms を払って早期打ち切り) にすれば、
+     1 リンク省略 = 2.75ms なのでトレードは大きく有利。spec.py の構造変更。
+   - phase_s は CPU 壁時計であり GPU 帰属ではない (maint の GPU 仕事は
+     次 phase の eval に遅延計上され得る)。phase 再帰属は実 call 数の
+     計装から。
+   - lm_head m=1 の 260GB/s は「名目帯域 (パラメタ bytes / 壁時計)」で、
+     decompose の lm_head 値には出力 slice のグラフも含まれる。原因候補の
+     筆頭は 4bit unpack/dequant の発行律速 (quantized.h の qdot)。
+     fused qmm→argmax/entropy は mx.fast に存在せず、自前 2 段カーネルが
+     必要 (価値は full-vocab softmax まで吸収する場合のみ)。
+   - 実施順の勧告: phase 再帰属 → m カーブ immutable 化 → lm_head m=1 →
+     capture 2 パス。
+
 ### カーネル側の確定事項 (親は前提にしてよい)
 
 - fast_qmm が M=6..16 のほぼ全域で最速 (残 nocap は (17408,5120) M=9 のみ)。
@@ -54,6 +73,9 @@
 - B1 (tools/bridge 直接エンコード) は park。利得上限 0.9us/dispatch =
   ステップの 2-3% で、残作業の保守リスクに見合わない。再開条件は
   BRIDGE-NOTES §5.1。
+- M=5 の依存チェーン 2 ラン再測定で MMA が全 4 形状勝ち。経路表は協定バー
+  (両ラン 5% 超) を満たす up/gate・q・lm_head の 3 形状で M=5 を MMA に拡張、
+  fast_qmm の M_MIN も 5 へ。M=2..4 は stock 維持が確定 (mma 1.07-1.65x 遅)。
 
 ### 保留中 (カーネル側で持っている)
 

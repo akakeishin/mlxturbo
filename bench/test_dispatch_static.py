@@ -36,7 +36,9 @@ def test_shape_by_m_table_and_unknown_fallback():
     assert dispatch.select_route(5120, 248320, 13) == dispatch.MMA
     assert dispatch.select_route(17408, 5120, 9) == dispatch.NOCAP
     assert dispatch.select_route(4096, 4096, 8) == dispatch.STOCK
-    assert dispatch.select_route(5120, 17408, 5) == dispatch.STOCK
+    assert dispatch.select_route(5120, 17408, 4) == dispatch.STOCK
+    assert dispatch.select_route(5120, 17408, 5) == dispatch.MMA
+    assert dispatch.select_route(17408, 5120, 5) == dispatch.STOCK
     assert dispatch.select_route(5120, 17408, 17) == dispatch.STOCK
 
 
@@ -45,7 +47,8 @@ def test_stock_path_preserves_full_contract():
     old_mx = dispatch._load_mx
     dispatch._load_mx = lambda: fake_mx
     try:
-        x = _Array((1, 5, 5120), "x")
+        # M=4: stock 帯 (M=5 は 2026-08-27 較正で MMA に移った)
+        x = _Array((1, 4, 5120), "x")
         w = _Array((17408, 640), "w")
         scales = _Array((17408, 80), "scales")
         biases = _Array((17408, 80), "biases")
@@ -61,7 +64,7 @@ def test_stock_path_preserves_full_contract():
     finally:
         dispatch._load_mx = old_mx
 
-    assert out.shape == (1, 5, 17408)
+    assert out.shape == (1, 4, 17408)
     assert len(fake_mx.calls) == 1
     args, kwargs = fake_mx.calls[0]
     assert args == (x, w)

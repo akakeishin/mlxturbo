@@ -41,12 +41,13 @@ import mlx.nn as nn
 KC = 128           # x staging chunk (4KB) — total threadgroup use 12KB
 NPT = 64           # output columns per threadgroup — amortizes the x staging
 TGT = 256          # 8 simdgroups
-M_MIN = 6          # measured crossover on a *dependent* chain (see below)
-# M=4 measures 0.98-1.10x — inside the noise, and it made MTP k=3 slower in the
-# model. M=6 is 1.16-1.52x and M=8 is 1.57-1.92x. Latency, not throughput, is
-# what decides here: benchmarked as independent calls this kernel looks like a
-# win from M=4, because 32 queued copies overlap and hide its longer critical
-# path. Decode is a dependent chain and cannot.
+M_MIN = 5          # measured crossover on a *dependent* chain (see below)
+# 2026-08-27 再測定 (B ステージングのベクトル化 + _zpad キャッシュ後):
+# M=5 は依存チェーン 2 ランの両方で全 4 形状勝ち (stock 比 0.91-0.96x)。
+# M=4 は 1.07-1.26x で依然 stock が勝つ (qmv が重み 1 回読みで帯域に近い)。
+# 旧クロスオーバー M=6 の根拠だった「M=4 は 0.98-1.10x でノイズ内、モデルでは
+# MTP k=3 を遅くした」という観測は M=4 には今も当てはまる。単発スループット
+# ではなく依存チェーンのレイテンシで判定している点は従来どおり。
 M_MAX = 8          # one MMA tile
 # Below this the grid is ceil(N/64) threadgroups and the GPU sits idle; the
 # model has 96 layers with N=48, which would each get a single threadgroup.
