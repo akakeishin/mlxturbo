@@ -52,6 +52,17 @@ VENDOR_ARCH = REPO_ROOT / "tools" / "vendor" / "qwen4_exp.py"
 _FIRST5_LAST5 = list(range(5)) + list(range(43, 48))
 _FIRST6_LAST6 = list(range(6)) + list(range(42, 48))
 
+
+def _spread(n: int) -> list[int]:
+    """48 層から n 層を等間隔で選ぶ (入口/出口に寄せない)。
+
+    v-exp6 までは「入口と出口が効く」という folklore に従って端に寄せていたが、
+    層別の感度は未測定。10 層を超えると端寄せの根拠がさらに薄くなるので、
+    多層を 6bit にする構成では偏りの無い等間隔にする。
+    """
+
+    return sorted({round(i * 48 / n) for i in range(n)})
+
 RECIPES: dict[str, dict] = {
     # 常用 (~96GB): 既定 GPU wired limit に KV 込みで収まる
     "v0-95": {
@@ -74,6 +85,27 @@ RECIPES: dict[str, dict] = {
         "experts_hi": {"bits": 6, "group_size": 64},
         "experts_hi_layers": _FIRST5_LAST5,
         "ngram": {"bits": 3, "group_size": 32},
+        "router": False,
+        "default": {"bits": 8, "group_size": 64},
+    },
+    # n-gram 2bit の検証用 (~99GB)。experts は v-exp6 と同一にして n-gram の
+    # ビットだけ 3 -> 2 に落とす。KLD が v-exp6 (0.00181) から大きく劣化しな
+    # ければ、n-gram は 2bit で足りることになり 6.4GB が experts へ回せる
+    "v-ng2": {
+        "experts": {"bits": 4, "group_size": 64},
+        "experts_hi": {"bits": 6, "group_size": 64},
+        "experts_hi_layers": _FIRST5_LAST5,
+        "ngram": {"bits": 2, "group_size": 32},
+        "router": False,
+        "default": {"bits": 8, "group_size": 64},
+    },
+    # v-ng2 が通ったときの本命 (~112GB): n-gram を 2bit に抑えて浮いた分を
+    # すべて experts に回し、6bit の層を 10 -> 32 に増やす
+    "v-exp-max": {
+        "experts": {"bits": 4, "group_size": 64},
+        "experts_hi": {"bits": 6, "group_size": 64},
+        "experts_hi_layers": _spread(32),
+        "ngram": {"bits": 2, "group_size": 32},
         "router": False,
         "default": {"bits": 8, "group_size": 64},
     },
