@@ -39,10 +39,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
     ap.add_argument("--ngram", default=None)
-    ap.add_argument("--rebit", required=True)
+    ap.add_argument("--rebit", default=None)
+    ap.add_argument("--fused-hc", action="store_true",
+                    help="hyper-connections の融合カーネルを入れて前後を測る")
     ap.add_argument("--tokens", type=int, default=60)
     ap.add_argument("--repeats", type=int, default=3)
     args = ap.parse_args()
+    if not args.rebit and not args.fused_hc:
+        ap.error("--rebit か --fused-hc のどちらかが要る")
 
     if args.ngram:
         os.environ["FASTMLX_NGRAM_DISK"] = "1"
@@ -59,21 +63,34 @@ def main():
         add_generation_prompt=True,
     )
 
+    # 92GB のページが順に載る過程が段の差に化けるので、測る前に一度通す。
+    # sweep の速度列はこれを怠って基準行が 69.75ms になり使えなくなった
+    print("温め中 (ページを載せる)", flush=True)
+    bench(model, ids, args.tokens)
+
     before = [bench(model, ids, args.tokens) for _ in range(args.repeats)]
     mem_before = mx.get_peak_memory() / 1e9
-    print(f"打ち直し前 {min(before):6.2f} ms/token ({1000 / min(before):5.2f} tok/s) "
+    print(f"変更前 {min(before):6.2f} ms/token ({1000 / min(before):5.2f} tok/s) "
           f"  全試行 {[round(v, 2) for v in before]}", flush=True)
 
-    from fastmlx import rebit
+    what = []
+    if args.rebit:
+        from fastmlx import rebit
 
-    rebit.apply(model, args.rebit)
+        rebit.apply(model, args.rebit)
+        what.append(args.rebit)
+    if args.fused_hc:
+        from fastmlx import fused
+
+        fused.enable_hyper_connection_kernel()
+        what.append("融合カーネル")
     mx.reset_peak_memory()
 
     after = [bench(model, ids, args.tokens) for _ in range(args.repeats)]
-    print(f"打ち直し後 {min(after):6.2f} ms/token ({1000 / min(after):5.2f} tok/s) "
+    print(f"変更後 {min(after):6.2f} ms/token ({1000 / min(after):5.2f} tok/s) "
           f"  全試行 {[round(v, 2) for v in after]}", flush=True)
     d = min(before) - min(after)
-    print(f"\n  {args.rebit}: {d:+.2f} ms/token "
+    print(f"\n  {' + '.join(what)}: {d:+.2f} ms/token "
           f"({1000 / min(after) - 1000 / min(before):+.2f} tok/s)")
     print(f"  ピーク RAM {mem_before:.1f} -> {mx.get_peak_memory() / 1e9:.1f} GB")
 
