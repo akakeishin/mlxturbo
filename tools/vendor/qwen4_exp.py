@@ -1,6 +1,10 @@
 # vendored from https://github.com/eauchs/mlx-lm branch add-qwen4-exp
 # (ml-explore/mlx-lm PR #1788, MIT ライセンス)。取り込み 2026-08-27。
-# fastmlx 側の変更点: sanitize が mtp.* を落とすようにした 1 点のみ
+# fastmlx 側の変更点:
+#   1. mtp.* を落とす (サイドカーへ別抽出する)
+#   2. model.language_model.* -> model.* に畳む (公開 ckpt は VLM 形状)
+#   3. mlp.experts.{gate_up,down}_proj -> switch_mlp.* へ分解・改名
+#   4. NGramEmbedding: ハッシュ乗数を再計算値でなく ckpt の実値から使う
 # (mlx-lm 本体は MTP モジュールを持たないため strict load が失敗する。
 #  MTP は fastmlx/convert_flash.py extract-mtp でサイドカーへ抽出して使う)。
 # インストール: fastmlx/convert_flash.py install-arch が
@@ -534,16 +538,17 @@ class NGramEmbedding(nn.Module):
             mults.append(
                 2 * (_splitmix64((base_seed + _GAMMA * (i + 1)) & _MASK64) % half) + 1
             )
-        # Public attributes: only there to absorb the checkpoint tensors. They live
-        # in parameters(), so an astype(float16) would destroy them; the values
-        # actually used live in the `_`-prefixed copies, outside parameters() and
-        # rebuilt identically from the config.
+        # ここで組むのは checkpoint が無い場合の初期値でしかない。load_weights が
+        # 同名テンソルで上書きするので、実際に使うのは常にこちら (fastmlx 変更点)。
+        # 元の port は `_`-prefix の再計算コピーを __call__ で使っていたが、
+        # layer_multipliers の再計算値は公開 checkpoint の実値と一致しない
+        # (vocab_sizes/offsets は一致する)。乗数が違うとハッシュ先が全部ずれて
+        # n-gram 埋め込みが丸ごと無意味になり、生成が壊れる。
+        # int64 は Module.set_dtype が浮動小数だけを触るので bf16 化で壊れない
+        # (変換後の safetensors 側で I64 のまま残ることを確認済み)。
         self.layer_multipliers = mx.array(mults, dtype=mx.int64)
         self.ngram_heads_vocab_sizes = mx.array(sizes, dtype=mx.int64)
         self.ngram_heads_offsets = mx.array(offsets, dtype=mx.int64)
-        self._mults = mx.array(mults, dtype=mx.int64)
-        self._sizes = mx.array(sizes, dtype=mx.int64)
-        self._offsets = mx.array(offsets, dtype=mx.int64)
 
     def _shift_right(self, ids: mx.array, shift: int) -> mx.array:
         """Shift right by `shift`, without crossing an EOS boundary."""
@@ -573,11 +578,13 @@ class NGramEmbedding(nn.Module):
         for ngram in range(2, self.ngram_size + 1):
             lo = (ngram - 2) * self.heads_per_ngram
             hi = lo + self.heads_per_ngram
-            mixed = shifted[0] * self._mults[0]
+            mixed = shifted[0] * self.layer_multipliers[0]
             for p in range(1, ngram):
-                mixed = mx.bitwise_xor(mixed, shifted[p] * self._mults[p])
-            gid = mixed[..., None] % self._sizes[lo:hi].reshape(1, 1, -1)
-            blocks.append(gid + self._offsets[lo:hi].reshape(1, 1, -1))
+                mixed = mx.bitwise_xor(mixed, shifted[p] * self.layer_multipliers[p])
+            gid = mixed[..., None] % self.ngram_heads_vocab_sizes[lo:hi].reshape(
+                1, 1, -1
+            )
+            blocks.append(self.ngram_heads_offsets[lo:hi].reshape(1, 1, -1) + gid)
 
         gid = mx.concatenate(blocks, axis=-1)[:, -n_new:]
         return self.ngram_embedding(gid).reshape(*gid.shape[:2], -1)
@@ -811,12 +818,30 @@ class Model(nn.Module):
     def sanitize(self, weights):
         out = {}
         for k, v in weights.items():
+            if k.startswith("model.language_model."):
+                # 公開 checkpoint は Qwen4ExpForConditionalGeneration (VLM) 形状で、
+                # テキスト側が model.language_model.* に入る。MLX 側の Model は
+                # model.* を期待するので中間の language_model を畳む
+                k = "model." + k[len("model.language_model.") :]
             if k.startswith("language_model."):
                 k = k[len("language_model.") :]
             if k.startswith("vision_tower.") or k.startswith("model.visual."):
                 continue  # text-only pour l'instant
             if k.startswith("mtp."):
                 # fastmlx: MTP はサイドカーへ抽出して別ロードする (ヘッダ参照)
+                continue
+            if k.endswith("mlp.experts.gate_up_proj"):
+                # ckpt は融合 (E, 2*moe_inter, H)。transformers の Qwen3-Next 系と
+                # 同じく linear 出力を chunk(2) する規約なので、行の前半が gate、
+                # 後半が up。MLX の SwitchGLU は分離した 2 枚を持つ
+                base = k[: -len("experts.gate_up_proj")] + "switch_mlp."
+                gate, up = mx.split(v, 2, axis=1)
+                out[base + "gate_proj.weight"] = gate
+                out[base + "up_proj.weight"] = up
+                continue
+            if k.endswith("mlp.experts.down_proj"):
+                base = k[: -len("experts.down_proj")] + "switch_mlp."
+                out[base + "down_proj.weight"] = v
                 continue
             if "conv1d.weight" in k and v.ndim == 3 and v.shape[-1] != 1:
                 # (C, 1, K) torch -> (C, K, 1) mlx

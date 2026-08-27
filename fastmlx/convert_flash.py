@@ -50,20 +50,20 @@ VENDOR_ARCH = REPO_ROOT / "tools" / "vendor" / "qwen4_exp.py"
 # ビットで焼く (入口/出口が感度高いという folklore 起点。感度スキャンの
 # 層別 KLD で入れ替える)。48 層 (0..47)。
 _FIRST5_LAST5 = list(range(5)) + list(range(43, 48))
-_FIRST8_LAST8 = list(range(8)) + list(range(40, 48))
+_FIRST6_LAST6 = list(range(6)) + list(range(42, 48))
 
 RECIPES: dict[str, dict] = {
     # 常用 (~96GB): 既定 GPU wired limit に KV 込みで収まる
     "v0-95": {
         "experts": {"bits": 4, "group_size": 64},
-        "ngram": {"bits": 3, "group_size": 64},
+        "ngram": {"bits": 3, "group_size": 32},
         "router": False,
         "default": {"bits": 8, "group_size": 64},
     },
     # n-gram へ +6.4GB (~102GB)。v-exp6 との等バイト A/B の片割れ
     "v0-105": {
         "experts": {"bits": 4, "group_size": 64},
-        "ngram": {"bits": 4, "group_size": 64},
+        "ngram": {"bits": 4, "group_size": 32},
         "router": False,
         "default": {"bits": 8, "group_size": 64},
     },
@@ -73,18 +73,20 @@ RECIPES: dict[str, dict] = {
         "experts": {"bits": 4, "group_size": 64},
         "experts_hi": {"bits": 6, "group_size": 64},
         "experts_hi_layers": _FIRST5_LAST5,
-        "ngram": {"bits": 3, "group_size": 64},
+        "ngram": {"bits": 3, "group_size": 32},
         "router": False,
         "default": {"bits": 8, "group_size": 64},
     },
-    # ギリギリ構成 (~112GB): n-gram 4bit + experts 16 層 6bit。
+    # ギリギリ構成 (~112GB): n-gram 4bit + experts 12 層 6bit。
     # iogpu.wired_limit_mb 引き上げ + 専用機運用前提。115GB 帯は OS が
-    # 苦しくなるのでこれを上限とする
+    # 苦しくなるのでこれを上限とする。6bit の層数を 16 -> 12 に詰めたのは、
+    # n-gram を group_size=32 にせざるを得ず (head_dim=160 が 64 で割れない)
+    # +3.2GB 増えた分を天井内で吸収するため
     "v-max-112": {
         "experts": {"bits": 4, "group_size": 64},
         "experts_hi": {"bits": 6, "group_size": 64},
-        "experts_hi_layers": _FIRST8_LAST8,
-        "ngram": {"bits": 4, "group_size": 64},
+        "experts_hi_layers": _FIRST6_LAST6,
+        "ngram": {"bits": 4, "group_size": 32},
         "router": False,
         "default": {"bits": 8, "group_size": 64},
     },
@@ -168,8 +170,11 @@ def cmd_estimate(args):
             n *= d
         c = classify(name)
         rule = resolve_rule(recipe, name)
-        if rule is False or len(shape) < 2:
-            # 非量子化 (router / norm / 1 次元テンソル) は bf16 のまま
+        if rule is False or len(shape) < 2 or shape[-1] % rule["group_size"]:
+            # 非量子化のまま残るもの: router / norm / 1 次元テンソル に加えて、
+            # 入力次元が group_size で割り切れないもの。mlx の quantize は
+            # これを黙って素通しする (n-gram の head_dim=160 で踏んだ)。
+            # 台帳が実測とずれる原因になるのでここでも同じ規則を適用する
             b = n * _DTYPE_BYTES.get(dtype, 2)
         else:
             # 実効 bits/weight = bits + 16*2/group_size (scale+bias が bf16)
@@ -195,6 +200,9 @@ def cmd_install_arch(args):
 def cmd_extract_mtp(args):
     import mlx.core as mx
 
+    # convert と同じ理由で CPU 側に置く (外付け SSD の mmap を GPU から
+    # 読むとコマンドバッファが監視タイムアウトする)
+    mx.set_default_device(mx.cpu)
     src = Path(args.src)
     picked: dict[str, object] = {}
     shard_names: dict[Path, list[str]] = {}
@@ -214,14 +222,31 @@ def cmd_extract_mtp(args):
 
 
 def cmd_convert(args):
+    import mlx.core as mx
     from mlx_lm.convert import convert
+
+    if args.device == "cpu":
+        # 既定は CPU。重みは外付け SSD 上の mmap なので、GPU で量子化すると
+        # カーネル実行中の page-in が USB 越しになり、Metal のコマンドバッファが
+        # 監視タイムアウトで落ちる (kIOGPUCommandBufferCallbackErrorTimeout、
+        # シャード 2 の保存で再現)。CPU には同じ監視が無い
+        mx.set_default_device(mx.cpu)
 
     cmd_install_arch(argparse.Namespace(force=False))
     convert(
         hf_path=args.src,
         mlx_path=args.out,
         quantize=True,
-        q_group_size=64,
+        # mlx_lm.quantize_model は predicate を呼ぶ前に
+        #   module.weight.shape[-1] % <この group_size> != 0 -> 量子化しない
+        # という足切りをする。ここを 64 にすると n-gram (head_dim=160) が
+        # レシピの group_size=32 に届く前に落ちて bf16 のまま残る (51B params
+        # がそのまま残り 178GB になって OOM した)。レシピ中の最小値を渡す。
+        q_group_size=min(
+            r["group_size"]
+            for r in RECIPES[args.recipe].values()
+            if isinstance(r, dict)
+        ),
         q_bits=4,
         quant_predicate=build_predicate(args.recipe),
     )
@@ -250,6 +275,7 @@ def main():
     p.add_argument("--recipe", choices=sorted(RECIPES), required=True)
     p.add_argument("--src", required=True)
     p.add_argument("--out", required=True)
+    p.add_argument("--device", choices=("cpu", "gpu"), default="cpu")
     p.set_defaults(fn=cmd_convert)
 
     args = ap.parse_args()

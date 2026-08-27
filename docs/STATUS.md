@@ -486,3 +486,64 @@ GLM-5.3-Flash (zai-org、MIT) の偵察結果:
 qwen-community-1.0 の再配布条項を精読してから (不可ならレシピ公開へ
 フォールバック)。GLM は MIT で制約なし。アップロード実行は都度ユーザーの
 承認を取る。
+
+## Phase Q: v0-95 焼き込み完了、port の forward が壊れている (2026-08-27)
+
+bf16 アーカイブ (131/131 シャード、335GiB、外付け SSD) から v0-95 を焼き、
+`/Users/ht/models/qwen38fn-mlx-v0-95` に 92GiB (98.8GB、見積もり 98.9GB と一致)。
+ロードも生成も通るが、**出力は無意味な反復**で使えない。
+
+### 公開 checkpoint に合わせて直した port のバグ 4 件
+
+vendored した PR #1788 は、公開されている bf16 リポジトリではなく作者の変換済み
+checkpoint (`Vontra/Qwen3.8-Flash-Next-MLX-4bit`) に対して書かれていた。
+
+1. `model.language_model.*` — 公開 ckpt は `Qwen4ExpForConditionalGeneration`
+   (VLM) 形状。sanitize で `model.*` に畳む
+2. `mlp.experts.gate_up_proj` `(512, 1280, 2560)` の融合 — SwitchGLU 用に
+   前半 gate / 後半 up へ分解。順序は参照 ckpt から byte-range で該当テンソルを
+   取って照合済み (ref.gate_proj vs 元の前半 = 0.085、後半 = 1.33)
+3. n-gram の `head_dim=160` が `group_size=64` で割れず、mlx が predicate を
+   呼ぶ前に足切りして bf16 のまま残る。51B params がそのまま残り 7.942 bpw
+   = 178GB になって OOM した。`group_size=32` に落とす。台帳 (estimate) にも
+   同じ割り切れ判定を入れた
+4. `NGramEmbedding` のハッシュ乗数を config から再計算していたが、実値と
+   一致しない (vocab_sizes / offsets は一致)。ckpt の値を使うよう変更
+
+### 変換系の環境依存
+
+外付け SSD 上の mmap を GPU から読むと、カーネル実行中の page-in が USB 越しに
+なって Metal のコマンドバッファが監視タイムアウトする
+(`kIOGPUCommandBufferCallbackErrorTimeout`、必ずシャード 2 の保存で再現)。
+`convert` / `extract-mtp` は既定で CPU デバイスに置く (`--device gpu` で戻せる)。
+
+### レシピのサイズ (n-gram group_size=32 化で一律 +3.2GB)
+
+| | 旧 | 実測ベース |
+|---|---|---|
+| v0-95 | 95.7 | 98.9 GB |
+| v0-105 | 102.1 | 105.3 GB |
+| v-exp6 | 102.0 | 105.2 GB |
+| v-max-112 | 112.1 | 112.8 GB (6bit 層を 16 -> 12 に詰めた) |
+
+### 変換は正しい / forward が壊れている
+
+- 逆量子化して元の bf16 と比較: 4bit≈0.09、8bit≈0.01、3bit≈0.17 と正常
+- 参照 ckpt と構造一致 (差は `language_model.` 接頭辞と vision tower 333 本のみ)
+- 層別量子化の復元も欠けなし (per-path 998 / 量子化テンソル 998)
+- 参照 ckpt は一律 4bit/gs32 なので、こちらの方が精度は高い
+- 層ごとの活性は健全 (mean|x| 0.05 -> 0.37、NaN も発散も無し) なのに
+  ロジットは一様ノイズ (max 7.4 / std 1.6)。**大きさを保ったまま情報を壊す
+  構造ミス**が forward のどこかにある
+- PLE を無効化しても壊れたままなので、幹の側
+
+PR の「実 checkpoint で生成を確認した」という記述は成立しない。上記 4 の乗数は
+作者の checkpoint にも元と同じ値で入っており、port はそれを使わず再計算値で
+動くため、参照 checkpoint でも同じ経路を通る。
+
+### 次
+
+参照実装 (transformers main の `qwen4_exp`、2707 行) を
+`scratchpad/ref-modeling_qwen4_exp.py` に取得済み。モジュール単位で突き合わせる。
+`GatedResidual` (hyper-connections) は照合済みで参照と一致。残りは
+`GatedDeltaNet` / `QSAIndexer` / `Attention` / `PLELayer` / 幹の配線。
