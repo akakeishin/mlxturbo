@@ -145,6 +145,51 @@ class MoE:
         return y + mx.sigmoid(self.shared_gate(x)) * sh
 
 
+def bench_residual(reps: int = 12) -> None:
+    """残差の合成 `hyper + (x[...,None,:] * inject[...,None]).reshape(...)`。
+
+    DecoderLayer で 1 層 2 回 x 48 層 = 96 回走る。行列積が挟まらない純粋な
+    elementwise の連なりなので、hyper-connections と違って mx.compile が
+    効くはず (あちらは間に量子化行列積が入って連なりが 1-3 op に分断された)。
+
+    ablate.py が「残り」としてまとめている約 10ms の中身の候補。
+    """
+
+    print("\n残差の合成 x 96 回\n")
+
+    def plain(hyper, x, inject):
+        return hyper + (x[..., None, :] * inject[..., None]).reshape(
+            *x.shape[:-1], -1
+        )
+
+    @mx.compile
+    def compiled(hyper, x, inject):
+        return hyper + (x[..., None, :] * inject[..., None]).reshape(
+            *x.shape[:-1], -1
+        )
+
+    hyper = mx.random.normal((1, 1, D * 4)).astype(mx.bfloat16)
+    x = mx.random.normal((1, 1, D)).astype(mx.bfloat16)
+    inject = mx.random.normal((1, 1, 4)).astype(mx.bfloat16)
+
+    # 数値が一致するかを先に見る
+    mx.eval(plain(hyper, x, inject), compiled(hyper, x, inject))
+    a, b = plain(hyper, x, inject), compiled(hyper, x, inject)
+    mx.eval(a, b)
+    err = float(mx.abs(a - b).max() / (mx.abs(a).max() + 1e-9))
+    print(f"  compile 版との相対誤差: {err:.2e} "
+          f"({'一致' if err == 0 else '不一致'})")
+
+    for name, fn in (("そのまま", plain), ("mx.compile", compiled)):
+        def run(h0, n, f=fn):
+            h = h0
+            for _ in range(n):
+                h = f(h, x, inject)
+            return h
+        ms = timeit(run, hyper, 96, reps)
+        print(f"  {name:14s} {ms:6.2f} ms  ({ms / 96 * 1000:5.1f} us/回)")
+
+
 def check_merged_shared_algebra() -> float:
     """「共有を第 N 番のエキスパートとして畳んでよい」を小さい形で確かめる。
 
@@ -276,6 +321,7 @@ def main():
     args = ap.parse_args()
 
     mx.random.seed(0)
+    bench_residual()
     err = check_merged_shared_algebra()
     print(f"共有を switch に畳む式の相対誤差: {err:.2e} "
           f"({'一致' if err < 1e-5 else '不一致 — 式が違う'})\n")
