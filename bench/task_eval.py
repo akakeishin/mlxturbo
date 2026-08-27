@@ -87,10 +87,22 @@ def _sample(rows: list[dict], n: int | None, seed: int = 0) -> list[dict]:
 
 
 class Runner:
-    def __init__(self, model_ref: str):
+    def __init__(self, model_ref: str, ngram: str | None = None):
+        if ngram:
+            # n-gram をディスクに置いた構成。arch は import 時に旗を読む
+            import os
+
+            os.environ["FASTMLX_NGRAM_DISK"] = "1"
         from mlx_lm import load
 
         self.model, self.tok = load(model_ref)
+        if ngram:
+            import sys
+
+            sys.path.insert(0, str(REPO_ROOT))
+            from fastmlx.ngram_stream import install
+
+            install(self.model, ngram)
 
     def chat_ids(self, text: str) -> list[int]:
         try:
@@ -261,11 +273,12 @@ def cmd_run(args):
 
     print(f"モデル読み込み: {args.model}")
     t0 = time.time()
-    run = Runner(args.model)
+    run = Runner(args.model, args.ngram)
     print(f"  {time.time() - t0:.0f} 秒")
 
     result = {
         "tag": args.tag,
+        "ngram_sidecar": args.ngram,
         "model": args.model,
         "at": datetime.now(timezone.utc).isoformat(),
         "tasks": {},
@@ -313,6 +326,7 @@ def main():
     p = sub.add_parser("run")
     p.add_argument("--model", required=True)
     p.add_argument("--tag", required=True)
+    p.add_argument("--ngram", default=None, help="n-gram サイドカー")
     p.add_argument("--tasks", default="gsm8k,humaneval,mmlu")
     p.add_argument("--limit", type=int, default=0, help="0 なら課題ごとの既定値")
     p.set_defaults(fn=cmd_run)
