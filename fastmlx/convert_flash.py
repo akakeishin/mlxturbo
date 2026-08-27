@@ -102,6 +102,27 @@ RECIPES: dict[str, dict] = {
         "router": False,
         "default": {"bits": 8, "group_size": 64},
     },
+    # 96GB Mac 向け (~71GB)。n-gram をディスクに追い出せる前提で、
+    # experts 4bit を維持したまま default を 8 -> 4bit に落として収める
+    "v-96": {
+        "experts": {"bits": 4, "group_size": 64},
+        "ngram": False,
+        "ngram_disk": True,
+        "router": False,
+        "default": {"bits": 4, "group_size": 64},
+    },
+    # 64GB Mac 向け (~48GB)。experts を半分 3bit / 半分 2bit にする。
+    # experts は誤差源として突出しているので品質の劣化は大きい。動くことを
+    # 優先した構成で、品質の数字を添えて出す
+    "v-64": {
+        "experts": {"bits": 2, "group_size": 64},
+        "experts_hi": {"bits": 3, "group_size": 64},
+        "experts_hi_layers": _spread(24),
+        "ngram": False,
+        "ngram_disk": True,
+        "router": False,
+        "default": {"bits": 4, "group_size": 64},
+    },
     # n-gram 2bit の検証用 (~99GB)。experts は v-exp6 と同一にして n-gram の
     # ビットだけ 3 -> 2 に落とす。KLD が v-exp6 (0.00181) から大きく劣化しな
     # ければ、n-gram は 2bit で足りることになり 6.4GB が experts へ回せる
