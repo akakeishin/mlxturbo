@@ -36,6 +36,19 @@ def qlin(inp: int, out: int, bits: int = 8, gs: int = 64):
     return lin.to_quantized(group_size=gs, bits=bits)
 
 
+@mx.compile
+def _router_head(logits):
+    """gate の出力 -> (選ばれた添字, 正規化された重み)。
+
+    行列積を含まないので、elementwise の連鎖が途切れない。hyper-connections で
+    mx.compile が効かなかったのは間に行列積が挟まるからで、ここは事情が違う。
+    """
+
+    idx = mx.argpartition(logits, N_EXPERTS - TOP_K, axis=-1)[..., -TOP_K:]
+    w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
+    return idx, w
+
+
 def timeit(fn, x, n_layers: int, reps: int = 12) -> float:
     """n_layers 回直列に通して 1 回 eval。中央値を ms で返す。"""
 
@@ -66,6 +79,11 @@ class MoE:
         self.shared_gp = qlin(D, MOE_INTER, bits=8)
         self.shared_up = qlin(D, MOE_INTER, bits=8)
         self.shared_dp = qlin(MOE_INTER, D, bits=8)
+        # 共有を第 512 番として持つ版 (merged_shared 用)
+        self.switch_plus = _quantize_switch(
+            SwitchGLU(D, MOE_INTER, N_EXPERTS + 1), expert_bits
+        )
+        self.shared_idx = mx.array([[[N_EXPERTS]]])
 
     # --- そのまま -----------------------------------------------------
     def plain(self, x):
@@ -89,6 +107,35 @@ class MoE:
         w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
         return (self.switch(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
 
+    # --- 否定を省く (argpartition の下側を取る) -----------------------
+    def no_negate(self, x):
+        logits = self.gate(x.astype(mx.float32))
+        idx = mx.argpartition(logits, N_EXPERTS - TOP_K, axis=-1)[..., -TOP_K:]
+        w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
+        out = (self.switch(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
+        sh = self.shared_dp(nn.silu(self.shared_gp(x)) * self.shared_up(x))
+        return out + mx.sigmoid(self.shared_gate(x)) * sh
+
+    # --- ルータ頭を mx.compile に通す ---------------------------------
+    def compiled_router(self, x):
+        logits = self.gate(x.astype(mx.float32))
+        idx, w = _router_head(logits)
+        out = (self.switch(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
+        sh = self.shared_dp(nn.silu(self.shared_gp(x)) * self.shared_up(x))
+        return out + mx.sigmoid(self.shared_gate(x)) * sh
+
+    # --- 共有エキスパートを switch に第 512 番として畳む ---------------
+    # 共有は hidden が routed と同じ 640 なので、同じテンソルに 1 本足せる。
+    # 合成は (y_e * w_e).sum なので、w の末尾に sigmoid(gate) を継げば
+    # 数式としては元と一致する
+    def merged_shared(self, x):
+        logits = self.gate(x.astype(mx.float32))
+        idx = mx.argpartition(logits, N_EXPERTS - TOP_K, axis=-1)[..., -TOP_K:]
+        w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
+        idx = mx.concatenate([idx, self.shared_idx], axis=-1)
+        w = mx.concatenate([w, mx.sigmoid(self.shared_gate(x))], axis=-1)
+        return (self.switch_plus(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
+
     # --- 合成 (mul+sum+astype) を除いた場合の上限 ----------------------
     def no_combine(self, x):
         logits = self.gate(x.astype(mx.float32))
@@ -96,6 +143,45 @@ class MoE:
         y = self.switch(x, idx)[..., 0, :]
         sh = self.shared_dp(nn.silu(self.shared_gp(x)) * self.shared_up(x))
         return y + mx.sigmoid(self.shared_gate(x)) * sh
+
+
+def check_merged_shared_algebra() -> float:
+    """「共有を第 N 番のエキスパートとして畳んでよい」を小さい形で確かめる。
+
+    合成は sum_e y_e * w_e なので、共有の出力に sigmoid(gate) を掛けて足すのと、
+    w の末尾に sigmoid(gate) を継いで一緒に足すのは同じ式になる。実装ではなく
+    式が合っているかを見たいので、量子化なしの小さい形でやる。
+
+    返すのは相対誤差。
+    """
+
+    from mlx_lm.models.switch_layers import SwitchGLU
+
+    d, hid, ne, k = 16, 8, 6, 3
+    mx.random.seed(1)
+    sw = SwitchGLU(d, hid, ne + 1)
+    mx.eval(sw.parameters())
+    x = mx.random.normal((1, 1, d))
+    gate_w = mx.random.normal((ne, d)) * 0.5
+    sgate_w = mx.random.normal((1, d)) * 0.5
+
+    logits = x @ gate_w.T
+    idx = mx.argpartition(logits, ne - k, axis=-1)[..., -k:]
+    w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
+    shared_w = mx.sigmoid(x @ sgate_w.T)
+
+    # 元の形: routed の重み付き和 + sigmoid(gate) * 共有
+    routed = (sw(x, idx) * w[..., None]).sum(axis=-2)
+    shared = sw(x, mx.array([[[ne]]]))[..., 0, :]
+    ref = routed + shared_w * shared
+
+    # 畳んだ形: 添字と重みを継いで一度に和を取る
+    idx2 = mx.concatenate([idx, mx.array([[[ne]]])], axis=-1)
+    w2 = mx.concatenate([w, shared_w], axis=-1)
+    got = (sw(x, idx2) * w2[..., None]).sum(axis=-2)
+
+    mx.eval(ref, got)
+    return float(mx.abs(ref - got).max() / (mx.abs(ref).max() + 1e-9))
 
 
 def _quantize_switch(sw, bits: int, gs: int = 64):
@@ -190,6 +276,10 @@ def main():
     args = ap.parse_args()
 
     mx.random.seed(0)
+    err = check_merged_shared_algebra()
+    print(f"共有を switch に畳む式の相対誤差: {err:.2e} "
+          f"({'一致' if err < 1e-5 else '不一致 — 式が違う'})\n")
+
     x = mx.random.normal((1, 1, D)).astype(mx.bfloat16)
 
     print(f"MoE (hidden={D}, inter={MOE_INTER}, experts={N_EXPERTS}, "
@@ -212,6 +302,9 @@ def main():
         ("ルータ頭なし (上限)", lambda h: moe.no_router(h, idx, w)),
         ("共有エキスパートなし (上限)", moe.no_shared),
         ("合成なし (上限)", moe.no_combine),
+        ("否定を省く", moe.no_negate),
+        ("ルータ頭を compile", moe.compiled_router),
+        ("共有を switch に畳む", moe.merged_shared),
     ):
         rows.append((name, timeit(chain(fn), x, N_LAYERS)))
 
