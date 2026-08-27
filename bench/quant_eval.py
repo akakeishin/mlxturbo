@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,24 +42,14 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 RESULTS_DIR = REPO_ROOT / "bench" / "results" / "quant-eval"
 
-# 感度が出やすい軸を広めに: 事実想起 (n-gram テーブル直撃)、コード、数学、
-# 反復構造、多言語、構造化出力、長め文脈の要約
-CALIB_PROMPTS: dict[str, str] = {
-    "ja-explain": "分散システムにおける結果整合性と強整合性の違いを、具体例を挙げながら詳しく説明してください。",
-    "ja-fact": "鎌倉幕府の成立から滅亡までの主要な出来事を、年号付きで時系列に列挙してください。",
-    "en-prose": "Explain why the sky is blue during the day but red at sunset, in a way a curious teenager would enjoy.",
-    "en-fact": "List the chemical elements discovered in the 20th century, with the year and discoverer for each.",
-    "code-py": "Pythonで、ディレクトリ以下の全ファイルをSHA-256でハッシュ化して重複ファイルを検出するスクリプトを書いてください。",
-    "code-rust": "Write a Rust function that parses an ISO-8601 timestamp without external crates, returning a struct with year, month, day, hour, minute, second.",
-    "math": "3桁の整数のうち、各桁の数字の和が10になるものは何個あるか。途中の考え方も含めて答えてください。",
-    "translate": "次の文を自然な英語に翻訳してください:「量子化は精度と引き換えにメモリと帯域を節約する技術であり、その配分には測定に基づく判断が必要である。」",
-    "zh": "请用中文解释一下什么是投机解码（speculative decoding），以及它为什么能加速大语言模型的推理。",
-    "json-struct": "架空の書店の在庫管理APIのレスポンス例をJSONで作成してください。書籍5冊分、各書籍にはISBN、タイトル、著者、価格、在庫数を含めてください。",
-    "repeat-edit": "次の関数に型ヒントとdocstringを追加してください。他は変えないでください。\n```python\ndef merge(a, b):\n    out = dict(a)\n    for k, v in b.items():\n        if k in out and isinstance(out[k], dict) and isinstance(v, dict):\n            out[k] = merge(out[k], v)\n        else:\n            out[k] = v\n    return out\n```",
-    "summarize": "次の主張を3行で要約してください: 大規模言語モデルの推論速度はメモリ帯域に律速されることが多い。重みを低ビットに量子化すると読み出し量が減って速度が上がるが、精度が犠牲になる。投機デコードは複数トークンを一括検証することで、帯域あたりの生成トークン数を増やす。この2つは独立に効くため併用できるが、量子化はドラフトの受理率を下げる方向にも働くため、併用時の利得は単純な掛け算にはならない。",
-}
+# プロンプトの設計と部品別の札は bench/eval_prompts.py 側にある
+from bench.eval_prompts import PROMPTS, STRESS_KINDS  # noqa: E402
+
+CALIB_PROMPTS: dict[str, str] = {k: v.text for k, v in PROMPTS.items()}
 
 
 def _load(model_ref: str):
@@ -125,7 +116,19 @@ def cmd_dump(args):
         logp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         idx = mx.argpartition(-logp, args.topk - 1, axis=-1)[:, : args.topk]
         top = mx.take_along_axis(logp, idx, axis=-1)
-        mx.eval(idx, top)
+        # argpartition は順序を保証しないので降順に並べ直す。idx[:, 0] を
+        # 参照の top-1 として扱う箇所があるため、ここを曖昧にしない
+        order = mx.argsort(-top, axis=-1)
+        idx = mx.take_along_axis(idx, order, axis=-1)
+        top = mx.take_along_axis(top, order, axis=-1)
+        # 正準トークンに参照が置く対数確率。Δp を「同じトークンに対する
+        # 両者の確率差」として測るために要る。参照の top-1 で代用すると、
+        # 逐次デコードと一括 forward の argmax がまれに食い違う分だけ
+        # 自己比較でも 0 にならない (bf16 同点の縮約順の違い、STATUS 参照)
+        tgt_ids = mx.array(full[start + 1 :])[:, None]
+        tgt_logp = mx.take_along_axis(logp, tgt_ids, axis=-1)[:, 0]
+        mx.eval(idx, top, tgt_logp)
+        arrays[f"{key}.tgt_logp"] = np.array(tgt_logp, dtype=np.float32)
         idx_np = np.array(idx, dtype=np.int32)
         top_np = np.array(top, dtype=np.float32)
         tail = np.log1p(-np.minimum(np.exp(top_np).sum(axis=-1), 1 - 1e-9))
@@ -171,18 +174,42 @@ def cmd_compare(args):
             mx.take_along_axis(logq_all, mx.array(tgt)[:, None], axis=-1)[:, 0],
             dtype=np.float64,
         )
+        # Δp: 正準トークン (= 参照の top-1) に参照と変種が置く確率の差。
+        # llama.cpp の perplexity ツールが出す指標に合わせている。KLD が
+        # 分布全体の距離なのに対し、こちらは「実際に選ばれる語がどれだけ
+        # 押し下げられたか」を見る
+        dp = np.exp(tgt_logq) - np.exp(ref[f"{key}.tgt_logp"].astype(np.float64))
         per_prompt[key] = {
             "kld_mean": float(kld_pos.mean()),
+            "kld_median": float(np.median(kld_pos)),
             "kld_p95": float(np.quantile(kld_pos, 0.95)),
+            "kld_p99": float(np.quantile(kld_pos, 0.99)),
+            "kld_max": float(kld_pos.max()),
             "top1_agree": float(agree),
+            "delta_p_mean": float(dp.mean()),
+            "delta_p_rms": float(np.sqrt((dp**2).mean())),
             "ppl": float(np.exp(-tgt_logq.mean())),
             "positions": int(kld_pos.shape[0]),
+            "stress": list(PROMPTS[key].stress) if key in PROMPTS else [],
         }
         print(f"[cmp] {key}: kld={per_prompt[key]['kld_mean']:.5f} agree={agree:.3f}")
         del logits, logq_all
         mx.clear_cache()
     klds = [v["kld_mean"] for v in per_prompt.values()]
     agrees = [v["top1_agree"] for v in per_prompt.values()]
+    # 部品別の集計。平均を 1 つに潰すと「n-gram と experts のどちらに
+    # ビットを盛るか」が読めなくなるので、札ごとに分けて持つ
+    by_stress = {}
+    for kind in STRESS_KINDS:
+        ks = [k for k, v in per_prompt.items() if kind in v["stress"]]
+        if not ks:
+            continue
+        by_stress[kind] = {
+            "prompts": len(ks),
+            "kld_mean": float(np.mean([per_prompt[k]["kld_mean"] for k in ks])),
+            "top1_agree": float(np.mean([per_prompt[k]["top1_agree"] for k in ks])),
+            "delta_p_rms": float(np.mean([per_prompt[k]["delta_p_rms"] for k in ks])),
+        }
     result = {
         "kind": "compare",
         "tag": args.tag,
@@ -192,6 +219,7 @@ def cmd_compare(args):
         "kld_mean": float(np.mean(klds)),
         "kld_worst_prompt": max(per_prompt, key=lambda k: per_prompt[k]["kld_mean"]),
         "top1_agree_mean": float(np.mean(agrees)),
+        "by_stress": by_stress,
         "per_prompt": per_prompt,
     }
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
