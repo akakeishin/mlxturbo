@@ -190,6 +190,39 @@ buffer は untracked になり得るので、dispatch 間に
 - `bridge` と `bridge-enc` の差は encoder 生成の値段。ここが大きいなら、
   検証ステップ全体で encoder を 1 本に保つ制約が効いてくる。
 
+### 5.1 実測結果と B1 の判定 (2026-08-27)
+
+bench_chain.py を初めて実行した (M3 Max、静音 load ~1.8、**バッテリー駆動**。
+絶対値は AC で 2-3 割速くなる可能性があるが、経路間の差分構造は不変)。
+生ログは bench/results/bridge-chain-noop.txt / bridge-chain-affine.txt。
+
+| 経路 | noop 傾き | affine 傾き | 切片 (noop) |
+|---|---|---|---|
+| mlx | 2.1 us/dispatch | 12.6 us/dispatch | 192 us/submit |
+| bridge | 1.2 | 11.7 | 174 |
+| bridge-enc | 1.3 | 12.0 | 172 |
+| bridge-cb | 15.0 | 18.7 | 165 |
+
+判定線に対して: bridge 傾きは 5 us を大きく下回り「有効」。bridge-cb は
+15-19 us で棄却線どおり脱落。ただし前提が崩れた:
+
+1. **mlx 経路自身の per-dispatch 限界費が 2.1 us しかない。** H2 の
+   0.064 ms/call は eval 境界込みの数字で、1 つの eval にまとめて流れる
+   dispatch の限界費はその 1/30。MLX の遅延評価が既にラッパ税を償却している。
+2. bridge が買える差分は **0.9 us/dispatch で一定** (noop でも affine でも)。
+   検証 1 ステップ ~1500-2000 dispatch として 1.4-1.8 ms、ステップ時間の
+   **2-3% が完遂時の上限**。切片も ~20 us/submit しか縮まない。
+3. 支配項は **切片 ~170-190 us/submit** (mx.eval 1 回の往復) で、これは
+   bridge でも消えない。ここを削る手段は「検証ステップあたりの eval 回数の
+   削減」であり、spec.py の同期点設計の問題 (親セッション持ち分)。
+
+**B1 判定: 保留 (park)。** §6 の残作業 (MLX 内蔵カーネルの引数レイアウト
+移植、バッファ arena、residency 管理) は保守リスクが高い割に上限 2-3% で、
+経路表較正 (1 op あたり 1.06-1.59x) と比べて優先度が立たない。再開条件:
+(a) ステップあたり dispatch 数が大きく増える設計変更、(b) MLX 側の
+per-dispatch 費の退行、(c) eval 回数削減を突き詰めた後に 2-3% が
+最後の残りになったとき。AC 電源での追認ランを 1 回取ってから正式に畳む。
+
 ## 6. 検証ステップ全体を直接エンコードするために足りないもの
 
 現状の 1 ステップは、64 層（GDN 48 + full attention 16）＋ lm_head ＋ MTP ヘッド。
