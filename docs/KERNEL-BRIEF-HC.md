@@ -97,7 +97,8 @@ return mixed, hyper, inject
 
 ```bash
 # 内訳を測る (部品を積み上げ式に無効化して差分)
-uv run python tools/ablate.py --model ~/models/qwen38fn-mlx-v-ng2
+uv run python tools/ablate.py --model ~/models/qwen38fn-mlx-v-stream \
+    --ngram ~/models/qwen38fn-ngram-4bit
 
 # デコードの内訳と一括 forward のスケーリング
 uv run python tools/decode_profile.py --model <model> \
@@ -117,7 +118,11 @@ uv run python bench/quant_eval.py compare --model <model> \
 
 - `~/models/qwen38fn-mlx-v-stream` + `~/models/qwen38fn-ngram-4bit`
   (現在の最良。98.4GB、KLD 0.00260、19.4 tok/s)
-- `~/models/qwen38fn-mlx-v-ng2` (n-gram を本体に持つ版。98.8GB、15.7 tok/s)
+
+`~/models/qwen38fn-mlx-v-ng2` は **2026-08-27 に削除した** (内蔵の空きが
+64GB しかなく、焼き 1 本ぶんも置けなかった)。速度でも RAM でも v-stream に
+負けていたので、測定は上の 1 本に寄せること。`--ngram` を付け忘れると
+n-gram の重みが無くて読み込みが落ちる。
 
 ## 境界
 

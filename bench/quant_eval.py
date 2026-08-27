@@ -52,7 +52,7 @@ from bench.eval_prompts import PROMPTS, STRESS_KINDS  # noqa: E402
 CALIB_PROMPTS: dict[str, str] = {k: v.text for k, v in PROMPTS.items()}
 
 
-def _load(model_ref: str, ngram: str | None = None):
+def _load(model_ref: str, ngram: str | None = None, rebit_spec: str | None = None):
     if ngram:
         # n-gram をディスクに置いた構成。vendored arch は import 時に旗を読む
         import os
@@ -65,6 +65,10 @@ def _load(model_ref: str, ngram: str | None = None):
         from fastmlx.ngram_stream import install
 
         install(model, ngram)
+    if rebit_spec:
+        from fastmlx import rebit
+
+        rebit.apply(model, rebit_spec)
     return model, tok
 
 
@@ -157,7 +161,8 @@ def cmd_dump(args):
 def cmd_compare(args):
     import mlx.core as mx
 
-    model, _ = _load(args.model, getattr(args, "ngram", None))
+    model, _ = _load(args.model, getattr(args, "ngram", None),
+                     getattr(args, "rebit", None))
     if getattr(args, "disable_ple", False):
         # n-gram/PLE を丸ごと切る。埋め込みがゼロなら PLE の出力もゼロになる
         # ので、層を外すのと等価。「n-gram が無いことの代償」を測るための経路
@@ -345,6 +350,8 @@ def main():
     p.add_argument("--ngram", help="n-gram サイドカーのディレクトリ")
     p.add_argument("--disable-ple", action="store_true",
                    help="n-gram/PLE を切って測る (無しの代償を見る)")
+    p.add_argument("--rebit", help="読み込み後にビットを打ち直す "
+                   "(例 gdn=4,hc=4)。焼かずにビット配分を試すため")
     p.set_defaults(fn=cmd_compare)
 
     p = sub.add_parser("speed")

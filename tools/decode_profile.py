@@ -81,6 +81,9 @@ def main():
                     help="disk=memmap から引く / ram=連結テーブルを常駐")
     ap.add_argument("--ngram", default=None)
     ap.add_argument("--tokens", type=int, default=40)
+    ap.add_argument("--rebit", default=None,
+                    help="読み込み後にビットを打ち直す (例 gdn=4)。"
+                         "焼かずに帯域を削ったときの速度を見る")
     args = ap.parse_args()
 
     if args.ngram:
@@ -93,6 +96,10 @@ def main():
         from fastmlx.ngram_stream import install, install_ram
 
         (install_ram if args.ngram_mode == "ram" else install)(model, args.ngram)
+    if args.rebit:
+        from fastmlx import rebit
+
+        rebit.apply(model, args.rebit)
 
     ids = tok.apply_chat_template(
         [{"role": "user", "content": "分散システムについて詳しく説明してください。"}],

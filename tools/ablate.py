@@ -41,7 +41,16 @@ def measure(model, ids, n=25) -> float:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
+    ap.add_argument("--ngram", default=None,
+                    help="n-gram サイドカー。ngram_disk で焼いたモデルには必須")
+    ap.add_argument("--rebit", default=None,
+                    help="読み込み後にビットを打ち直す (例 gdn=4)")
     args = ap.parse_args()
+
+    import os
+
+    if args.ngram:
+        os.environ["FASTMLX_NGRAM_DISK"] = "1"
 
     import mlx.core as mx
     from mlx_lm import load
@@ -49,6 +58,14 @@ def main():
     import mlx_lm.models.qwen4_exp as Q
 
     model, tok = load(args.model)
+    if args.ngram:
+        from fastmlx.ngram_stream import install
+
+        install(model, args.ngram)
+    if args.rebit:
+        from fastmlx import rebit
+
+        rebit.apply(model, args.rebit)
     ids = tok.apply_chat_template(
         [{"role": "user", "content": "分散システムについて説明してください。"}],
         add_generation_prompt=True,
