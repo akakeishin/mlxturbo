@@ -102,6 +102,20 @@ RECIPES: dict[str, dict] = {
         "router": False,
         "default": {"bits": 8, "group_size": 64},
     },
+    # v-stream から GDN 投影だけ 4bit に落とす。GDN 投影は 1 トークンあたりの
+    # 読み出しの 34.3% を占める最大手で (tools/byte_budget.py)、限界コストは
+    # 帯域そのものなので削った分がそのまま時間になる。rebit での事前判定は
+    # -3.27 ms/token (19.55 -> 20.88 tok/s)。品質は KLD で確認してから焼く
+    "v-fast": {
+        "experts": {"bits": 4, "group_size": 64},
+        "experts_hi": {"bits": 6, "group_size": 64},
+        "experts_hi_layers": _spread(40),
+        "ngram": False,
+        "ngram_disk": True,
+        "router": False,
+        "gdn": {"bits": 4, "group_size": 64},
+        "default": {"bits": 8, "group_size": 64},
+    },
     # 96GB Mac 向け (~71GB)。n-gram をディスクに追い出せる前提で、
     # experts 4bit を維持したまま default を 8 -> 4bit に落として収める
     "v-96": {
@@ -173,18 +187,29 @@ def _layer_index(path: str) -> int | None:
 
 
 def resolve_rule(recipe: dict, path: str):
-    """パス → そのテンソル/モジュールに適用する量子化規則。"""
+    """パス → そのテンソル/モジュールに適用する量子化規則。
+
+    細かいクラス (gdn/attn/head/hc) はレシピに書かれていなければ default に
+    落ちる。既存レシピの挙動は変わらない。
+    """
 
     c = classify(path)
     if c == "experts":
         hi_layers = recipe.get("experts_hi_layers")
         if hi_layers is not None and _layer_index(path) in hi_layers:
             return recipe["experts_hi"]
-    return recipe[c]
+    if c in recipe:
+        return recipe[c]
+    return recipe["default"]
 
 
 def classify(path: str) -> str:
-    """モジュールパス/テンソル名 → レシピクラス。"""
+    """モジュールパス/テンソル名 → レシピクラス。
+
+    分類は tools/byte_budget.py と揃えてある。1 トークンあたりの読み出しは
+    GDN 投影 34.3% / experts 28.1% / hyper-connections 10.5% / lm_head 10.5% で、
+    experts 以外は全部 default (8bit) に入っていた。
+    """
 
     if "ngram" in path:
         return "ngram"
@@ -192,6 +217,16 @@ def classify(path: str) -> str:
         return "router"
     if "switch_mlp" in path or ".experts." in path:
         return "experts"
+    if "shared_expert" in path:
+        return "shared"
+    if "linear_attn" in path:
+        return "gdn"
+    if "self_attn" in path:
+        return "attn"
+    if "hyper_connection" in path:
+        return "hc"
+    if "lm_head" in path:
+        return "head"
     return "default"
 
 
