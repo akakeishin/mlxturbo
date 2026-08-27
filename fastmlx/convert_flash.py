@@ -102,10 +102,21 @@ RECIPES: dict[str, dict] = {
         "router": False,
         "default": {"bits": 8, "group_size": 64},
     },
-    # v-stream の default クラス (GDN 投影/attention/lm_head/hyper-connections/
-    # 共有エキスパート) をまとめて 6bit に落とす。読み出しは 6.462 -> 5.346
-    # GB/token になり、帯域だけの下限が 60 -> 72 tok/s へ動く。
-    # 8bit を選んだ根拠は当時無く、experts 以外を一括で default に入れていただけ
+    # v-stream から、読み出しの多いクラスだけ 6bit に落とす。default に 8bit を
+    # 選んだ根拠は当時無く、experts 以外を一括で入れていただけだった。
+    #
+    # ビットは rebit の積み上げ掃引 (bench/results/quant-eval/sweep-vstream-6bit.json)
+    # で 1 つずつ代償を測って決めた。KLD 増は base 0.00260 から:
+    #   gdn 8->6     +0.00063   読み出し -0.554 GB  <- 一番おいしい
+    #   head 8->6    +0.00041   読み出し -0.169 GB
+    #   attn 8->6    +0.00082   読み出し -0.159 GB
+    #   shared 8->6  -0.00015   読み出し -0.063 GB  (誤差。感度が無い)
+    #   hc 8->4      +0.01337   <- 高すぎるので採らない。8bit のまま
+    #
+    # hyper-connections は融合カーネルが 4/8 しか受けないので 6bit を選べない。
+    # 4bit は KLD を 1 段で 3 倍にするので、8bit に据え置く。
+    # default (norm/embed_tokens/PLE/indexer) は 1 トークンあたりほぼ読まないので
+    # 落としても速度に効かない。掃引していない変更を混ぜない意味でも 8bit に残す
     "v-fast6": {
         "experts": {"bits": 4, "group_size": 64},
         "experts_hi": {"bits": 6, "group_size": 64},
@@ -113,10 +124,12 @@ RECIPES: dict[str, dict] = {
         "ngram": False,
         "ngram_disk": True,
         "router": False,
-        # hyper-connections だけ 6bit にできない。融合カーネルが 4/8 しか
-        # 受けず、6bit だと黙って素の実装に落ちて 16ms が戻る
+        "gdn": {"bits": 6, "group_size": 64},
+        "head": {"bits": 6, "group_size": 64},
+        "attn": {"bits": 6, "group_size": 64},
+        "shared": {"bits": 6, "group_size": 64},
         "hc": {"bits": 8, "group_size": 64},
-        "default": {"bits": 6, "group_size": 64},
+        "default": {"bits": 8, "group_size": 64},
     },
     # v-stream から GDN 投影だけ 4bit に落とす。GDN 投影は 1 トークンあたりの
     # 読み出しの 34.3% を占める最大手で (tools/byte_budget.py)、限界コストは
