@@ -52,10 +52,20 @@ from bench.eval_prompts import PROMPTS, STRESS_KINDS  # noqa: E402
 CALIB_PROMPTS: dict[str, str] = {k: v.text for k, v in PROMPTS.items()}
 
 
-def _load(model_ref: str):
+def _load(model_ref: str, ngram: str | None = None):
+    if ngram:
+        # n-gram をディスクに置いた構成。vendored arch は import 時に旗を読む
+        import os
+
+        os.environ["FASTMLX_NGRAM_DISK"] = "1"
     from mlx_lm import load
 
-    return load(model_ref)
+    model, tok = load(model_ref)
+    if ngram:
+        from fastmlx.ngram_stream import install
+
+        install(model, ngram)
+    return model, tok
 
 
 def _prompt_ids(tokenizer, text: str) -> list[int]:
@@ -147,7 +157,16 @@ def cmd_dump(args):
 def cmd_compare(args):
     import mlx.core as mx
 
-    model, _ = _load(args.model)
+    model, _ = _load(args.model, getattr(args, "ngram", None))
+    if getattr(args, "disable_ple", False):
+        # n-gram/PLE を丸ごと切る。埋め込みがゼロなら PLE の出力もゼロになる
+        # ので、層を外すのと等価。「n-gram が無いことの代償」を測るための経路
+        n = 0
+        for layer in model.model.layers:
+            if getattr(layer, "ple", None) is not None:
+                layer.ple = None
+                n += 1
+        print(f"PLE を無効化した ({n} 層)")
     cont = json.loads(Path(args.continuations).read_text())
     ref = np.load(args.ref_dump)
     per_prompt = {}
@@ -323,6 +342,9 @@ def main():
     p.add_argument("--continuations", required=True)
     p.add_argument("--ref-dump", required=True)
     p.add_argument("--tag", required=True)
+    p.add_argument("--ngram", help="n-gram サイドカーのディレクトリ")
+    p.add_argument("--disable-ple", action="store_true",
+                   help="n-gram/PLE を切って測る (無しの代償を見る)")
     p.set_defaults(fn=cmd_compare)
 
     p = sub.add_parser("speed")

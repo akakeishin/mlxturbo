@@ -5,6 +5,8 @@
 #   2. model.language_model.* -> model.* に畳む (公開 ckpt は VLM 形状)
 #   3. mlp.experts.{gate_up,down}_proj -> switch_mlp.* へ分解・改名
 #   4. NGramEmbedding: ハッシュ乗数を再計算値でなく ckpt の実値から使う
+#   5. RMSNorm を (1 + weight) 規約に直す (参照実装と同じ Gemma 系)
+#   6. FASTMLX_NGRAM_DISK=1 で n-gram 表を持たない (ディスクから行を引く)
 # (mlx-lm 本体は MTP モジュールを持たないため strict load が失敗する。
 #  MTP は fastmlx/convert_flash.py extract-mtp でサイドカーへ抽出して使う)。
 # インストール: fastmlx/convert_flash.py install-arch が
@@ -16,6 +18,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -27,6 +30,10 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 from .cache import ArraysCache, KVCache, _BaseCache
 from .gated_delta import gated_delta_update
 from .switch_layers import SwitchGLU
+
+# fastmlx: n-gram 表 (51.2B params) を RAM に持たず、行だけディスクから引く
+# 運用に切り替える。変換時と読込時の両方でこの旗を立てる必要がある。
+NGRAM_ON_DISK = os.environ.get("FASTMLX_NGRAM_DISK") == "1"
 
 
 @dataclass
@@ -603,10 +610,19 @@ class _ShardedEmbedding(nn.Module):
         self.n_shards = n_shards
         self.rows = rows
         self.dim = dim
+        if NGRAM_ON_DISK:
+            # fastmlx: 表を持たない。実体は fastmlx.ngram_stream.install が
+            # サイドカー参照に差し替える。ここで確保すると 102GB 取られる
+            return
         for i in range(n_shards):
             setattr(self, f"shard_{i}", nn.Embedding(rows, dim))
 
     def __call__(self, gid: mx.array) -> mx.array:
+        if NGRAM_ON_DISK:
+            raise RuntimeError(
+                "n-gram がディスク運用のまま差し替えられていない。"
+                "fastmlx.ngram_stream.install(model, <サイドカー>) を呼ぶこと"
+            )
         flat = gid.reshape(-1)
         shard_of = flat // self.rows
         row_of = flat % self.rows
@@ -832,6 +848,9 @@ class Model(nn.Module):
                 k = k[len("language_model.") :]
             if k.startswith("vision_tower.") or k.startswith("model.visual."):
                 continue  # text-only pour l'instant
+            if NGRAM_ON_DISK and "ngram_embedding.shard_" in k:
+                # fastmlx: ディスク運用ではモデル本体に持たせない
+                continue
             if k.startswith("mtp."):
                 # fastmlx: MTP はサイドカーへ抽出して別ロードする (ヘッダ参照)
                 continue

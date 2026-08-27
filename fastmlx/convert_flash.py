@@ -10,6 +10,7 @@ Phase Q (docs/STATUS.md)。bf16 アーカイブ (外付け SSD) から、128GB M
   extract-mtp   mtp.* テンソルをサイドカー safetensors へ抽出 (bf16 のまま。
                 量子化はエンジン読込時の --mtp-bits に任せる、27B と同じ規約)
   convert       mlx_lm.convert + クラス別 quant_predicate で本体を変換
+  build-ngram   n-gram 表を量子化してサイドカーへ出す (ディスク運用向け)
 
 使い方 (例):
   uv run python -m fastmlx.convert_flash install-arch
@@ -85,6 +86,19 @@ RECIPES: dict[str, dict] = {
         "experts_hi": {"bits": 6, "group_size": 64},
         "experts_hi_layers": _FIRST5_LAST5,
         "ngram": {"bits": 3, "group_size": 32},
+        "router": False,
+        "default": {"bits": 8, "group_size": 64},
+    },
+    # n-gram を RAM から追い出す構成 (~98GB)。表はサイドカーに置き、
+    # 浮いた 19.2GB をすべて experts に回して 6bit の層を 10 -> 40 に増やす。
+    # 使うには build-ngram でサイドカーを作り、読込後に
+    # fastmlx.ngram_stream.install(model, <サイドカー>) を呼ぶ
+    "v-stream": {
+        "experts": {"bits": 4, "group_size": 64},
+        "experts_hi": {"bits": 6, "group_size": 64},
+        "experts_hi_layers": _spread(40),
+        "ngram": False,
+        "ngram_disk": True,
         "router": False,
         "default": {"bits": 8, "group_size": 64},
     },
@@ -201,6 +215,8 @@ def cmd_estimate(args):
         for d in shape:
             n *= d
         c = classify(name)
+        if c == "ngram" and recipe.get("ngram_disk"):
+            continue  # サイドカーへ出すので本体には入らない
         rule = resolve_rule(recipe, name)
         if rule is False or len(shape) < 2 or shape[-1] % rule["group_size"]:
             # 非量子化のまま残るもの: router / norm / 1 次元テンソル に加えて、
@@ -254,6 +270,13 @@ def cmd_extract_mtp(args):
 
 
 def cmd_convert(args):
+    import os
+
+    if RECIPES[args.recipe].get("ngram_disk"):
+        # vendored arch は import 時にこの旗を読む。mlx_lm を触る前に立てる
+        os.environ["FASTMLX_NGRAM_DISK"] = "1"
+        print("n-gram はディスク運用: 本体には入れない")
+
     import mlx.core as mx
     from mlx_lm.convert import convert
 
@@ -264,7 +287,10 @@ def cmd_convert(args):
         # シャード 2 の保存で再現)。CPU には同じ監視が無い
         mx.set_default_device(mx.cpu)
 
-    cmd_install_arch(argparse.Namespace(force=False))
+    # vendor 側を編集したまま古いコピーが site-packages に残ると、旗も
+    # 修正も効かないまま焼き上がる (n-gram が落ちず 169GB まで膨らんだ)。
+    # vendor が正本なので毎回上書きする
+    cmd_install_arch(argparse.Namespace(force=True))
     convert(
         hf_path=args.src,
         mlx_path=args.out,
@@ -285,6 +311,12 @@ def cmd_convert(args):
     print(f"converted -> {args.out}")
 
 
+def cmd_build_ngram(args):
+    from .ngram_stream import build_sidecar
+
+    build_sidecar(Path(args.src), Path(args.out), bits=args.bits, group_size=32)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -302,6 +334,12 @@ def main():
     p.add_argument("--src", required=True)
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_extract_mtp)
+
+    p = sub.add_parser("build-ngram")
+    p.add_argument("--src", required=True, help="bf16 アーカイブ")
+    p.add_argument("--out", required=True, help="サイドカーの出力先")
+    p.add_argument("--bits", type=int, default=4, choices=(2, 3, 4, 5, 6, 8))
+    p.set_defaults(fn=cmd_build_ngram)
 
     p = sub.add_parser("convert")
     p.add_argument("--recipe", choices=sorted(RECIPES), required=True)
