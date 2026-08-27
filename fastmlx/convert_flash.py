@@ -164,6 +164,9 @@ RECIPES: dict[str, dict] = {
     # 64GB Mac 向け (~48GB)。experts を半分 3bit / 半分 2bit にする。
     # experts は誤差源として突出しているので品質の劣化は大きい。動くことを
     # 優先した構成で、品質の数字を添えて出す
+    # experts を削るのが主眼なので、experts 以外で安く効くところは戻す。
+    # hc 8bit と gdn 6bit で +0.9GB (48GB に対して 2%)。掃引の代償を見ると
+    # ここを 4bit にするのは、容量を得るには高すぎる買い物になる
     "v-64": {
         "experts": {"bits": 2, "group_size": 64},
         "experts_hi": {"bits": 3, "group_size": 64},
@@ -171,6 +174,8 @@ RECIPES: dict[str, dict] = {
         "ngram": False,
         "ngram_disk": True,
         "router": False,
+        "hc": {"bits": 8, "group_size": 64},
+        "gdn": {"bits": 6, "group_size": 64},
         "default": {"bits": 4, "group_size": 64},
     },
     # n-gram 2bit の検証用 (~99GB)。experts は v-exp6 と同一にして n-gram の
