@@ -457,3 +457,22 @@ n-gram 欠落品のみで、128GB Mac 向け決定版は空席。
   v0-95 = experts 4bit + ngram 3bit + 制御系 8bit = 95.7GB (実台帳から算出)
   v0-105 = ngram 4bit = 102.1GB。感度スキャンで配分を更新する
 - ライセンス qwen-community-1.0 の再配布条件は公開前に精読すること
+
+## Phase Q の順序確定 + GLM-5.3-Flash 偵察 (2026-08-27)
+
+順序 (ユーザー確定): Flash-Next を完走 (残り DL 139GB → v0-95 焼き → 起動 →
+AR 実測 → 等バイト A/B → v-max) してから、Qwen 系アーカイブを全消しして
+GLM-5.3-Flash に移る。空きが増えれば GLM は bf16 取得も視野 (当面 DL 禁止)。
+
+GLM-5.3-Flash (zai-org、MIT) の偵察結果:
+- glm5_next / 320B 総 / 18B 活性 / 45 層 / 288 experts / linear_attention +
+  deepseek_sparse_attention ハイブリッド + mHC。MTP 内蔵
+  (num_nextn_predict_layers=1、DeepSeek 流 NextN)
+- 配布は FP8 ネイティブ 328GB (F8_E4M3 314GB + bf16 14GB)。vision 同梱
+  (テキスト用途では落とす)
+- 128GB に入れるには実効 ~2.5bit 動的量子化 (~100-105GB) が唯一の道。
+  活性 18B なので載れば AR ~50-60 t/s + 純正 MTP
+- mlx-lm に glm5_next 実装なし (glm_moe_dsa は GLM-5.2 系 DSA のみ)。
+  モデル実装の自前ポートが必要 = qwen4_exp より一段重い
+- ダウンロード時の注意: Mobile SSD は Qwen 完走後の空き ~284GB に対し
+  GLM FP8 328GB で ~50GB 不足。Qwen アーカイブ削除後なら bf16 も視野
