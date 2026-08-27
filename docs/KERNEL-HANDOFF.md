@@ -18,7 +18,19 @@ AC 復帰後の確定 (2026-08-27 昼):
   → draft 側の実レバーは「捨てリンクを作らない」(項目 5 の逐次ゲート化、
   1 本スキップ = 2.15ms+) に一本化される。
 - B1 (tools/bridge) は AC 追認済みで正式クローズ (BRIDGE-NOTES §5.1)。
-- compare_engines 公式レップ (official2 rep1) を AC で実行中。
+- compare_engines official2 rep1 は**無効** (bench/results/
+  compare-official2-rep1-invalid-thermal.json に改名して保存)。2 つの障害:
+  (1) **充電中 (83%→) + GPU 持続負荷の熱ソーク**でマシン全体が単調劣化し、
+  fastmlx どころか無改変の mlx-lm 素まで 21→4 tok/s に崩壊した。ベンチ前の
+  スポット計測は 3 巡安定でも、開始 ~10 分から進行する。pmset にサーマル
+  警告は出ない。終了後 GPU は完全回復 (lm_head 2.05ms @348GB/s) を確認済み。
+  **教訓: 公式レップは満充電付近・冷えた筐体で開始する。** 中間で mlx-lm の
+  同一コマンドの数値が同水準かをラン間検証に使える (今回 same-quant 3 本目
+  で既に 17.7 に落ちていた)。
+  (2) mtplx が全ラン rc=6 即死 — ~/.mtplx/models が消えていて
+  「model is not available locally」。旧 rep1 にも同じ rc=6 があった
+  (旧 mtplx 値は rep2/3 由来)。2 モデルを mtplx pull で再取得中。
+  冷却・満充電後に rep1 を取り直す。
 
 ### 親側で判断・作業が要るもの
 
