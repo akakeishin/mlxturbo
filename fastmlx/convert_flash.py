@@ -46,22 +46,72 @@ VENDOR_ARCH = REPO_ROOT / "tools" / "vendor" / "qwen4_exp.py"
 #   qsa:      model.layers.N.self_attn.* (indexer 含む)
 #   embed:    model.embed_tokens / lm_head
 
-RECIPES: dict[str, dict[str, dict | bool]] = {
-    # 常用 (~95GB): 既定 GPU wired limit に KV 込みで収まる
+# 層別上書き: "experts_hi_layers" に載る層の experts は "experts_hi" の
+# ビットで焼く (入口/出口が感度高いという folklore 起点。感度スキャンの
+# 層別 KLD で入れ替える)。48 層 (0..47)。
+_FIRST5_LAST5 = list(range(5)) + list(range(43, 48))
+_FIRST8_LAST8 = list(range(8)) + list(range(40, 48))
+
+RECIPES: dict[str, dict] = {
+    # 常用 (~96GB): 既定 GPU wired limit に KV 込みで収まる
     "v0-95": {
         "experts": {"bits": 4, "group_size": 64},
         "ngram": {"bits": 3, "group_size": 64},
         "router": False,
         "default": {"bits": 8, "group_size": 64},
     },
-    # 全部盛り (~103GB): n-gram も 4bit。iogpu.wired_limit_mb 引き上げ運用向け
+    # n-gram へ +6.4GB (~102GB)。v-exp6 との等バイト A/B の片割れ
     "v0-105": {
         "experts": {"bits": 4, "group_size": 64},
         "ngram": {"bits": 4, "group_size": 64},
         "router": False,
         "default": {"bits": 8, "group_size": 64},
     },
+    # 同じ +6.3GB を experts 10 層の 6bit に使う (~102GB)。v0-105 と KLD を
+    # 等予算で比較し「n-gram と experts のどちらにビットを盛るか」を決める
+    "v-exp6": {
+        "experts": {"bits": 4, "group_size": 64},
+        "experts_hi": {"bits": 6, "group_size": 64},
+        "experts_hi_layers": _FIRST5_LAST5,
+        "ngram": {"bits": 3, "group_size": 64},
+        "router": False,
+        "default": {"bits": 8, "group_size": 64},
+    },
+    # ギリギリ構成 (~112GB): n-gram 4bit + experts 16 層 6bit。
+    # iogpu.wired_limit_mb 引き上げ + 専用機運用前提。115GB 帯は OS が
+    # 苦しくなるのでこれを上限とする
+    "v-max-112": {
+        "experts": {"bits": 4, "group_size": 64},
+        "experts_hi": {"bits": 6, "group_size": 64},
+        "experts_hi_layers": _FIRST8_LAST8,
+        "ngram": {"bits": 4, "group_size": 64},
+        "router": False,
+        "default": {"bits": 8, "group_size": 64},
+    },
 }
+
+_LAYER_RE = None
+
+
+def _layer_index(path: str) -> int | None:
+    global _LAYER_RE
+    if _LAYER_RE is None:
+        import re
+
+        _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+    m = _LAYER_RE.search(path)
+    return int(m.group(1)) if m else None
+
+
+def resolve_rule(recipe: dict, path: str):
+    """パス → そのテンソル/モジュールに適用する量子化規則。"""
+
+    c = classify(path)
+    if c == "experts":
+        hi_layers = recipe.get("experts_hi_layers")
+        if hi_layers is not None and _layer_index(path) in hi_layers:
+            return recipe["experts_hi"]
+    return recipe[c]
 
 
 def classify(path: str) -> str:
@@ -81,7 +131,7 @@ def build_predicate(recipe_name: str):
 
     def predicate(path, module, *_config):
         del module
-        return recipe[classify(path)]
+        return resolve_rule(recipe, path)
 
     return predicate
 
@@ -117,7 +167,7 @@ def cmd_estimate(args):
         for d in shape:
             n *= d
         c = classify(name)
-        rule = recipe[c]
+        rule = resolve_rule(recipe, name)
         if rule is False or len(shape) < 2:
             # 非量子化 (router / norm / 1 次元テンソル) は bf16 のまま
             b = n * _DTYPE_BYTES.get(dtype, 2)
