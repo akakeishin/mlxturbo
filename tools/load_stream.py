@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 
-def load_streamed(model_path: str, ngram_dir: str | None):
+def load_streamed(model_path: str, ngram_dir: str | None, mode: str = "disk"):
     """n-gram をサイドカー参照にしたモデルとトークナイザを返す。"""
 
     # vendored arch は import 時にこの旗を読む。mlx_lm を触る前に立てる
@@ -34,15 +34,17 @@ def load_streamed(model_path: str, ngram_dir: str | None):
 
     model, tok = load(model_path)
     if ngram_dir:
-        from fastmlx.ngram_stream import install
+        from fastmlx.ngram_stream import install, install_ram
 
-        install(model, ngram_dir)
+        (install_ram if mode == "ram" else install)(model, ngram_dir)
     return model, tok
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
+    ap.add_argument("--ngram-mode", default="disk", choices=("disk","ram"),
+                    help="disk=memmap から引く / ram=連結テーブルを常駐")
     ap.add_argument("--ngram", default=None, help="省略すると素の読み込み (比較用)")
     ap.add_argument("--prompt", default="日本の首都はどこですか。一文で答えてください。")
     ap.add_argument("--max-tokens", type=int, default=60)
@@ -51,7 +53,7 @@ def main():
     import mlx.core as mx
 
     t0 = time.time()
-    model, tok = load_streamed(args.model, args.ngram)
+    model, tok = load_streamed(args.model, args.ngram, args.ngram_mode)
     print(f"読み込み {time.time() - t0:.0f}s  peak={mx.get_peak_memory() / 1e9:.1f}GB")
 
     ids = tok.apply_chat_template(

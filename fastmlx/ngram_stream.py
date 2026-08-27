@@ -60,10 +60,17 @@ def _iter_shard_tensors(src: Path):
         yield i, found[i]
 
 
-def build_sidecar(src: Path, out: Path, bits: int = 4, group_size: int = 32) -> dict:
+def build_sidecar(
+    src: Path, out: Path, bits: int = 4, group_size: int = 32, layout: str = "interleaved"
+) -> dict:
     """bf16 アーカイブから量子化済みサイドカーを作る。
 
     行ブロック単位で読み書きするのでメモリは数百 MB しか使わない。
+
+    layout="interleaved" は 1 行を 1 レコードに連続配置する。ディスクに置いた
+    まま引く用で、触るページが 1 行あたり 1 枚で済む。
+    layout="separate" は weight/scales/biases を別ファイルにする。RAM に載せて
+    `mx.take` で引く用で、こちらは 3 本の配列がそのまま要る。
     """
 
     import mlx.core as mx
@@ -84,7 +91,13 @@ def build_sidecar(src: Path, out: Path, bits: int = 4, group_size: int = 32) -> 
     print(f"{len(shards)} シャード / {total_rows:,} 行 x {dim} 次元 -> {bits}bit")
     wb, sb = n_packed * 4, n_groups * 2
     rec_bytes = wb + sb * 2
-    frows = open(out / "rows.bin", "wb")
+    sep = layout == "separate"
+    if sep:
+        fw = open(out / "weight.bin", "wb")
+        fs = open(out / "scales.bin", "wb")
+        fb = open(out / "biases.bin", "wb")
+    else:
+        frows = open(out / "rows.bin", "wb")
     BLOCK = 1 << 16
     for i, (path, a, b, shape) in shards:
         rows, _ = shape
@@ -95,6 +108,11 @@ def build_sidecar(src: Path, out: Path, bits: int = 4, group_size: int = 32) -> 
             q, sc, bi = mx.quantize(w, group_size=group_size, bits=bits)
             mx.eval(q, sc, bi)
             n = q.shape[0]
+            if sep:
+                fw.write(np.array(q, copy=False).tobytes())
+                fs.write(np.array(sc.view(mx.uint16), copy=False).tobytes())
+                fb.write(np.array(bi.view(mx.uint16), copy=False).tobytes())
+                continue
             buf = np.empty((n, rec_bytes), dtype=np.uint8)
             buf[:, :wb] = np.array(q, copy=False).view(np.uint8).reshape(n, wb)
             buf[:, wb : wb + sb] = (
@@ -107,7 +125,10 @@ def build_sidecar(src: Path, out: Path, bits: int = 4, group_size: int = 32) -> 
         del mm
         if (i + 1) % 16 == 0:
             print(f"  shard {i + 1}/{len(shards)}", flush=True)
-    frows.close()
+    if sep:
+        fw.close(), fs.close(), fb.close()
+    else:
+        frows.close()
 
     manifest = {
         "rows": total_rows,
@@ -118,13 +139,16 @@ def build_sidecar(src: Path, out: Path, bits: int = 4, group_size: int = 32) -> 
         "group_size": group_size,
         "packed_per_row": n_packed,
         "groups_per_row": n_groups,
-        "layout": "interleaved",
+        "layout": layout,
         "record_bytes": rec_bytes,
         "weight_bytes": wb,
         "scale_bytes": sb,
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
-    size = (out / "rows.bin").stat().st_size
+    size = sum(
+        (out / f).stat().st_size
+        for f in (("weight.bin", "scales.bin", "biases.bin") if sep else ("rows.bin",))
+    )
     print(f"wrote {out}  {size / 1e9:.1f} GB")
     return manifest
 
@@ -201,4 +225,79 @@ def install(model, sidecar: str | Path) -> None:
     print(f"n-gram をサイドカー参照に差し替えた ({n} 層, {stream.bits}bit, RAM 0)")
 
 
-__all__ = ["StreamNGram", "build_sidecar", "install"]
+__all__ = ["RamNGram", "StreamNGram", "build_sidecar", "install", "install_ram"]
+
+
+class RamNGram:
+    """連結済みの n-gram 表を RAM に持ち、`mx.take` 一発で引く。
+
+    素の `_ShardedEmbedding` は 128 枚を別々に持つため、引くたびに
+    `np.unique` でホストへ降りて (= 毎トークン GPU 同期)、触れたシャードごとに
+    numpy と MLX を往復する。実測で 1 トークン 11-30ms を食っていた
+    (デコード全体の 38.5%、docs/STATUS.md)。
+
+    128 枚は論理的に行ブロックを並べたものなので、連結してしまえば
+    シャード計算も分岐も要らない。gather 3 回 + dequantize の 4 op で済み、
+    同期も Python ループも消える。メモリ量は連結前と同じ。
+    """
+
+    def __init__(self, sidecar: Path):
+        import mlx.core as mx
+
+        self.dir = Path(sidecar)
+        m = json.loads((self.dir / "manifest.json").read_text())
+        if m.get("layout") != "separate":
+            raise ValueError(
+                f"RAM 常駐には layout=separate のサイドカーが要る "
+                f"(このサイドカーは {m.get('layout')})"
+            )
+        self.dim, self.bits = m["dim"], m["bits"]
+        self.group_size = m["group_size"]
+        rows, npack, ngrp = m["rows"], m["packed_per_row"], m["groups_per_row"]
+
+        def load(name, dtype, cols):
+            a = np.fromfile(self.dir / name, dtype=dtype).reshape(rows, cols)
+            return mx.array(a)
+
+        self.w = load("weight.bin", np.uint32, npack)
+        self.s = load("scales.bin", np.uint16, ngrp).view(mx.bfloat16)
+        self.b = load("biases.bin", np.uint16, ngrp).view(mx.bfloat16)
+        mx.eval(self.w, self.s, self.b)
+
+    @property
+    def nbytes(self) -> int:
+        return self.w.nbytes + self.s.nbytes + self.b.nbytes
+
+    def __call__(self, gid):
+        import mlx.core as mx
+
+        flat = gid.reshape(-1)
+        out = mx.dequantize(
+            mx.take(self.w, flat, axis=0),
+            mx.take(self.s, flat, axis=0),
+            mx.take(self.b, flat, axis=0),
+            group_size=self.group_size,
+            bits=self.bits,
+        )
+        return out.reshape(*gid.shape, self.dim)
+
+
+def install_ram(model, sidecar: str | Path) -> None:
+    """n-gram 表を RAM 常駐の連結テーブルに差し替える (速度重視の経路)。"""
+
+    table = RamNGram(Path(sidecar))
+    n = 0
+    for layer in model.model.layers:
+        ple = getattr(layer, "ple", None)
+        if ple is None:
+            continue
+        if ple.ple_embedding.ngram_embedding.dim != table.dim:
+            raise ValueError("次元が合わない")
+        ple.ple_embedding.ngram_embedding = table
+        n += 1
+    if n == 0:
+        raise ValueError("PLE 層が見つからない")
+    print(
+        f"n-gram を連結テーブルに差し替えた "
+        f"({n} 層, {table.bits}bit, RAM {table.nbytes / 1e9:.1f}GB, gather 1 回)"
+    )

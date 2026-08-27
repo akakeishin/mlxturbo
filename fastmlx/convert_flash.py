@@ -314,7 +314,10 @@ def cmd_convert(args):
 def cmd_build_ngram(args):
     from .ngram_stream import build_sidecar
 
-    build_sidecar(Path(args.src), Path(args.out), bits=args.bits, group_size=32)
+    build_sidecar(
+        Path(args.src), Path(args.out), bits=args.bits, group_size=32,
+        layout=args.layout,
+    )
 
 
 def main():
@@ -339,6 +342,10 @@ def main():
     p.add_argument("--src", required=True, help="bf16 アーカイブ")
     p.add_argument("--out", required=True, help="サイドカーの出力先")
     p.add_argument("--bits", type=int, default=4, choices=(2, 3, 4, 5, 6, 8))
+    p.add_argument(
+        "--layout", default="interleaved", choices=("interleaved", "separate"),
+        help="interleaved=ディスク常駐向け / separate=RAM 常駐向け",
+    )
     p.set_defaults(fn=cmd_build_ngram)
 
     p = sub.add_parser("convert")

@@ -77,6 +77,8 @@ def bench_batch(model, ids, sizes=(1, 2, 4, 8, 16)):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
+    ap.add_argument("--ngram-mode", default="disk", choices=("disk","ram"),
+                    help="disk=memmap から引く / ram=連結テーブルを常駐")
     ap.add_argument("--ngram", default=None)
     ap.add_argument("--tokens", type=int, default=40)
     args = ap.parse_args()
@@ -88,9 +90,9 @@ def main():
 
     model, tok = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from fastmlx.ngram_stream import install, install_ram
 
-        install(model, args.ngram)
+        (install_ram if args.ngram_mode == "ram" else install)(model, args.ngram)
 
     ids = tok.apply_chat_template(
         [{"role": "user", "content": "分散システムについて詳しく説明してください。"}],
