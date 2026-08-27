@@ -265,6 +265,11 @@ def cmd_sweep(args):
 
     model, tok = _load(args.model, getattr(args, "ngram", None))
     cont = json.loads(Path(args.continuations).read_text())
+    if args.prompts:
+        keep = set(args.prompts.split(","))
+        cont = {**cont, "prompts": {k: v for k, v in cont["prompts"].items()
+                                    if k in keep}}
+        print(f"プロンプトを {len(cont['prompts'])} 本に絞った")
     ref = np.load(args.ref_dump)
     ids = _prompt_ids(tok, "分散システムについて詳しく説明してください。")
 
@@ -287,8 +292,26 @@ def cmd_sweep(args):
 
     from fastmlx import rebit
 
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out = RESULTS_DIR / f"sweep-{args.tag}.json"
+
     rows = []
     applied: list[str] = []
+
+    def save():
+        # 段ごとに書く。98GB のモデルを 2 セッションが同時に読むとメモリ圧で
+        # 落ちるので、最後にまとめて書くと 30 分ぶんが丸ごと消える (3 回やった)
+        out.write_text(json.dumps({
+            "kind": "rebit-sweep",
+            "tag": args.tag,
+            "model": args.model,
+            "ref_dump": str(args.ref_dump),
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "note": "rebit は二重量子化なので、実際に焼いた場合より悪く出る",
+            "complete": len(rows) == len(args.steps) + 1,
+            "rows": rows,
+        }, indent=1))
+
     for label in ["(そのまま)"] + list(args.steps):
         if label != "(そのまま)":
             rebit.apply(model, label)
@@ -306,6 +329,7 @@ def cmd_sweep(args):
         print(f"  {label:14s} {ms:6.2f} ms/token ({1000 / ms:5.2f} tok/s)  "
               f"KLD {s['kld_mean']:.5f}  top1 {s['top1_agree_mean']:.4f}  "
               f"最悪 {s['kld_worst_prompt']}", flush=True)
+        save()
 
     base = rows[0]
     print("\n  段ごとの差分 (直前の段からの増分)")
@@ -318,17 +342,7 @@ def cmd_sweep(args):
     print(f"\n  合計 {base['ms_per_token'] - rows[-1]['ms_per_token']:+.2f} ms/token, "
           f"KLD {base['kld_mean']:.5f} -> {rows[-1]['kld_mean']:.5f}")
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out = RESULTS_DIR / f"sweep-{args.tag}.json"
-    out.write_text(json.dumps({
-        "kind": "rebit-sweep",
-        "tag": args.tag,
-        "model": args.model,
-        "ref_dump": str(args.ref_dump),
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "note": "rebit は二重量子化なので、実際に焼いた場合より悪く出る",
-        "rows": rows,
-    }, indent=1))
+    save()
     print(f"wrote {out}")
 
 
@@ -473,6 +487,9 @@ def main():
     p.add_argument("--ngram", help="n-gram サイドカーのディレクトリ")
     p.add_argument("--steps", nargs="+", required=True,
                    help="積み上げる rebit 指定 (例 gdn=4 hc=4 head=4)")
+    p.add_argument("--prompts", default=None,
+                   help="評価に使うプロンプトを絞る (カンマ区切り)。段あたりの "
+                        "時間が縮むので、落とされる前に終わる")
     p.add_argument("--speed-tokens", type=int, default=40)
     p.set_defaults(fn=cmd_sweep)
 

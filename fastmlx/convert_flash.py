@@ -113,6 +113,9 @@ RECIPES: dict[str, dict] = {
         "ngram": False,
         "ngram_disk": True,
         "router": False,
+        # hyper-connections だけ 6bit にできない。融合カーネルが 4/8 しか
+        # 受けず、6bit だと黙って素の実装に落ちて 16ms が戻る
+        "hc": {"bits": 8, "group_size": 64},
         "default": {"bits": 6, "group_size": 64},
     },
     # v-stream から GDN 投影だけ 4bit に落とす。GDN 投影は 1 トークンあたりの
@@ -243,6 +246,28 @@ def classify(path: str) -> str:
     return "default"
 
 
+def validate_recipe(recipe_name: str) -> None:
+    """焼く前に、他のレーンと噛み合わない指定を弾く。
+
+    hyper-connections の融合カーネル (fastmlx/kernels/hyper_connection.py) は
+    `eligible()` で bits を 4/8 に限っている。6bit を指定すると例外も警告も
+    出さずに素の実装へ落ちるだけで、hyper-connections の 16ms がそのまま戻る。
+    焼き上がってから速度が出ない理由を探す羽目になるので、ここで止める。
+    """
+
+    recipe = RECIPES[recipe_name]
+    # default から暗黙に落ちてくる場合も拾いたいので、実際のパスで解決する
+    hc = resolve_rule(recipe, "model.layers.0.attn_hyper_connection.input_mix_weight_down")
+    if isinstance(hc, dict) and hc.get("bits") not in (4, 8):
+        raise SystemExit(
+            f"レシピ {recipe_name}: hyper-connections に bits={hc.get('bits')} は"
+            "使えない。融合カーネルが 4/8 しか受けないので、素の実装に落ちて "
+            "hyper-connections の 16ms が戻る。\n"
+            '  レシピに "hc": {"bits": 8, "group_size": 64} を明示して、'
+            "default から外すこと"
+        )
+
+
 def build_predicate(recipe_name: str):
     recipe = RECIPES[recipe_name]
 
@@ -341,6 +366,7 @@ def cmd_extract_mtp(args):
 def cmd_convert(args):
     import os
 
+    validate_recipe(args.recipe)
     if RECIPES[args.recipe].get("ngram_disk"):
         # vendored arch は import 時にこの旗を読む。mlx_lm を触る前に立てる
         os.environ["FASTMLX_NGRAM_DISK"] = "1"
