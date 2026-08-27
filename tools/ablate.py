@@ -45,6 +45,9 @@ def main():
                     help="n-gram サイドカー。ngram_disk で焼いたモデルには必須")
     ap.add_argument("--rebit", default=None,
                     help="読み込み後にビットを打ち直す (例 gdn=4)")
+    ap.add_argument("--fused-hc", action="store_true",
+                    help="hyper-connections を融合カーネルで動かしてから測る "
+                         "(fastmlx.fused.enable_hyper_connection_kernel)")
     args = ap.parse_args()
 
     import os
@@ -70,6 +73,11 @@ def main():
         [{"role": "user", "content": "分散システムについて説明してください。"}],
         add_generation_prompt=True,
     )
+    if args.fused_hc:
+        from fastmlx import fused
+
+        fused.enable_hyper_connection_kernel()
+        print("hyper-connections を融合カーネルに差し替えた")
     layers = model.model.layers
 
     rows: list[tuple[str, float]] = []

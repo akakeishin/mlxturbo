@@ -127,13 +127,15 @@ uv run python bench/quant_eval.py compare --model <model> \
 
 測定に使うモデル:
 
-- `~/models/qwen38fn-mlx-v-stream` + `~/models/qwen38fn-ngram-4bit`
-  (現在の最良。98.4GB、KLD 0.00260、19.4 tok/s)
+- `~/models/qwen38fn-mlx-v-fast6` + `~/models/qwen38fn-ngram-4bit`
+  (現在の最良。91GB / 6.206 bpw、KLD 0.00378、融合ありで 29.5 tok/s)
 
-`~/models/qwen38fn-mlx-v-ng2` は **2026-08-27 に削除した** (内蔵の空きが
-64GB しかなく、焼き 1 本ぶんも置けなかった)。速度でも RAM でも v-stream に
-負けていたので、測定は上の 1 本に寄せること。`--ngram` を付け忘れると
-n-gram の重みが無くて読み込みが落ちる。
+**`~/models/qwen38fn-mlx-v-ng2` と `~/models/qwen38fn-mlx-v-stream` は削除した**
+(2026-08-27 と 08-28。内蔵の空きが足りず、焼き 1 本ぶんも置けなかった)。
+v-fast6 が両者の上位互換 (v-stream 比で -2.47ms、KLD は 0.00260 -> 0.00378)。
+過去の数字と比べるときは、v-stream 基準の値がそのままでは使えない点に注意。
+
+`--ngram` を付け忘れると n-gram の重みが無くて読み込みが落ちる。
 
 ## 境界
 
