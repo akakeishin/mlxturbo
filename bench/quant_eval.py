@@ -158,22 +158,15 @@ def cmd_dump(args):
     print(f"wrote {args.out}")
 
 
-def cmd_compare(args):
+def evaluate(model, cont: dict, ref, quiet: bool = False) -> dict:
+    """読み込み済みモデルを参照ダンプと突き合わせ、プロンプト別の指標を返す。
+
+    cmd_compare と cmd_sweep で共有する。sweep はモデルを 1 回しか読まずに
+    ビット構成を積み上げていくので、ここがモデルを読まないことが要件。
+    """
+
     import mlx.core as mx
 
-    model, _ = _load(args.model, getattr(args, "ngram", None),
-                     getattr(args, "rebit", None))
-    if getattr(args, "disable_ple", False):
-        # n-gram/PLE を丸ごと切る。埋め込みがゼロなら PLE の出力もゼロになる
-        # ので、層を外すのと等価。「n-gram が無いことの代償」を測るための経路
-        n = 0
-        for layer in model.model.layers:
-            if getattr(layer, "ple", None) is not None:
-                layer.ple = None
-                n += 1
-        print(f"PLE を無効化した ({n} 層)")
-    cont = json.loads(Path(args.continuations).read_text())
-    ref = np.load(args.ref_dump)
     per_prompt = {}
     for key, entry in cont["prompts"].items():
         full = entry["prompt_ids"] + entry["continuation_ids"]
@@ -216,9 +209,17 @@ def cmd_compare(args):
             "positions": int(kld_pos.shape[0]),
             "stress": list(PROMPTS[key].stress) if key in PROMPTS else [],
         }
-        print(f"[cmp] {key}: kld={per_prompt[key]['kld_mean']:.5f} agree={agree:.3f}")
+        if not quiet:
+            print(f"[cmp] {key}: kld={per_prompt[key]['kld_mean']:.5f} "
+                  f"agree={agree:.3f}", flush=True)
         del logits, logq_all
         mx.clear_cache()
+    return per_prompt
+
+
+def summarize(per_prompt: dict) -> dict:
+    """プロンプト別の指標 → 全体と札別の集計。"""
+
     klds = [v["kld_mean"] for v in per_prompt.values()]
     agrees = [v["top1_agree"] for v in per_prompt.values()]
     # 部品別の集計。平均を 1 つに潰すと「n-gram と experts のどちらに
@@ -234,16 +235,126 @@ def cmd_compare(args):
             "top1_agree": float(np.mean([per_prompt[k]["top1_agree"] for k in ks])),
             "delta_p_rms": float(np.mean([per_prompt[k]["delta_p_rms"] for k in ks])),
         }
-    result = {
-        "kind": "compare",
+    return {
+        "kld_mean": float(np.mean(klds)),
+        "kld_worst_prompt": max(per_prompt, key=lambda k: per_prompt[k]["kld_mean"]),
+        "top1_agree_mean": float(np.mean(agrees)),
+        "delta_p_rms_mean": float(
+            np.mean([v["delta_p_rms"] for v in per_prompt.values()])
+        ),
+        "by_stress": by_stress,
+    }
+
+
+def cmd_sweep(args):
+    """1 回のロードでビット構成を積み上げながら、品質と速度を同時に測る。
+
+    独立に測るならモデルを構成の数だけ読み直すことになり、92GB x N の読み込みで
+    半日が溶ける。積み上げなら 1 回で済む。段を 1 つずつ足すので、増分はその段の
+    寄与として読める (効果がおおむね加法的である限り)。
+
+    最終行が、その全部を適用したレシピの見込み値になる。
+
+        uv run python bench/quant_eval.py sweep --model <m> --ngram <s> \
+            --continuations ... --ref-dump ... --steps gdn=4 hc=4 head=4
+    """
+
+    import time
+
+    import mlx.core as mx
+
+    model, tok = _load(args.model, getattr(args, "ngram", None))
+    cont = json.loads(Path(args.continuations).read_text())
+    ref = np.load(args.ref_dump)
+    ids = _prompt_ids(tok, "分散システムについて詳しく説明してください。")
+
+    def speed() -> float:
+        cache = model.make_cache()
+        logits = model(mx.array(ids)[None], cache=cache)
+        cur = int(mx.argmax(logits[0, -1], axis=-1))
+        for _ in range(5):
+            logits = model(mx.array([[cur]]), cache=cache)
+            cur = int(mx.argmax(logits[0, -1], axis=-1))
+        best = None
+        for _ in range(2):
+            t0 = time.perf_counter()
+            for _ in range(args.speed_tokens):
+                logits = model(mx.array([[cur]]), cache=cache)
+                cur = int(mx.argmax(logits[0, -1], axis=-1))
+            dt = (time.perf_counter() - t0) / args.speed_tokens * 1000
+            best = dt if best is None else min(best, dt)
+        return best
+
+    from fastmlx import rebit
+
+    rows = []
+    applied: list[str] = []
+    for label in ["(そのまま)"] + list(args.steps):
+        if label != "(そのまま)":
+            rebit.apply(model, label)
+            applied.append(label)
+        ms = speed()
+        per_prompt = evaluate(model, cont, ref, quiet=True)
+        s = summarize(per_prompt)
+        rows.append({
+            "step": label,
+            "applied": list(applied),
+            "ms_per_token": ms,
+            **{k: v for k, v in s.items() if k != "by_stress"},
+            "by_stress": s["by_stress"],
+        })
+        print(f"  {label:14s} {ms:6.2f} ms/token ({1000 / ms:5.2f} tok/s)  "
+              f"KLD {s['kld_mean']:.5f}  top1 {s['top1_agree_mean']:.4f}  "
+              f"最悪 {s['kld_worst_prompt']}", flush=True)
+
+    base = rows[0]
+    print("\n  段ごとの差分 (直前の段からの増分)")
+    print(f"  {'段':14s} {'ms':>8s} {'KLD 増':>10s} {'ms/KLD':>10s}")
+    for prev, cur in zip(rows, rows[1:]):
+        d_ms = prev["ms_per_token"] - cur["ms_per_token"]
+        d_kld = cur["kld_mean"] - prev["kld_mean"]
+        rate = d_ms / d_kld if d_kld > 1e-9 else float("inf")
+        print(f"  {cur['step']:14s} {d_ms:+8.2f} {d_kld:+10.5f} {rate:10.0f}")
+    print(f"\n  合計 {base['ms_per_token'] - rows[-1]['ms_per_token']:+.2f} ms/token, "
+          f"KLD {base['kld_mean']:.5f} -> {rows[-1]['kld_mean']:.5f}")
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out = RESULTS_DIR / f"sweep-{args.tag}.json"
+    out.write_text(json.dumps({
+        "kind": "rebit-sweep",
         "tag": args.tag,
         "model": args.model,
         "ref_dump": str(args.ref_dump),
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "kld_mean": float(np.mean(klds)),
-        "kld_worst_prompt": max(per_prompt, key=lambda k: per_prompt[k]["kld_mean"]),
-        "top1_agree_mean": float(np.mean(agrees)),
-        "by_stress": by_stress,
+        "note": "rebit は二重量子化なので、実際に焼いた場合より悪く出る",
+        "rows": rows,
+    }, indent=1))
+    print(f"wrote {out}")
+
+
+def cmd_compare(args):
+    model, _ = _load(args.model, getattr(args, "ngram", None),
+                     getattr(args, "rebit", None))
+    if getattr(args, "disable_ple", False):
+        # n-gram/PLE を丸ごと切る。埋め込みがゼロなら PLE の出力もゼロになる
+        # ので、層を外すのと等価。「n-gram が無いことの代償」を測るための経路
+        n = 0
+        for layer in model.model.layers:
+            if getattr(layer, "ple", None) is not None:
+                layer.ple = None
+                n += 1
+        print(f"PLE を無効化した ({n} 層)")
+    cont = json.loads(Path(args.continuations).read_text())
+    ref = np.load(args.ref_dump)
+    per_prompt = evaluate(model, cont, ref)
+    result = {
+        "kind": "compare",
+        "tag": args.tag,
+        "model": args.model,
+        "rebit": getattr(args, "rebit", None),
+        "ref_dump": str(args.ref_dump),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        **summarize(per_prompt),
         "per_prompt": per_prompt,
     }
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -353,6 +464,17 @@ def main():
     p.add_argument("--rebit", help="読み込み後にビットを打ち直す "
                    "(例 gdn=4,hc=4)。焼かずにビット配分を試すため")
     p.set_defaults(fn=cmd_compare)
+
+    p = sub.add_parser("sweep", help="1 回のロードでビット構成を積み上げて測る")
+    p.add_argument("--model", required=True)
+    p.add_argument("--continuations", required=True)
+    p.add_argument("--ref-dump", required=True)
+    p.add_argument("--tag", required=True)
+    p.add_argument("--ngram", help="n-gram サイドカーのディレクトリ")
+    p.add_argument("--steps", nargs="+", required=True,
+                   help="積み上げる rebit 指定 (例 gdn=4 hc=4 head=4)")
+    p.add_argument("--speed-tokens", type=int, default=40)
+    p.set_defaults(fn=cmd_sweep)
 
     p = sub.add_parser("speed")
     p.add_argument("--model", required=True)
