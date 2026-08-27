@@ -30,7 +30,9 @@ RAM はゼロになり、しかも精度は上げられる (4bit で相対誤差
 from __future__ import annotations
 
 import json
+import os
 import struct
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -161,9 +163,29 @@ class StreamNGram:
 
     nn.Module ではない。パラメータを 1 つも持たないので、モデルの
     `parameters()` に現れてはいけない (現れると保存や dtype 変換の対象になる)。
+
+    mmap の fancy index は 1 回のギャザーに見えるが、実体は行ごとにページ
+    フォールトを起こし、それがカーネル内で直列に処理される。実測で 16 行
+    (1 トークン分) の引きに 1.5-2ms かかっており、これがデコード全体の
+    7-9% を占めていた。ddalcu/mlx-serve (Zig 実装) が同じ設計で同じ問題を
+    踏んでいて、"serial mmap faults were ~5ms of every decode step" とある。
+
+    `os.pread` は GIL を解放するので、行ごとに別スレッドで並列に投げれば
+    フォールトの直列化が消える。マイクロベンチ (tools/ngram_pread_bench.py)
+    では 16 行の引きが mmap 比 5-7x、128 行 (バッチ forward 相当) で
+    10-12x 速い。スレッド数は 8-24 の間でほぼ横ばいで、性能コア数
+    (このマシンでは 12) に合わせるのが無難と見て既定値にした。
+
+    退行したときに戻せるよう mmap 経路は残す。`FASTMLX_NGRAM_BACKEND=mmap`
+    か `backend="mmap"` で切り替えられる。
     """
 
-    def __init__(self, sidecar: Path):
+    def __init__(
+        self,
+        sidecar: Path,
+        backend: str | None = None,
+        n_threads: int | None = None,
+    ):
         self.dir = Path(sidecar)
         m = json.loads((self.dir / "manifest.json").read_text())
         self.rows = m["rows"]
@@ -174,18 +196,52 @@ class StreamNGram:
         self.rec = m.get("record_bytes", self.npack * 4 + self.ngrp * 4)
         self.wb = m.get("weight_bytes", self.npack * 4)
         self.sb = m.get("scale_bytes", self.ngrp * 2)
-        self.mm = np.memmap(
-            self.dir / "rows.bin", dtype=np.uint8, mode="r", shape=(self.rows, self.rec)
-        )
+        rows_bin = self.dir / "rows.bin"
+        self.mm = np.memmap(rows_bin, dtype=np.uint8, mode="r", shape=(self.rows, self.rec))
+
+        self.backend = backend or os.environ.get("FASTMLX_NGRAM_BACKEND", "pread")
+        if self.backend not in ("mmap", "pread"):
+            raise ValueError(f"backend は mmap/pread のどちらか ({self.backend})")
+        if self.backend == "pread":
+            self.n_threads = n_threads or int(
+                os.environ.get("FASTMLX_NGRAM_THREADS", "12")
+            )
+            # 呼び出しごとに作らない。プール生成はスレッド起動込みで数ms
+            # かかり、毎トークン作っていたら並列化した意味が消える
+            self._pool = ThreadPoolExecutor(max_workers=self.n_threads)
+            self._fd = os.open(str(rows_bin), os.O_RDONLY)
+
+    def _gather_pread(self, flat: np.ndarray) -> np.ndarray:
+        """行 id 配列を受けて、対応するレコードを並列 pread で埋める。"""
+
+        n = flat.shape[0]
+        buf = np.empty((n, self.rec), dtype=np.uint8)
+        rec_bytes = self.rec
+
+        def read_one(i: int, row_id: int) -> None:
+            # os.pread は GIL を解放するので、ここで実際にディスク I/O が
+            # 並列に走る。書き込み先 buf[i] は行ごとに素なので競合しない
+            buf[i] = np.frombuffer(
+                os.pread(self._fd, rec_bytes, int(row_id) * rec_bytes), dtype=np.uint8
+            )
+
+        futures = [self._pool.submit(read_one, i, row_id) for i, row_id in enumerate(flat)]
+        for f in futures:
+            f.result()
+        return buf
 
     def __call__(self, gid):
         import mlx.core as mx
 
         flat = np.array(gid.reshape(-1), copy=False).astype(np.int64)
-        # numpy の fancy index は C 側で一度に集める。行ごとの Python ループに
-        # すると生成時に効いてくるので、ここは必ず 1 回のギャザーで済ませる。
-        # 1 行が連続レコードなので、触るページも 1 行あたり 1 枚で済む
-        rec = self.mm[flat]
+        if self.backend == "pread":
+            rec = self._gather_pread(flat)
+        else:
+            # numpy の fancy index は C 側で一度に集める。行ごとの Python
+            # ループにすると生成時に効いてくるので、ここは必ず 1 回の
+            # ギャザーで済ませる。1 行が連続レコードなので、触るページも
+            # 1 行あたり 1 枚で済む
+            rec = self.mm[flat]
         n = rec.shape[0]
         w = mx.array(rec[:, : self.wb].copy().view(np.uint32).reshape(n, self.npack))
         s = mx.array(
