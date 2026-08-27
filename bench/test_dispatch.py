@@ -6,9 +6,12 @@ measurement must be repeated on a quiet machine.
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
+
+os.environ.setdefault("MLXLM_FAST_QMM_WIDE", "1")  # dispatch (_load_kernels) と同条件
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -23,7 +26,7 @@ from fastmlx.kernels.dispatch import (
     quantized_matmul,
     select_route,
 )
-from fastmlx.kernels.qmm_skinny_mma import qmm_skinny_mma
+from fastmlx.fast_qmm import fast_qmm
 from fastmlx.kernels.qmv_wide_nocap import qmv_wide_nocap
 
 
@@ -50,7 +53,9 @@ def _op(route, x, q):
     if route == NOCAP:
         return qmv_wide_nocap(x, *q, group_size=64, bits=4)
     if route == MMA:
-        return qmm_skinny_mma(x, *q, group_size=64, bits=4)
+        # dispatch の MMA 経路の実体は fast_qmm (dispatch._load_kernels と同じ)。
+        # 以前はここが v5 skinny を測っていて較正列と実体がズレていた。
+        return fast_qmm(x, *q, group_size=64, bits=4)
     if route == "dispatch":
         return quantized_matmul(
             x, *q, group_size=64, bits=4, mode="affine"

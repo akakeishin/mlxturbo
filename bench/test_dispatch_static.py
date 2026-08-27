@@ -29,11 +29,12 @@ class _FakeMX:
 
 
 def test_shape_by_m_table_and_unknown_fallback():
-    assert dispatch.select_route(5120, 17408, 6) == dispatch.NOCAP
+    assert dispatch.select_route(5120, 17408, 6) == dispatch.MMA
     assert dispatch.select_route(5120, 17408, 8) == dispatch.MMA
     assert dispatch.select_route(17408, 5120, 16) == dispatch.MMA
     assert dispatch.select_route(5120, 248320, 12) == dispatch.MMA
-    assert dispatch.select_route(5120, 248320, 13) == dispatch.STOCK
+    assert dispatch.select_route(5120, 248320, 13) == dispatch.MMA
+    assert dispatch.select_route(17408, 5120, 9) == dispatch.NOCAP
     assert dispatch.select_route(4096, 4096, 8) == dispatch.STOCK
     assert dispatch.select_route(5120, 17408, 5) == dispatch.STOCK
     assert dispatch.select_route(5120, 17408, 17) == dispatch.STOCK
@@ -115,7 +116,7 @@ def test_custom_routes_flatten_and_restore_prefix_shape():
     assert out6.shape == (1, 6, 17408)
     assert out8.shape == (2, 4, 17408)
     assert calls == [
-        ("nocap", (6, 5120), {"group_size": 64, "bits": 4}),
+        ("mma", (6, 5120), {"group_size": 64, "bits": 4}),
         ("mma", (8, 5120), {"group_size": 64, "bits": 4}),
     ]
     assert not fake_mx.calls

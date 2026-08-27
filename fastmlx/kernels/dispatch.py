@@ -19,11 +19,12 @@ _ROUTES = frozenset((STOCK, NOCAP, MMA))
 def _routes(overrides: dict[int, str] | None = None) -> tuple[str, ...]:
     """Build an M-indexed route row; indices outside 6..16 are stock.
 
-    基本形: M=6..8 MMA (fast_qmm、m=8 で stock 比 1.2-1.6x)、M=9..11 nocap、
-    12+ stock (dispatch-fastq.json / dispatch-a3-quiet.json)。形状ごとの
-    上書きは 2026-08-27 静音較正 (calib-quiet-a/b.json、両ラン 5% 超一致行のみ
-    採用) による: 広い M=14..16 は wide MMA が 16 行タイルを使い切って最大
-    1.25x、M=6..7 の一部はゼロ埋めコピー税で nocap が勝つ。
+    基本形: M=6..8 MMA (fast_qmm)、M=9..11 nocap、12+ stock。形状ごとの
+    上書きは 2026-08-27 依存チェーン較正による (bench/results/
+    calib-chain-a/b.json、2 ラン勝者一致 + 両ランで現経路比 5% 超の行のみ
+    反転)。B ステージングのベクトル化と _zpad キャッシュ後の fast_qmm は
+    M=6..16 のほぼ全域で nocap/stock に勝つ (勝ち幅 1.06-1.59x)。
+    単発レイテンシではなく依存チェーンで判定している (BRIEF の規律)。
     """
 
     row = [STOCK] * 17
@@ -41,10 +42,11 @@ def _routes(overrides: dict[int, str] | None = None) -> tuple[str, ...]:
 # bench/op_curve.py.  A3's GPU gate compares every selected entry with both
 # alternatives before acceptance.
 DEFAULT_ROUTE_TABLE: dict[tuple[int, int], tuple[str, ...]] = {
-    (5120, 17408): _routes({6: NOCAP, 7: NOCAP, 16: MMA}),        # MLP up/gate
-    (17408, 5120): _routes({6: NOCAP, 15: MMA, 16: MMA}),         # MLP down
-    (5120, 12288): _routes({14: MMA, 15: MMA, 16: MMA}),          # attention q
-    (5120, 248320): _routes({6: NOCAP, 12: MMA, 16: MMA}),        # lm_head
+    (5120, 17408): _routes({m: MMA for m in range(9, 17)}),   # MLP up/gate
+    # M=9 は 2 ラン較正で勝者が割れたため nocap (基本形) を維持
+    (17408, 5120): _routes({m: MMA for m in range(10, 17)}),  # MLP down
+    (5120, 12288): _routes({m: MMA for m in range(9, 17)}),   # attention q
+    (5120, 248320): _routes({m: MMA for m in range(9, 17)}),  # lm_head
 }
 
 _DISPATCHED_CLASS = None
@@ -81,7 +83,15 @@ def _load_nn():
     return nn
 
 
+_KERNELS = None
+
+
 def _load_kernels():
+    # quantized_matmul は呼び出しごとにここを通るので、import と closure
+    # 生成を初回だけにする (単発レイテンシ計測で wrapper 税として観測された)
+    global _KERNELS
+    if _KERNELS is not None:
+        return _KERNELS
     import os
 
     # fast_qmm (MIT、ライセンス確認済み 2026-08-26) が依存チェーン実測で
@@ -94,7 +104,8 @@ def _load_kernels():
     def mma(flat, w, scales, biases, *, group_size, bits):
         return fast_qmm(flat, w, scales, biases, group_size=group_size, bits=bits)
 
-    return qmv_wide_nocap, mma
+    _KERNELS = (qmv_wide_nocap, mma)
+    return _KERNELS
 
 
 def quantized_matmul(
