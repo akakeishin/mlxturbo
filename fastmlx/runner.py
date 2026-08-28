@@ -110,13 +110,52 @@ class SpecRunner:
         )
 
 
+class FallbackSession:
+    """FallbackRunner 用の会話ごとの mlx_lm prompt_cache 入れ物。
+
+    spec.ChatSession と同じ契約 (新プロンプトが前回処理列の純粋な追記なら
+    差分だけ prefill、そうでなければ全再構築) を、mlx_lm.models.cache の
+    汎用 KV キャッシュに対して行う。FallbackRunner が実際に通る唯一のモデル
+    (qwen4_exp/Flash-Next 系) は GDN ハイブリッドで、線形状態は途中位置へ
+    巻き戻せない (fastmlx/spec.py の ChatSession docstring と同じ制約) ため、
+    ここでも部分巻き戻し (trim) は行わず、追記か全再構築かの二択に倒す。
+
+    ``processed``: これまでにこのキャッシュへ実際に feed 済みのトークン列
+    (prompt + それまでに生成したトークン)。mlx_lm.generate.stream_generate
+    は yield されたトークンを次ステップの入力として cache へ feed してから
+    出す (see FallbackRunner.generate 呼び出し側の解析)ので、生成が EOS で
+    早期終了しても max_tokens で打ち切られても、``tokens`` に集まった列は
+    そのままキャッシュへ feed 済みの列と一致する。
+    """
+
+    def __init__(self):
+        self.cache = None
+        self.processed: list[int] = []
+
+    def invalidate(self):
+        """Drop the published cache before it is aliased and mutated in place."""
+
+        self.cache = None
+        self.processed = []
+
+    def publish(self, cache, processed):
+        self.cache = cache
+        self.processed = processed
+
+
 class FallbackRunner:
     """SpecEngine が受け付けないモデル向けの普通の (非投機) 生成経路。
 
-    mlx_lm.generate.stream_generate をそのまま使う。session (ChatSession) は
-    投機経路専用の LCP prefill 再利用機構なのでここでは意味を持たず、無視
-    する (毎ターン全量 prefill になる)。n_draft/max_draft/fly_* も投機経路
-    専用なので **extra で受け取って無視するだけ。
+    mlx_lm.generate.stream_generate をそのまま使う。session
+    (FallbackSession) が渡されれば、前回処理列との LCP (最長共通接頭辞) が
+    その session の処理済み列全体と一致する場合に限り mlx_lm の
+    prompt_cache をそのまま渡して差分だけを prefill する。一致しなければ
+    (会話が切り替わった・テンプレートが履歴を書き換えた等) 黙って新規
+    prompt_cache を作り、prompt 全体を流し直す — 部分巻き戻しは行わない
+    (FallbackSession docstring 参照)。session が None ならこの機構自体を
+    素通しし、旧来どおり mlx_lm 側の一時 cache に任せる (毎ターン全量
+    prefill)。n_draft/max_draft/fly_* も投機経路専用なので **extra で受け
+    取って無視するだけ。
 
     ``SUPPORTED_SAMPLING_PARAMS``: 投機の分布保証を気にする必要が無い経路
     なので、mlx_lm.sample_utils がサポートするものは全部そのまま素通しする。
@@ -171,9 +210,44 @@ class FallbackRunner:
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
         )
+
+        # session が渡されていれば LCP (最長共通接頭辞) が session の処理済み
+        # 列全体と一致するときだけ prompt_cache を再利用する (FallbackSession
+        # docstring 参照)。session が None なら旧来どおり prompt_cache 自体を
+        # 渡さない — stream_generate/generate_step が毎回内部で一時 cache を
+        # 作る、以前と完全に同じ経路 (単体テストが直接このメソッドを
+        # session=None で叩いても壊れないようにするための分岐でもある)。
+        prompt_cache = None
+        reused = 0
+        if session is not None:
+            if session.cache is not None:
+                pl = session.processed
+                n = min(len(pl), len(prompt_ids))
+                lcp = 0
+                while lcp < n and pl[lcp] == prompt_ids[lcp]:
+                    lcp += 1
+                if lcp == len(pl) and lcp < len(prompt_ids):
+                    prompt_cache = session.cache
+                    reused = lcp
+                    # session.cache を以後このローカル変数が所有する。
+                    # 生成中の例外 (KeyboardInterrupt 含む) はここから先、
+                    # publish() されるまで公開 session を invalid のままにする
+                    # (in-place で書き換わっていく cache を半端な状態で公開
+                    # しないため — spec.ChatSession と同じ理由)。
+                    session.invalidate()
+            if prompt_cache is None:
+                from mlx_lm.models.cache import make_prompt_cache
+
+                prompt_cache = make_prompt_cache(self.model)
+
+        remaining_prompt = prompt_ids[reused:]
+
         tokens: list[int] = []
         t0 = time.perf_counter()
         ttft = None
+        stream_kwargs = {}
+        if prompt_cache is not None:
+            stream_kwargs["prompt_cache"] = prompt_cache
         # stream_generate yields exactly one GenerationResponse per generated
         # token (the very last one is folded into the finish_reason-carrying
         # wrap-up response instead of a plain per-step one, see its source),
@@ -182,10 +256,11 @@ class FallbackRunner:
         for resp in stream_generate(
             self.model,
             self.tokenizer,
-            prompt_ids,
+            remaining_prompt,
             max_tokens=max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
+            **stream_kwargs,
         ):
             if ttft is None:
                 ttft = time.perf_counter() - t0
@@ -201,12 +276,17 @@ class FallbackRunner:
                 on_tokens([resp.token], resp.text)
         decode_time = time.perf_counter() - t0 - (ttft or 0.0)
         n_decode = max(len(tokens) - 1, 0)
+        if session is not None:
+            # generate_step は yield したトークンを次ステップの入力として
+            # cache へ feed してから出す (EOS で早期終了しても同様) ので、
+            # tokens はそのまま prompt_cache へ feed 済みの生成列と一致する。
+            session.publish(prompt_cache, list(prompt_ids) + tokens)
         return {
             "tokens": tokens,
             "ttft_s": ttft or 0.0,
             "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
-            "prefill_reused": 0,
-            "prefill_new": len(prompt_ids),
+            "prefill_reused": reused,
+            "prefill_new": len(prompt_ids) - reused,
             # 投機なしなので 1 ステップ = 1 トークン固定。cli.py の表示行が
             # どちらの経路でも同じ res.keys() を仮定できるよう埋めておく。
             "tokens_per_step": 1.0,
