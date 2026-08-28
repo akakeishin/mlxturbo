@@ -63,3 +63,41 @@
 `SpecEngine` は `fastmlx/_mlx_compat.py:111` で GDN ハイブリッド固有の構造 (`fa_idx` / `ssm_idx` / 層ごとの `is_linear` / linear cache の `advance`) を要求するため、他アーキテクチャで投機を効かせるには contract の一般化が要る。lookup (SAM) 側はモデル非依存なので、そちらだけ先に切り出す手はある。
 
 この Mac では VRAM が先に効くので、載せられるサイズが実質的な制約になる。
+
+## 5. サーバーの残タスク (mlx_lm との差分調査より、2026-08-28)
+
+サンプリングパラメータ (top_p/top_k/min_p/repetition_penalty/presence_penalty/frequency_penalty/seed/logit_bias)・`/health`・CORS・`prompt_tokens_details.cached_tokens`・`/v1/completions` は実装済み (`fastmlx/server.py`, `fastmlx/runner.py`)。以下は mlx_lm/server.py にあって fastmlx には無いが、意図的に見送ったもの。
+
+- **`--decode-concurrency` / `--prompt-concurrency` (並列スロット)。** fastmlx サーバーは `asyncio.Lock` + 単一ワーカースレッドで直列化する設計 (server.py 冒頭 docstring)。91GB 級モデルを 128GB 機に載せている前提なので、複数リクエストを同時にバッチングする余地が薄い (BACKLOG §3 参照: prefill の遅さが先に効く可能性が高く、並列化の是非自体がまだ判定できていない)。並列スロットを足すには直列化の設計そのものをやめる必要があり、この差分調査の範囲を超える。
+- **`--draft-model` / `--num-draft-tokens` (mlx_lm 側の投機デコード機構)。** fastmlx は自前の投機エンジン (`fastmlx/spec.py` の `SpecEngine`: MTP 連鎖 + n-gram lookup + Block Verification) を持っており、mlx_lm の draft-model 方式とは別の実装。二重に投機機構を持つ意味が無い。
+- **`n` (1 リクエストで複数候補を生成)。** 91GB 級モデルを直列で回す構成では、候補数だけ生成コストが単純倍増する。現実的な用途 (best-of-n 選択など) が出てから改めて検討する。
+- **`logprobs` / `top_logprobs`。** 実装コストに対して需要が低いと判断。加えて SpecRunner 経路では意味付けが難しい: Block Verification は受理側 (target) の分布からサンプリングするが、実際に出力されたトークンが「ドラフト由来でそのまま受理されたもの」か「棄却後に target から再サンプリングしたもの」かでどの分布の logprob を返すべきかが変わり、素朴に「最終ロジットの softmax」を返すと投機デコードをしていないかのような値になる (受理された draft トークンの真の logprob は verify 時点のロジットから取れるので不可能ではないが、実装・検証コストが見合わない)。
+
+## 6. tool calling (次に着手する候補として最有力)
+
+コーディングエージェント (opencode 等) をこのサーバーに繋ぐには必須の機能。今回は実装していないが、規模の見積もりと方針を書いておく。
+
+### mlx_lm 側の実装のかたち
+
+参考にした箇所 (`.venv/lib/python3.13/site-packages/mlx_lm/server.py`):
+
+- `146-147`: `tool_call_start` / `tool_call_end` をモデルごとの文字列 (例 Qwen なら `<tool_call>` / `</tool_call>`) として `TokenizerWrapper` に渡す。渡された文字列はトークナイズして `_tool_call_start_tokens` / `_tool_call_end_tokens` として保持する (fastmlx の `think_start_tokens` / `think_end_tokens` と全く同じパターン)。
+- `537`: `ToolCallFormatter` がモデル固有の tool call 構文をパースする本体。generation_config やモデル名からパーサ (`tool_parser`) を選ぶ。
+- `668`: 生成中の状態機械が `normal` / `reasoning` / `tool` の 3 状態を持ち、`tool_call_start` トークン列を検出すると `tool` 状態に遷移する。これは fastmlx の `ThinkingRouter` が `detect` / `thinking` / `content` の 3 状態を持つのと同型 (第 4 の状態 `tool` を足す形になる)。
+- `1359-1360`, `1486`, `1511`: 状態が `tool` の間はテキストをそのままクライアントへ流さず貯め、`tool` から抜けたタイミングで `tool_calls` 配列に確定させてから OpenAI 形式の `message.tool_calls` に載せる。
+- `1540`: `finish_reason` が `tool_calls` になる分岐 (通常の `stop` の代わり)。
+
+つまりモデル固有の構文解析は「開始/終了マーカー文字列 → トークン列 → 状態機械」という、fastmlx がすでに thinking で持っている仕組みの再利用で足りる。ゼロから構文パーサを書く必要は無い。
+
+### fastmlx のどこに入るか
+
+- `fastmlx/server.py` の `ThinkingRouter` を拡張して 4 状態 (`detect` / `thinking` / `tool` / `content`) にするか、`ToolCallRouter` として並列に持つか。マーカー検出ロジック (バッファ先読み・境界またぎ処理) は thinking と共通化できるので、共通クラスから両方を作る形が筋が良い。
+- マーカー文字列の出どころ: mlx_lm は `TokenizerWrapper` に無い (fastmlx 独自に付与が必要)。Qwen3.5/Qwen4 系なら `<tool_call>` / `</tool_call>` 固定でおそらく足りるが、他アーキテクチャ対応時にモデルごとの一覧を持つ必要がある (BACKLOG §4 の「他モデル対応」と絡む)。
+- パース結果 (関数名・引数 JSON) を OpenAI 形式 (`message.tool_calls[].function.{name,arguments}`) と Anthropic 形式 (`content` 内の `tool_use` ブロック) の両方に変換する層が要る。現状 `chat_completions`/`anthropic_messages` がそれぞれ独立にレスポンスを組み立てているのと同じ場所に、プロトコルごとの変換を足す。
+- リクエスト側: `body["tools"]` (OpenAI) / `body["tools"]` (Anthropic、形は微妙に違う) を読み、chat template の `tools=` 引数へ渡す配線が要る (`_apply_template` の拡張)。
+
+### 分からないこと・要検証
+
+- **SpecRunner 経路との相性。** ドラフト (MTP/lookup) が tool call のマーカートークン列を跨いで投機した場合、Block Verification 自体は受理判定に影響しない (マーカーもただのトークン列なので) はずだが、`ThinkingRouter`/`ToolCallRouter` の状態機械が「複数トークンをまとめて受理した瞬間」に正しく動くかは要確認 (`on_tokens` は投機の受理まとめて複数トークンを一度に渡してくる、既存の thinking 実装がこれに対応済みなのでおそらく同じ形で対応できる)。
+- **モデルが実際に tool call 構文を安定して出すか。** Flash-Next / Qwen3.8-27B が tool calling についてどの程度チューニングされているかは未確認。構文が安定しないと状態機械側でどれだけ頑張っても意味が無いので、着手前にモデル側の tool call 出力を手動で数サンプル確認するべき。
+- 規模感: thinking 分離の実装 (`ThinkingRouter` 本体 + OpenAI/Anthropic 両プロトコルへの配線) が現状のコード量の目安になる。tool calling は状態がもう 1 つ増える・JSON 引数のパース/エラー処理・プロトコル別のレスポンス形式変換が追加で乗るので、体感でその 1.5〜2 倍程度の実装量になると見ている。
