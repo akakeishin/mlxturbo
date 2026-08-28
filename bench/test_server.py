@@ -14,13 +14,14 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+from collections import OrderedDict
 
 import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
 
 import fastmlx.server as server
-from fastmlx.runner import FallbackRunner, SpecRunner
+from fastmlx.runner import FallbackRunner, FallbackSession, SpecRunner
 from fastmlx.spec import ChatSession
 
 
@@ -72,7 +73,14 @@ class FakeTokenizer:
         tool_call_start: str = "<tool_call>",
         tool_call_end: str = "</tool_call>",
         tool_parser=_default_qwen_tool_parser,
+        prompt_ids_fn=None,
     ):
+        # prompt_ids_fn: messages -> list[int] を差し替えるフック。既定の
+        # `prompt_ids` は messages の中身に関わらず常に固定値を返すので、
+        # 会話が育つにつれてプロンプト token 列も伸びる (= session の
+        # processed 列に対する LCP 再利用が試せる) ことを検証したいテスト
+        # だけがこれを渡す。
+        self._prompt_ids_fn = prompt_ids_fn
         self.vocab = vocab or {}
         self.has_thinking = has_thinking
         self.think_start_tokens = think_start_tokens or []
@@ -107,6 +115,8 @@ class FakeTokenizer:
             "tools": tools,
             "enable_thinking": enable_thinking,
         }
+        if self._prompt_ids_fn is not None:
+            return self._prompt_ids_fn(messages)
         return list(self._prompt_ids)
 
 
@@ -155,6 +165,89 @@ class FakeSpecRunner(FakeRunner):
     SUPPORTED_SAMPLING_PARAMS = SpecRunner.SUPPORTED_SAMPLING_PARAMS
 
 
+class FakeReusingRunner:
+    """本物の Runner (SpecEngine/FallbackRunner) が持つ「渡された session の
+    processed 列に対する LCP が session.processed 全体と一致するときだけ
+    再利用扱いにする」契約だけを最小限で模す。ChatSession/FallbackSession の
+    publish() シグネチャはそれぞれ違う (前者は 5 引数、後者は 2 引数) ので、
+    どちらにも依存しないよう ``session.processed`` を直接書き換える (両方
+    ただの list 属性)。session.py/runner.py の本物の実装とは独立に、
+    server.py の session プール選択 (_select_session) が正しい session
+    オブジェクトを渡せているかどうかだけを検証する目的。
+    """
+
+    KIND = "fallback"
+    SUPPORTED_SAMPLING_PARAMS = FallbackRunner.SUPPORTED_SAMPLING_PARAMS
+
+    def __init__(self, reply_tokens: list[int]):
+        self.reply_tokens = reply_tokens
+        self.calls: list[dict] = []
+
+    def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
+        prompt_ids = list(prompt_ids)
+        reused = 0
+        if session is not None and session.processed:
+            pl = session.processed
+            n = min(len(pl), len(prompt_ids))
+            lcp = 0
+            while lcp < n and pl[lcp] == prompt_ids[lcp]:
+                lcp += 1
+            if lcp == len(pl) and lcp < len(prompt_ids):
+                reused = lcp
+        self.calls.append(
+            {"prompt_ids": prompt_ids, "reused_before_call": reused, "session": session}
+        )
+        toks = list(self.reply_tokens)
+        if on_tokens:
+            for t in toks:
+                on_tokens([t])
+        if session is not None:
+            session.processed = prompt_ids + toks
+        return {
+            "tokens": toks,
+            "ttft_s": 0.001,
+            "decode_tps": 100.0,
+            "prefill_reused": reused,
+            "prefill_new": len(prompt_ids) - reused,
+            "tokens_per_step": 1.0,
+        }
+
+
+def _fake_messages_to_ids(messages):
+    """FakeTokenizer.prompt_ids_fn: messages を token id 列へ変換する。
+
+    role: content をそのまま char ごとに ord() 化するだけだが、role ==
+    "assistant" のメッセージだけは content を「カンマ区切りの生 token id
+    列」として解釈する — 本物のチャットテンプレートが、確定した過去ターンの
+    assistant 応答を "その応答を実際に生成したのと同じ token 列" として履歴に
+    埋め戻す (再トークナイズしても同じ id に戻る) という性質を、テストの
+    フェイクとして最小限で再現するための約束事。呼び出し側のテストは前の
+    ターンで実際に生成された token id をそのままカンマ区切り文字列にして
+    次ターンの assistant メッセージの content に使う。
+
+    固定マーカー 0 は「ここから assistant のターンが始まる」合図 (本物の
+    チャットテンプレートの ``<|assistant|>`` 相当) で、履歴に埋め戻された
+    assistant メッセージの直前と、末尾の生成プロンプト (次に生成させたい
+    ターンの合図) の両方に同じものが立つ — これが無いと、1 ターン目の
+    「生成プロンプトの 0」と 2 ターン目の「履歴に埋め戻された assistant
+    メッセージ直前の 0」が同じ位置に揃わず、processed 列が新プロンプトの
+    正しい接頭辞にならない (本物のチャットテンプレートなら両方とも同じ
+    "<|assistant|>" トークン列になるので揃う)。
+    """
+
+    ids: list[int] = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "") or ""
+        if role == "assistant":
+            ids.append(0)
+            ids.extend(int(t) for t in content.split(",") if t)
+        else:
+            ids.extend(ord(c) for c in f"{role}:{content}\n")
+    ids.append(0)  # 次に生成させたいターンの生成プロンプト
+    return ids
+
+
 # ---------- 共通ヘルパ ----------
 
 
@@ -162,7 +255,8 @@ def _install_state(runner, tokenizer=None, **overrides) -> server.ModelState:
     state = server.ModelState(
         runner=runner,
         tokenizer=tokenizer or FakeTokenizer(),
-        session=ChatSession(),
+        session_pool=overrides.get("session_pool", OrderedDict()),
+        session_factory=overrides.get("session_factory", ChatSession),
         lock=asyncio.Lock(),
         executor=concurrent.futures.ThreadPoolExecutor(max_workers=1),
         model_name=overrides.get("model_name", "test-model"),
@@ -170,6 +264,7 @@ def _install_state(runner, tokenizer=None, **overrides) -> server.ModelState:
         max_tokens_cap=overrides.get("max_tokens_cap", 4096),
         default_temp=overrides.get("default_temp", 0.7),
         created_ts=0,
+        max_sessions=overrides.get("max_sessions", 8),
     )
     server.STATE = state
     return state
@@ -1051,3 +1146,363 @@ def test_anthropic_tool_use_block_in_user_message_is_400(client):
     )
     assert resp.status_code == 400, resp.text
     assert not runner.calls
+
+
+# ---------- 会話ごとの session プール (_select_session) ----------
+
+
+class _FakeSession:
+    """_select_session が読むのは processed 属性だけ (ChatSession/
+    FallbackSession のどちらも duck typing で扱える) なので、プール選択
+    ロジックだけを見るテストではこの最小限のフェイクで足りる。"""
+
+    def __init__(self, processed=()):
+        self.processed = list(processed)
+
+
+def test_select_session_separates_independent_conversations():
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    s1 = server._select_session([1, 2, 3])
+    s1.processed = [1, 2, 3, 99]
+    s2 = server._select_session([7, 8, 9])
+
+    assert s1 is not s2
+    assert len(server.STATE.session_pool) == 2
+
+
+def test_select_session_reuses_slot_for_append_only_continuation():
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    s1 = server._select_session([1, 2, 3])
+    s1.processed = [1, 2, 3, 99]
+
+    # turn 2: 前ターンの処理済み列 [1, 2, 3, 99] がそのまま接頭辞になっている
+    s1_again = server._select_session([1, 2, 3, 99, 4, 5])
+
+    assert s1_again is s1
+    assert len(server.STATE.session_pool) == 1
+
+
+def test_select_session_discards_on_non_append_prompt():
+    """処理済み列の途中で分岐する新プロンプトは、既存スロットを再利用せず
+    (=部分巻き戻しをせず)、processed が空の新規スロットを割り当てる。既存
+    スロットの状態は (別の会話かもしれないので) そのまま残る。"""
+
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    s1 = server._select_session([1, 2, 3])
+    s1.processed = [1, 2, 3, 99]
+
+    s2 = server._select_session([1, 5, 6])  # 位置 1 で分岐、追記ではない
+
+    assert s2 is not s1
+    assert s2.processed == []
+    assert s1.processed == [1, 2, 3, 99]  # 既存スロットは無傷
+    assert len(server.STATE.session_pool) == 2
+
+
+def test_select_session_evicts_lru_when_pool_full():
+    _install_state(FakeRunner(tokens_to_emit=[]), max_sessions=2)
+
+    s1 = server._select_session([1])
+    s1.processed = [1, 100]
+    s2 = server._select_session([2])
+    s2.processed = [2, 200]
+    assert len(server.STATE.session_pool) == 2
+
+    s3 = server._select_session([3])  # プール上限超過 -> s1 (LRU) を追い出す
+    s3.processed = [3, 300]
+    assert len(server.STATE.session_pool) == 2
+
+    # 会話 1 の続きのつもりで送っても、そのスロットはもう無い
+    s1_cont = server._select_session([1, 100, 4])
+    assert s1_cont is not s1
+    assert s1_cont.processed == []
+
+
+def test_select_session_touching_a_slot_protects_it_from_eviction():
+    _install_state(FakeRunner(tokens_to_emit=[]), max_sessions=2)
+
+    s1 = server._select_session([1])
+    s1.processed = [1, 100]
+    s2 = server._select_session([2])
+    s2.processed = [2, 200]
+
+    # 会話 1 を継続 (LRU 順で会話 1 が最新になる)
+    s1_cont = server._select_session([1, 100, 4])
+    assert s1_cont is s1
+    s1_cont.processed = [1, 100, 4, 400]
+
+    # 会話 3 が入ってくると、今度は会話 2 (触っていない方) が追い出される
+    s3 = server._select_session([3])
+    s3.processed = [3, 300]
+    assert len(server.STATE.session_pool) == 2
+
+    s2_cont = server._select_session([2, 200, 5])
+    assert s2_cont is not s2
+    assert s2_cont.processed == []
+
+
+# ---------- 会話ごとの session プール: HTTP 経由の end-to-end ----------
+
+
+def test_http_multiturn_reuses_prefill_via_session_pool(client):
+    """2 ターン目のリクエストで、1 ターン目の応答 (session.processed) が
+    そのまま新プロンプトの接頭辞になっていれば cached_tokens に反映される
+    ことを、HTTP 層 (server.py の _select_session 配線) まで通して確認する。
+    """
+
+    runner = FakeReusingRunner(reply_tokens=[10, 11])
+    tok = FakeTokenizer(vocab={10: "hi", 11: " there"}, prompt_ids_fn=_fake_messages_to_ids)
+    _install_state(runner, tokenizer=tok)
+
+    turn1 = [{"role": "user", "content": "hello"}]
+    resp1 = client.post("/v1/chat/completions", json={"messages": turn1})
+    assert resp1.status_code == 200, resp1.text
+    assert resp1.json()["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+
+    turn2 = turn1 + [
+        {"role": "assistant", "content": "10,11"},  # 前ターンの生 token 列
+        {"role": "user", "content": "how are you"},
+    ]
+    resp2 = client.post("/v1/chat/completions", json={"messages": turn2})
+    assert resp2.status_code == 200, resp2.text
+    cached = resp2.json()["usage"]["prompt_tokens_details"]["cached_tokens"]
+
+    assert len(runner.calls) == 2
+    # 1 ターン目でこのスロットへ publish された processed 列全体が、2 ターン
+    # 目のプロンプトの接頭辞として丸ごと再利用されている
+    assert cached == len(runner.calls[0]["prompt_ids"]) + 2  # +2 = 1 ターン目の応答分
+    assert runner.calls[1]["session"] is runner.calls[0]["session"]
+
+
+def test_http_two_independent_conversations_get_different_sessions(client):
+    runner = FakeReusingRunner(reply_tokens=[10])
+    tok = FakeTokenizer(vocab={10: "hi"}, prompt_ids_fn=_fake_messages_to_ids)
+    _install_state(runner, tokenizer=tok)
+
+    resp_a = client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "conversation A"}]}
+    )
+    resp_b = client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "conversation B"}]}
+    )
+    assert resp_a.status_code == 200 and resp_b.status_code == 200
+    assert len(server.STATE.session_pool) == 2
+    assert runner.calls[0]["session"] is not runner.calls[1]["session"]
+    # 別会話なので、どちらも 1 ターン目扱い (再利用ゼロ)
+    assert resp_a.json()["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+    assert resp_b.json()["usage"]["prompt_tokens_details"]["cached_tokens"] == 0
+
+
+def test_http_max_sessions_caps_pool_size(client):
+    runner = FakeReusingRunner(reply_tokens=[10])
+    tok = FakeTokenizer(vocab={10: "hi"}, prompt_ids_fn=_fake_messages_to_ids)
+    _install_state(runner, tokenizer=tok, max_sessions=2)
+
+    for name in ("A", "B", "C"):
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": f"conversation {name}"}]},
+        )
+        assert resp.status_code == 200, resp.text
+
+    assert len(server.STATE.session_pool) == 2
+
+
+# ---------- FallbackRunner: mlx_lm prompt_cache の再利用 (runner.py) ----------
+
+
+class _FakeMlxCache:
+    """make_prompt_cache が返す本物のリストの代わり。中身は使わず、id() で
+    「同じオブジェクトが session 経由で往復したか」だけを確認する。"""
+
+
+def test_fallback_runner_reuses_prompt_cache_on_append(monkeypatch):
+    """session.processed が新プロンプトの接頭辞なら、session.cache が
+    そのまま stream_generate へ渡され、送る prompt は差分だけになる。"""
+
+    import importlib
+
+    mlx_generate = importlib.import_module("mlx_lm.generate")
+
+    calls = []
+
+    def fake_stream_generate(model, tokenizer, prompt, max_tokens, sampler=None,
+                              logits_processors=None, prompt_cache=None):
+        calls.append({"prompt": list(prompt), "prompt_cache": prompt_cache})
+        for i, tok in enumerate([50, 51]):
+            yield _FakeGenResponse(tok, str(tok))
+
+    monkeypatch.setattr(mlx_generate, "stream_generate", fake_stream_generate)
+
+    runner = FallbackRunner(model=object(), tokenizer=object())
+    session = FallbackSession()
+    existing_cache = _FakeMlxCache()
+    session.publish(existing_cache, [1, 2, 3])  # 前ターンの処理済み列
+
+    res = runner.generate(
+        [1, 2, 3, 4, 5],  # [1, 2, 3] の続きとして 4, 5 が追記されている
+        max_tokens=2,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=session,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["prompt"] == [4, 5]  # 差分だけ prefill
+    assert calls[0]["prompt_cache"] is existing_cache  # 同じ cache を再利用
+    assert res["prefill_reused"] == 3
+    assert res["prefill_new"] == 2
+    # 生成後は「今回の prompt + 生成した token」で processed が更新される
+    assert session.processed == [1, 2, 3, 4, 5, 50, 51]
+    assert session.cache is existing_cache
+
+
+def test_fallback_runner_discards_and_rebuilds_on_non_append_prompt(monkeypatch):
+    """新プロンプトが前回処理済み列の追記でなければ、古い cache は使わず
+    全量を新しい cache へ流し直す (部分巻き戻しはしない)。"""
+
+    import importlib
+
+    mlx_generate = importlib.import_module("mlx_lm.generate")
+    mlx_cache_mod = importlib.import_module("mlx_lm.models.cache")
+
+    calls = []
+    fresh_cache = _FakeMlxCache()
+    monkeypatch.setattr(mlx_cache_mod, "make_prompt_cache", lambda model: fresh_cache)
+
+    def fake_stream_generate(model, tokenizer, prompt, max_tokens, sampler=None,
+                              logits_processors=None, prompt_cache=None):
+        calls.append({"prompt": list(prompt), "prompt_cache": prompt_cache})
+        yield _FakeGenResponse(50, "x")
+
+    monkeypatch.setattr(mlx_generate, "stream_generate", fake_stream_generate)
+
+    runner = FallbackRunner(model=object(), tokenizer=object())
+    session = FallbackSession()
+    stale_cache = _FakeMlxCache()
+    session.publish(stale_cache, [1, 2, 3])
+
+    res = runner.generate(
+        [1, 9, 9],  # 位置 1 で分岐、[1, 2, 3] の追記ではない
+        max_tokens=1,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=session,
+    )
+
+    assert calls[0]["prompt"] == [1, 9, 9]  # 全量を流し直す
+    assert calls[0]["prompt_cache"] is fresh_cache  # 古い cache は使わない
+    assert calls[0]["prompt_cache"] is not stale_cache
+    assert res["prefill_reused"] == 0
+    assert res["prefill_new"] == 3
+    assert session.cache is fresh_cache
+
+
+def test_fallback_runner_without_session_matches_pre_existing_behavior(monkeypatch):
+    """session=None なら prompt_cache 機構自体に触らない (呼び出し既存テスト
+    3 本 test_fallback_runner_* が検証している「以前どおり全量 prefill」と
+    完全に同じ経路のまま)。"""
+
+    import importlib
+
+    mlx_generate = importlib.import_module("mlx_lm.generate")
+    calls = []
+
+    def fake_stream_generate(model, tokenizer, prompt, max_tokens, sampler=None,
+                              logits_processors=None):
+        calls.append({"prompt": list(prompt)})
+        return
+        yield  # pragma: no cover - keep this a generator
+
+    monkeypatch.setattr(mlx_generate, "stream_generate", fake_stream_generate)
+
+    runner = FallbackRunner(model=object(), tokenizer=object())
+    runner.generate(
+        [1, 2, 3], max_tokens=0, temp=0.0, eos_ids=set(), on_tokens=None, session=None
+    )
+    assert calls[0]["prompt"] == [1, 2, 3]
+
+
+# ---------- ストリーミング: 最初のイベントが生成開始より前に出る ----------
+
+
+def test_openai_stream_first_event_precedes_generation(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    tok = FakeTokenizer(vocab={10: "hi"})
+    _install_state(runner, tokenizer=tok)
+
+    async def run():
+        gen = server._openai_stream(
+            [1, 2, 3],
+            8,
+            0.0,
+            "chatcmpl-x",
+            0,
+            "test-model",
+            [],
+            False,
+            None,
+        )
+        first = await gen.__anext__()
+        # 最初のイベントを受け取った時点では、まだロックすら獲得しておらず
+        # ワーカーも投入されていない
+        assert runner.calls == []
+        assert '"role": "assistant"' in first
+
+        chunks = [first]
+        async for chunk in gen:
+            chunks.append(chunk)
+        # 生成は最終的にはちゃんと行われている
+        assert runner.calls
+
+    asyncio.run(run())
+
+
+def test_anthropic_stream_first_event_precedes_generation(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    tok = FakeTokenizer(vocab={10: "hi"})
+    _install_state(runner, tokenizer=tok)
+
+    async def run():
+        gen = server._anthropic_stream(
+            [1, 2, 3],
+            8,
+            0.0,
+            "msg_x",
+            "test-model",
+            [],
+            None,
+        )
+        first = await gen.__anext__()
+        assert runner.calls == []
+        assert "message_start" in first
+
+        chunks = [first]
+        async for chunk in gen:
+            chunks.append(chunk)
+        assert runner.calls
+
+    asyncio.run(run())
+
+
+def test_streaming_400_returns_before_any_sse_event(client):
+    """SpecRunner 経路で top_p のような未対応パラメータを stream=True で
+    送ると、生成 (enqueue) より前に 400 で弾かれ、SSE イベントは 1 つも
+    流れない (プレーンな JSON 400 のまま)。"""
+
+    runner = FakeSpecRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True, "top_p": 0.5},
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+    assert "text/event-stream" not in resp.headers.get("content-type", "")
+    assert not resp.text.startswith("data: ")

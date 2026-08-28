@@ -3,23 +3,38 @@
 既存の投機デコードエンジン (fastmlx.spec.SpecEngine) をそのまま使う。モデルは
 起動時に 1 回だけロードして常駐させ、リクエストはグローバルなロックで直列化
 する: 91GB 級のモデルを 128GB 機に載せている前提なので、同時実行 (並列
-バッチング) はしない。待機中のリクエストもコネクションは保ったまま
-(asyncio のロック待ちで単に await するだけ)、ロックが空くまで待たせる。
+バッチング) はまだしない (BatchGenerator ベースのスケジューラは次段)。待機中
+のリクエストもコネクションは保ったまま (asyncio のロック待ちで単に await
+するだけ)、ロックが空くまで待たせる。
 
 会話履歴はクライアントが毎ターン全文を送り直す (OpenAI/Anthropic どちらの
-API も無状態) ので、cli.py の run_turn と同じやり方で使う: 単一の
-ChatSession をプロセス全体で使い回し、新しいプロンプトの先頭が前回処理した
-トークン列と一致すれば SpecEngine 側が自動で prefill を再利用する
-(fastmlx/spec.py の ChatSession.publish/invalidate)。一致しなければ黙って
-全再構築にフォールバックするだけなので、複数の会話が入れ替わり立ち替わり
-来ても壊れない (遅くなるだけ)。
+API も無状態) ので、session (SpecEngine 経路なら fastmlx.spec.ChatSession、
+FallbackRunner 経路なら fastmlx.runner.FallbackSession) はリクエスト単位で
+所有権を持つ ``STATE.session_pool`` (会話ごとの LRU プール、``_select_session``
+参照) から都度引き当てる。新しいプロンプトの先頭が既存スロットの処理済み
+トークン列全体と一致すれば (= 純粋な追記なら) そのスロットを引き当てて
+prefill を再利用する。一致しなければ新規スロットを割り当てる (プールが
+上限に達していれば最も長く使われていないスロットを ``popitem(last=False)``
+で捨てる)。91GB 級モデルの上に会話ごとの KV を無制限に積み上げないための
+上限であり、フィールド名は違うが SpecEngine/FallbackRunner どちらの経路でも
+同じプールを使う (``STATE.session_factory`` が起動時にどちらのクラスを
+積むか決める)。
+
+直列化ロック (``STATE.lock``) は今回はまだ外していない — 現状は「1 リクエスト
+= 1 生成」を保証する唯一の仕組みであり続けるが、session の所有権がリクエスト
+単位になったことで、ロックさえ外せば異なる会話を同時に生成しても互いの
+session を破壊しなくなる (ロックを外すこと自体は次のスケジューラの回でやる)。
+``STATE.session_pool`` 自体への並行アクセス (2 リクエストが同時にスロットを
+選ぶ・追い出す) はまだこのロックに守られている前提のままなので、ロックを
+外す際はプール操作自体にも別途排他が要る。
 
 SpecEngine が受け付けないモデル (Llama/Gemma/dense Qwen や、GDN ハイブリッド
 でもレイアウトが異なるもの) では、起動時に fastmlx.runner.build_runner が
 mlx_lm.generate.stream_generate による普通の (非投機) 生成に自動でフォール
 バックする。どちらの経路でも HTTP 層から見た形は同一 (Runner.generate が
-同じ dict を返す) で、起動時にどちらの経路が有効かを一行ログで出す。詳細は
-fastmlx/runner.py を参照。
+同じ dict を返す) で、起動時にどちらの経路が有効かを一行ログで出す。
+FallbackRunner も (SpecEngine と同じ LCP 契約で) mlx_lm の prompt_cache を
+session 経由で再利用する。詳細は fastmlx/runner.py を参照。
 
 MLX の計算グラフ (モデルの重み・KV キャッシュを含む) はロードしたスレッドに
 紐づく。asyncio.to_thread や汎用スレッドプールで別スレッドへ逃がすと
@@ -34,8 +49,17 @@ MLX の計算グラフ (モデルの重み・KV キャッシュを含む) はロ
 保持し、クライアント切断 (StreamingResponse がジェネレータを ``aclose()``
 する = ``GeneratorExit``) やエラーで早期に抜ける場合も、``finally`` でその
 Future を待ってからロックを解放する。そうしないと、まだ生成中のワーカーが
-共有の ``STATE.session`` (ChatSession) を触っている間に次のリクエストが
-ロックを取れてしまい、同じ session を 2 つの生成が同時に書き換える。
+このリクエストへ引き当てた session を触っている間に次のリクエストがロックを
+取れてしまい、同じ session を 2 つの生成が同時に書き換える。
+
+ストリーミング応答は、検証 (400 になりうるチェック全て) をエンドポイント
+関数内で StreamingResponse を組み立てる前に済ませたあと、生成の開始 (ロック
+獲得・ワーカー投入) を待たずに最初の SSE イベント (OpenAI なら role delta の
+チャンク、Anthropic なら message_start) を即座に流す — TTFT (prefill) が
+支配項のワークロードでは、クライアントが最初の 1 バイトを受け取るまでの
+時間そのものが切断の実因になるため。200 を返してから 400 相当が判明する
+経路にはなっていない (判明し得るチェックは全て StreamingResponse を返す前
+に完了している)。
 
 thinking (推論過程) の扱い: OpenAI の ``reasoning_effort`` / Anthropic の
 ``thinking`` だけを読む (fastmlx 独自フィールドは無い)。値はトークン予算
@@ -53,20 +77,23 @@ import argparse
 import asyncio
 import concurrent.futures
 import functools
+import itertools
 import json
 import os
 import queue
 import time
 import uuid
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable, Iterator
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ._mlx_compat import mlx_lm_load
-from .runner import Runner, build_runner
+from .runner import FallbackSession, Runner, build_runner
 from .spec import ChatSession
 
 app = FastAPI()
@@ -92,7 +119,13 @@ def _add_cors_middleware(fastapi_app: FastAPI, allowed_origins: list[str]) -> No
 class ModelState:
     runner: Runner
     tokenizer: object
-    session: ChatSession
+    # 会話ごとの session (ChatSession/FallbackSession) の LRU プール。キーは
+    # 会話の身元そのものではなく単なる挿入順管理用の連番 (_select_session
+    # 参照) — 選択はキーではなく各スロットの processed 列との LCP で行う。
+    session_pool: "OrderedDict[int, object]"
+    # runner の種類 (SpecRunner なら ChatSession、FallbackRunner なら
+    # FallbackSession) に応じて起動時に決める、新規スロット用のファクトリ。
+    session_factory: Callable[[], object]
     lock: asyncio.Lock
     executor: concurrent.futures.ThreadPoolExecutor
     model_name: str  # served id: GET /v1/models と全レスポンスの "model" 欄
@@ -100,9 +133,65 @@ class ModelState:
     max_tokens_cap: int
     default_temp: float
     created_ts: int
+    max_sessions: int = 8  # session_pool の上限 (LRU)。91GB 級モデルの上に
+    # 会話ごとの KV を無制限に積まないための上限で、--max-sessions で変えられる。
+    session_key_seq: Iterator[int] = field(default_factory=lambda: itertools.count())
 
 
 STATE: ModelState | None = None
+
+
+def _select_session(prompt_ids: list[int]):
+    """新しいプロンプトに対して使う session (ChatSession/FallbackSession) を
+    ``STATE.session_pool`` から選ぶ。
+
+    選択基準は「既存スロットの処理済みトークン列全体が新プロンプトの接頭辞に
+    なっている (= 純粋な追記)」だけ — 会話の身元を messages の内容から
+    推測する (システムプロンプトのハッシュ等) のではなく、SpecEngine の
+    ChatSession が単一セッションで既にやっている LCP 判定 (fastmlx/spec.py)
+    をプール全体に広げただけなので、動的に変化しうるシステムプロンプト
+    (現在時刻の埋め込み等) が混ざっていても「一致しなければ新規スロット
+    (=全再構築)」に自然に倒れる — 誤ったスロットを掴んで壊れることはない。
+
+    一致するスロットが複数ありうる状況 (通常は起こらない — ある会話の
+    processed 列が別の会話の新プロンプトの真の接頭辞になるのは、後者が前者
+    と全く同じ内容を再送してきた場合だけ) では最長一致を優先する。
+
+    一致するスロットが無ければ、プールが上限未満なら新規スロットを、上限
+    ならず最も長く未使用のスロット (先頭 = LRU) を追い出して新規スロットを
+    割り当てる。
+
+    呼び出し側は ``STATE.lock`` を保持した状態でこれを呼ぶこと — プール自体
+    への読み書きはこの関数もその後の session.publish/invalidate も排他して
+    いない (直列化ロックに守られている前提)。ロックを外す (次のスケジューラ
+    の回) ときは、ここにも別途排他が要る。
+    """
+
+    pool = STATE.session_pool
+    best_key = None
+    best_lcp = -1
+    for key, sess in pool.items():
+        pl = sess.processed
+        if not pl:
+            continue
+        n = min(len(pl), len(prompt_ids))
+        lcp = 0
+        while lcp < n and pl[lcp] == prompt_ids[lcp]:
+            lcp += 1
+        if lcp == len(pl) and lcp < len(prompt_ids) and lcp > best_lcp:
+            best_lcp = lcp
+            best_key = key
+
+    if best_key is not None:
+        pool.move_to_end(best_key)
+        return pool[best_key]
+
+    if len(pool) >= STATE.max_sessions:
+        pool.popitem(last=False)
+    key = next(STATE.session_key_seq)
+    session = STATE.session_factory()
+    pool[key] = session
+    return session
 
 
 # ---------- 入力の正規化・検証 ----------
@@ -1262,9 +1351,14 @@ def _start_generation(
     thinking_budget: int | None,
     tool_calling_enabled: bool = False,
     tools_for_parsing=None,
+    session=None,
     **sampling_kwargs,
 ):
     """ワーカーを STATE.executor へ投げ、(キュー, Future) を返す。
+
+    ``session`` はこのリクエスト用に ``_select_session`` が引き当てた
+    session (ChatSession/FallbackSession) — 呼び出し側が ``STATE.lock`` の
+    中で選んで渡す (グローバル状態の STATE.session は無い)。
 
     キューに積まれる要素: ``("reasoning_delta", text)`` / ``("content_delta",
     text)`` / ``("tool_call", {"id","name","arguments"})`` (成功裏に解析
@@ -1273,8 +1367,8 @@ def _start_generation(
 
     呼び出し側は必ずこの Future を最後まで待つこと (正常終了・エラー・
     クライアント切断のどの経路でも)。そうしないと、まだ実行中のワーカーが
-    共有の STATE.session を触っている間に次のリクエストがロックを取れて
-    しまい、同じ ChatSession を 2 つの生成が同時に書き換えるレースになる。
+    この ``session`` を触っている間に次のリクエストがロックを取れてしまい、
+    同じ session を 2 つの生成が同時に書き換えるレースになる。
     """
 
     q: queue.Queue = queue.Queue()
@@ -1301,7 +1395,7 @@ def _start_generation(
                 temp=temp,
                 eos_ids=eos_ids,
                 on_tokens=on_tokens,
-                session=STATE.session,
+                session=session,
                 **sampling_kwargs,
             )
             if not router.budget_exceeded:
@@ -1555,13 +1649,14 @@ async def chat_completions(request: Request):
 
     try:
         async with STATE.lock:
+            session = _select_session(prompt_ids)
             res = await _run_generate(
                 prompt_ids,
                 max_tokens,
                 temp,
                 STATE.eos_ids,
                 None,
-                STATE.session,
+                session,
                 **sampling_params,
             )
     except Exception as exc:
@@ -1632,7 +1727,24 @@ async def _openai_stream(
     tool_enabled: bool = False,
     tools_for_parsing=None,
 ):
+    # 受付 (検証) は呼び出し側で StreamingResponse を組み立てる前に完了して
+    # いる。生成の開始 (ロック獲得・ワーカー投入) を待たずに最初のイベントを
+    # 出すことで、TTFT が支配項のワークロードでも「最初の 1 バイト」を早く
+    # 返す (server.py の docstring 参照)。ここから先で 400 相当が判明する
+    # 経路は無い。
+    first = {
+        "id": req_id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model_id,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+    }
+    if include_usage:
+        first["usage"] = None
+    yield f"data: {json.dumps(first)}\n\n"
+
     async with STATE.lock:
+        session = _select_session(prompt_ids)
         q, future = _start_generation(
             prompt_ids,
             max_tokens,
@@ -1640,20 +1752,10 @@ async def _openai_stream(
             thinking_budget,
             tool_enabled,
             tools_for_parsing,
+            session=session,
             **(sampling_params or {}),
         )
         try:
-            first = {
-                "id": req_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model_id,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
-            }
-            if include_usage:
-                first["usage"] = None
-            yield f"data: {json.dumps(first)}\n\n"
-
             finish_reason = "length"
             n_completion = 0
             cached_tokens = 0
@@ -1916,13 +2018,14 @@ async def anthropic_messages(request: Request):
 
     try:
         async with STATE.lock:
+            session = _select_session(prompt_ids)
             res = await _run_generate(
                 prompt_ids,
                 max_tokens,
                 temp,
                 STATE.eos_ids,
                 None,
-                STATE.session,
+                session,
                 **sampling_params,
             )
     except Exception as exc:
@@ -1988,7 +2091,31 @@ async def _anthropic_stream(
     def sse(event, data):
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
+    # 受付 (検証) は呼び出し側で StreamingResponse を組み立てる前に完了して
+    # いる。生成の開始 (ロック獲得・ワーカー投入) を待たずに message_start を
+    # 出すことで、TTFT が支配項のワークロードでも「最初の 1 バイト」を早く
+    # 返す (server.py の docstring 参照)。ここから先で 400 相当が判明する
+    # 経路は無い。
+    yield sse(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model_id,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": len(prompt_ids), "output_tokens": 0},
+            },
+        },
+    )
+    yield sse("ping", {"type": "ping"})
+
     async with STATE.lock:
+        session = _select_session(prompt_ids)
         q, future = _start_generation(
             prompt_ids,
             max_tokens,
@@ -1996,26 +2123,10 @@ async def _anthropic_stream(
             thinking_budget,
             tool_enabled,
             tools_for_parsing,
+            session=session,
             **(sampling_params or {}),
         )
         try:
-            yield sse(
-                "message_start",
-                {
-                    "type": "message_start",
-                    "message": {
-                        "id": msg_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "model": model_id,
-                        "content": [],
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": {"input_tokens": len(prompt_ids), "output_tokens": 0},
-                    },
-                },
-            )
-            yield sse("ping", {"type": "ping"})
             # content_block_start は最初のデルタが来てから、その channel
             # (thinking が起きたかどうか) に応じて出す。事前には分からない
             # ため (実 API も、最初のブロックを送る直前に content_block_start
@@ -2266,13 +2377,14 @@ async def completions(request: Request):
 
     try:
         async with STATE.lock:
+            session = _select_session(prompt_ids)
             res = await _run_generate(
                 prompt_ids,
                 max_tokens,
                 temp,
                 STATE.eos_ids,
                 None,
-                STATE.session,
+                session,
                 **sampling_params,
             )
     except Exception as exc:
@@ -2318,10 +2430,11 @@ async def _completions_stream(
     sampling_params: dict | None = None,
 ):
     async with STATE.lock:
+        session = _select_session(prompt_ids)
         # thinking_budget=0: ThinkingRouter を content-only に固定する
         # (has_thinking に関わらず) ので reasoning_delta は絶対に来ない。
         q, future = _start_generation(
-            prompt_ids, max_tokens, temp, 0, **(sampling_params or {})
+            prompt_ids, max_tokens, temp, 0, session=session, **(sampling_params or {})
         )
         try:
             finish_reason = "length"
@@ -2454,6 +2567,14 @@ def main() -> None:
         " 既定 (未指定) では CORS ヘッダを一切付けない = ローカル専用のまま"
         " (Open WebUI 等、ブラウザで動く UI から直接叩きたい場合に指定する)",
     )
+    ap.add_argument(
+        "--max-sessions",
+        type=int,
+        default=8,
+        help="会話ごとの session (KV/prompt cache) を同時に保持する上限 (LRU、"
+        " 超えたら最も長く未使用のものを捨てる)。91GB 級モデルの上に会話ごとの"
+        " KV を無制限に積まないための上限",
+    )
     args = ap.parse_args()
 
     global STATE
@@ -2486,10 +2607,17 @@ def main() -> None:
 
     runner, tokenizer = executor.submit(_load).result()
 
+    # runner の種類に応じて会話ごとのスロットが積むクラスを決める。
+    # SpecRunner なら SpecEngine 用の ChatSession、それ以外 (FallbackRunner)
+    # なら mlx_lm prompt_cache 用の FallbackSession — どちらも .processed を
+    # 持ち、_select_session はこれを見るだけなので中身は気にしない。
+    session_factory = ChatSession if getattr(runner, "KIND", None) == "spec" else FallbackSession
+
     STATE = ModelState(
         runner=runner,
         tokenizer=tokenizer,
-        session=ChatSession(),
+        session_pool=OrderedDict(),
+        session_factory=session_factory,
         lock=asyncio.Lock(),
         executor=executor,
         model_name=served_name,
@@ -2497,8 +2625,12 @@ def main() -> None:
         max_tokens_cap=args.max_tokens,
         default_temp=args.temp,
         created_ts=int(time.time()),
+        max_sessions=args.max_sessions,
     )
-    print(f"[fastmlx-serve] served model name: {served_name}")
+    print(
+        f"[fastmlx-serve] served model name: {served_name} "
+        f"(session pool: {session_factory.__name__}, max {args.max_sessions} 会話)"
+    )
     if getattr(tokenizer, "has_thinking", False):
         print(
             f"[fastmlx-serve] thinking マーカー検出: {tokenizer.think_start!r} / "

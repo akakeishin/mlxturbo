@@ -11,7 +11,7 @@ import time
 from ._mlx_compat import mlx_lm_load, resolve_local_model_path
 from .convert import load_quantized_mtp
 from .mtp import find_snapshot, load_mtp
-from .runner import build_runner
+from .runner import FallbackSession, build_runner
 from .spec import ChatSession
 
 
@@ -102,7 +102,12 @@ def main() -> None:
     )
 
     eos_ids = set(tokenizer.eos_token_ids)
-    session = ChatSession()
+    # runner の種類に応じて session の型を選ぶ (server.py の main() と同じ理由):
+    # SpecRunner は ChatSession (spec.py 独自の caches/mtp_cache/h_last) を、
+    # FallbackRunner は FallbackSession (mlx_lm prompt_cache) を要求する。
+    # 両方に ChatSession を渡すと FallbackRunner 側で `.cache` 属性が無く
+    # AttributeError になる (FallbackRunner.generate 参照)。
+    session = ChatSession() if getattr(runner, "KIND", None) == "spec" else FallbackSession()
 
     def run_turn(messages):
         kwargs = {"add_generation_prompt": True}
