@@ -83,6 +83,32 @@ RESPEC_SCORE_PRIOR = 0.5
 RESPEC_BUCKET_WIDTH = 4
 RESPEC_MAX_BUCKET = 8
 
+# ---------- prefill チャンク分割 ----------
+#
+# 新規プロンプトを一括で _hidden_forward に流すと、注意スコア行列が
+# heads * S^2 * 2 バイトで確保され、Metal の 1 バッファ上限 (実測 86GB 強)
+# を S ≈ 43,000-52,000 トークン付近で超えて [metal::malloc] で落ちる
+# (実測: 42,688 は通り、約 57,000 は 103,639,939,200 = 16 * 57,000^2 * 2
+# で失敗)。PREFILL_STEP_SIZE トークンずつ流せば、そのチャンクの注意スコア
+# 行列は heads * chunk * S * 2 (S に対して線形) で収まる。
+#
+# fastmlx/runner.py の FallbackRunner (mlx_lm.generate.stream_generate) が
+# 既にこの値で prefill を分割しており、Flash-Next の出荷経路はそちらを
+# 通っている。SpecEngine 側だけ別の刻み幅にすると「同じプロンプトなのに
+# 経路によって出力が違う」を自作することになるので、値はここ 1 箇所だけに
+# 置き、fastmlx/runner.py はこの定数をそのまま import して両経路で共有する。
+#
+# 決定性の範囲: mx.quantized_matmul は行データが同じでもバッチ長 (M) が
+# 違うと異なる丸めを返す (実測で確認済み — 4-bit 量子化モデルの層 1 回の
+# 出力だけで ~0.4% の相対差、40 層を通すと ~30% まで拡大する)。したがって
+# 「チャンク幅を変えると出力が変わる」— 分割なしとは一致しない。保証する
+# のは「同一のチャンク幅・同一構成である限り決定的」ことと、投機デコードの
+# 受理判定が実際に計算された target logits と整合していること (= spec-on
+# と spec-off が同一チャンク幅の下で一致すること) の 2 点。前者は
+# vLLM/llama.cpp も提供しないビット不変性の話であり要求しない。詳細は
+# docs/PREFILL-CHUNKING-DETERMINISM.md。
+PREFILL_STEP_SIZE = 2048
+
 
 class ChatSession:
     """ターンをまたいで KV と線形状態を持ち越すための入れ物。
@@ -119,11 +145,12 @@ class ChatSession:
 
 
 class SpecEngine:
-    def __init__(self, model, mtp):
+    def __init__(self, model, mtp, prefill_step_size: int = PREFILL_STEP_SIZE):
         validate_spec_model_contract(model)
         self.text = model.language_model
         self.inner = self.text.model
         self.mtp = mtp
+        self.prefill_step_size = prefill_step_size
         # Install the replacement without touching prefill/draft behavior.
         # Dispatch is activated only by the verification scopes below.
         enable_quantized_dispatch(self.text, active=False)
@@ -177,6 +204,42 @@ class SpecEngine:
                 else:
                     h = layer(h, mask=fa_mask, cache=c)
         return h, sink
+
+    def _prefill_hidden(self, tokens: mx.array, caches) -> mx.array:
+        """新規プロンプト分をチャンク分割して forward する (generate() の
+        最初の一括 prefill 専用)。
+
+        tokens 全体を _hidden_forward に一括で渡すと注意スコア行列が S^2 で
+        確保され Metal の上限を超える (モジュール冒頭の PREFILL_STEP_SIZE
+        docstring 参照)。PREFILL_STEP_SIZE トークンずつ常に (短いプロンプト
+        でも 1 チャンクとして) 流し、チャンクごとに mx.eval + mx.clear_cache()
+        してから次へ進む — fastmlx/runner.py の FallbackRunner が使う
+        mlx_lm.generate の prefill ループと同じ形、同じ刻み幅。caches は
+        capture=False の通常経路 (KVCache.update_and_fetch / GDN の
+        cache.advance) でチャンクをまたいで状態を引き継ぐ。
+
+        分割の有無で hidden states の数値は変わり得る (mx.quantized_matmul
+        がバッチ長依存の丸めをするため、PREFILL_STEP_SIZE docstring 参照)。
+        ここが保証するのは同一チャンク幅での決定性と、投機の受理判定が
+        実際に計算された target logits と整合していることの 2 点であって、
+        分割なし処理とのビット一致ではない。
+        """
+        n = tokens.shape[0]
+        step = getattr(self, "prefill_step_size", PREFILL_STEP_SIZE)
+        chunks = []
+        i = 0
+        while i < n:
+            j = min(i + step, n)
+            h_chunk, _ = self._hidden_forward(tokens[i:j], caches, capture=False)
+            chunks.append(h_chunk)
+            mx.eval(h_chunk)
+            for c in caches:
+                state = getattr(c, "state", None)
+                if state is not None:
+                    mx.eval(state)
+            mx.clear_cache()
+            i = j
+        return chunks[0] if len(chunks) == 1 else mx.concatenate(chunks, axis=1)
 
     def _linear_capture(self, layer, x, cache, sink, mask=None):
         """GatedDeltaNet と同じ計算を、位置ごとの再帰状態を残しながら行う。"""
@@ -555,7 +618,7 @@ class SpecEngine:
         prompt = mx.array(prompt_ids[reused:])
 
         t0 = time.perf_counter()
-        h_all, _ = self._hidden_forward(prompt, caches, capture=False)
+        h_all = self._prefill_hidden(prompt, caches)
         if use_mtp:
             if reused:
                 mtp_hiddens = mx.concatenate(

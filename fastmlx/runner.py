@@ -34,7 +34,7 @@ from typing import Protocol
 import mlx.core as mx
 
 from ._mlx_compat import TextModelArgs
-from .spec import ChatSession, SpecEngine
+from .spec import PREFILL_STEP_SIZE, ChatSession, SpecEngine
 
 
 class Runner(Protocol):
@@ -260,6 +260,12 @@ class FallbackRunner:
             max_tokens=max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
+            # fastmlx.spec.PREFILL_STEP_SIZE と明示的に共有する。この値を
+            # 渡さなければ mlx_lm.generate 側の既定 (2048、たまたま同じ) に
+            # 黙って乗るだけで、どちらかを変えたときに経路ごとに prefill の
+            # 刻み幅がずれる — 同じプロンプトが経路によって別のチャンク幅
+            # で処理され、出力が食い違うバグを自分で作ることになる。
+            prefill_step_size=PREFILL_STEP_SIZE,
             **stream_kwargs,
         ):
             if ttft is None:
