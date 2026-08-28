@@ -5,13 +5,16 @@ description = "Apple Silicon で MLX 推論を速くするエンジン"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.141.1",
     "huggingface-hub>=1.28.0",
     "mlx>=0.32.2,<0.33",
     "mlx-lm>=0.31.3,<0.32",
+    "uvicorn>=0.52.4",
 ]
 
 [project.scripts]
 fastmlx = "fastmlx.cli:main"
+fastmlx-serve = "fastmlx.server:main"
 
 [build-system]
 requires = ["hatchling"]
