@@ -14,7 +14,9 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import threading
 from collections import OrderedDict
+from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
@@ -22,7 +24,7 @@ from fastapi.testclient import TestClient
 
 import fastmlx.server as server
 from fastmlx.runner import FallbackRunner, FallbackSession, SpecRunner
-from fastmlx.spec import ChatSession
+from fastmlx.spec import ChatSession, SpecEngine
 
 
 # ---------- フェイク tokenizer/detokenizer ----------
@@ -51,7 +53,7 @@ class _FakeDetokenizer:
         return seg
 
 
-def _default_qwen_tool_parser(text, tools=None):
+def _json_tools_parser(text, tools=None):
     """json_tools.py (mlx_lm) と同じ最小のパーサ: '<tool_call>' と
     '</tool_call>' の間のテキストをそのまま json.loads するだけ。"""
 
@@ -72,7 +74,7 @@ class FakeTokenizer:
         tool_call_end_tokens: list[int] | None = None,
         tool_call_start: str = "<tool_call>",
         tool_call_end: str = "</tool_call>",
-        tool_parser=_default_qwen_tool_parser,
+        tool_parser=_json_tools_parser,
         prompt_ids_fn=None,
     ):
         # prompt_ids_fn: messages -> list[int] を差し替えるフック。既定の
@@ -106,6 +108,9 @@ class FakeTokenizer:
 
     def encode(self, text: str) -> list[int]:
         return [ord(c) for c in text]
+
+    def decode(self, tokens: list[int]) -> str:
+        return "".join(self.vocab.get(t, f"<{t}>") for t in tokens)
 
     def apply_chat_template(
         self, messages, add_generation_prompt=True, enable_thinking=None, tools=None
@@ -144,12 +149,20 @@ class FakeRunner:
                 **extra,
             }
         )
-        toks = self.tokens_to_emit
-        if on_tokens:
-            for t in toks:
+        # Match the real runners' two terminal boundaries.  A permissive fake
+        # that ignores max_tokens/EOS can make protocol status tests exercise
+        # an output sequence that production can never return.
+        toks = []
+        for t in self.tokens_to_emit:
+            if len(toks) >= max_tokens:
+                break
+            toks.append(t)
+            if on_tokens:
                 on_tokens([t])
+            if t in eos_ids:
+                break
         return {
-            "tokens": list(toks),
+            "tokens": toks,
             "ttft_s": 0.001,
             "decode_tps": 100.0,
             "prefill_reused": self.prefill_reused,
@@ -182,20 +195,23 @@ class FakeSpecRunner(FakeRunner):
             raise TypeError(
                 f"SpecEngine.generate() got an unexpected keyword argument '{unexpected[0]}'"
             )
+        if "seed" in extra:
+            # SpecRunner.generate seeds MLX immediately before generation.
+            # Keeping that side effect in the fake makes the HTTP forwarding
+            # assertion cover the real boundary instead of only recording a kwarg.
+            mx.random.seed(extra["seed"])
         return super().generate(
             prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra
         )
 
 
 class FakeReusingRunner:
-    """本物の Runner (SpecEngine/FallbackRunner) が持つ「渡された session の
-    processed 列に対する LCP が session.processed 全体と一致するときだけ
-    再利用扱いにする」契約だけを最小限で模す。ChatSession/FallbackSession の
-    publish() シグネチャはそれぞれ違う (前者は 5 引数、後者は 2 引数) ので、
-    どちらにも依存しないよう ``session.processed`` を直接書き換える (両方
-    ただの list 属性)。session.py/runner.py の本物の実装とは独立に、
-    server.py の session プール選択 (_select_session) が正しい session
-    オブジェクトを渡せているかどうかだけを検証する目的。
+    """FallbackRunner の cache 所有と LCP 再利用契約を最小限で模す。
+
+    ``processed`` だけが残り cache が無い session は、実物と同じく再利用
+    できない。生成が成功した時だけ sentinel cache と新しい processed 列を
+    公開することで、server.py の session プール配線を緩い fake で誤魔化さ
+    ない。
     """
 
     KIND = "fallback"
@@ -208,7 +224,7 @@ class FakeReusingRunner:
     def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
         prompt_ids = list(prompt_ids)
         reused = 0
-        if session is not None and session.processed:
+        if session is not None and session.cache is not None and session.processed:
             pl = session.processed
             n = min(len(pl), len(prompt_ids))
             lcp = 0
@@ -219,11 +235,17 @@ class FakeReusingRunner:
         self.calls.append(
             {"prompt_ids": prompt_ids, "reused_before_call": reused, "session": session}
         )
-        toks = list(self.reply_tokens)
-        if on_tokens:
-            for t in toks:
+        toks = []
+        for t in self.reply_tokens:
+            if len(toks) >= max_tokens:
+                break
+            toks.append(t)
+            if on_tokens:
                 on_tokens([t])
+            if t in eos_ids:
+                break
         if session is not None:
+            session.cache = object()
             session.processed = prompt_ids + toks
         return {
             "tokens": toks,
@@ -274,11 +296,14 @@ def _fake_messages_to_ids(messages):
 
 
 def _install_state(runner, tokenizer=None, **overrides) -> server.ModelState:
+    session_factory = overrides.get("session_factory")
+    if session_factory is None:
+        session_factory = ChatSession if runner.KIND == "spec" else FallbackSession
     state = server.ModelState(
         runner=runner,
         tokenizer=tokenizer or FakeTokenizer(),
         session_pool=overrides.get("session_pool", OrderedDict()),
-        session_factory=overrides.get("session_factory", ChatSession),
+        session_factory=session_factory,
         lock=asyncio.Lock(),
         executor=concurrent.futures.ThreadPoolExecutor(max_workers=1),
         model_name=overrides.get("model_name", "test-model"),
@@ -287,6 +312,7 @@ def _install_state(runner, tokenizer=None, **overrides) -> server.ModelState:
         default_temp=overrides.get("default_temp", 0.7),
         created_ts=0,
         max_sessions=overrides.get("max_sessions", 8),
+        max_context_tokens=overrides.get("max_context_tokens"),
     )
     server.STATE = state
     return state
@@ -373,7 +399,7 @@ def test_sampling_params_omitted_when_not_requested(client):
     [
         ("top_p", 1.5),
         ("top_p", "nope"),
-        ("top_k", -1),
+        ("top_k", -2),
         ("min_p", -0.1),
         ("repetition_penalty", -1.0),
         ("logit_bias", "not-a-dict"),
@@ -437,7 +463,9 @@ def test_spec_runner_rejects_unsupported_sampling_params(client, params):
     assert not runner.calls
 
 
-def test_spec_runner_allows_seed(client):
+def test_spec_runner_allows_seed(client, monkeypatch):
+    seeded = []
+    monkeypatch.setattr(mx.random, "seed", seeded.append)
     runner = FakeSpecRunner(tokens_to_emit=[10])
     _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
 
@@ -447,6 +475,65 @@ def test_spec_runner_allows_seed(client):
     )
     assert resp.status_code == 200, resp.text
     assert runner.calls[0]["seed"] == 7
+    assert seeded == [7]
+
+
+@pytest.mark.parametrize(
+    ("tokens", "max_tokens", "eos_ids", "expected"),
+    [
+        pytest.param([10, 11], 1, set(), [10], id="max-tokens"),
+        pytest.param([10, 999, 11], 8, {999}, [10, 999], id="eos"),
+    ],
+)
+@pytest.mark.parametrize("runner_cls", [FakeRunner, FakeReusingRunner])
+def test_fake_runners_match_real_generation_boundaries(
+    runner_cls, tokens, max_tokens, eos_ids, expected
+):
+    """The test doubles must stop where FallbackRunner/SpecRunner stop."""
+
+    runner = runner_cls(tokens)
+    observed = []
+    result = runner.generate(
+        [1, 2, 3],
+        max_tokens=max_tokens,
+        temp=0.0,
+        eos_ids=eos_ids,
+        on_tokens=observed.extend,
+        session=None,
+    )
+    assert result["tokens"] == expected
+    assert observed == expected
+
+
+def test_fake_reusing_runner_requires_a_published_cache():
+    """processed tokens alone do not make a FallbackSession reusable."""
+
+    runner = FakeReusingRunner([10])
+    session = FallbackSession()
+    session.processed = [1]
+
+    first = runner.generate(
+        [1, 2], 8, 0.0, set(), None, session
+    )
+    assert first["prefill_reused"] == 0
+    assert session.cache is not None
+
+    second = runner.generate(
+        [1, 2, 10, 3], 8, 0.0, set(), None, session
+    )
+    assert second["prefill_reused"] == 3
+
+
+@pytest.mark.parametrize(
+    ("runner", "expected_factory"),
+    [
+        pytest.param(FakeRunner([]), FallbackSession, id="fallback"),
+        pytest.param(FakeSpecRunner([]), ChatSession, id="spec"),
+    ],
+)
+def test_install_state_matches_production_session_type(runner, expected_factory):
+    state = _install_state(runner)
+    assert state.session_factory is expected_factory
 
 
 # ---------- 2b. SpecRunner 経路でも恒等値 (分布を変えない既定値) は通す ----------
@@ -471,11 +558,14 @@ def test_spec_runner_allows_seed(client):
 @pytest.mark.parametrize(
     "params",
     [
+        {"top_p": 0.0},
         {"top_p": 1.0},
         {"top_k": 0},
+        {"top_k": -1},
         {"min_p": 0.0},
         {"frequency_penalty": 0.0},
         {"presence_penalty": 0.0},
+        {"repetition_penalty": 0.0},
         {"repetition_penalty": 1.0},
         {"logit_bias": {}},
     ],
@@ -629,7 +719,9 @@ def test_fallback_runner_seed_makes_output_reproducible(monkeypatch):
 
     mlx_generate = importlib.import_module("mlx_lm.generate")
 
-    def fake_stream_generate(model, tokenizer, prompt, max_tokens, sampler=None, logits_processors=None):
+    def fake_stream_generate(
+        model, tokenizer, prompt, max_tokens, sampler=None, logits_processors=None, **_kwargs
+    ):
         for _ in range(max_tokens):
             val = int(mx.random.randint(0, 1_000_000, shape=()).item())
             yield _FakeGenResponse(val, str(val))
@@ -664,7 +756,9 @@ def test_fallback_runner_calls_mx_random_seed(monkeypatch):
 
     mlx_generate = importlib.import_module("mlx_lm.generate")
 
-    def fake_stream_generate(model, tokenizer, prompt, max_tokens, sampler=None, logits_processors=None):
+    def fake_stream_generate(
+        model, tokenizer, prompt, max_tokens, sampler=None, logits_processors=None, **_kwargs
+    ):
         return iter(())
 
     monkeypatch.setattr(mlx_generate, "stream_generate", fake_stream_generate)
@@ -1196,6 +1290,97 @@ def test_malformed_tool_call_json_falls_back_to_text(client):
     assert "</tool_call>" in message["content"]
 
 
+def test_qwen36_tool_parser_matches_production_xml_boundary(client):
+    """Exercise qwen3_coder's XML boundary used by the target Qwen3.6 model."""
+
+    from mlx_lm.tool_parsers.qwen3_coder import parse_tool_call
+
+    raw_call = (
+        "<function=get_weather>\n"
+        "<parameter=city>\nTokyo\n</parameter>\n"
+        "</function>"
+    )
+    tok = _tool_calling_tokenizer({200: raw_call}, tool_parser=parse_tool_call)
+    runner = FakeRunner(tokens_to_emit=[100, 200, 101, 999])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [_WEATHER_TOOL_OPENAI],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    call = resp.json()["choices"][0]["message"]["tool_calls"][0]
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"]) == {"city": "Tokyo"}
+
+
+@pytest.mark.parametrize(
+    "tool_parser",
+    [
+        pytest.param(
+            lambda text, tools=None: (_ for _ in ()).throw(SyntaxError("bad literal")),
+            id="parser-raises-syntax-error",
+        ),
+        pytest.param(
+            lambda text, tools=None: {
+                "name": "get_weather",
+                "arguments": {"cities": {"Tokyo"}},
+            },
+            id="parser-returns-non-json-arguments",
+        ),
+    ],
+)
+def test_tool_parser_failures_at_real_boundary_fall_back_to_text(client, tool_parser):
+    """Model-specific mlx_lm parsers can fail more broadly than json.loads.
+
+    The server must validate their return value before protocol serializers see
+    it; otherwise a parser SyntaxError or a non-JSON literal becomes a 500 after
+    the permissive FakeRunner has already made the request look successful.
+    """
+
+    raw_call = "malformed model tool output"
+    vocab = {200: raw_call}
+    tok = _tool_calling_tokenizer(vocab, tool_parser=tool_parser)
+    runner = FakeRunner(tokens_to_emit=[100, 200, 101, 999])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [_WEATHER_TOOL_OPENAI],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    message = resp.json()["choices"][0]["message"]
+    assert "tool_calls" not in message
+    assert message["content"] == f"<tool_call>{raw_call}</tool_call>"
+
+
+def test_unclosed_tool_call_is_not_promoted_to_structured_call(client):
+    """Valid-looking JSON is still incomplete until the model emits the end marker."""
+
+    vocab = {200: _TOOL_CALL_JSON}
+    tok = _tool_calling_tokenizer(vocab)
+    runner = FakeRunner(tokens_to_emit=[100, 200, 999])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "weather?"}],
+            "tools": [_WEATHER_TOOL_OPENAI],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    message = resp.json()["choices"][0]["message"]
+    assert "tool_calls" not in message
+    assert message["content"] == f"<tool_call>{_TOOL_CALL_JSON}"
+
+
 # ---- 6.3 履歴 (tool_calls / tool_result) の正規化 ----
 
 
@@ -1500,7 +1685,7 @@ def test_fallback_runner_reuses_prompt_cache_on_append(monkeypatch):
     calls = []
 
     def fake_stream_generate(model, tokenizer, prompt, max_tokens, sampler=None,
-                              logits_processors=None, prompt_cache=None):
+                              logits_processors=None, prompt_cache=None, **_kwargs):
         calls.append({"prompt": list(prompt), "prompt_cache": prompt_cache})
         for i, tok in enumerate([50, 51]):
             yield _FakeGenResponse(tok, str(tok))
@@ -1545,7 +1730,7 @@ def test_fallback_runner_discards_and_rebuilds_on_non_append_prompt(monkeypatch)
     monkeypatch.setattr(mlx_cache_mod, "make_prompt_cache", lambda model: fresh_cache)
 
     def fake_stream_generate(model, tokenizer, prompt, max_tokens, sampler=None,
-                              logits_processors=None, prompt_cache=None):
+                              logits_processors=None, prompt_cache=None, **_kwargs):
         calls.append({"prompt": list(prompt), "prompt_cache": prompt_cache})
         yield _FakeGenResponse(50, "x")
 
@@ -1584,7 +1769,7 @@ def test_fallback_runner_without_session_matches_pre_existing_behavior(monkeypat
     calls = []
 
     def fake_stream_generate(model, tokenizer, prompt, max_tokens, sampler=None,
-                              logits_processors=None):
+                              logits_processors=None, **_kwargs):
         calls.append({"prompt": list(prompt)})
         return
         yield  # pragma: no cover - keep this a generator
@@ -1596,6 +1781,84 @@ def test_fallback_runner_without_session_matches_pre_existing_behavior(monkeypat
         [1, 2, 3], max_tokens=0, temp=0.0, eos_ids=set(), on_tokens=None, session=None
     )
     assert calls[0]["prompt"] == [1, 2, 3]
+
+
+def test_nonstream_cancellation_keeps_lock_until_worker_finishes():
+    """Cancelling the HTTP task must not expose a still-mutating session."""
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class BlockingRunner(FakeRunner):
+        def generate(self, *args, **kwargs):
+            started.set()
+            assert release.wait(2), "test did not release blocking fake runner"
+            try:
+                return super().generate(*args, **kwargs)
+            finally:
+                finished.set()
+
+    state = _install_state(BlockingRunner([10]))
+
+    async def run():
+        async def request():
+            async with state.lock:
+                await server._run_generate(
+                    [1, 2, 3], 8, 0.0, state.eos_ids, None, object()
+                )
+
+        task = asyncio.create_task(request())
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0)
+
+        # Before the fix, cancellation propagated through run_in_executor at
+        # this point, releasing the lock while the worker was still blocked.
+        assert state.lock.locked()
+        assert not finished.is_set()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set()
+        assert not state.lock.locked()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("protocol", ["openai", "anthropic"])
+def test_streaming_generation_errors_keep_protocol_error_shape(client, protocol):
+    class RaisingRunner(FakeRunner):
+        def generate(self, *args, **kwargs):
+            raise RuntimeError("runner exploded")
+
+    _install_state(RaisingRunner([]))
+    if protocol == "openai":
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+        error = next(event["error"] for event in _sse_events(resp.text) if "error" in event)
+        assert error == {
+            "message": "runner exploded",
+            "type": "server_error",
+            "param": None,
+            "code": "server_error",
+        }
+        assert "data: [DONE]" in resp.text
+    else:
+        resp = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+            },
+        )
+        error = next(event for event in _sse_events(resp.text) if event.get("type") == "error")
+        assert error["error"] == {"type": "server_error", "message": "runner exploded"}
 
 
 # ---------- ストリーミング: 最初のイベントが生成開始より前に出る ----------
@@ -1676,6 +1939,35 @@ def test_streaming_400_returns_before_any_sse_event(client):
     assert not runner.calls
     assert "text/event-stream" not in resp.headers.get("content-type", "")
     assert not resp.text.startswith("data: ")
+
+
+@pytest.mark.parametrize(
+    ("effort", "expected_budget"),
+    [
+        ("low", 2048),
+        ("medium", 8192),
+        ("high", 32768),
+        ("xhigh", 65536),
+        ("max", 131072),
+    ],
+)
+def test_anthropic_adaptive_thinking_effort_is_accepted(client, effort, expected_budget):
+    tok = FakeTokenizer(vocab={10: "ok"}, has_thinking=True)
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok, max_tokens_cap=200000)
+
+    body = {
+        "model": "test-model",
+        "max_tokens": 200000,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": effort},
+    }
+    assert server._resolve_thinking(body, "anthropic") == (True, expected_budget, None)
+
+    resp = client.post("/v1/messages", json=body)
+    assert resp.status_code == 200, resp.text
+    assert tok.last_apply_chat_template_kwargs["enable_thinking"] is True
 
 
 # ---------- 7. バグ修正: thinking がプロンプト側で既に開かれている場合 ----------
@@ -1768,7 +2060,9 @@ def test_bug1_anthropic_nonstream_thinking_not_mixed_into_content(client):
     )
     assert resp.status_code == 200, resp.text
     blocks = resp.json()["content"]
-    assert blocks[0] == {"type": "thinking", "thinking": "pondering. "}
+    assert blocks[0]["type"] == "thinking"
+    assert blocks[0]["thinking"] == "pondering. "
+    assert blocks[0]["signature"] == server._thinking_signature("pondering. ")
     text_blocks = [b for b in blocks if b["type"] == "text"]
     assert text_blocks and text_blocks[0]["text"] == "the answer is 4"
     assert all("</think>" not in b.get("text", "") for b in blocks)
@@ -1801,12 +2095,19 @@ def test_bug1_anthropic_stream_thinking_not_mixed_into_content(client):
         for e in events
         if e.get("type") == "content_block_delta" and e["delta"].get("type") == "thinking_delta"
     )
+    signature_deltas = [
+        e["delta"]["signature"]
+        for e in events
+        if e.get("type") == "content_block_delta"
+        and e["delta"].get("type") == "signature_delta"
+    ]
     text_deltas = "".join(
         e["delta"]["text"]
         for e in events
         if e.get("type") == "content_block_delta" and e["delta"].get("type") == "text_delta"
     )
     assert thinking_deltas == "pondering. "
+    assert signature_deltas == [server._thinking_signature("pondering. ")]
     assert text_deltas == "the answer is 4"
     assert "</think>" not in text_deltas
 
@@ -1869,7 +2170,121 @@ def test_bug1_budget_only_counts_generated_thinking_tokens(client):
     assert body["stop_reason"] == "max_tokens"
     thinking_blocks = [b for b in body["content"] if b["type"] == "thinking"]
     assert thinking_blocks
-    assert thinking_blocks[0]["thinking"] == "aa"
+    assert thinking_blocks[0]["thinking"] == "a"
+
+
+def test_thinking_budget_is_enforced_when_close_marker_is_missing(client):
+    tok = FakeTokenizer(
+        vocab={10: "a"},
+        has_thinking=True,
+        think_start_tokens=[500],
+        think_end_tokens=[501],
+        prompt_ids=[1, 500],
+    )
+    runner = FakeRunner(tokens_to_emit=[10, 10, 999])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 1},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stop_reason"] == "max_tokens"
+    thinking_blocks = [b for b in body["content"] if b["type"] == "thinking"]
+    assert thinking_blocks == [
+        {
+            "type": "thinking",
+            "thinking": "a",
+            "signature": server._thinking_signature("a"),
+        }
+    ]
+
+
+def test_user_literal_think_marker_does_not_open_assistant_thinking(client):
+    """An unmatched marker in rendered history is not the generation suffix."""
+
+    tok = FakeTokenizer(
+        vocab={42: "user text", 500: "<think>", 43: "assistant:", 10: "answer"},
+        has_thinking=True,
+        think_start_tokens=[500],
+        think_end_tokens=[501],
+        prompt_ids=[42, 500, 43],
+    )
+    runner = FakeRunner(tokens_to_emit=[10, 999])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "literal <think> marker"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    message = resp.json()["choices"][0]["message"]
+    assert message["content"] == "answer"
+    assert "reasoning_content" not in message
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_post_thinking_separator_newlines_are_not_exposed(client, stream):
+    """The template/model separator after ``</think>`` is framing, not answer text.
+
+    The real Qwen template emits ``</think>\n\n<answer>``.  Keeping those two
+    newlines made Chat Completions return ``\n\n408`` and Responses return
+    ``\n\npong`` even though the visible answer itself did not start with a blank
+    paragraph.  Cover both collection modes because they use separate assembly
+    paths around the shared ThinkingRouter.
+    """
+
+    tok = FakeTokenizer(
+        vocab={10: "pondering", 501: "</think>", 11: "\n\n", 12: "pong"},
+        has_thinking=True,
+        think_start_tokens=[500],
+        think_end_tokens=[501],
+        prompt_ids=[1, 500],
+    )
+    runner = FakeRunner(tokens_to_emit=[10, 501, 11, 12])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "ping",
+            "reasoning": {"effort": "low"},
+            "stream": stream,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    if stream:
+        pairs = _responses_sse_pairs(resp.text)
+        content = "".join(
+            data["delta"] for event, data in pairs if event == "response.output_text.delta"
+        )
+    else:
+        content = next(
+            item["content"][0]["text"]
+            for item in resp.json()["output"]
+            if item["type"] == "message"
+        )
+    assert content == "pong"
+
+
+def test_leading_newlines_without_thinking_are_preserved(client):
+    """Only the separator after a real thinking phase is framing."""
+
+    tok = FakeTokenizer(vocab={10: "\n\n", 11: "pong"})
+    runner = FakeRunner(tokens_to_emit=[10, 11])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post("/v1/responses", json={"model": "test-model", "input": "ping"})
+    assert resp.status_code == 200, resp.text
+    message = next(item for item in resp.json()["output"] if item["type"] == "message")
+    assert message["content"][0]["text"] == "\n\npong"
 
 
 # ---------- 8. バグ修正: thinking/redacted_thinking ブロックを履歴で 400 にしない ----------
@@ -1923,6 +2338,37 @@ def test_anthropic_history_thinking_block_does_not_400(client):
     assert not any(
         "let me check the weather tool" in str(m.get("content", "")) for m in rendered_messages
     )
+
+
+def test_anthropic_rejects_modified_fastmlx_thinking_signature(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "ok"}))
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "modified",
+                            "signature": server._thinking_signature("original"),
+                        },
+                        {"type": "text", "text": "answer"},
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert "modified" in resp.json()["error"]["message"]
+    assert not runner.calls
 
 
 def test_anthropic_history_redacted_thinking_block_does_not_400(client):
@@ -2185,6 +2631,22 @@ def test_responses_model_mismatch_is_404(client):
     assert not runner.calls
 
 
+def test_protocol_error_envelopes_include_required_metadata(client):
+    runner = FakeRunner(tokens_to_emit=[])
+    _install_state(runner)
+
+    openai = client.post("/v1/responses", json={"model": "test-model"})
+    assert openai.status_code == 400
+    assert openai.json()["error"]["param"] is None
+    assert "code" in openai.json()["error"]
+
+    anthropic = client.post("/v1/messages", json={"model": "test-model"})
+    assert anthropic.status_code == 400
+    request_id = anthropic.json()["request_id"]
+    assert request_id.startswith("req_")
+    assert anthropic.headers["request-id"] == request_id
+
+
 def test_responses_previous_response_id_is_400(client):
     tok = FakeTokenizer(vocab={10: "ok"})
     runner = FakeRunner(tokens_to_emit=[10])
@@ -2247,6 +2709,7 @@ def test_responses_stream_event_sequence(client):
     assert resp.status_code == 200, resp.text
     pairs = _responses_sse_pairs(resp.text)
     events = [e for e, _ in pairs]
+    assert [data["sequence_number"] for _, data in pairs] == list(range(len(pairs)))
     assert events[0] == "response.created"
     assert "response.output_item.added" in events
     assert "response.output_text.delta" in events
@@ -2259,6 +2722,64 @@ def test_responses_stream_event_sequence(client):
     completed = next(d for e, d in pairs if e == "response.completed")
     assert completed["response"]["status"] == "completed"
     assert completed["response"]["output"][0]["content"][0]["text"] == "hello world"
+
+
+def test_responses_stream_uses_incomplete_terminal_event_at_token_cap(client):
+    """A status=incomplete body must not be wrapped in response.completed."""
+
+    runner = FakeRunner(tokens_to_emit=[10, 11])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "a", 11: "b"}))
+
+    resp = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "hi", "stream": True, "max_output_tokens": 1},
+    )
+    assert resp.status_code == 200, resp.text
+    pairs = _responses_sse_pairs(resp.text)
+    assert pairs[-1][0] == "response.incomplete"
+    assert pairs[-1][1]["response"]["status"] == "incomplete"
+    assert pairs[-1][1]["response"]["incomplete_details"] == {
+        "reason": "max_output_tokens"
+    }
+
+
+def test_responses_complete_tool_call_without_eos_is_completed(client):
+    tok = _tool_calling_tokenizer({200: _TOOL_CALL_JSON})
+    # The fourth token is deliberately truncated: the closed tool call lands
+    # exactly on the generation cap and must still win over length termination.
+    runner = FakeRunner(tokens_to_emit=[100, 200, 101, 10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "weather?",
+            "tools": [_RESPONSES_WEATHER_TOOL],
+            "max_output_tokens": 3,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "completed"
+    assert resp.json()["output"][0]["type"] == "function_call"
+
+
+def test_responses_stream_failure_has_failed_terminal_event(client):
+    class RaisingRunner(FakeRunner):
+        def generate(self, *args, **kwargs):
+            raise RuntimeError("runner exploded")
+
+    _install_state(RaisingRunner([]))
+    resp = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "hi", "stream": True},
+    )
+    assert resp.status_code == 200, resp.text
+    pairs = _responses_sse_pairs(resp.text)
+    assert [event for event, _ in pairs][-2:] == ["error", "response.failed"]
+    failed = pairs[-1][1]["response"]
+    assert failed["status"] == "failed"
+    assert failed["error"]["message"] == "runner exploded"
 
 
 def test_responses_stream_emits_function_call_arguments_delta(client):
@@ -2280,6 +2801,15 @@ def test_responses_stream_emits_function_call_arguments_delta(client):
     pairs = _responses_sse_pairs(resp.text)
     events = [e for e, _ in pairs]
     assert "response.function_call_arguments.delta" in events
+    assert "response.function_call_arguments.done" in events
+
+    done = next(d for e, d in pairs if e == "response.function_call_arguments.done")
+    assert done["type"] == "response.function_call_arguments.done"
+    assert done["name"] == "get_weather"
+    assert done["output_index"] == 1
+    assert done["item_id"].startswith("fc_")
+    assert done["arguments"]
+    assert isinstance(done["sequence_number"], int)
 
     args_str = "".join(
         d["delta"] for e, d in pairs if e == "response.function_call_arguments.delta"
@@ -2320,6 +2850,10 @@ def test_responses_stream_emits_reasoning_summary_text_delta(client):
     reasoning_text = "".join(
         d["delta"] for e, d in pairs if e == "response.reasoning_summary_text.delta"
     )
+    reasoning_deltas = [
+        d for e, d in pairs if e == "response.reasoning_summary_text.delta"
+    ]
+    assert reasoning_deltas and all(d["summary_index"] == 0 for d in reasoning_deltas)
     content_text = "".join(d["delta"] for e, d in pairs if e == "response.output_text.delta")
     assert reasoning_text == "pondering. "
     assert content_text == "42"
@@ -2345,3 +2879,868 @@ def test_responses_stream_first_event_precedes_generation(client):
         assert runner.calls
 
     asyncio.run(run())
+
+
+# ---------- 10. バグ修正: Anthropic system の並び順 (実クライアント: Claude Code) ----------
+#
+# 実際に捕獲した Claude Code のリクエストボディでは、トップレベルの
+# "system" (3 要素の text ブロック配列) に加えて、"messages" のロール並びが
+# ['user', 'system'] — system ロールのメッセージが末尾に来る。Qwen 系の
+# チャットテンプレートは system が先頭に無いと "System message must be at
+# the beginning" で落ちるので、トップレベルの system と messages 内の
+# system ロールを両方とも先頭へ寄せて 1 個の system メッセージへ連結する
+# (fastmlx/server.py の anthropic_messages 参照)。
+
+
+def test_anthropic_system_role_in_messages_moved_to_front_with_top_level_system(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    body = {
+        "model": "test-model",
+        "max_tokens": 32,
+        "system": [
+            {"type": "text", "text": "top-level sys A. "},
+            {
+                "type": "text",
+                "text": "top-level sys B.",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            },
+        ],
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "embedded sys C"},
+        ],
+    }
+    resp = client.post("/v1/messages", json=body)
+    assert resp.status_code == 200, resp.text
+
+    rendered = tok.last_apply_chat_template_kwargs["messages"]
+    assert rendered == [
+        {
+            "role": "system",
+            "content": "top-level sys A. top-level sys B.\n\nembedded sys C",
+        },
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_anthropic_embedded_system_role_without_top_level_system(client):
+    """トップレベル system が無くても、messages 内の system ロールだけで
+    先頭へ寄せる経路が動くことを確認する。"""
+
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    body = {
+        "model": "test-model",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": "embedded only"},
+        ],
+    }
+    resp = client.post("/v1/messages", json=body)
+    assert resp.status_code == 200, resp.text
+
+    rendered = tok.last_apply_chat_template_kwargs["messages"]
+    assert rendered == [
+        {"role": "system", "content": "embedded only"},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_anthropic_multiple_embedded_system_roles_keep_relative_order(client):
+    """messages 内に system ロールが複数回現れても (トップレベルも含めて)
+    元の出現順のまま連結される。system 以外のメッセージの相対順序も崩れ
+    ない。"""
+
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    body = {
+        "model": "test-model",
+        "max_tokens": 32,
+        "system": "top",
+        "messages": [
+            {"role": "user", "content": "u1"},
+            {"role": "system", "content": "s1"},
+            {"role": "user", "content": "u2"},
+            {"role": "system", "content": "s2"},
+        ],
+    }
+    resp = client.post("/v1/messages", json=body)
+    assert resp.status_code == 200, resp.text
+
+    rendered = tok.last_apply_chat_template_kwargs["messages"]
+    assert rendered == [
+        {"role": "system", "content": "top\n\ns1\n\ns2"},
+        {"role": "user", "content": "u1"},
+        {"role": "user", "content": "u2"},
+    ]
+
+
+# ---------- 11. バグ修正: Codex CLI の tools (namespace 展開 / web_search 除外) ----------
+#
+# 実際に捕獲した Codex CLI のリクエストボディでは、"tools" に
+# {"type": "function", ...} 以外の要素 (namespace で入れ子になった
+# サブエージェント用ツール群、web_search) が混ざって送られてくる。fastmlx
+# は "each item in 'tools' must be an object with \"type\": \"function\""
+# で 400 を返していた。namespace は中の function を展開して拾い、
+# web_search はこのサーバーに実行主体が無いので黙って落とさずログへ残して
+# から除く (fastmlx/server.py の _flatten_responses_tools 参照)。
+
+
+def test_responses_tools_flattens_namespace_and_drops_web_search(client, capsys):
+    tok = FakeTokenizer(vocab={10: "ok"}, has_tool_calling=True)
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    body = {
+        "model": "test-model",
+        "input": "hi",
+        "tools": [
+            {
+                "type": "function",
+                "name": "f",
+                "description": "top-level function",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "namespace",
+                "name": "multi_agent_v1",
+                "description": "Tools for spawning and managing sub-agents.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "close_agent",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                ],
+            },
+            {"type": "web_search", "external_web_access": False},
+        ],
+    }
+    resp = client.post("/v1/responses", json=body)
+    assert resp.status_code == 200, resp.text
+
+    sent_tools = tok.last_apply_chat_template_kwargs["tools"]
+    names = {t["function"]["name"] for t in sent_tools}
+    assert names == {"f", "close_agent", "spawn_agent"}
+    assert all(t["type"] == "function" for t in sent_tools)
+
+    # web_search を黙って握りつぶさず、落としたことがログに残る。
+    log = capsys.readouterr().out
+    assert "web_search" in log
+    assert "[fastmlx-serve]" in log
+
+
+def test_responses_tools_all_unsupported_falls_back_to_no_tools(client):
+    """namespace/web_search を展開・除外した結果 tools が空になった場合、
+    400 にはせず「今回のターンはツール無し」として素通しする。"""
+
+    tok = FakeTokenizer(vocab={10: "ok"}, has_tool_calling=True)
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "hi",
+            "tools": [{"type": "web_search", "external_web_access": False}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert tok.last_apply_chat_template_kwargs["tools"] is None
+
+
+def test_responses_tools_nested_namespace_expands_recursively(client):
+    tok = FakeTokenizer(vocab={10: "ok"}, has_tool_calling=True)
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    body = {
+        "model": "test-model",
+        "input": "hi",
+        "tools": [
+            {
+                "type": "namespace",
+                "name": "outer",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "inner",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "deep",
+                                "parameters": {"type": "object", "properties": {}},
+                            }
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
+    resp = client.post("/v1/responses", json=body)
+    assert resp.status_code == 200, resp.text
+    sent_tools = tok.last_apply_chat_template_kwargs["tools"]
+    assert [t["function"]["name"] for t in sent_tools] == ["deep"]
+
+
+# ---------- 11b. バグ修正: Responses API の instructions/developer の並び順 ----------
+#
+# 実クライアントでの検証中に発見: Codex CLI は トップレベルの
+# "instructions" に加えて、"input" の先頭に role: "developer" のメッセージ
+# を混ぜて送ってくる (捕獲したボディで確認済み)。developer は system と
+# 同じ扱いにする既存の変換のせいで、system 相当のメッセージが 2 個
+# (instructions 由来 + developer 由来) 別々の位置に並び、Anthropic 経路の
+# bug (10 番) と同じ理由で "System message must be at the beginning" に
+# なっていた。instructions と developer/system ロールの input アイテムは
+# すべて 1 個の system メッセージへ連結し、先頭に置く。
+
+
+def test_responses_instructions_and_developer_role_consolidated_to_front(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    body = {
+        "model": "test-model",
+        "instructions": "top-level instructions",
+        "input": [
+            {"type": "message", "role": "developer", "content": "developer text"},
+            {"type": "message", "role": "user", "content": "hi"},
+        ],
+    }
+    resp = client.post("/v1/responses", json=body)
+    assert resp.status_code == 200, resp.text
+
+    rendered = tok.last_apply_chat_template_kwargs["messages"]
+    assert rendered == [
+        {"role": "system", "content": "top-level instructions\n\ndeveloper text"},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_responses_string_input_with_instructions_still_consolidates(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "instructions": "sys", "input": "hi"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert tok.last_apply_chat_template_kwargs["messages"] == [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+# ---------- 12. バグ修正: _select_session の部分一致 + KV trim ----------
+#
+# opencode 実測: 3 ターン目以降で ~11.7k の接頭辞を共有しているのに毎ターン
+# 全量を再 prefill していた。原因は _select_session が「処理済み列の全体が
+# 新プロンプトの接頭辞であること」(lcp == len(pl)) を要求していたこと —
+# チャットテンプレートが生成プロンプトの末尾に開く thinking マーカー等は
+# 次ターンの履歴には再現されないため、末尾のわずかなトークンが一致せず
+# 全体が不一致扱いになり、毎ターン全再構築していた。
+#
+# 実際に確かめると (このモジュール冒頭の調査参照): KV キャッシュを最長
+# 共通接頭辞まで巻き戻す (trim) 操作自体は、GDN ハイブリッドの線形層に
+# 使う ArraysCache では原理的に不可能 (mlx_lm.models.cache.ArraysCache は
+# is_trimmable() を持たず、常に False)。このサーバーが実運用で使う
+# 唯一の 2 経路 (SpecEngine の ChatSession、FallbackRunner の
+# FallbackSession) はどちらも GDN ハイブリッド専用なので、trim は実際には
+# 常に不発に終わり、既存の「全体一致 or 新規スロット」という安全な挙動が
+# そのまま保たれる。以下のテストは、(a) trim が安全に効く汎用的な形
+# (KVCache だけで構成されたキャッシュ、mlx_lm.models.cache の本物を使う)
+# と、(b) 実運用どおり ArraysCache が混ざっていて trim が不発に終わる形の
+# 両方を、実際の mlx_lm キャッシュ実装に対して確認する。
+
+
+def _real_kv_cache(offset: int):
+    """mlx_lm.models.cache.KVCache を trim 判定・実行だけ検証できる最小限の
+    状態で作る。KVCache.trim() は offset を減らすだけで keys/values の中身
+    は見ない (mlx_lm/models/cache.py 参照) ので、shape さえ辻褄が合っていれ
+    ば中身はダミーでよい。"""
+
+    from mlx_lm.models.cache import KVCache
+
+    c = KVCache()
+    c.offset = offset
+    c.keys = mx.zeros((1, 1, max(offset, 1), 1))
+    c.values = mx.zeros((1, 1, max(offset, 1), 1))
+    return c
+
+
+def test_select_session_reuses_via_trim_when_cache_is_fully_trimmable():
+    """caches が (GDN の線形層を含まない、通常の attention だけの)
+    KVCache だけで構成されていれば、部分一致でも実際に trim して同じ
+    スロットを再利用する。"""
+
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    sess = ChatSession()
+    sess.processed = [1, 2, 3, 4, 5]
+    sess.caches = [_real_kv_cache(5), _real_kv_cache(5)]
+    sess.mtp_valid = False
+    server.STATE.session_pool[0] = sess
+
+    got = server._select_session([1, 2, 3, 9, 9])
+
+    assert got is sess
+    assert got.processed == [1, 2, 3]
+    assert got.caches[0].offset == 3
+    assert got.caches[1].offset == 3
+    # MTP 継続用の状態は、対応する位置が無いので巻き戻し後は使わせない。
+    assert got.mtp_cache is None
+    assert got.h_last is None
+
+
+def test_select_session_falls_back_when_a_cache_layer_is_not_trimmable():
+    """1 レイヤーでも巻き戻せなければ (実運用の GDN ハイブリッド構成:
+    ArraysCache が線形層に混ざる)、部分一致は諦めて新規スロットへ倒す。
+    元のスロットは無傷のまま残る。"""
+
+    from mlx_lm.models.cache import ArraysCache
+
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    sess = ChatSession()
+    sess.processed = [1, 2, 3, 4, 5]
+    sess.caches = [_real_kv_cache(5), ArraysCache(size=2)]
+    server.STATE.session_pool[0] = sess
+
+    got = server._select_session([1, 2, 3, 9, 9])
+
+    assert got is not sess
+    assert got.processed == []
+    assert sess.processed == [1, 2, 3, 4, 5]  # 元のスロットは半端に壊れていない
+    assert sess.caches[0].offset == 5
+
+
+def test_select_session_skips_partial_match_when_mtp_valid():
+    """caches 自体は全レイヤー trim 可能でも、mtp_valid が立っていれば
+    (MTP 継続用の h_last が巻き戻し後の位置に対応しなくなる) 部分一致は
+    使わない。"""
+
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    sess = ChatSession()
+    sess.processed = [1, 2, 3, 4, 5]
+    sess.caches = [_real_kv_cache(5)]
+    sess.mtp_valid = True
+    server.STATE.session_pool[0] = sess
+
+    got = server._select_session([1, 2, 3, 9, 9])
+
+    assert got is not sess
+    assert sess.processed == [1, 2, 3, 4, 5]
+    assert sess.caches[0].offset == 5  # 触られていない
+
+
+def test_select_session_full_match_still_preferred_over_partial(client):
+    """全体一致するスロットがあれば、より長い部分一致候補が他にあっても
+    キャッシュに触れない既存の安全経路 (全体一致) が優先される。"""
+
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    # 部分一致で "得" に見えるが trim 不可のスロット (長い processed)
+    from mlx_lm.models.cache import ArraysCache
+
+    partial = ChatSession()
+    partial.processed = [1, 2, 3, 4, 5, 6, 7, 8]
+    partial.caches = [ArraysCache(size=2)]
+    server.STATE.session_pool["partial"] = partial
+
+    # 全体一致するスロット (短いが、キャッシュに触れず安全に再利用できる)
+    full = ChatSession()
+    full.processed = [1, 2, 3]
+    full.caches = [_real_kv_cache(3)]
+    server.STATE.session_pool["full"] = full
+
+    got = server._select_session([1, 2, 3, 4])
+
+    assert got is full
+    assert got.processed == [1, 2, 3]  # 変更されていない (追記のみ)
+
+
+class FakeChatSessionRunner:
+    """ChatSession 経由 (KIND="spec") の実運用に近い形で、_select_session の
+    trim 経路を HTTP 越しに確認するための最小フェイク。caches は本物の
+    mlx_lm.models.cache.KVCache を使う (KVCache.trim は offset を減らす
+    だけなので、中身のトークンを実際に流し込まなくても "この session が
+    どこまで処理済みか" を offset で正しく表現できる — _real_kv_cache と
+    同じ理屈)。MTP は使わない (mtp_valid は常に False) — MTP を絡めた
+    分岐は test_select_session_skips_partial_match_when_mtp_valid で別途
+    見ている。
+    """
+
+    KIND = "spec"
+    SUPPORTED_SAMPLING_PARAMS = SpecRunner.SUPPORTED_SAMPLING_PARAMS
+
+    def __init__(self, reply_tokens_by_call: list[list[int]]):
+        self._reply_tokens_by_call = list(reply_tokens_by_call)
+        self.calls: list[dict] = []
+
+    def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
+        prompt_ids = list(prompt_ids)
+        reused = 0
+        if session is not None and session.caches is not None:
+            pl = session.processed
+            n = min(len(pl), len(prompt_ids))
+            lcp = 0
+            while lcp < n and pl[lcp] == prompt_ids[lcp]:
+                lcp += 1
+            if lcp == len(pl) and lcp < len(prompt_ids):
+                reused = lcp
+        emitted: list[int] = []
+        toks = self._reply_tokens_by_call[len(self.calls)]
+        for t in toks:
+            if len(emitted) >= max_tokens:
+                break
+            emitted.append(t)
+            if on_tokens:
+                on_tokens([t])
+            if t in eos_ids:
+                break
+        self.calls.append(
+            {"prompt_ids": prompt_ids, "reused_before_call": reused, "emitted": emitted}
+        )
+        if session is not None:
+            new_processed = prompt_ids + emitted
+            session.publish([_real_kv_cache(len(new_processed))], None, False, new_processed, None)
+        return {
+            "tokens": emitted,
+            "ttft_s": 0.001,
+            "decode_tps": 100.0,
+            "prefill_reused": reused,
+            "prefill_new": len(prompt_ids) - reused,
+            "tokens_per_step": 1.0,
+            "accept_hist": {},
+        }
+
+
+def _fake_messages_to_ids_reopened_marker(messages):
+    """<think>\\n 再オープンによる末尾不一致バグを模す prompt_ids_fn。
+
+    生成直前にだけ open marker (77) を付けるが、確定した過去ターンを
+    履歴へ埋め戻すときは (本物のチャットテンプレートが thinking を履歴
+    から落とすのと同じ非対称性で) open marker を含めない。そのため
+    「新プロンプトが前回の処理済み列の純粋な追記になる」という
+    _fake_messages_to_ids の前提が崩れ、部分一致 (assistant ターンの
+    直前までは一致、その先の open marker だけ食い違う) になる。
+    """
+
+    ids: list[int] = []
+    for m in messages:
+        role = m.get("role", "user")
+        content = m.get("content", "") or ""
+        if role == "assistant":
+            ids.extend(int(t) for t in content.split(",") if t)
+        else:
+            ids.extend(ord(c) for c in f"{role}:{content}\n")
+    ids.append(77)
+    return ids
+
+
+def test_http_partial_match_trim_reuses_slot_and_reports_nonzero_reused(client):
+    tok = FakeTokenizer(
+        vocab={10: "ok"}, prompt_ids_fn=_fake_messages_to_ids_reopened_marker
+    )
+    runner = FakeChatSessionRunner(reply_tokens_by_call=[[10], [10]])
+    _install_state(runner, tokenizer=tok)
+
+    turn1 = [{"role": "user", "content": "hello"}]
+    r1 = client.post("/v1/chat/completions", json={"messages": turn1})
+    assert r1.status_code == 200, r1.text
+    assert runner.calls[0]["reused_before_call"] == 0
+
+    turn2 = turn1 + [
+        {"role": "assistant", "content": "10"},
+        {"role": "user", "content": "again"},
+    ]
+    r2 = client.post("/v1/chat/completions", json={"messages": turn2})
+    assert r2.status_code == 200, r2.text
+
+    # 全体一致では届かなかった再利用が、部分一致 + trim 経由で発生する。
+    assert runner.calls[1]["reused_before_call"] > 0
+    assert r2.json()["usage"]["prompt_tokens_details"]["cached_tokens"] > 0
+
+
+def test_http_partial_match_trim_produces_same_prompt_and_output_as_full_rebuild(client):
+    """部分一致 + trim でスロットを再利用したときも、trim を封じて (新規
+    スロット =全再構築に倒れる状態で) 処理したときも、runner.generate() に
+    渡る prompt_ids (実際にモデルへ見せる論理プロンプト) と最終的な出力は
+    完全に一致することを確認する。session 再利用は runner 内部で
+    「どこまで KV を使い回せるか」を決めるだけの最適化であり、上位から
+    モデルへ見せる入力そのものは変えない — ここが一致していれば trim の
+    有無は出力に影響しない。
+    """
+
+    tok = FakeTokenizer(
+        vocab={10: "ok"}, prompt_ids_fn=_fake_messages_to_ids_reopened_marker
+    )
+    turn1 = [{"role": "user", "content": "hello"}]
+    turn2 = turn1 + [
+        {"role": "assistant", "content": "10"},
+        {"role": "user", "content": "again"},
+    ]
+
+    # (a) 部分一致 + trim でスロットを再利用するケース。
+    runner_reused = FakeChatSessionRunner(reply_tokens_by_call=[[10], [10]])
+    _install_state(runner_reused, tokenizer=tok)
+    r1 = client.post("/v1/chat/completions", json={"messages": turn1})
+    assert r1.status_code == 200, r1.text
+    r2_reused = client.post("/v1/chat/completions", json={"messages": turn2})
+    assert r2_reused.status_code == 200, r2_reused.text
+    assert runner_reused.calls[1]["reused_before_call"] > 0
+
+    # (b) 毎回まっさらな pool で turn2 だけを新規スロットとして処理する
+    #     (trim を経由しない = 全再構築) ケース。
+    runner_fresh = FakeChatSessionRunner(reply_tokens_by_call=[[10]])
+    _install_state(runner_fresh, tokenizer=tok)
+    r2_fresh = client.post("/v1/chat/completions", json={"messages": turn2})
+    assert r2_fresh.status_code == 200, r2_fresh.text
+    assert runner_fresh.calls[0]["reused_before_call"] == 0
+
+    assert runner_reused.calls[1]["prompt_ids"] == runner_fresh.calls[0]["prompt_ids"]
+    assert (
+        r2_reused.json()["choices"][0]["message"]["content"]
+        == r2_fresh.json()["choices"][0]["message"]["content"]
+    )
+
+
+# ---------- 文脈長ガード (_resolve_model_max_context / _check_context_length) ----------
+#
+# 実サーバーで ~57,000 トークンのプロンプトが Metal の一括確保上限を超えて
+# [metal::malloc] のまま 500 になっていた事故 (fastmlx/spec.py のチャンク
+# prefill とは別レイヤの、起動時にモデル config から決まる上限による事前
+# ガード)。ここではモデルをロードせず、STATE.max_context_tokens を直接
+# 差し込んで 4 経路 (chat/anthropic/completions/responses) と境界条件を
+# 検証する。
+
+
+def test_resolve_model_max_context_reads_top_level_field():
+    assert server._resolve_model_max_context({"max_position_embeddings": 131072}) == 131072
+
+
+def test_resolve_model_max_context_reads_nested_text_config():
+    # VLM ラッパー形式 (実物の Qwen3.6-35B-A3B config.json と同じ形):
+    # トップレベルには無く、text_config の下にネストされている。
+    config = {
+        "model_type": "qwen3_5_moe",
+        "text_config": {"max_position_embeddings": 262144},
+    }
+    assert server._resolve_model_max_context(config) == 262144
+
+
+def test_resolve_model_max_context_prefers_top_level_over_nested():
+    config = {
+        "max_position_embeddings": 4096,
+        "text_config": {"max_position_embeddings": 262144},
+    }
+    assert server._resolve_model_max_context(config) == 4096
+
+
+def test_resolve_model_max_context_returns_none_when_absent():
+    assert server._resolve_model_max_context({"model_type": "whatever"}) is None
+    assert server._resolve_model_max_context({"text_config": {}}) is None
+
+
+# ---------- _metal_safe_prefill_limit / _resolve_default_max_context_tokens ----------
+#
+# SpecEngine は新規プロンプトを PREFILL_STEP_SIZE (既定 2048) トークンずつ
+# チャンク分割して forward する (SpecEngine._prefill_hidden)。1 回の forward
+# の注意スコア行列確保は num_attention_heads * PREFILL_STEP_SIZE * T *
+# bytes_per_elem (T に対して線形)。それでも T が非常に大きいモデルでは
+# Metal の 1 バッファ上限を超え得るので、モデルが申告する
+# max_position_embeddings をそのまま上限にはせず、この関数が求めた値との
+# 小さい方を使う (_resolve_default_max_context_tokens)。
+#
+# ここでのテスト用の分母 (n_heads * PREFILL_STEP_SIZE * bytes_per_elem) は
+# 2 * 2048 * 2 = 8192 (PREFILL_STEP_SIZE は fastmlx.spec の実定数をそのまま
+# 使う -- テスト側で別の値を仮定すると経路間の共有を検証したことにならない)。
+
+
+_METAL_TEST_DENOM = 2 * server.PREFILL_STEP_SIZE * 2  # heads=2, bf16=2 bytes
+
+
+def test_metal_safe_prefill_limit_computes_from_heads_and_buffer_length(monkeypatch):
+    monkeypatch.setattr(
+        server.mx, "device_info", lambda: {"max_buffer_length": _METAL_TEST_DENOM * 100}
+    )
+    config = {"num_attention_heads": 2, "dtype": "bfloat16"}
+    # theoretical = (denom * 100) / denom = 100; limit = int(100 * 0.9) = 90
+    assert server._metal_safe_prefill_limit(config) == 90
+
+
+def test_metal_safe_prefill_limit_reads_nested_text_config(monkeypatch):
+    monkeypatch.setattr(
+        server.mx, "device_info", lambda: {"max_buffer_length": _METAL_TEST_DENOM * 100}
+    )
+    config = {"text_config": {"num_attention_heads": 2, "dtype": "bfloat16"}}
+    assert server._metal_safe_prefill_limit(config) == 90
+
+
+def test_metal_safe_prefill_limit_none_without_head_count(monkeypatch):
+    monkeypatch.setattr(
+        server.mx, "device_info", lambda: {"max_buffer_length": _METAL_TEST_DENOM * 100}
+    )
+    assert server._metal_safe_prefill_limit({"dtype": "bfloat16"}) is None
+
+
+def test_metal_safe_prefill_limit_none_when_device_info_unavailable(monkeypatch):
+    def _raise():
+        raise RuntimeError("no metal device")
+
+    monkeypatch.setattr(server.mx, "device_info", _raise)
+    config = {"num_attention_heads": 2, "dtype": "bfloat16"}
+    assert server._metal_safe_prefill_limit(config) is None
+
+
+def test_resolve_default_max_context_tokens_takes_the_smaller_value(monkeypatch):
+    # config の max_position_embeddings (大きい) より Metal 由来の実測上限
+    # (小さい) が効く -- コーディネータ指摘の通り、config を鵜呑みにしない。
+    monkeypatch.setattr(
+        server.mx, "device_info", lambda: {"max_buffer_length": _METAL_TEST_DENOM * 100}
+    )
+    config = {
+        "max_position_embeddings": 100_000,
+        "num_attention_heads": 2,
+        "dtype": "bfloat16",
+    }
+    assert server._resolve_default_max_context_tokens(config) == 90
+
+
+def test_resolve_default_max_context_tokens_uses_config_when_it_is_smaller(monkeypatch):
+    monkeypatch.setattr(
+        server.mx, "device_info", lambda: {"max_buffer_length": _METAL_TEST_DENOM * 100}
+    )
+    config = {
+        "max_position_embeddings": 10,
+        "num_attention_heads": 2,
+        "dtype": "bfloat16",
+    }
+    assert server._resolve_default_max_context_tokens(config) == 10
+
+
+def test_resolve_default_max_context_tokens_falls_back_to_whichever_is_available(monkeypatch):
+    monkeypatch.setattr(
+        server.mx, "device_info", lambda: {"max_buffer_length": _METAL_TEST_DENOM * 100}
+    )
+    # heads 情報が無い -> Metal 由来の値は None、config 側だけが効く。
+    assert server._resolve_default_max_context_tokens({"max_position_embeddings": 500}) == 500
+
+
+def test_resolve_default_max_context_tokens_none_when_nothing_available(monkeypatch):
+    monkeypatch.setattr(
+        server.mx, "device_info", lambda: {"max_buffer_length": _METAL_TEST_DENOM * 100}
+    )
+    assert server._resolve_default_max_context_tokens({"model_type": "whatever"}) is None
+
+
+# ---------- SpecEngine chunked prefill: spec-on == spec-off (docs/PREFILL-CHUNKING-DETERMINISM.md) ----------
+#
+# 分割あり/なしのビット一致は要求しない (mx.quantized_matmul がバッチ長
+# 依存の丸めをするため、docs/PREFILL-CHUNKING-DETERMINISM.md 参照)。代わりに
+# 要求するのは「チャンク幅を固定した下で、投機あり (SAM lookup) と投機なし
+# の貪欲デコード出力トークン列が完全一致する」こと。実モデルでの確認は別途
+# 手動で行った (report 参照)。ここでは合成の小さな GDN ハイブリッドモデルで
+# 同じ性質を高速に固定回帰できるようにする。
+
+
+def test_chunked_prefill_spec_on_matches_spec_off(monkeypatch):
+    """PREFILL_STEP_SIZE を小さく (3) してプロンプトが何チャンクにも分かれる
+    ようにし、lookup 投機ありの貪欲デコードと投機なしの貪欲デコードが完全
+    一致することを検証する。``_respec_trigger`` を強制的に True にして毎
+    ステップ lookup 候補を出させる (合成モデルは未学習で target logits の
+    エントロピーが高く、素の閾値では lookup がほぼ起動しないため) — 起動
+    自体の可否 (エントロピーゲート) は他のテストの対象で、ここでの主張は
+    「lookup が実際に起動したとき、受理判定が spec-off と矛盾しない」こと
+    だけに絞る。"""
+
+    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+    mx.random.seed(0)
+    args = TextModelArgs(
+        model_type="qwen3_5",
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=6,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=48,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        full_attention_interval=3,
+        head_dim=8,
+        tie_word_embeddings=True,
+    )
+    text_model = TextModel(args)
+    mx.eval(text_model.parameters())
+    fake_model = SimpleNamespace(language_model=text_model)
+    engine = SpecEngine(fake_model, mtp=None, prefill_step_size=3)
+
+    monkeypatch.setattr(SpecEngine, "_respec_trigger", staticmethod(lambda *a, **k: True))
+
+    # 繰り返しパターンにして SAM lookup が match_len >= lookup_ngram を
+    # 確実に見つけられるようにする。29 トークンは step=3 で 10 チャンクに
+    # 分かれる (チャンク境界をまたいだ prefill を実際に運動させる)。
+    pattern = [3, 7, 12, 20, 5, 41]
+    prompt_ids = (pattern * 6)[:29]
+
+    r_on = engine.generate(
+        prompt_ids,
+        max_tokens=20,
+        n_draft=0,
+        max_draft=0,
+        lookup_len=8,
+        lookup_ngram=3,
+        temp=0.0,
+        eos_ids=set(),
+    )
+    r_off = engine.generate(
+        prompt_ids,
+        max_tokens=20,
+        n_draft=0,
+        max_draft=0,
+        lookup_len=0,
+        temp=0.0,
+        eos_ids=set(),
+    )
+
+    assert r_on["tokens"] == r_off["tokens"]
+    # lookup が実際に起動したことを確認する (でなければこのテストは
+    # spec-off と実質同じ経路しか通っておらず、何も検証していない)。
+    assert sum(r_on["src_hist"]["lookup"].values()) > 0
+
+
+def test_context_length_guard_disabled_by_default(client):
+    # _install_state はデフォルトで max_context_tokens=None を積む =
+    # ガード無効。長いプロンプトでも通常どおり生成へ進む。
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner, tokenizer=FakeTokenizer(vocab={10: "x"}, prompt_ids=list(range(50_000)))
+    )
+    resp = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
+    assert resp.status_code == 200, resp.text
+    assert runner.calls
+
+
+def test_context_length_guard_rejects_over_limit_chat(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner,
+        tokenizer=FakeTokenizer(vocab={10: "x"}, prompt_ids=list(range(101))),
+        max_context_tokens=100,
+    )
+    resp = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+    err = resp.json()["error"]
+    assert err["type"] == "invalid_request_error"
+    assert err["code"] == "context_length_exceeded"
+    assert "100" in err["message"] and "101" in err["message"]
+
+
+def test_context_length_guard_rejects_over_limit_anthropic(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner,
+        tokenizer=FakeTokenizer(vocab={10: "x"}, prompt_ids=list(range(101))),
+        max_context_tokens=100,
+    )
+    resp = client.post(
+        "/v1/messages",
+        json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 16},
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+    body = resp.json()
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "invalid_request_error"
+    request_id = body["request_id"]
+    assert request_id.startswith("req_")
+    assert resp.headers["request-id"] == request_id
+
+
+def test_context_length_guard_rejects_over_limit_completions(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}), max_context_tokens=5)
+    resp = client.post("/v1/completions", json={"prompt": [1, 2, 3, 4, 5, 6]})
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+    err = resp.json()["error"]
+    assert err["code"] == "context_length_exceeded"
+
+
+def test_context_length_guard_rejects_over_limit_responses(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner,
+        tokenizer=FakeTokenizer(vocab={10: "x"}, prompt_ids=list(range(101))),
+        max_context_tokens=100,
+    )
+    resp = client.post("/v1/responses", json={"input": "hi"})
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+    err = resp.json()["error"]
+    assert err["code"] == "context_length_exceeded"
+
+
+def test_context_length_guard_boundary_exact_limit_is_allowed(client):
+    # ちょうど上限と同じ長さ (超えてはいない) は通す。
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner,
+        tokenizer=FakeTokenizer(vocab={10: "x"}, prompt_ids=list(range(100))),
+        max_context_tokens=100,
+    )
+    resp = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
+    assert resp.status_code == 200, resp.text
+    assert runner.calls
+
+
+def test_context_length_guard_boundary_one_over_limit_is_rejected(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner,
+        tokenizer=FakeTokenizer(vocab={10: "x"}, prompt_ids=list(range(101))),
+        max_context_tokens=100,
+    )
+    resp = client.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+
+
+def test_context_length_guard_streaming_400_returns_before_any_sse_event(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner,
+        tokenizer=FakeTokenizer(vocab={10: "x"}, prompt_ids=list(range(101))),
+        max_context_tokens=100,
+    )
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+    assert "text/event-stream" not in resp.headers.get("content-type", "")
+    assert not resp.text.startswith("data: ")

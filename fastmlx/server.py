@@ -77,6 +77,8 @@ import argparse
 import asyncio
 import concurrent.futures
 import functools
+import hashlib
+import hmac
 import itertools
 import json
 import os
@@ -88,13 +90,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator
 
+import mlx.core as mx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ._mlx_compat import mlx_lm_load
 from .runner import FallbackSession, Runner, build_runner
-from .spec import ChatSession
+from .spec import PREFILL_STEP_SIZE, ChatSession
 
 app = FastAPI()
 
@@ -135,30 +138,119 @@ class ModelState:
     created_ts: int
     max_sessions: int = 8  # session_pool の上限 (LRU)。91GB 級モデルの上に
     # 会話ごとの KV を無制限に積まないための上限で、--max-sessions で変えられる。
+    # プロンプト長 (トークン数) の上限。既定はモデル config の
+    # max_position_embeddings と、Metal が一括確保できる実際の上限から
+    # 逆算した値の小さい方を自動で取る (_resolve_default_max_context_tokens)、
+    # --max-context-tokens で上書き可。None なら未検出でガード無効。
+    # _check_context_length が全 4 経路 (chat/anthropic/completions/responses)
+    # で参照する。
+    max_context_tokens: int | None = None
     session_key_seq: Iterator[int] = field(default_factory=lambda: itertools.count())
 
 
 STATE: ModelState | None = None
+
+_THINKING_SIGNATURE_PREFIX = "fastmlx_v1:"
+_THINKING_SIGNATURE_KEY = os.urandom(32)
+_THINKING_SIGNATURE_KEY_ID = hashlib.sha256(_THINKING_SIGNATURE_KEY).hexdigest()[:16]
+
+
+def _thinking_signature(text: str) -> str:
+    """Process-local integrity token for Anthropic thinking block round-trips."""
+
+    digest = hmac.new(
+        _THINKING_SIGNATURE_KEY, text.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    return f"{_THINKING_SIGNATURE_PREFIX}{_THINKING_SIGNATURE_KEY_ID}:{digest}"
+
+
+def _validate_local_thinking_signature(text: str, signature) -> bool:
+    """Validate signatures issued here; leave opaque foreign signatures alone."""
+
+    if not isinstance(signature, str) or not signature.startswith(_THINKING_SIGNATURE_PREFIX):
+        return True
+    try:
+        key_id, _ = signature[len(_THINKING_SIGNATURE_PREFIX) :].split(":", 1)
+    except ValueError:
+        return False
+    # A conversation resumed after a server restart carries a signature from
+    # a no-longer-available process key.  Treat it like another provider's
+    # opaque signature instead of breaking an otherwise valid history.
+    if key_id != _THINKING_SIGNATURE_KEY_ID:
+        return True
+    return hmac.compare_digest(signature, _thinking_signature(text))
+
+
+def _try_trim_session_cache(sess, n_trim: int) -> bool:
+    """``sess`` (ChatSession/FallbackSession) の KV キャッシュを ``n_trim``
+    トークン分だけ巻き戻せるか確認し、できれば実際に巻き戻す。
+
+    個々のキャッシュ実装 (mlx_lm.models.cache の ``KVCache`` は巻き戻せる。
+    GDN ハイブリッドの線形層に使う ``ArraysCache`` は再帰状態を途中位置へ
+    戻す手段が無く巻き戻せない — fastmlx/spec.py の ChatSession docstring、
+    fastmlx/runner.py の FallbackSession docstring 参照) をこの関数自身は
+    一切知らない。判定・実行はどちらも mlx_lm.models.cache の
+    ``can_trim_prompt_cache``/``trim_prompt_cache`` にそのまま委ねる —
+    構成する全レイヤーが ``is_trimmable()`` を申告したときだけ実際に trim
+    し、1 レイヤーでも無理なら何もせず False を返す (半端に書き換えて
+    壊れた状態を残さない)。
+
+    ``mtp_valid`` (ChatSession のみ) が立っている session は対象外にする:
+    MTP 連鎖用の ``h_last``/``mtp_cache`` はセッションの最終位置 1 点分の
+    状態しか持たず、途中位置まで KV を巻き戻しても対応する h_last が
+    無いため、巻き戻した位置での MTP 継続を保証できない。呼び出し側が
+    ``mtp_valid`` を立てて渡してくる可能性がある構成 (GDN ハイブリッド +
+    MTP、このサーバーの現行構成そのもの) では、そもそも ``ArraysCache``
+    が混ざっているため ``can_trim_prompt_cache`` が False を返して自然に
+    弾かれるはずだが、それに依存せずここでも明示的に弾く (二重の安全策)。
+    """
+
+    if getattr(sess, "mtp_valid", False):
+        return False
+    cache_list = getattr(sess, "caches", None)
+    if cache_list is None:
+        cache_list = getattr(sess, "cache", None)
+    # 実際の ChatSession.caches/FallbackSession.cache は常に
+    # mlx_lm.models.cache._BaseCache のインスタンスのリストだが、この
+    # 関数は runner の種類を知らない (テストの軽量フェイクは cache を
+    # 中身の無い sentinel オブジェクトにすることがある) ので、その形に
+    # なっていなければ trim できないものとして安全側に倒す。
+    if not isinstance(cache_list, list) or not cache_list:
+        return False
+    from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
+
+    if not can_trim_prompt_cache(cache_list):
+        return False
+    trimmed = trim_prompt_cache(cache_list, n_trim)
+    return trimmed == n_trim
 
 
 def _select_session(prompt_ids: list[int]):
     """新しいプロンプトに対して使う session (ChatSession/FallbackSession) を
     ``STATE.session_pool`` から選ぶ。
 
-    選択基準は「既存スロットの処理済みトークン列全体が新プロンプトの接頭辞に
-    なっている (= 純粋な追記)」だけ — 会話の身元を messages の内容から
-    推測する (システムプロンプトのハッシュ等) のではなく、SpecEngine の
-    ChatSession が単一セッションで既にやっている LCP 判定 (fastmlx/spec.py)
-    をプール全体に広げただけなので、動的に変化しうるシステムプロンプト
-    (現在時刻の埋め込み等) が混ざっていても「一致しなければ新規スロット
-    (=全再構築)」に自然に倒れる — 誤ったスロットを掴んで壊れることはない。
+    まず既存の安全な経路を最優先で試す: 「既存スロットの処理済みトークン列
+    全体が新プロンプトの接頭辞になっている (= 純粋な追記)」スロットが
+    あれば、キャッシュには一切触れずそのまま使う。会話の身元を messages
+    の内容から推測する (システムプロンプトのハッシュ等) のではなく、
+    SpecEngine の ChatSession が単一セッションで既にやっている LCP 判定
+    (fastmlx/spec.py) をプール全体に広げただけなので、動的に変化しうる
+    システムプロンプト (現在時刻の埋め込み等) が混ざっていても「一致
+    しなければ次点へ」に自然に倒れる。一致するスロットが複数ありうる
+    状況では最長一致を優先する。
 
-    一致するスロットが複数ありうる状況 (通常は起こらない — ある会話の
-    processed 列が別の会話の新プロンプトの真の接頭辞になるのは、後者が前者
-    と全く同じ内容を再送してきた場合だけ) では最長一致を優先する。
+    全体一致が無ければ、部分一致 (処理済み列の一部だけが新プロンプトの
+    接頭辞) の中で LCP が長い順に、KV キャッシュをその LCP まで実際に
+    巻き戻せるか試す (llama.cpp と同様、最長共通接頭辞まで再利用してから
+    trim する発想)。巻き戻し可否の判定は ``_try_trim_session_cache`` に
+    委ねており、巻き戻せた場合だけそのスロットを使い、``processed`` を
+    LCP 長へ切り詰める。1 つも巻き戻せなければ (GDN ハイブリッド層を含む
+    構成では常にこうなる — 上記 docstring 参照) 部分一致は諦め、従来
+    どおり新規スロットへ倒す。誤った/半端な状態のスロットを掴んで壊れる
+    ことは無い。
 
-    一致するスロットが無ければ、プールが上限未満なら新規スロットを、上限
-    ならず最も長く未使用のスロット (先頭 = LRU) を追い出して新規スロットを
+    候補が 1 つも無ければ、プールが上限未満なら新規スロットを、上限なら
+    最も長く未使用のスロット (先頭 = LRU) を追い出して新規スロットを
     割り当てる。
 
     呼び出し側は ``STATE.lock`` を保持した状態でこれを呼ぶこと — プール自体
@@ -168,16 +260,22 @@ def _select_session(prompt_ids: list[int]):
     """
 
     pool = STATE.session_pool
+
+    def _lcp(pl: list[int]) -> int:
+        n = min(len(pl), len(prompt_ids))
+        i = 0
+        while i < n and pl[i] == prompt_ids[i]:
+            i += 1
+        return i
+
+    # 1st pass: 全体一致 (純粋な追記) — キャッシュに触れない、既存の安全経路。
     best_key = None
     best_lcp = -1
     for key, sess in pool.items():
         pl = sess.processed
         if not pl:
             continue
-        n = min(len(pl), len(prompt_ids))
-        lcp = 0
-        while lcp < n and pl[lcp] == prompt_ids[lcp]:
-            lcp += 1
+        lcp = _lcp(pl)
         if lcp == len(pl) and lcp < len(prompt_ids) and lcp > best_lcp:
             best_lcp = lcp
             best_key = key
@@ -185,6 +283,28 @@ def _select_session(prompt_ids: list[int]):
     if best_key is not None:
         pool.move_to_end(best_key)
         return pool[best_key]
+
+    # 2nd pass: 部分一致。LCP が長い候補から順に、実際に巻き戻せるスロット
+    # が見つかるまで試す。
+    partial = []
+    for key, sess in pool.items():
+        pl = sess.processed
+        if not pl:
+            continue
+        lcp = _lcp(pl)
+        if 0 < lcp < len(pl) and lcp < len(prompt_ids):
+            partial.append((lcp, key, sess))
+    partial.sort(key=lambda c: -c[0])
+
+    for lcp, key, sess in partial:
+        if _try_trim_session_cache(sess, len(sess.processed) - lcp):
+            sess.processed = sess.processed[:lcp]
+            if hasattr(sess, "mtp_cache"):
+                sess.mtp_cache = None
+            if hasattr(sess, "h_last"):
+                sess.h_last = None
+            pool.move_to_end(key)
+            return sess
 
     if len(pool) >= STATE.max_sessions:
         pool.popitem(last=False)
@@ -406,7 +526,22 @@ def _normalize_anthropic_messages(messages: list[dict]) -> list[dict]:
                 # 返している (このモジュール内で "thinking" ブロックを組み
                 # 立てている箇所を参照) ので、tool を使う複数ターンの会話を
                 # 送り返すクライアント (例: Claude Code) は確実にこの型を
-                # 履歴へ含めてくる。中身をモデルに再度読ませる必要は無い
+                # 履歴へ含めてくる。fastmlx 自身が発行した thinking signature
+                # は改変されていないことを確認する (他 provider の opaque
+                # signature は解釈できないので、そのまま受け付ける)。
+                if btype == "thinking":
+                    thinking = block.get("thinking")
+                    if not isinstance(thinking, str):
+                        raise InvalidContentError(
+                            "content block of type 'thinking' must have a string 'thinking' field"
+                        )
+                    if not _validate_local_thinking_signature(
+                        thinking, block.get("signature")
+                    ):
+                        raise InvalidContentError(
+                            "thinking block was modified after its signature was issued"
+                        )
+                # 中身をモデルに再度読ませる必要は無い
                 # (thinking 対応チャットテンプレートは確定した過去ターンの
                 # think 内容を履歴から落とす想定 — _apply_template の
                 # docstring 参照) ので、ここでは 400 にせず読み飛ばすだけ
@@ -494,6 +629,8 @@ _REASONING_EFFORT_BUDGET = {
     "low": 2048,
     "medium": 8192,
     "high": 32768,
+    "xhigh": 65536,
+    "max": 131072,
 }
 _REASONING_EFFORT_DEFAULT_BUDGET = _REASONING_EFFORT_BUDGET["medium"]
 
@@ -532,7 +669,25 @@ def _resolve_thinking(body: dict, protocol: str) -> tuple[bool | None, int | Non
         if not isinstance(budget, int) or isinstance(budget, bool) or budget < 0:
             return None, None, "'thinking.budget_tokens' must be a non-negative integer"
         return True, budget, None
-    return None, None, f"'thinking.type' must be 'enabled' or 'disabled', got {t!r}"
+    if t == "adaptive":
+        output_config = body.get("output_config", {})
+        if not isinstance(output_config, dict):
+            return None, None, "'output_config' must be an object"
+        effort = output_config.get("effort", "high")
+        if effort not in {"low", "medium", "high", "xhigh", "max"}:
+            return None, None, (
+                "'output_config.effort' must be 'low', 'medium', 'high', "
+                f"'xhigh', or 'max', got {effort!r}"
+            )
+        # Local Qwen templates expose a binary enable_thinking switch rather
+        # than Anthropic's model-side adaptive controller.  Preserve the wire
+        # contract by accepting adaptive mode and map its soft effort hint to
+        # the same bounded router budget used by reasoning_effort.  The endpoint
+        # clamps this to max_tokens before generation.
+        return True, _REASONING_EFFORT_BUDGET[effort], None
+    return None, None, (
+        f"'thinking.type' must be 'enabled', 'adaptive', or 'disabled', got {t!r}"
+    )
 
 
 # ---------- tool calling: リクエスト側 (tools/tool_choice の検証・解決) ----------
@@ -686,14 +841,12 @@ def _prompt_already_thinking(prompt_ids: list[int]) -> bool:
     ``</think>`` だけが閉じ側の生テキストとして残る。
 
     判定は「think_start_tokens の最後の出現位置より後ろに think_end_tokens
-    が無い」= 末尾が開きっぱなしの thinking ブロックの中にある、で行う
-    (末尾の完全一致だけを見ないのは、``<think>`` の直後に改行トークン等が
-    続くテンプレートで取りこぼさないため — ``<think>`` 自体は語彙表に登録
-    された 1 トークンの特殊トークンなので、直後の空白文字は別トークンに
-    なりうる)。過去ターンの assistant 応答内に生の ``<think>``/``</think>``
-    が残っている (通常は起きない — ``_apply_template`` の docstring 参照)
-    としても、その場合は必ずペアで現れるので最後の出現位置の前後関係には
-    影響しない。
+    が無く、start より後ろが空白だけ」= 生成プロンプトの末尾が開きっぱなし
+    の thinking ブロック、で行う。末尾の完全一致だけを見ないのは、
+    ``<think>`` の直後に改行トークン等が続くテンプレートで取りこぼさない
+    ため。逆に user/history 内のリテラルな ``<think>`` から assistant の
+    generation suffix までには空白以外の role delimiter が続くので、誤って
+    thinking 開始扱いにしない。
 
     ``has_thinking`` が False (このモデルではそもそも thinking を分離
     しない) なら常に False。
@@ -720,7 +873,26 @@ def _prompt_already_thinking(prompt_ids: list[int]) -> bool:
     if start_idx < 0:
         return False
     end_idx = _rfind(prompt_ids, end) if end else -1
-    return end_idx < start_idx
+    if end_idx >= start_idx:
+        return False
+
+    # A literal unmatched marker can occur in user/history text.  A template-
+    # opened thinking block is specifically a generation suffix: only ignorable
+    # whitespace may follow the last start marker.  Looking at the whole prompt
+    # without this suffix check routes an ordinary answer into reasoning whenever
+    # a user happens to type ``<think>``.
+    tail = prompt_ids[start_idx + len(start) :]
+    if tail:
+        decoder = getattr(tokenizer, "decode", None)
+        if not callable(decoder):
+            return False
+        try:
+            tail_text = decoder(tail)
+        except Exception:
+            return False
+        if not isinstance(tail_text, str) or tail_text.strip():
+            return False
+    return True
 
 
 class ThinkingRouter:
@@ -824,6 +996,10 @@ class ThinkingRouter:
         self.tool_detok = tokenizer.detokenizer
         self.thinking_token_count = 0
         self.budget_exceeded = False
+        # Qwen 系は thinking 終了マーカーの直後に回答との区切りとして
+        # ``\n\n`` を生成する。この framing を可視本文へ混ぜない。ただし
+        # thinking を通らない応答の先頭改行はモデル出力そのものなので触らない。
+        self._strip_post_thinking_newlines = False
         self._start_tokens = list(tokenizer.think_start_tokens) if self.enabled else []
         self._end_tokens = list(tokenizer.think_end_tokens) if self.enabled else []
         self._tool_start = (
@@ -833,6 +1009,26 @@ class ThinkingRouter:
             list(tokenizer.tool_call_end_tokens) if self.tool_enabled else []
         )
 
+    def _clean_content_segment(self, segment: str) -> str:
+        """Drop only leading CR/LF framing immediately after a thinking block."""
+
+        if not segment or not self._strip_post_thinking_newlines:
+            return segment
+        cleaned = segment.lstrip("\r\n")
+        if cleaned:
+            self._strip_post_thinking_newlines = False
+        return cleaned
+
+    def _feed_thinking_token(self, token: int) -> bool:
+        """Decode one allowed thinking token; return False at the budget boundary."""
+
+        if self.budget is not None and self.thinking_token_count >= self.budget:
+            self.budget_exceeded = True
+            return False
+        self.think_detok.add_token(token)
+        self.thinking_token_count += 1
+        return True
+
     def _feed_content_token(self, t: int, out: list) -> None:
         """content フェーズの 1 トークンを処理する。tool ルーティングが
         無効なら即デコードするだけ (従来どおり)。有効なら
@@ -841,7 +1037,7 @@ class ThinkingRouter:
 
         if not self.tool_enabled:
             self.content_detok.add_token(t)
-            seg = self.content_detok.last_segment
+            seg = self._clean_content_segment(self.content_detok.last_segment)
             if seg:
                 out.append(("content", seg))
             return
@@ -850,18 +1046,20 @@ class ThinkingRouter:
             if self.tool_buf == self._tool_start:
                 self.phase = "tool"
                 self.tool_buf = []
+                self._strip_post_thinking_newlines = False
                 out.append(("tool_start", ""))
             return
         cut = len(self.tool_buf) - len(self._tool_start)
         flush, self.tool_buf = self.tool_buf[:cut], self.tool_buf[cut:]
         for ft in flush:
             self.content_detok.add_token(ft)
-        seg = self.content_detok.last_segment
+        seg = self._clean_content_segment(self.content_detok.last_segment)
         if seg:
             out.append(("content", seg))
         if self.tool_buf == self._tool_start:
             self.phase = "tool"
             self.tool_buf = []
+            self._strip_post_thinking_newlines = False
             out.append(("tool_start", ""))
 
     def _feed_tool_token(self, t: int, out: list) -> None:
@@ -915,16 +1113,14 @@ class ThinkingRouter:
                     if self.buf == self._end_tokens:
                         self.phase = "content"
                         self.buf = []
+                        self._strip_post_thinking_newlines = True
                     continue
                 # ウィンドウが end marker 長を超えた分だけ確定で thinking へ
                 # 流す (末尾は常に marker 長ぶん保持して先読みを続ける)。
                 cut = len(self.buf) - len(self._end_tokens)
                 flush, self.buf = self.buf[:cut], self.buf[cut:]
                 for ft in flush:
-                    self.think_detok.add_token(ft)
-                    self.thinking_token_count += 1
-                    if self.budget is not None and self.thinking_token_count > self.budget:
-                        self.budget_exceeded = True
+                    if not self._feed_thinking_token(ft):
                         break
                 seg = self.think_detok.last_segment
                 if seg:
@@ -934,6 +1130,7 @@ class ThinkingRouter:
                 if self.buf == self._end_tokens:
                     self.phase = "content"
                     self.buf = []
+                    self._strip_post_thinking_newlines = True
                 continue
             if self.phase == "content":
                 self._feed_content_token(t, out)
@@ -956,8 +1153,8 @@ class ThinkingRouter:
             # </think> を出さないまま max_tokens/eos に達した。バッファに
             # 残る未確定トークンは thinking として確定させる。
             for t in self.buf:
-                self.think_detok.add_token(t)
-                self.thinking_token_count += 1
+                if not self._feed_thinking_token(t):
+                    break
             self.buf = []
             self.think_detok.finalize()
             seg = self.think_detok.last_segment
@@ -982,7 +1179,7 @@ class ThinkingRouter:
             self.content_detok.add_token(t)
         self.tool_buf = []
         self.content_detok.finalize()
-        seg = self.content_detok.last_segment
+        seg = self._clean_content_segment(self.content_detok.last_segment)
         if seg:
             out.append(("content", seg))
         return out
@@ -1110,7 +1307,7 @@ def _parse_sampling_params(body: dict) -> tuple[dict, str | None]:
     if top_p is not None:
         params["top_p"] = top_p
 
-    top_k, err = _parse_optional_int(body, "top_k", 0)
+    top_k, err = _parse_optional_int(body, "top_k", -1)
     if err is not None:
         return {}, err
     if top_k is not None:
@@ -1163,16 +1360,16 @@ def _parse_sampling_params(body: dict) -> tuple[dict, str | None]:
 # ここへ集約する。logit_bias は「None または空 dict」が恒等値なので、
 # 値そのものではなく _is_identity_sampling_value 側で特別扱いする。
 #
-# top_k の -1 は現状 _parse_optional_int(..., lo=0) が事前に 400 で弾くため
-# 実際にはここへ到達しないが、"top_k を無効化する" 値として一般的なので
-# 恒等値の定義としては含めておく (無害)。
+# top_k の -1 は 0 と同じく「top-k を無効化する」恒等値として扱う。
+# FallbackRunner が使う mlx_lm.make_sampler も ``top_k > 0`` のときだけ
+# フィルタを有効化するため、この値をそのまま渡しても分布は変わらない。
 _IDENTITY_SAMPLING_VALUES: dict[str, tuple] = {
-    "top_p": (1.0,),
+    "top_p": (0.0, 1.0),
     "top_k": (0, -1),
     "min_p": (0.0,),
     "frequency_penalty": (0.0,),
     "presence_penalty": (0.0,),
-    "repetition_penalty": (1.0,),
+    "repetition_penalty": (0.0, 1.0),
 }
 
 
@@ -1263,17 +1460,28 @@ def _find_stop(text: str, stops: list[str]) -> tuple[int, str] | None:
     return best
 
 
-def _openai_error(message: str, status: int = 400, err_type: str = "invalid_request_error", code: str | None = None):
-    err = {"message": message, "type": err_type}
-    if code is not None:
-        err["code"] = code
+def _openai_error(
+    message: str,
+    status: int = 400,
+    err_type: str = "invalid_request_error",
+    code: str | None = None,
+):
+    # OpenAI's error object carries nullable ``param`` and ``code`` keys even
+    # when a validation failure is not tied to one request field.
+    err = {"message": message, "type": err_type, "param": None, "code": code}
     return JSONResponse(status_code=status, content={"error": err})
 
 
 def _anthropic_error(message: str, status: int = 400, err_type: str = "invalid_request_error"):
+    request_id = f"req_{uuid.uuid4().hex}"
     return JSONResponse(
         status_code=status,
-        content={"type": "error", "error": {"type": err_type, "message": message}},
+        content={
+            "type": "error",
+            "error": {"type": err_type, "message": message},
+            "request_id": request_id,
+        },
+        headers={"request-id": request_id},
     )
 
 
@@ -1303,12 +1511,59 @@ def _check_model_anthropic(body: dict):
     return None
 
 
+def _check_context_length(prompt_ids: list[int], protocol: str):
+    """プロンプトが起動時に決めた上限 (モデル config の max_position_embeddings
+    と、Metal が一括確保できる実際の上限から逆算した値のうち小さい方。
+    ``--max-context-tokens`` で上書き可。``_resolve_default_max_context_tokens``
+    参照) を超えていれば 400 を返す。
+
+    Metal がアテンション行列を一括確保できず [metal::malloc] で落ちて
+    そのまま 500 になる事故 (実測で ~57,000 トークン付近から発生) を防ぐ
+    ための事前チェック。SpecEngine は新規プロンプトを一括で forward する
+    (チャンク分割は 4-bit 量子化モデルで mx.quantized_matmul がバッチ長に
+    応じて異なる丸めを返し、分割の有無で生成トークン列が一致しなくなる
+    ことを実測で確認したため見送った) ので、この上限が実質的な唯一の
+    ガードになる。"""
+
+    limit = STATE.max_context_tokens
+    if limit is None or len(prompt_ids) <= limit:
+        return None
+    message = (
+        f"This model's maximum context length is {limit} tokens. "
+        f"However, your messages resulted in {len(prompt_ids)} tokens. "
+        "Please reduce the length of the messages."
+    )
+    if protocol == "anthropic":
+        return _anthropic_error(message, status=400, err_type="invalid_request_error")
+    return _openai_error(
+        message, status=400, err_type="invalid_request_error", code="context_length_exceeded"
+    )
+
+
 def _finish_reason_openai(tokens: list[int]) -> str:
     return "stop" if tokens and tokens[-1] in STATE.eos_ids else "length"
 
 
 def _stop_reason_anthropic(tokens: list[int]) -> str:
     return "end_turn" if tokens and tokens[-1] in STATE.eos_ids else "max_tokens"
+
+
+def _responses_terminal_state(
+    tokens: list[int], budget_exceeded: bool, has_tool_calls: bool
+) -> tuple[str, str | None]:
+    """Return the Responses status/reason from the same terminal facts as Chat.
+
+    A fully parsed tool call is a successful assistant turn even when the model
+    does not append EOS.  Chat Completions and Anthropic already give tool calls
+    precedence over the token cap; Responses must not describe the same output
+    as incomplete merely because its adapter looked only at the last token.
+    """
+
+    if budget_exceeded:
+        return "incomplete", "max_output_tokens"
+    if has_tool_calls or (tokens and tokens[-1] in STATE.eos_ids):
+        return "completed", None
+    return "incomplete", "max_output_tokens"
 
 
 def _usage_dict(prompt_tokens: int, completion_tokens: int, cached_tokens: int) -> dict:
@@ -1374,7 +1629,27 @@ async def _run_generate(
         session=session,
         **sampling_kwargs,
     )
-    return await loop.run_in_executor(STATE.executor, fn)
+    future = loop.run_in_executor(STATE.executor, fn)
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(future)
+        except asyncio.CancelledError as exc:
+            if future.cancelled():
+                raise
+            # A client cancellation must not release STATE.lock while this
+            # synchronous worker still owns/mutates its selected session.
+            # Defer propagating cancellation until the executor future ends;
+            # the loop also tolerates a repeated cancellation request.
+            cancelled = exc
+            continue
+        except Exception:
+            if cancelled is not None:
+                raise cancelled
+            raise
+        if cancelled is not None:
+            raise cancelled
+        return result
 
 
 def _chunk_string(s: str, size: int = 24) -> list[str]:
@@ -1415,7 +1690,7 @@ def _parse_tool_calls_text(raw: str, tools_for_parsing) -> list[dict] | None:
         return None
     try:
         parsed = parser(raw, tools_for_parsing)
-    except (ValueError, TypeError, KeyError, AttributeError, IndexError) as exc:
+    except Exception as exc:  # noqa: BLE001 - model output drives third-party parsers
         print(
             f"[fastmlx-serve] tool call の解析に失敗 ({type(exc).__name__}: {exc})。"
             " テキストとしてそのまま返す"
@@ -1431,7 +1706,18 @@ def _parse_tool_calls_text(raw: str, tools_for_parsing) -> list[dict] | None:
         if not isinstance(name, str) or not name:
             return None
         arguments = tc.get("arguments", {})
-        tc_id = tc.get("id") or f"call_{uuid.uuid4().hex}"
+        if not isinstance(arguments, dict):
+            return None
+        try:
+            # Protocol responses require a JSON object.  Some mlx_lm parsers
+            # use ast.literal_eval and can therefore produce sets/tuples or
+            # non-finite floats that json.dumps would reject (or encode as
+            # non-standard JSON) only after streaming has already started.
+            json.dumps(arguments, allow_nan=False)
+        except (TypeError, ValueError):
+            return None
+        raw_id = tc.get("id")
+        tc_id = raw_id if isinstance(raw_id, str) and raw_id else f"call_{uuid.uuid4().hex}"
         calls.append({"name": name, "arguments": arguments, "id": tc_id})
     return calls
 
@@ -1475,7 +1761,10 @@ class SegmentAssembler:
             matched = bool(payload)
             raw = "".join(self._tool_buf) if self._tool_buf is not None else ""
             self._tool_buf = None
-            calls = _parse_tool_calls_text(raw, self.tools_for_parsing)
+            # A JSON-looking prefix is not a completed tool call until the
+            # model emits the closing marker.  Parsing an unterminated block
+            # fabricates a structured call from truncated model output.
+            calls = _parse_tool_calls_text(raw, self.tools_for_parsing) if matched else None
             if calls:
                 return [("tool_call", c) for c in calls]
             start_m = getattr(STATE.tokenizer, "tool_call_start", None) or ""
@@ -1761,6 +2050,9 @@ async def chat_completions(request: Request):
         prompt_ids = _apply_template(norm_messages, enable_thinking, tools=resolved_tools)
     except Exception as exc:
         return _openai_error(f"failed to render chat template: {exc}")
+    ctx_err = _check_context_length(prompt_ids, "openai")
+    if ctx_err is not None:
+        return ctx_err
 
     max_tokens, err = _resolve_max_tokens_openai(body, STATE.max_tokens_cap)
     if err is not None:
@@ -2036,7 +2328,14 @@ async def _openai_stream(
                     _log_gen_stats(payload)
                     break
                 else:  # error
-                    err = {"error": {"message": str(payload), "type": "server_error"}}
+                    err = {
+                        "error": {
+                            "message": str(payload),
+                            "type": "server_error",
+                            "param": None,
+                            "code": "server_error",
+                        }
+                    }
                     yield f"data: {json.dumps(err)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
@@ -2096,11 +2395,32 @@ async def anthropic_messages(request: Request):
         return _anthropic_error(shape_err)
 
     try:
+        # トップレベルの ``system`` に加えて、``messages`` 内に role: "system"
+        # の要素が混ざって送られてくるクライアントがいる (実例: Claude Code
+        # — 捕獲したボディでは ['user', 'system'] の順で、system が末尾に来る。
+        # Anthropic の公開仕様は role: "system" を messages に許していないが、
+        # 実クライアントは普通に送ってくる)。チャットテンプレート
+        # (Qwen 系) は system メッセージが先頭に無いと
+        # "System message must be at the beginning" で落ちるので、トップ
+        # レベルの system と messages 内の system ロールを両方とも先頭へ
+        # 寄せて 1 個の system メッセージへ連結する。連結順は「トップ
+        # レベル -> messages に現れた順」で元の順序を保つ (どちらも
+        # 崩さない)。system 以外のメッセージは元の相対順序のまま残す。
+        normalized = _normalize_anthropic_messages(messages)
+        system_parts: list[str] = []
+        top_system = body.get("system")
+        if top_system:
+            system_parts.append(_content_to_text(top_system))
         norm_messages = []
-        system = body.get("system")
-        if system:
-            norm_messages.append({"role": "system", "content": _content_to_text(system)})
-        norm_messages.extend(_normalize_anthropic_messages(messages))
+        for m in normalized:
+            if m.get("role") == "system":
+                text = m.get("content") or ""
+                if text:
+                    system_parts.append(text)
+                continue
+            norm_messages.append(m)
+        if system_parts:
+            norm_messages.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
     except ContentNormalizationError as exc:
         return _anthropic_error(str(exc))
 
@@ -2119,6 +2439,9 @@ async def anthropic_messages(request: Request):
         prompt_ids = _apply_template(norm_messages, enable_thinking, tools=resolved_tools)
     except Exception as exc:
         return _anthropic_error(f"failed to render chat template: {exc}")
+    ctx_err = _check_context_length(prompt_ids, "anthropic")
+    if ctx_err is not None:
+        return ctx_err
 
     max_tokens, err = _parse_anthropic_max_tokens(body["max_tokens"], STATE.max_tokens_cap)
     if err is not None:
@@ -2213,7 +2536,13 @@ async def anthropic_messages(request: Request):
 
     content_blocks = []
     if reasoning_text:
-        content_blocks.append({"type": "thinking", "thinking": reasoning_text})
+        content_blocks.append(
+            {
+                "type": "thinking",
+                "thinking": reasoning_text,
+                "signature": _thinking_signature(reasoning_text),
+            }
+        )
     content_blocks.extend(_anthropic_blocks_from_events(events))
     if not content_blocks:
         content_blocks.append({"type": "text", "text": ""})
@@ -2302,6 +2631,7 @@ async def _anthropic_stream(
             # 区別できないので、別フラグで持つ。
             next_index = 0
             block_index: dict[str, int] = {}
+            thinking_text_by_index: dict[int, str] = {}
 
             def open_block(channel: str):
                 nonlocal next_index
@@ -2309,13 +2639,41 @@ async def _anthropic_stream(
                 next_index += 1
                 block_index[channel] = idx
                 if channel == "reasoning":
-                    content_block = {"type": "thinking", "thinking": ""}
+                    thinking_text_by_index[idx] = ""
+                    content_block = {"type": "thinking", "thinking": "", "signature": ""}
                 else:
                     content_block = {"type": "text", "text": ""}
                 return idx, sse(
                     "content_block_start",
                     {"type": "content_block_start", "index": idx, "content_block": content_block},
                 )
+
+            def close_block(channel: str) -> list[str]:
+                idx = block_index[channel]
+                events = []
+                if channel == "reasoning":
+                    events.append(
+                        sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {
+                                    "type": "signature_delta",
+                                    "signature": _thinking_signature(
+                                        thinking_text_by_index.get(idx, "")
+                                    ),
+                                },
+                            },
+                        )
+                    )
+                events.append(
+                    sse(
+                        "content_block_stop",
+                        {"type": "content_block_stop", "index": idx},
+                    )
+                )
+                return events
 
             while True:
                 kind, payload = await asyncio.to_thread(q.get)
@@ -2325,10 +2683,8 @@ async def _anthropic_stream(
                     made_tool_call = True
                     any_block_emitted = True
                     if current_block is not None:
-                        yield sse(
-                            "content_block_stop",
-                            {"type": "content_block_stop", "index": block_index[current_block]},
-                        )
+                        for event in close_block(current_block):
+                            yield event
                         current_block = None
                     idx = next_index
                     next_index += 1
@@ -2375,10 +2731,8 @@ async def _anthropic_stream(
                         continue
                     if current_block != channel:
                         if current_block is not None:
-                            yield sse(
-                                "content_block_stop",
-                                {"type": "content_block_stop", "index": block_index[current_block]},
-                            )
+                            for event in close_block(current_block):
+                                yield event
                         idx, start_evt = open_block(channel)
                         yield start_evt
                         current_block = channel
@@ -2388,6 +2742,9 @@ async def _anthropic_stream(
                         if channel == "reasoning"
                         else {"type": "text_delta", "text": visible}
                     )
+                    if channel == "reasoning":
+                        idx = block_index[channel]
+                        thinking_text_by_index[idx] += visible
                     yield sse(
                         "content_block_delta",
                         {
@@ -2418,10 +2775,8 @@ async def _anthropic_stream(
                     return
 
             if current_block is not None:
-                yield sse(
-                    "content_block_stop",
-                    {"type": "content_block_stop", "index": block_index[current_block]},
-                )
+                for event in close_block(current_block):
+                    yield event
             elif not any_block_emitted:
                 # 何も生成されなかった (例: max_tokens が極端に小さい)。
                 # 「content_block が最低 1 つはある」前提を壊さないよう、
@@ -2494,6 +2849,9 @@ async def completions(request: Request):
     prompt_ids, err = _prompt_to_ids(body["prompt"])
     if err is not None:
         return _openai_error(err)
+    ctx_err = _check_context_length(prompt_ids, "openai")
+    if ctx_err is not None:
+        return ctx_err
 
     max_tokens, err = _resolve_max_tokens_openai(body, STATE.max_tokens_cap)
     if err is not None:
@@ -2776,22 +3134,36 @@ def _normalize_responses_input(input_value, instructions) -> list[dict]:
     - それ以外の未知の type は黙って無視せず 400 にする (壊れた/対応外の
       入力を空プロンプトとして通さない、というこのサーバー全体の方針に
       揃える)。
+
+    Codex CLI は ``instructions`` (トップレベル) に加えて、``input`` の
+    先頭付近に role: "developer" のメッセージを混ぜてくる (捕獲したボディ
+    で確認済み)。developer は system と同じ扱いにするため、そのままだと
+    system 相当のメッセージが 2 個、非連続または「先頭以外」の位置に並ぶ
+    ことになり、Anthropic 経路の bug (System message must be at the
+    beginning) と同じ理由でチャットテンプレートが落ちる。system/developer
+    の内容はすべて集めて、``instructions`` -> ``input`` に現れた順で
+    1 個の system メッセージへ連結し、必ず先頭へ置く。
     """
 
-    out: list[dict] = []
+    system_parts: list[str] = []
     if instructions:
-        out.append({"role": "system", "content": _content_to_text(instructions)})
+        system_parts.append(_content_to_text(instructions))
+
+    def _finish(out: list[dict]) -> list[dict]:
+        if system_parts:
+            out.insert(0, {"role": "system", "content": "\n\n".join(system_parts)})
+        return out
 
     if input_value is None:
         raise InvalidContentError("'input' is required")
     if isinstance(input_value, str):
-        out.append({"role": "user", "content": input_value})
-        return out
+        return _finish([{"role": "user", "content": input_value}])
     if not isinstance(input_value, list):
         raise InvalidContentError(
             f"'input' must be a string or an array of items, got {type(input_value).__name__}"
         )
 
+    out: list[dict] = []
     pending_calls: list[dict] | None = None
 
     def flush_pending() -> None:
@@ -2814,8 +3186,11 @@ def _normalize_responses_input(input_value, instructions) -> list[dict]:
                 )
             flush_pending()
             text = _responses_content_to_text(item.get("content"))
-            norm_role = "system" if role == "developer" else role
-            out.append({"role": norm_role, "content": text})
+            if role in ("system", "developer"):
+                if text:
+                    system_parts.append(text)
+                continue
+            out.append({"role": role, "content": text})
             continue
 
         if itype == "function_call":
@@ -2860,7 +3235,50 @@ def _normalize_responses_input(input_value, instructions) -> list[dict]:
         raise InvalidContentError(f"unsupported 'input' item type: {itype!r}")
 
     flush_pending()
-    return out
+    return _finish(out)
+
+
+def _flatten_responses_tools(tools: list) -> list:
+    """Codex CLI が ``tools`` に混ぜてくる非 ``function`` 型を処理する。
+
+    実際に捕獲したボディで確認した 2 種類:
+
+    - ``{"type": "namespace", "tools": [...]}``: サブエージェント関連の
+      ツール群をまとめる入れ物で、それ自体は呼び出し可能なツールではない。
+      中の ``tools`` (中身は通常の ``{"type": "function", ...}``) を
+      展開してトップレベルへ引き上げる。入れ子になっている場合に備えて
+      再帰的に展開する。
+    - ``{"type": "web_search", ...}``: このサーバーには web 検索を実行する
+      主体が無い (fastmlx はローカルモデルへの単純な forward しか持たない)
+      ので、渡されても実行できない。黙って握りつぶすとクライアントは
+      検索が使えると思ったまま話を進めてしまうので、落としたことを
+      運用者向けログへ残してから除く (_log_gen_stats と同じ
+      ``[fastmlx-serve]`` 一行ログの作法)。
+
+    ``function`` 型はそのまま素通しする (後続の ``_validate_responses_tools``
+    がその形自体を検証する)。
+    """
+
+    flat: list = []
+    for t in tools:
+        if not isinstance(t, dict):
+            flat.append(t)
+            continue
+        ttype = t.get("type")
+        if ttype == "namespace":
+            nested = t.get("tools")
+            if isinstance(nested, list):
+                flat.extend(_flatten_responses_tools(nested))
+            continue
+        if ttype != "function":
+            print(
+                f"[fastmlx-serve] dropping unsupported tool in 'tools': "
+                f"type={ttype!r} name={t.get('name')!r} — this server has no "
+                "execution backend for it"
+            )
+            continue
+        flat.append(t)
+    return flat
 
 
 def _validate_responses_tools(tools) -> str | None:
@@ -2901,6 +3319,10 @@ def _resolve_tool_choice_responses(body: dict) -> tuple[list | None, str | None]
     tools = body.get("tools")
     if not tools:
         return None, None
+    if isinstance(tools, list):
+        tools = _flatten_responses_tools(tools)
+        if not tools:
+            return None, None
     shape_err = _validate_responses_tools(tools)
     if shape_err is not None:
         return None, shape_err
@@ -3063,6 +3485,9 @@ async def responses_endpoint(request: Request):
         prompt_ids = _apply_template(norm_messages, enable_thinking, tools=resolved_tools)
     except Exception as exc:
         return _openai_error(f"failed to render chat template: {exc}")
+    ctx_err = _check_context_length(prompt_ids, "openai")
+    if ctx_err is not None:
+        return ctx_err
 
     max_tokens, err = _resolve_max_output_tokens(body, STATE.max_tokens_cap)
     if err is not None:
@@ -3121,13 +3546,11 @@ async def responses_endpoint(request: Request):
         prompt_ids, res["tokens"], thinking_budget, tool_enabled, resolved_tools
     )
     output_items = _responses_output_items_from_events(events)
-    finished_naturally = bool(res["tokens"]) and res["tokens"][-1] in STATE.eos_ids
-    if budget_exceeded or not finished_naturally:
-        status = "incomplete"
-        incomplete_reason = "max_output_tokens"
-    else:
-        status = "completed"
-        incomplete_reason = None
+    status, incomplete_reason = _responses_terminal_state(
+        res["tokens"],
+        budget_exceeded,
+        any(kind == "tool_call" for kind, _ in events),
+    )
 
     out = {
         "id": resp_id,
@@ -3159,10 +3582,11 @@ async def _responses_stream(
     tool_enabled: bool = False,
     tools_for_parsing=None,
 ):
-    """最低限のイベント列を出す: response.created ->
+    """Responses の主要な lifecycle イベント列を出す: response.created ->
     response.output_item.added -> response.output_text.delta /
     response.reasoning_summary_text.delta / response.function_call_arguments.delta
-    -> response.output_item.done (アイテムごと) -> response.completed。
+    -> 各 done イベント -> response.output_item.done ->
+    response.completed / response.incomplete / response.failed。
 
     受付 (検証) は呼び出し側で StreamingResponse を組み立てる前に完了して
     いる — OpenAI/Anthropic の既存ストリーミング経路 (server.py の docstring
@@ -3170,8 +3594,14 @@ async def _responses_stream(
     流す。
     """
 
+    sequence_number = 0
+
     def sse(event: str, data: dict) -> str:
-        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+        nonlocal sequence_number
+        payload = dict(data)
+        payload.setdefault("sequence_number", sequence_number)
+        sequence_number += 1
+        return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
     yield sse(
         "response.created",
@@ -3209,28 +3639,62 @@ async def _responses_stream(
             current_index = 0
             budget_exceeded = False
             final_tokens: list[int] = []
+            saw_tool_call = False
 
             def close_current():
                 nonlocal current_item, current_kind
                 if current_item is None:
-                    return None
+                    return []
                 item = current_item
+                events = []
                 if item["type"] == "message":
                     item["status"] = "completed"
+                    events.append(
+                        sse(
+                            "response.output_text.done",
+                            {
+                                "type": "response.output_text.done",
+                                "output_index": current_index,
+                                "item_id": item["id"],
+                                "content_index": 0,
+                                "text": item["content"][0]["text"],
+                                "logprobs": [],
+                            },
+                        )
+                    )
+                else:
+                    events.append(
+                        sse(
+                            "response.reasoning_summary_text.done",
+                            {
+                                "type": "response.reasoning_summary_text.done",
+                                "output_index": current_index,
+                                "item_id": item["id"],
+                                "summary_index": 0,
+                                "text": item["summary"][0]["text"],
+                            },
+                        )
+                    )
                 output_items.append(item)
-                evt = sse(
-                    "response.output_item.done",
-                    {"type": "response.output_item.done", "output_index": current_index, "item": item},
+                events.append(
+                    sse(
+                        "response.output_item.done",
+                        {
+                            "type": "response.output_item.done",
+                            "output_index": current_index,
+                            "item": item,
+                        },
+                    )
                 )
                 current_item = None
                 current_kind = None
-                return evt
+                return events
 
             while True:
                 kind, payload = await asyncio.to_thread(q.get)
                 if kind == "tool_call":
-                    closing = close_current()
-                    if closing:
+                    saw_tool_call = True
+                    for closing in close_current():
                         yield closing
                     idx = next_index
                     next_index += 1
@@ -3259,6 +3723,16 @@ async def _responses_stream(
                         )
                     call_item["arguments"] = args_str
                     call_item["status"] = "completed"
+                    yield sse(
+                        "response.function_call_arguments.done",
+                        {
+                            "type": "response.function_call_arguments.done",
+                            "output_index": idx,
+                            "item_id": call_item["id"],
+                            "name": call_item["name"],
+                            "arguments": args_str,
+                        },
+                    )
                     output_items.append(call_item)
                     yield sse(
                         "response.output_item.done",
@@ -3269,8 +3743,7 @@ async def _responses_stream(
                         continue
                     channel = "reasoning" if kind == "reasoning_delta" else "content"
                     if current_kind != channel:
-                        closing = close_current()
-                        if closing:
+                        for closing in close_current():
                             yield closing
                         idx = next_index
                         next_index += 1
@@ -3302,6 +3775,7 @@ async def _responses_stream(
                                 "type": "response.reasoning_summary_text.delta",
                                 "output_index": current_index,
                                 "item_id": current_item["id"],
+                                "summary_index": 0,
                                 "delta": payload,
                             },
                         )
@@ -3313,6 +3787,8 @@ async def _responses_stream(
                                 "type": "response.output_text.delta",
                                 "output_index": current_index,
                                 "item_id": current_item["id"],
+                                "content_index": 0,
+                                "logprobs": [],
                                 "delta": payload,
                             },
                         )
@@ -3323,23 +3799,37 @@ async def _responses_stream(
                     _log_gen_stats(payload)
                     break
                 else:  # error
+                    response_error = {
+                        "code": "server_error",
+                        "message": str(payload),
+                        "param": None,
+                    }
                     yield sse(
                         "error",
-                        {"type": "error", "message": str(payload)},
+                        {"type": "error", **response_error},
+                    )
+                    failed_response = {
+                        "id": resp_id,
+                        "object": "response",
+                        "created_at": created,
+                        "status": "failed",
+                        "model": model_id,
+                        "output": output_items,
+                        "error": response_error,
+                        "usage": None,
+                    }
+                    yield sse(
+                        "response.failed",
+                        {"type": "response.failed", "response": failed_response},
                     )
                     return
 
-            closing = close_current()
-            if closing:
+            for closing in close_current():
                 yield closing
 
-            finished_naturally = bool(final_tokens) and final_tokens[-1] in STATE.eos_ids
-            if budget_exceeded or not finished_naturally:
-                status = "incomplete"
-                incomplete_reason = "max_output_tokens"
-            else:
-                status = "completed"
-                incomplete_reason = None
+            status, incomplete_reason = _responses_terminal_state(
+                final_tokens, budget_exceeded, saw_tool_call
+            )
 
             final_response = {
                 "id": resp_id,
@@ -3356,12 +3846,98 @@ async def _responses_stream(
             }
             if incomplete_reason is not None:
                 final_response["incomplete_details"] = {"reason": incomplete_reason}
-            yield sse("response.completed", {"type": "response.completed", "response": final_response})
+            terminal_event = (
+                "response.completed" if status == "completed" else "response.incomplete"
+            )
+            yield sse(
+                terminal_event,
+                {"type": terminal_event, "response": final_response},
+            )
         finally:
             await _await_worker(future)
 
 
 # ---------- 起動 ----------
+
+
+def _resolve_model_max_context(config: dict) -> int | None:
+    """モデル自身が申告する文脈長上限を、起動時にロードした生の config
+    (``mlx_lm_load(..., return_config=True)`` の戻り値) から取る。
+    ハードコードしない — ``--max-context-tokens`` が優先され、これは
+    未指定時のフォールバックにだけ使う。
+
+    VLM ラッパー形式 (Qwen3.6-35B-A3B 等) は ``max_position_embeddings`` が
+    トップレベルではなく ``text_config`` の下にネストされているので、
+    見つからなければ 1 段だけ潜って探す。見つからなければ None を返し、
+    ``_check_context_length`` はガード無効 (無制限) のまま動く。
+    """
+
+    if isinstance(config.get("max_position_embeddings"), int):
+        return config["max_position_embeddings"]
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict) and isinstance(
+        text_config.get("max_position_embeddings"), int
+    ):
+        return text_config["max_position_embeddings"]
+    return None
+
+
+def _metal_safe_prefill_limit(config: dict) -> int | None:
+    """SpecEngine が新規プロンプトを forward できる、Metal の実際の確保上限
+    から逆算したトークン数上限。
+
+    SpecEngine (fastmlx/spec.py) は新規プロンプトを PREFILL_STEP_SIZE
+    (既定 2048) トークンずつチャンク分割して forward する
+    (``SpecEngine._prefill_hidden``)。そのため 1 回の forward で確保される
+    注意スコア行列は ``num_attention_heads * PREFILL_STEP_SIZE * T *
+    bytes_per_elem`` (T は処理済みトークン数の総量、最後のチャンクで最大)
+    — 分割前の ``num_attention_heads * T^2 * bytes_per_elem`` (T に対して
+    二次) から、T に対して線形に下がっている。それでも Metal の 1 バッファ
+    上限 (``mx.device_info()["max_buffer_length"]``、実機で 86,586,540,032
+    バイト) を超えると ``[metal::malloc]`` でリクエストが失敗する。
+
+    ``max_position_embeddings`` (モデルが申告する学習時文脈長) だけを見ると
+    現実的にはまず届かない桁の値を返すこともあるので、その値をそのまま
+    上限にはせず、ここで求めた値と ``_resolve_model_max_context`` の値の
+    小さい方を実際の上限として使う (``_resolve_default_max_context_tokens``)。
+    多くのモデルでは max_position_embeddings の方が先に効く — 分割後の壁は
+    非常に大きい (このモデルでは 100 万トークン超) ため。
+
+    理論上ちょうど 1 バッファを埋め切る T (割ると即失敗する境界) に 0.9 を
+    掛けて安全側に倒す — アテンション行列以外にも同時に確保されるバッファ
+    がある分、理論値ちょうどまでは安全とは言えないため。
+    """
+
+    text_config = config.get("text_config", config)
+    if not isinstance(text_config, dict):
+        return None
+    n_heads = text_config.get("num_attention_heads")
+    if not isinstance(n_heads, int) or n_heads <= 0:
+        return None
+    dtype = str(text_config.get("dtype") or config.get("dtype") or "bfloat16")
+    bytes_per_elem = 2 if "16" in dtype else 4
+    try:
+        max_buffer_bytes = mx.device_info()["max_buffer_length"]
+    except Exception:
+        return None
+    if not isinstance(max_buffer_bytes, int) or max_buffer_bytes <= 0:
+        return None
+    theoretical = int(max_buffer_bytes / (n_heads * PREFILL_STEP_SIZE * bytes_per_elem))
+    return int(theoretical * 0.9)
+
+
+def _resolve_default_max_context_tokens(config: dict) -> int | None:
+    """``--max-context-tokens`` 未指定時の既定値: モデルが申告する上限
+    (``_resolve_model_max_context``) と、Metal が実際に確保できる上限から
+    逆算した値 (``_metal_safe_prefill_limit``) の小さい方。どちらも取れな
+    ければ None (ガード無効)。"""
+
+    candidates = [
+        v
+        for v in (_resolve_model_max_context(config), _metal_safe_prefill_limit(config))
+        if v is not None
+    ]
+    return min(candidates) if candidates else None
 
 
 def main() -> None:
@@ -3415,6 +3991,17 @@ def main() -> None:
         " 超えたら最も長く未使用のものを捨てる)。91GB 級モデルの上に会話ごとの"
         " KV を無制限に積まないための上限",
     )
+    ap.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=None,
+        help="1 リクエストのプロンプト長 (トークン数) の上限。超えたリクエストは"
+        " 400 (invalid_request_error) で弾く。既定 (未指定) はモデルの config"
+        " (max_position_embeddings 等) と、Metal が一括確保できる実際の上限"
+        " から逆算した値のうち小さい方を自動で使う"
+        " (_resolve_default_max_context_tokens 参照)。どちらも取れなければ"
+        " ガード無効 (無制限)",
+    )
     args = ap.parse_args()
 
     global STATE
@@ -3443,9 +4030,30 @@ def main() -> None:
             install(model, args.ngram)
         print(f"[fastmlx-serve] loaded in {time.perf_counter() - t0:.1f}s: {args.model}")
         runner = build_runner(model, tokenizer, config, args, log_prefix="[fastmlx-serve]")
-        return runner, tokenizer
+        if args.max_context_tokens is not None:
+            max_context_tokens, source = args.max_context_tokens, "--max-context-tokens"
+        else:
+            from_config = _resolve_model_max_context(config)
+            from_metal = _metal_safe_prefill_limit(config)
+            if from_config is None and from_metal is None:
+                max_context_tokens, source = None, None
+            elif from_metal is None or (from_config is not None and from_config <= from_metal):
+                max_context_tokens, source = from_config, "config"
+            else:
+                max_context_tokens, source = from_metal, "Metal 一括確保上限から逆算"
+        return runner, tokenizer, max_context_tokens, source
 
-    runner, tokenizer = executor.submit(_load).result()
+    runner, tokenizer, max_context_tokens, source = executor.submit(_load).result()
+    if max_context_tokens is not None:
+        print(
+            f"[fastmlx-serve] プロンプト長の上限: {max_context_tokens} トークン ({source})"
+        )
+    else:
+        print(
+            "[fastmlx-serve] プロンプト長の上限: 検出できず (ガード無効 — config に"
+            " max_position_embeddings が見当たらず、Metal 側の逆算もできなかった。"
+            " --max-context-tokens で指定可)"
+        )
 
     # runner の種類に応じて会話ごとのスロットが積むクラスを決める。
     # SpecRunner なら SpecEngine 用の ChatSession、それ以外 (FallbackRunner)
@@ -3466,6 +4074,7 @@ def main() -> None:
         default_temp=args.temp,
         created_ts=int(time.time()),
         max_sessions=args.max_sessions,
+        max_context_tokens=max_context_tokens,
     )
     print(
         f"[fastmlx-serve] served model name: {served_name} "
