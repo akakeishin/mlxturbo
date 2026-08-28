@@ -1506,3 +1506,208 @@ def test_streaming_400_returns_before_any_sse_event(client):
     assert not runner.calls
     assert "text/event-stream" not in resp.headers.get("content-type", "")
     assert not resp.text.startswith("data: ")
+
+
+# ---------- 7. バグ修正: thinking がプロンプト側で既に開かれている場合 ----------
+#
+# _apply_template が描画するプロンプトの末尾が think_start トークン列で
+# 終端している (テンプレート自身が既に <think> を開いている) モデルでは、
+# モデルは think_start を生成し直さない。ThinkingRouter が detect フェーズ
+# から始まると「冒頭が一致しない = 考えていない」と誤判定し、思考が本文
+# (content) へ混入したうえ閉じ側の </think> だけが生テキストとして残る
+# (実モデルで確認済みのバグ)。フェイクトークナイザで prompt_ids の末尾に
+# think_start トークンを置くことで、この状況を再現する。
+#
+# 終了マーカーが 1 トークンだと ThinkingRouter のローリングウィンドウが
+# 1 トークン遅れて確定する (tool calling のテストと同じ理由)。
+
+
+def test_bug1_openai_nonstream_thinking_not_mixed_into_content(client):
+    tok = FakeTokenizer(
+        vocab={10: "pondering. ", 501: "</think>", 11: "the answer is 4"},
+        has_thinking=True,
+        think_start_tokens=[500],
+        think_end_tokens=[501],
+        prompt_ids=[1, 2, 3, 500],  # 描画済みプロンプトが <think> で終わる
+    )
+    runner = FakeRunner(tokens_to_emit=[10, 501, 11])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "2+2?"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    message = resp.json()["choices"][0]["message"]
+    assert message["reasoning_content"] == "pondering. "
+    assert message["content"] == "the answer is 4"
+    assert "</think>" not in message["content"]
+    assert "pondering" not in message["content"]
+
+
+def test_bug1_openai_stream_thinking_not_mixed_into_content(client):
+    tok = FakeTokenizer(
+        vocab={10: "pondering. ", 501: "</think>", 11: "the answer is 4"},
+        has_thinking=True,
+        think_start_tokens=[500],
+        think_end_tokens=[501],
+        prompt_ids=[1, 2, 3, 500],
+    )
+    runner = FakeRunner(tokens_to_emit=[10, 501, 11])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "2+2?"}], "stream": True},
+    )
+    assert resp.status_code == 200, resp.text
+    events = _sse_events(resp.text)
+    reasoning_text = "".join(
+        e["choices"][0]["delta"].get("reasoning_content", "")
+        for e in events
+        if e.get("choices") and "reasoning_content" in e["choices"][0].get("delta", {})
+    )
+    content_text = "".join(
+        e["choices"][0]["delta"].get("content", "")
+        for e in events
+        if e.get("choices") and "content" in e["choices"][0].get("delta", {})
+    )
+    assert reasoning_text == "pondering. "
+    assert content_text == "the answer is 4"
+    assert "</think>" not in content_text
+
+
+def test_bug1_anthropic_nonstream_thinking_not_mixed_into_content(client):
+    tok = FakeTokenizer(
+        vocab={10: "pondering. ", 501: "</think>", 11: "the answer is 4"},
+        has_thinking=True,
+        think_start_tokens=[500],
+        think_end_tokens=[501],
+        prompt_ids=[1, 2, 3, 500],
+    )
+    runner = FakeRunner(tokens_to_emit=[10, 501, 11])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "2+2?"}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    blocks = resp.json()["content"]
+    assert blocks[0] == {"type": "thinking", "thinking": "pondering. "}
+    text_blocks = [b for b in blocks if b["type"] == "text"]
+    assert text_blocks and text_blocks[0]["text"] == "the answer is 4"
+    assert all("</think>" not in b.get("text", "") for b in blocks)
+
+
+def test_bug1_anthropic_stream_thinking_not_mixed_into_content(client):
+    tok = FakeTokenizer(
+        vocab={10: "pondering. ", 501: "</think>", 11: "the answer is 4"},
+        has_thinking=True,
+        think_start_tokens=[500],
+        think_end_tokens=[501],
+        prompt_ids=[1, 2, 3, 500],
+    )
+    runner = FakeRunner(tokens_to_emit=[10, 501, 11])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "2+2?"}],
+            "stream": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    events = _sse_events(resp.text)
+    thinking_deltas = "".join(
+        e["delta"]["thinking"]
+        for e in events
+        if e.get("type") == "content_block_delta" and e["delta"].get("type") == "thinking_delta"
+    )
+    text_deltas = "".join(
+        e["delta"]["text"]
+        for e in events
+        if e.get("type") == "content_block_delta" and e["delta"].get("type") == "text_delta"
+    )
+    assert thinking_deltas == "pondering. "
+    assert text_deltas == "the answer is 4"
+    assert "</think>" not in text_deltas
+
+
+def test_bug1_tool_calling_still_works_when_prompt_already_thinking(client):
+    tok = FakeTokenizer(
+        vocab={10: "pondering. ", 501: "</think>", 200: _TOOL_CALL_JSON, 11: "done"},
+        has_thinking=True,
+        think_start_tokens=[500],
+        think_end_tokens=[501],
+        prompt_ids=[1, 2, 3, 500],
+        has_tool_calling=True,
+        tool_call_start_tokens=[100],
+        tool_call_end_tokens=[101],
+    )
+    runner = FakeRunner(tokens_to_emit=[10, 501, 100, 200, 101, 11])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "weather in tokyo?"}],
+            "tools": [_WEATHER_TOOL_OPENAI],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    message = resp.json()["choices"][0]["message"]
+    assert message["reasoning_content"] == "pondering. "
+    assert "</think>" not in (message.get("content") or "")
+    assert len(message["tool_calls"]) == 1
+    assert message["tool_calls"][0]["function"]["name"] == "get_weather"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"city": "Tokyo"}
+
+
+def test_bug1_budget_only_counts_generated_thinking_tokens(client):
+    """<think> がプロンプト側 (テンプレート由来) に含まれる場合でも、budget
+    はモデルが実際に生成した thinking トークンだけを数える。"""
+
+    tok = FakeTokenizer(
+        vocab={10: "a", 501: "", 11: "b"},
+        has_thinking=True,
+        think_start_tokens=[500],
+        think_end_tokens=[501],
+        prompt_ids=[1, 500],
+    )
+    runner = FakeRunner(tokens_to_emit=[10, 10, 10, 501, 11])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "enabled", "budget_tokens": 1},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stop_reason"] == "max_tokens"
+    thinking_blocks = [b for b in body["content"] if b["type"] == "thinking"]
+    assert thinking_blocks
+    assert thinking_blocks[0]["thinking"] == "aa"
+
+
+# ---------- 8. バグ修正: thinking/redacted_thinking ブロックを履歴で 400 にしない ----------
+#
+# 拡張思考 + tool use の Anthropic 規約では、直前ターンの thinking/
+# redacted_thinking ブロックを次ターンの履歴にそのまま含めて送り返す必要が
+# ある。このサーバー自身が thinking 有効時に "thinking" ブロックを返して
+# いるので、tool を使う複数ターンの会話を送り返すクライアント (Claude Code
+# 等) は確実にこの型を履歴へ含めてくる。
+
+

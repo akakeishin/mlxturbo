@@ -657,6 +657,58 @@ def _check_tool_calling_support(resolved_tools) -> str | None:
     return None
 
 
+def _prompt_already_thinking(prompt_ids: list[int]) -> bool:
+    """``_apply_template`` が描画したプロンプトが、未閉鎖の thinking ブロック
+    で終わっているか (= チャットテンプレート自身が生成プロンプトの末尾で
+    既に ``<think>`` を開いているか) を判定する。
+
+    実モデル (Qwen3.6 / Flash-Next) で確認済みのバグ: これらのテンプレートは
+    ``<|im_start|>assistant\\n<think>\\n`` のように、モデルへ渡す時点で既に
+    ``<think>`` を開いた状態でプロンプトを終える。モデル自身は (開き済みの
+    マーカーをもう一度は出さないので) ``<think>`` を生成しない。一方
+    ``ThinkingRouter`` は常に ``phase="detect"`` (冒頭が think_start と一致
+    するかをこれから待つ) から始まるため、「冒頭が一致しない = 考えていない」
+    と誤判定して全文を content へ流してしまい、思考が本文に混入したうえ
+    ``</think>`` だけが閉じ側の生テキストとして残る。
+
+    判定は「think_start_tokens の最後の出現位置より後ろに think_end_tokens
+    が無い」= 末尾が開きっぱなしの thinking ブロックの中にある、で行う
+    (末尾の完全一致だけを見ないのは、``<think>`` の直後に改行トークン等が
+    続くテンプレートで取りこぼさないため — ``<think>`` 自体は語彙表に登録
+    された 1 トークンの特殊トークンなので、直後の空白文字は別トークンに
+    なりうる)。過去ターンの assistant 応答内に生の ``<think>``/``</think>``
+    が残っている (通常は起きない — ``_apply_template`` の docstring 参照)
+    としても、その場合は必ずペアで現れるので最後の出現位置の前後関係には
+    影響しない。
+
+    ``has_thinking`` が False (このモデルではそもそも thinking を分離
+    しない) なら常に False。
+    """
+
+    tokenizer = STATE.tokenizer
+    if not getattr(tokenizer, "has_thinking", False):
+        return False
+    start = tuple(getattr(tokenizer, "think_start_tokens", None) or ())
+    if not start:
+        return False
+    end = tuple(getattr(tokenizer, "think_end_tokens", None) or ())
+
+    def _rfind(seq, sub) -> int:
+        n = len(sub)
+        if n == 0 or n > len(seq):
+            return -1
+        for i in range(len(seq) - n, -1, -1):
+            if tuple(seq[i : i + n]) == sub:
+                return i
+        return -1
+
+    start_idx = _rfind(prompt_ids, start)
+    if start_idx < 0:
+        return False
+    end_idx = _rfind(prompt_ids, end) if end else -1
+    return end_idx < start_idx
+
+
 class ThinkingRouter:
     """モデルの生トークン列を reasoning (thinking) / content の 2 チャンネル
     へ振り分ける。マーカーは推測せず、mlx_lm.TokenizerWrapper の公開 API
@@ -715,6 +767,16 @@ class ThinkingRouter:
     ``tool_end`` の bool は「本当に終了マーカーで閉じたか」— False は
     max_tokens 等で強制的に打ち切られたことを示し、呼び出し側は再構成時に
     終了マーカー文字列を足さない判断に使う。
+
+    ``already_thinking`` (bool): ``_apply_template`` が描画したプロンプトの
+    末尾が既に未閉鎖の ``<think>`` で終わっている場合 (``_prompt_already_thinking``
+    参照) に True を渡す。この場合モデル自身は think_start マーカーを生成
+    しない (テンプレート側が既に出している) ので、``phase="detect"`` から
+    始めて先頭が think_start と一致するのを待つと「考えていない」と誤判定
+    してしまう。True なら ``phase`` をいきなり ``"thinking"`` から始める
+    (detect をスキップする) — budget の計上・ストリーミング/非ストリーミング・
+    tool calling の各経路は全て ``phase`` の値だけで分岐しているので、この
+    初期値を変えるだけで全経路に一貫して効く。
     """
 
     def __init__(
@@ -723,6 +785,7 @@ class ThinkingRouter:
         budget: int | None,
         eos_ids: set,
         tool_calling_enabled: bool = False,
+        already_thinking: bool = False,
     ):
         self.tokenizer = tokenizer
         self.budget = budget
@@ -731,7 +794,15 @@ class ThinkingRouter:
         self.tool_enabled = tool_calling_enabled and bool(
             getattr(tokenizer, "has_tool_calling", False)
         )
-        self.phase = "detect" if self.enabled else "content"
+        if not self.enabled:
+            self.phase = "content"
+        elif already_thinking:
+            # テンプレートが既に <think> を開いた状態でプロンプトを終えて
+            # いる。モデルは think_start を生成し直さないので detect を
+            # 経由せず、いきなり thinking フェーズから始める。
+            self.phase = "thinking"
+        else:
+            self.phase = "detect"
         self.buf: list[int] = []
         self.tool_buf: list[int] = []
         self.think_detok = tokenizer.detokenizer
@@ -1374,7 +1445,11 @@ def _start_generation(
     q: queue.Queue = queue.Queue()
     eos_ids = STATE.eos_ids
     router = ThinkingRouter(
-        STATE.tokenizer, thinking_budget, eos_ids, tool_calling_enabled=tool_calling_enabled
+        STATE.tokenizer,
+        thinking_budget,
+        eos_ids,
+        tool_calling_enabled=tool_calling_enabled,
+        already_thinking=_prompt_already_thinking(prompt_ids),
     )
     assembler = SegmentAssembler(tools_for_parsing)
     signaled = [False]
@@ -1426,6 +1501,7 @@ async def _await_worker(future) -> None:
 
 
 def _collect_events(
+    prompt_ids: list[int],
     tokens: list[int],
     budget: int | None,
     tool_calling_enabled: bool,
@@ -1436,10 +1512,19 @@ def _collect_events(
     ``push()`` と同じ語彙: reasoning_delta/content_delta/tool_call) と
     budget_exceeded を返す。ストリーミング経路 (_start_generation) が
     on_tokens のたびに逐次行っているのと同じ変換を、非ストリームでは
-    生成後に一括で行うだけ。"""
+    生成後に一括で行うだけ。
+
+    ``prompt_ids`` は ``_apply_template`` が描画した実際のプロンプト —
+    ``_prompt_already_thinking`` でテンプレートが既に ``<think>`` を開いた
+    状態かどうかを判定し、``ThinkingRouter`` の初期 phase に反映する
+    (server.py の ``_prompt_already_thinking`` docstring 参照)。"""
 
     router = ThinkingRouter(
-        STATE.tokenizer, budget, STATE.eos_ids, tool_calling_enabled=tool_calling_enabled
+        STATE.tokenizer,
+        budget,
+        STATE.eos_ids,
+        tool_calling_enabled=tool_calling_enabled,
+        already_thinking=_prompt_already_thinking(prompt_ids),
     )
     parts = router.feed(tokens) + router.finalize()
     assembler = SegmentAssembler(tools_for_parsing)
@@ -1450,6 +1535,7 @@ def _collect_events(
 
 
 def _split_response_final(
+    prompt_ids: list[int],
     tokens: list[int],
     budget: int | None,
     tool_calling_enabled: bool = False,
@@ -1458,10 +1544,11 @@ def _split_response_final(
     """OpenAI 非ストリーム向け: (reasoning_text, content_text, tool_calls,
     budget_exceeded) を返す。tool_calls は成功裏に解析できた呼び出しだけ
     (解析に失敗したものは content_text 側にマーカーごと生テキストとして
-    含まれる — 捏造しない方針)。"""
+    含まれる — 捏造しない方針)。``prompt_ids`` は ``_collect_events`` へ
+    そのまま渡す (already_thinking 判定用)。"""
 
     events, budget_exceeded = _collect_events(
-        tokens, budget, tool_calling_enabled, tools_for_parsing
+        prompt_ids, tokens, budget, tool_calling_enabled, tools_for_parsing
     )
     reasoning_text = "".join(v for k, v in events if k == "reasoning_delta")
     content_text = "".join(v for k, v in events if k == "content_delta")
@@ -1664,7 +1751,7 @@ async def chat_completions(request: Request):
     _log_gen_stats(res)
 
     reasoning_text, content_text, tool_calls, budget_exceeded = _split_response_final(
-        res["tokens"], thinking_budget, tool_enabled, resolved_tools
+        prompt_ids, res["tokens"], thinking_budget, tool_enabled, resolved_tools
     )
     finish_reason = _finish_reason_openai(res["tokens"])
     if budget_exceeded:
@@ -2033,7 +2120,7 @@ async def anthropic_messages(request: Request):
     _log_gen_stats(res)
 
     events, budget_exceeded = _collect_events(
-        res["tokens"], thinking_budget, tool_enabled, resolved_tools
+        prompt_ids, res["tokens"], thinking_budget, tool_enabled, resolved_tools
     )
     reasoning_text = "".join(v for k, v in events if k == "reasoning_delta")
     tool_calls = [v for k, v in events if k == "tool_call"]
@@ -2391,7 +2478,9 @@ async def completions(request: Request):
         return _openai_error(str(exc), status=500, err_type="server_error")
     _log_gen_stats(res)
 
-    _reasoning_text, text, _tool_calls, _budget_exceeded = _split_response_final(res["tokens"], 0)
+    _reasoning_text, text, _tool_calls, _budget_exceeded = _split_response_final(
+        prompt_ids, res["tokens"], 0
+    )
     finish_reason = _finish_reason_openai(res["tokens"])
     if stops:
         hit = _find_stop(text, stops)
