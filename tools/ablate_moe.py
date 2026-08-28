@@ -91,6 +91,9 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--ngram", default=None)
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--fused-route", action="store_true",
+                    help="ルーティングを融合カーネルにしてから測る "
+                         "(fastmlx.fused.enable_moe_route)")
     args = ap.parse_args()
 
     import os
@@ -112,6 +115,12 @@ def main():
         [{"role": "user", "content": "分散システムについて説明してください。"}],
         add_generation_prompt=True,
     )
+
+    if args.fused_route:
+        from fastmlx import fused
+
+        fused.enable_moe_route()
+        print("ルーティングを融合カーネルに差し替えた")
 
     orig, variants = _variants(Q, mx)
     samples: dict[str, list[float]] = {name: [] for name, _ in variants}
