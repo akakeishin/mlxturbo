@@ -36,6 +36,17 @@ MLX の計算グラフ (モデルの重み・KV キャッシュを含む) はロ
 Future を待ってからロックを解放する。そうしないと、まだ生成中のワーカーが
 共有の ``STATE.session`` (ChatSession) を触っている間に次のリクエストが
 ロックを取れてしまい、同じ session を 2 つの生成が同時に書き換える。
+
+thinking (推論過程) の扱い: OpenAI の ``reasoning_effort`` / Anthropic の
+``thinking`` だけを読む (fastmlx 独自フィールドは無い)。値はトークン予算
+(budget) に写し、``ThinkingRouter`` が生トークン列を reasoning/content の
+2 チャンネルへ振り分ける。マーカーは mlx_lm.TokenizerWrapper の公開 API
+(``has_thinking``/``think_start_tokens``/``think_end_tokens``) から引き、
+引けないモデルでは常に content 一本 (分離しない)。予算超過時は「思考を
+強制的に閉じて本文を続けさせる」その場再開はしていない (SpecEngine/
+mlx_lm.stream_generate のどちらも生成途中の割り込みを許さないため) —
+それ以降の出力をクライアントへ転送しないという、観測可能な形で打ち切る。
+詳細は ThinkingRouter の docstring を参照。
 """
 
 import argparse
@@ -71,7 +82,6 @@ class ModelState:
     eos_ids: set
     max_tokens_cap: int
     default_temp: float
-    default_enable_thinking: bool | None
     created_ts: int
 
 
@@ -178,17 +188,18 @@ def _naive_prompt_ids(messages: list[dict]):
 
 
 def _apply_template(messages: list[dict], enable_thinking: bool | None = None):
-    """``enable_thinking`` is an optional passthrough for reasoning-model chat
-    templates (Qwen3 系など)。省略時はテンプレートの既定 (通常 thinking 有効)
-    に任せる。cli.py の --no-think と同じキーワードで、対応しないテンプレート
-    では単に無視される (下の TypeError フォールバック)。
+    """``enable_thinking`` は標準フィールド (reasoning_effort/thinking) から
+    解決済みの値。省略時 (None) はテンプレートの既定に任せる — mlx_lm の
+    TokenizerWrapper.apply_chat_template は enable_thinking が渡されなければ
+    ``self.has_thinking`` を自分で補う (thinking 対応モデルは既定 on)。
 
     thinking が有効なテンプレートの一部は、確定した過去ターンの assistant
     メッセージを履歴へ組み込む際に <think>...</think> を落とす (再度読ませる
     必要がないため)。そのため実際に生成されたトークン列より次ターンの
     prompt が短くなり、ChatSession の LCP 再利用 (前回処理列がそのまま新
     prompt の接頭辞であることを要求する) が原理的に成立しなくなる。
-    enable_thinking=False を明示すればこの型のモデルでも再利用の対象に戻る。
+    enable_thinking=False (reasoning_effort: "none" 等) を渡せばこの型の
+    モデルでも再利用の対象に戻る。
     """
 
     kwargs = {"add_generation_prompt": True}
@@ -207,16 +218,192 @@ def _apply_template(messages: list[dict], enable_thinking: bool | None = None):
         return _naive_prompt_ids(messages)
 
 
-def _effective_enable_thinking(body: dict) -> bool | None:
-    """リクエストが ``enable_thinking`` を明示すればそれを最優先。省略時は
-    ``--no-think`` で決めたサーバー既定 (未指定ならテンプレート任せの None)
-    に落ちる。OpenAI/Anthropic 系クライアントの多くはこのフィールドを送って
-    こないので、既定を運用者側で選べるようにしておく必要がある。"""
+# reasoning_effort -> thinking トークン予算の目安。fastmlx は思考の深さを
+# 直接は調整できないので、予算 (ThinkingRouter が数える生成済みトークン数の
+# 上限) に写して実際に効かせる。未知の値は 400 にせず medium 相当とする
+# (将来 effort の値が増えても壊れない)。
+_REASONING_EFFORT_BUDGET = {
+    "minimal": 512,
+    "low": 2048,
+    "medium": 8192,
+    "high": 32768,
+}
+_REASONING_EFFORT_DEFAULT_BUDGET = _REASONING_EFFORT_BUDGET["medium"]
 
-    requested = body.get("enable_thinking")
-    if requested is not None:
-        return requested
-    return STATE.default_enable_thinking
+
+def _resolve_thinking(body: dict, protocol: str) -> tuple[bool | None, int | None, str | None]:
+    """標準フィールドだけを読み、(enable_thinking 用の kwarg, 予算, エラー)
+    を返す。fastmlx 独自フィールドは無い — 何も指定が無ければ
+    (None, None, None) (テンプレート任せ・予算強制なし)。
+
+    予算: None = 強制なし (自然に終わるまで待つ)、0 = thinking 完全オフ、
+    正の整数 = ThinkingRouter がその数のトークンで打ち切る。呼び出し側で
+    max_tokens に対して clamp すること (ここでは知らないため)。
+    """
+
+    if protocol == "openai":
+        if "reasoning_effort" not in body:
+            return None, None, None
+        value = body["reasoning_effort"]
+        key = value.lower() if isinstance(value, str) else None
+        if key == "none":
+            return False, 0, None
+        budget = _REASONING_EFFORT_BUDGET.get(key, _REASONING_EFFORT_DEFAULT_BUDGET)
+        return True, budget, None
+
+    # anthropic
+    if "thinking" not in body:
+        return None, None, None
+    value = body["thinking"]
+    if not isinstance(value, dict):
+        return None, None, "'thinking' must be an object with a 'type' field"
+    t = value.get("type")
+    if t == "disabled":
+        return False, 0, None
+    if t == "enabled":
+        budget = value.get("budget_tokens")
+        if not isinstance(budget, int) or isinstance(budget, bool) or budget < 0:
+            return None, None, "'thinking.budget_tokens' must be a non-negative integer"
+        return True, budget, None
+    return None, None, f"'thinking.type' must be 'enabled' or 'disabled', got {t!r}"
+
+
+class ThinkingRouter:
+    """モデルの生トークン列を reasoning (thinking) / content の 2 チャンネル
+    へ振り分ける。マーカーは推測せず、mlx_lm.TokenizerWrapper の公開 API
+    (``has_thinking``/``think_start_tokens``/``think_end_tokens``、Qwen の
+    ``<think>``/``</think>`` や channel 方式のモデルも同じ口でカバーされる)
+    から引く。引けないモデル (``has_thinking`` が False) では常に content
+    一本になる — 「このモデルでは thinking を分離できない」という意味で、
+    全文が従来どおり本文に入る。
+
+    マーカー境界をまたいで正しくデコードするため、reasoning と content で
+    別々のストリーミング detokenizer を使う (BPE の trailing-space マージ
+    等は各チャンネル内で完結する)。マーカートークン列 (複数トークンのことが
+    ある) を跨いだ誤検出を避けるため、マーカー長ぶんの生トークンを常に
+    バッファして先読みし、一致しないと分かった分だけ確定でどちらかの
+    detokenizer へ流す。
+
+    budget (int | None): thinking ブロック内で許すトークン数の上限。None は
+    無制限 (自然に終わるまで待つ)。0 は「thinking 完全オフ」で、そもそも
+    ルーティングしない。
+
+    予算超過時にできることの限界: SpecEngine (spec.py) も
+    mlx_lm.generate.stream_generate も、生成の途中で外部から割り込んで
+    「ここで打ち切り、続きを別のプロンプトから作り直す」ライブな口を持たな
+    い (on_tokens の戻り値は見ていない — 呼び出し元を変えても、既存の
+    投機デコードエンジンにその変更を入れない限り実現できない)。そのため
+    ここで実装しているのは「予算に達した後のトークンはクライアントへ転送
+    しない」までで、「思考を強制的に閉じて本文を続けさせる」その場再開は
+    やっていない。budget_exceeded フラグで検知でき、呼び出し側はこれを
+    finish_reason/stop_reason に反映する。
+    (2 段構えの再開そのものは技術的に不可能ではない: 予算に達した時点で
+    現在の generate() 呼び出しを見限り、prompt_ids + それまでに生成された
+    トークン + </think> を新しい prompt として generate() をもう一度呼べば、
+    ChatSession の LCP 再利用によって prefill の再計算は避けられる。ただし
+    ストリーミング/非ストリーミング両経路・SpecRunner/FallbackRunner 両方で
+    このチャンク分割を整合させる実装コストとバグ面積が、この機能の価値に
+    見合わないと判断し、今回は見送った。)
+    """
+
+    def __init__(self, tokenizer, budget: int | None, eos_ids: set):
+        self.tokenizer = tokenizer
+        self.budget = budget
+        self.eos_ids = eos_ids
+        self.enabled = bool(getattr(tokenizer, "has_thinking", False)) and budget != 0
+        self.phase = "detect" if self.enabled else "content"
+        self.buf: list[int] = []
+        self.think_detok = tokenizer.detokenizer
+        self.content_detok = tokenizer.detokenizer
+        self.thinking_token_count = 0
+        self.budget_exceeded = False
+        self._start_tokens = list(tokenizer.think_start_tokens) if self.enabled else []
+        self._end_tokens = list(tokenizer.think_end_tokens) if self.enabled else []
+
+    def feed(self, toks) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for t in toks:
+            if t in self.eos_ids:
+                continue
+            if self.budget_exceeded:
+                continue
+            if self.phase == "detect":
+                self.buf.append(t)
+                if len(self.buf) < len(self._start_tokens):
+                    continue
+                if self.buf == self._start_tokens:
+                    self.phase = "thinking"
+                    self.buf = []
+                else:
+                    # 冒頭が think_start と一致しない = このターンは考えて
+                    # いない。貯めていた分はすべて content 側へ回す。
+                    self.phase = "content"
+                    pending, self.buf = self.buf, []
+                    for pt in pending:
+                        self.content_detok.add_token(pt)
+                    seg = self.content_detok.last_segment
+                    if seg:
+                        out.append(("content", seg))
+                continue
+            if self.phase == "thinking":
+                self.buf.append(t)
+                if len(self.buf) <= len(self._end_tokens):
+                    if self.buf == self._end_tokens:
+                        self.phase = "content"
+                        self.buf = []
+                    continue
+                # ウィンドウが end marker 長を超えた分だけ確定で thinking へ
+                # 流す (末尾は常に marker 長ぶん保持して先読みを続ける)。
+                cut = len(self.buf) - len(self._end_tokens)
+                flush, self.buf = self.buf[:cut], self.buf[cut:]
+                for ft in flush:
+                    self.think_detok.add_token(ft)
+                    self.thinking_token_count += 1
+                    if self.budget is not None and self.thinking_token_count > self.budget:
+                        self.budget_exceeded = True
+                        break
+                seg = self.think_detok.last_segment
+                if seg:
+                    out.append(("reasoning", seg))
+                if self.budget_exceeded:
+                    return out
+                if self.buf == self._end_tokens:
+                    self.phase = "content"
+                    self.buf = []
+                continue
+            # phase == "content"
+            self.content_detok.add_token(t)
+            seg = self.content_detok.last_segment
+            if seg:
+                out.append(("content", seg))
+        return out
+
+    def finalize(self) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        if self.budget_exceeded:
+            return out
+        if self.phase == "detect":
+            # マーカー長に届かないまま生成が終わった (極端に短い max_tokens
+            # 等)。安全側で content 扱いにする。
+            for t in self.buf:
+                self.content_detok.add_token(t)
+            self.buf = []
+        elif self.phase == "thinking":
+            # </think> を出さないまま max_tokens/eos に達した。バッファに
+            # 残る未確定トークンは thinking として確定させる。
+            for t in self.buf:
+                self.think_detok.add_token(t)
+                self.thinking_token_count += 1
+            self.buf = []
+            self.think_detok.finalize()
+            seg = self.think_detok.last_segment
+            if seg:
+                out.append(("reasoning", seg))
+        self.content_detok.finalize()
+        seg = self.content_detok.last_segment
+        if seg:
+            out.append(("content", seg))
+        return out
 
 
 def _parse_positive_int(raw, cap: int, field_name: str) -> tuple[int, str | None]:
@@ -365,13 +552,14 @@ def _log_gen_stats(res: dict) -> None:
 
 # ---------- 生成の下回り ----------
 #
-# on_tokens は投機の受理まとめて複数トークンを一度に渡してくる。SpecRunner
-# (SpecEngine) はテキストを持たず生トークンしか渡してこないので、その場合は
-# ここの detok がトークンごとに分解し直さず detokenizer.last_segment を
-# そのまま 1 個の delta として流す。FallbackRunner (mlx_lm.stream_generate)
-# は自分の内部 detokenizer で resp.text をすでに正しく計算済みなので、それを
-# 渡してもらったときはここでの再デトケナイズをスキップする (二重デコード
-# だと BPE の trailing-space マージ等が二重に走り、先頭空白の扱いが崩れうる)。
+# on_tokens は投機の受理まとめて複数トークンを一度に渡してくる。生トークン
+# 列は常に渡ってくる (SpecRunner はそれしか持たず、FallbackRunner も
+# on_tokens(toks, text) の toks は必ず渡す) ので、ThinkingRouter はどちらの
+# 経路でも同じロジックで reasoning/content を振り分けられる。thinking の
+# 分離が絡む場合は FallbackRunner の precomputed text (二重デコード回避策)
+# を使わず、ここで raw id から必ず再デトケナイズする — マーカー境界をまたぐ
+# 判定に生トークンが要るのと、reasoning/content で detokenizer を分ける
+# 必要があるため。
 #
 # STATE.runner.generate は同期・長時間実行なので、モデルをロードしたのと
 # 同じ専用ワーカースレッド (STATE.executor) に必ず投げる。asyncio の汎用
@@ -395,8 +583,12 @@ async def _run_generate(prompt_ids, max_tokens, temp, eos_ids, on_tokens, sessio
     return await loop.run_in_executor(STATE.executor, fn)
 
 
-def _start_generation(prompt_ids, max_tokens: int, temp: float):
+def _start_generation(prompt_ids, max_tokens: int, temp: float, thinking_budget: int | None):
     """ワーカーを STATE.executor へ投げ、(キュー, Future) を返す。
+
+    キューに積まれる要素: ``("reasoning_delta", text)`` / ``("content_delta",
+    text)`` / ``("budget_exceeded", None)`` (予算超過を検知した回だけ 1 回) /
+    ``("done", res)`` / ``("error", exc)``。
 
     呼び出し側は必ずこの Future を最後まで待つこと (正常終了・エラー・
     クライアント切断のどの経路でも)。そうしないと、まだ実行中のワーカーが
@@ -405,22 +597,16 @@ def _start_generation(prompt_ids, max_tokens: int, temp: float):
     """
 
     q: queue.Queue = queue.Queue()
-    detok = STATE.tokenizer.detokenizer
-    detok.reset()
     eos_ids = STATE.eos_ids
+    router = ThinkingRouter(STATE.tokenizer, thinking_budget, eos_ids)
+    signaled = [False]
 
     def on_tokens(toks, text=None):
-        if text is not None:
-            if text:
-                q.put(("delta", text))
-            return
-        for t in toks:
-            if t in eos_ids:
-                continue
-            detok.add_token(t)
-        seg = detok.last_segment
-        if seg:
-            q.put(("delta", seg))
+        for channel, seg in router.feed(toks):
+            q.put((f"{channel}_delta", seg))
+        if router.budget_exceeded and not signaled[0]:
+            q.put(("budget_exceeded", None))
+            signaled[0] = True
 
     def worker():
         try:
@@ -432,10 +618,9 @@ def _start_generation(prompt_ids, max_tokens: int, temp: float):
                 on_tokens=on_tokens,
                 session=STATE.session,
             )
-            detok.finalize()
-            seg = detok.last_segment
-            if seg:
-                q.put(("delta", seg))
+            if not router.budget_exceeded:
+                for channel, seg in router.finalize():
+                    q.put((f"{channel}_delta", seg))
             q.put(("done", res))
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as an SSE error event
             q.put(("error", exc))
@@ -457,6 +642,17 @@ async def _await_worker(future) -> None:
         await asyncio.wrap_future(future)
     except Exception:
         pass
+
+
+def _split_thinking_final(tokens: list[int], budget: int | None) -> tuple[str, str, bool]:
+    """非ストリーム向け: 最終トークン列をまとめて ThinkingRouter に通し、
+    (reasoning_text, content_text, budget_exceeded) を返す。"""
+
+    router = ThinkingRouter(STATE.tokenizer, budget, STATE.eos_ids)
+    parts = router.feed(tokens) + router.finalize()
+    reasoning_text = "".join(t for ch, t in parts if ch == "reasoning")
+    content_text = "".join(t for ch, t in parts if ch == "content")
+    return reasoning_text, content_text, router.budget_exceeded
 
 
 # ---------- OpenAI 互換 ----------
@@ -504,14 +700,20 @@ async def chat_completions(request: Request):
         ]
     except ContentNormalizationError as exc:
         return _openai_error(str(exc))
+
+    enable_thinking, thinking_budget, err = _resolve_thinking(body, "openai")
+    if err is not None:
+        return _openai_error(err)
     try:
-        prompt_ids = _apply_template(norm_messages, _effective_enable_thinking(body))
+        prompt_ids = _apply_template(norm_messages, enable_thinking)
     except Exception as exc:
         return _openai_error(f"failed to render chat template: {exc}")
 
     max_tokens, err = _resolve_max_tokens_openai(body, STATE.max_tokens_cap)
     if err is not None:
         return _openai_error(err)
+    if thinking_budget is not None:
+        thinking_budget = min(thinking_budget, max_tokens)
     temp, err = _parse_temperature(body, STATE.default_temp)
     if err is not None:
         return _openai_error(err)
@@ -527,7 +729,15 @@ async def chat_completions(request: Request):
         include_usage = bool(stream_options.get("include_usage", False))
         return StreamingResponse(
             _openai_stream(
-                prompt_ids, max_tokens, temp, req_id, created, model_id, stops, include_usage
+                prompt_ids,
+                max_tokens,
+                temp,
+                req_id,
+                created,
+                model_id,
+                stops,
+                include_usage,
+                thinking_budget,
             ),
             media_type="text/event-stream",
         )
@@ -541,13 +751,21 @@ async def chat_completions(request: Request):
         return _openai_error(str(exc), status=500, err_type="server_error")
     _log_gen_stats(res)
 
-    text = STATE.tokenizer.decode([t for t in res["tokens"] if t not in STATE.eos_ids])
+    reasoning_text, content_text, budget_exceeded = _split_thinking_final(
+        res["tokens"], thinking_budget
+    )
     finish_reason = _finish_reason_openai(res["tokens"])
-    if stops:
-        hit = _find_stop(text, stops)
+    if budget_exceeded:
+        finish_reason = "length"
+    elif stops:
+        hit = _find_stop(content_text, stops)
         if hit is not None:
-            text = text[: hit[0]]
+            content_text = content_text[: hit[0]]
             finish_reason = "stop"
+
+    message = {"role": "assistant", "content": content_text}
+    if reasoning_text:
+        message["reasoning_content"] = reasoning_text
 
     return {
         "id": req_id,
@@ -557,7 +775,7 @@ async def chat_completions(request: Request):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
+                "message": message,
                 "finish_reason": finish_reason,
             }
         ],
@@ -570,10 +788,18 @@ async def chat_completions(request: Request):
 
 
 async def _openai_stream(
-    prompt_ids, max_tokens, temp, req_id, created, model_id, stops, include_usage
+    prompt_ids,
+    max_tokens,
+    temp,
+    req_id,
+    created,
+    model_id,
+    stops,
+    include_usage,
+    thinking_budget,
 ):
     async with STATE.lock:
-        q, future = _start_generation(prompt_ids, max_tokens, temp)
+        q, future = _start_generation(prompt_ids, max_tokens, temp, thinking_budget)
         try:
             first = {
                 "id": req_id,
@@ -592,10 +818,30 @@ async def _openai_stream(
             stopped = False  # stop 文字列に一致してからはクライアントへの
             # 転送だけ止め、実際の生成が終わる ("done") まではキューを
             # 空読みし続ける (正確な usage を得るのと、Future を待つ前提を
-            # 崩さないため)。
+            # 崩さないため)。budget_exceeded も同様の「転送だけ止める」形。
+            budget_exceeded = False
             while True:
                 kind, payload = await asyncio.to_thread(q.get)
-                if kind == "delta":
+                if kind == "reasoning_delta":
+                    if stopped or payload == "":
+                        continue
+                    chunk = {
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"reasoning_content": payload},
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    if include_usage:
+                        chunk["usage"] = None
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                elif kind == "content_delta":
                     if stopped:
                         continue
                     visible = payload
@@ -621,8 +867,13 @@ async def _openai_stream(
                         if include_usage:
                             chunk["usage"] = None
                         yield f"data: {json.dumps(chunk)}\n\n"
+                elif kind == "budget_exceeded":
+                    budget_exceeded = True
                 elif kind == "done":
-                    finish_reason = "stop" if stopped else _finish_reason_openai(payload["tokens"])
+                    if budget_exceeded:
+                        finish_reason = "length"
+                    else:
+                        finish_reason = "stop" if stopped else _finish_reason_openai(payload["tokens"])
                     n_completion = len(payload["tokens"])
                     _log_gen_stats(payload)
                     break
@@ -702,14 +953,19 @@ async def anthropic_messages(request: Request):
     except ContentNormalizationError as exc:
         return _anthropic_error(str(exc))
 
+    enable_thinking, thinking_budget, err = _resolve_thinking(body, "anthropic")
+    if err is not None:
+        return _anthropic_error(err)
     try:
-        prompt_ids = _apply_template(norm_messages, _effective_enable_thinking(body))
+        prompt_ids = _apply_template(norm_messages, enable_thinking)
     except Exception as exc:
         return _anthropic_error(f"failed to render chat template: {exc}")
 
     max_tokens, err = _parse_anthropic_max_tokens(body["max_tokens"], STATE.max_tokens_cap)
     if err is not None:
         return _anthropic_error(err)
+    if thinking_budget is not None:
+        thinking_budget = min(thinking_budget, max_tokens)
     temp, err = _parse_temperature(body, STATE.default_temp)
     if err is not None:
         return _anthropic_error(err)
@@ -737,7 +993,9 @@ async def anthropic_messages(request: Request):
 
     if stream:
         return StreamingResponse(
-            _anthropic_stream(prompt_ids, max_tokens, temp, msg_id, model_id, stops),
+            _anthropic_stream(
+                prompt_ids, max_tokens, temp, msg_id, model_id, stops, thinking_budget
+            ),
             media_type="text/event-stream",
         )
 
@@ -750,22 +1008,32 @@ async def anthropic_messages(request: Request):
         return _anthropic_error(str(exc), status=500, err_type="server_error")
     _log_gen_stats(res)
 
-    text = STATE.tokenizer.decode([t for t in res["tokens"] if t not in STATE.eos_ids])
+    reasoning_text, content_text, budget_exceeded = _split_thinking_final(
+        res["tokens"], thinking_budget
+    )
     stop_reason = _stop_reason_anthropic(res["tokens"])
     matched_stop = None
-    if stops:
-        hit = _find_stop(text, stops)
+    if budget_exceeded:
+        stop_reason = "max_tokens"
+    elif stops:
+        hit = _find_stop(content_text, stops)
         if hit is not None:
-            text = text[: hit[0]]
+            content_text = content_text[: hit[0]]
             stop_reason = "stop_sequence"
             matched_stop = hit[1]
+
+    content_blocks = []
+    if reasoning_text:
+        content_blocks.append({"type": "thinking", "thinking": reasoning_text})
+    if content_text or not reasoning_text:
+        content_blocks.append({"type": "text", "text": content_text})
 
     return {
         "id": msg_id,
         "type": "message",
         "role": "assistant",
         "model": model_id,
-        "content": [{"type": "text", "text": text}],
+        "content": content_blocks,
         "stop_reason": stop_reason,
         "stop_sequence": matched_stop,
         "usage": {
@@ -775,12 +1043,14 @@ async def anthropic_messages(request: Request):
     }
 
 
-async def _anthropic_stream(prompt_ids, max_tokens, temp, msg_id, model_id, stops):
+async def _anthropic_stream(
+    prompt_ids, max_tokens, temp, msg_id, model_id, stops, thinking_budget
+):
     def sse(event, data):
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
     async with STATE.lock:
-        q, future = _start_generation(prompt_ids, max_tokens, temp)
+        q, future = _start_generation(prompt_ids, max_tokens, temp, thinking_budget)
         try:
             yield sse(
                 "message_start",
@@ -798,28 +1068,44 @@ async def _anthropic_stream(prompt_ids, max_tokens, temp, msg_id, model_id, stop
                     },
                 },
             )
-            yield sse(
-                "content_block_start",
-                {
-                    "type": "content_block_start",
-                    "index": 0,
-                    "content_block": {"type": "text", "text": ""},
-                },
-            )
             yield sse("ping", {"type": "ping"})
+            # content_block_start は最初のデルタが来てから、その channel
+            # (thinking が起きたかどうか) に応じて出す。事前には分からない
+            # ため (実 API も、最初のブロックを送る直前に content_block_start
+            # を出す形なので、順序としては同じ)。
 
             n_out = 0
             stop_reason = "end_turn"
             matched_stop = None
             acc_text = ""
             stopped = False
+            budget_exceeded = False
+            current_block: str | None = None  # None | "reasoning" | "content"
+            next_index = 0
+            block_index: dict[str, int] = {}
+
+            def open_block(channel: str):
+                nonlocal next_index
+                idx = next_index
+                next_index += 1
+                block_index[channel] = idx
+                if channel == "reasoning":
+                    content_block = {"type": "thinking", "thinking": ""}
+                else:
+                    content_block = {"type": "text", "text": ""}
+                return idx, sse(
+                    "content_block_start",
+                    {"type": "content_block_start", "index": idx, "content_block": content_block},
+                )
+
             while True:
                 kind, payload = await asyncio.to_thread(q.get)
-                if kind == "delta":
+                if kind in ("reasoning_delta", "content_delta"):
                     if stopped:
                         continue
+                    channel = "reasoning" if kind == "reasoning_delta" else "content"
                     visible = payload
-                    if stops:
+                    if channel == "content" and stops:
                         new_acc = acc_text + payload
                         hit = _find_stop(new_acc, stops)
                         if hit is not None:
@@ -829,33 +1115,62 @@ async def _anthropic_stream(prompt_ids, max_tokens, temp, msg_id, model_id, stop
                             stopped = True
                             matched_stop = matched
                         acc_text = new_acc
-                    if visible:
-                        yield sse(
-                            "content_block_delta",
-                            {
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "text_delta", "text": visible},
-                            },
-                        )
+                    if not visible:
+                        continue
+                    if current_block != channel:
+                        if current_block is not None:
+                            yield sse(
+                                "content_block_stop",
+                                {"type": "content_block_stop", "index": block_index[current_block]},
+                            )
+                        idx, start_evt = open_block(channel)
+                        yield start_evt
+                        current_block = channel
+                    delta_field = (
+                        {"type": "thinking_delta", "thinking": visible}
+                        if channel == "reasoning"
+                        else {"type": "text_delta", "text": visible}
+                    )
+                    yield sse(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": block_index[channel],
+                            "delta": delta_field,
+                        },
+                    )
+                elif kind == "budget_exceeded":
+                    budget_exceeded = True
                 elif kind == "done":
                     n_out = len(payload["tokens"])
-                    stop_reason = (
-                        "stop_sequence" if stopped else _stop_reason_anthropic(payload["tokens"])
-                    )
+                    if budget_exceeded:
+                        stop_reason = "max_tokens"
+                    else:
+                        stop_reason = (
+                            "stop_sequence" if stopped else _stop_reason_anthropic(payload["tokens"])
+                        )
                     _log_gen_stats(payload)
                     break
                 else:  # error
                     yield sse(
                         "error",
-                        {
-                            "type": "error",
-                            "error": {"type": "server_error", "message": str(payload)},
-                        },
+                        {"type": "error", "error": {"type": "server_error", "message": str(payload)}},
                     )
                     return
 
-            yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
+            if current_block is not None:
+                yield sse(
+                    "content_block_stop",
+                    {"type": "content_block_stop", "index": block_index[current_block]},
+                )
+            else:
+                # 何も生成されなかった (例: max_tokens が極端に小さい)。
+                # 「content_block が最低 1 つはある」前提を壊さないよう、
+                # 空の text ブロックを開いてすぐ閉じる。
+                idx, start_evt = open_block("content")
+                yield start_evt
+                yield sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+
             yield sse(
                 "message_delta",
                 {
@@ -907,12 +1222,6 @@ def main() -> None:
         help="hyper-connections 融合カーネルを無効化する (既定は有効)。"
         "qwen4_exp (Flash-Next 系) の通常生成経路にのみ効く",
     )
-    ap.add_argument(
-        "--no-think",
-        action="store_true",
-        help="リクエストが enable_thinking を明示しない場合の既定を thinking 無効にする"
-        " (cli.py の --no-think と同じ)。リクエスト側の enable_thinking が優先される",
-    )
     args = ap.parse_args()
 
     global STATE
@@ -955,10 +1264,16 @@ def main() -> None:
         eos_ids=set(tokenizer.eos_token_ids),
         max_tokens_cap=args.max_tokens,
         default_temp=args.temp,
-        default_enable_thinking=False if args.no_think else None,
         created_ts=int(time.time()),
     )
     print(f"[fastmlx-serve] served model name: {served_name}")
+    if getattr(tokenizer, "has_thinking", False):
+        print(
+            f"[fastmlx-serve] thinking マーカー検出: {tokenizer.think_start!r} / "
+            f"{tokenizer.think_end!r} (reasoning_content/thinking ブロック分離が有効)"
+        )
+    else:
+        print("[fastmlx-serve] thinking マーカー検出なし (このモデルでは分離しない)")
 
     import uvicorn
 
