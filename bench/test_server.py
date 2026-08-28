@@ -1711,3 +1711,94 @@ def test_bug1_budget_only_counts_generated_thinking_tokens(client):
 # 等) は確実にこの型を履歴へ含めてくる。
 
 
+def test_anthropic_history_thinking_block_does_not_400(client):
+    tok = FakeTokenizer(vocab={10: "ok"}, has_tool_calling=True)
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "weather in tokyo?"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "let me check the weather tool",
+                            "signature": "sig123",
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "get_weather",
+                            "input": {"city": "Tokyo"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "sunny"},
+                    ],
+                },
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    rendered_messages = tok.last_apply_chat_template_kwargs["messages"]
+    assert not any(
+        "let me check the weather tool" in str(m.get("content", "")) for m in rendered_messages
+    )
+
+
+def test_anthropic_history_redacted_thinking_block_does_not_400(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "redacted_thinking", "data": "opaque-blob"},
+                        {"type": "text", "text": "hello"},
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+
+# ---------- 9. Responses API (/v1/responses) ----------
+#
+# Codex CLI (wire_api: "responses") 向け。生成そのもの・thinking の分離・
+# tool call の解析・サンプリングパラメータ・session 選択・stop 判定は
+# Chat Completions/Anthropic 経路と共有する (_collect_events/_start_generation
+# をそのまま使う) — ここで検証するのは input の読み取りと output/イベント
+# の組み立てだけ。
+
+
+_RESPONSES_WEATHER_TOOL = {
+    "type": "function",
+    "name": "get_weather",
+    "description": "get the weather for a city",
+    "parameters": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"],
+    },
+}
+
+

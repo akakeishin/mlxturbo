@@ -398,6 +398,20 @@ def _normalize_anthropic_messages(messages: list[dict]) -> list[dict]:
                 tool_result_msgs.append(
                     {"role": "tool", "content": result_text, "tool_call_id": tuid}
                 )
+            elif btype in ("thinking", "redacted_thinking"):
+                # 拡張思考 + tool use の Anthropic 規約: 直前ターンの
+                # thinking/redacted_thinking ブロックは次ターンの履歴に
+                # そのまま含めて送り返す必要がある (公式ドキュメントで
+                # 明記)。このサーバー自身が thinking 有効時にこのブロックを
+                # 返している (このモジュール内で "thinking" ブロックを組み
+                # 立てている箇所を参照) ので、tool を使う複数ターンの会話を
+                # 送り返すクライアント (例: Claude Code) は確実にこの型を
+                # 履歴へ含めてくる。中身をモデルに再度読ませる必要は無い
+                # (thinking 対応チャットテンプレートは確定した過去ターンの
+                # think 内容を履歴から落とす想定 — _apply_template の
+                # docstring 参照) ので、ここでは 400 にせず読み飛ばすだけ
+                # にする。
+                pass
             else:
                 raise MultimodalContentError(btype)
         # tool_result (前ターンの結果) はこのメッセージの通常テキストより
