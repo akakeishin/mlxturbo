@@ -55,6 +55,13 @@ def main():
     ap.add_argument("--blocks", type=int, default=6, help="backend ごとの計測ブロック数")
     ap.add_argument("--tokens", type=int, default=12, help="1 ブロックのトークン数")
     ap.add_argument("--threads", type=int, default=None)
+    ap.add_argument(
+        "--fused",
+        action="store_true",
+        help="hyper-connections 融合カーネルを有効にしてから測る。既定 off の"
+        "ままだと 1 トークン 49ms 前後の (出荷経路より遅い) 土俵で比べることに"
+        "なり、n-gram の読み出しが占める割合が実際より小さく見える",
+    )
     args = ap.parse_args()
 
     os.environ["FASTMLX_NGRAM_DISK"] = "1"
@@ -64,6 +71,11 @@ def main():
     from fastmlx.ngram_stream import StreamNGram
 
     model, tok = load(args.model)
+    if args.fused:
+        from fastmlx import fused
+
+        fused.enable_hyper_connection_kernel()
+        print("hyper-connections 融合カーネル有効")
     sidecar = Path(args.ngram)
     pread_stream = StreamNGram(sidecar, backend="pread", n_threads=args.threads)
     mmap_stream = StreamNGram(sidecar, backend="mmap")
