@@ -191,6 +191,139 @@ def _validate_messages_shape(messages) -> str | None:
     return None
 
 
+# ---------- tool calling: 履歴 (tool_calls / tool_result) の正規化 ----------
+#
+# apply_chat_template に渡す messages は、どちらのプロトコルから来ても
+# OpenAI 形式 (assistant: {"role","content","tool_calls":[{"id","type":
+# "function","function":{"name","arguments": <dict>}}]} / tool 結果:
+# {"role":"tool","tool_call_id","content"}) に揃える。チャットテンプレート
+# 自体が (mlx_lm の tool_parser 自動選択と同様に) OpenAI/Qwen 系の tool
+# calling 規約を前提にしているため。arguments は dict のまま渡す
+# (mlx_lm.server.process_message_content も同様に json.loads してから
+# テンプレートへ渡している — テンプレートは大抵 tojson でシリアライズし
+# 直すので、文字列を二重にエンコードしてはいけない)。
+
+
+def _normalize_openai_messages(messages: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        tool_calls = m.get("tool_calls")
+        if role == "assistant" and tool_calls:
+            raw_content = m.get("content")
+            text = "" if raw_content is None else _content_to_text(raw_content)
+            converted_calls = []
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    raise InvalidContentError("each item in 'tool_calls' must be an object")
+                func = tc.get("function")
+                if not isinstance(func, dict) or not isinstance(func.get("name"), str):
+                    raise InvalidContentError(
+                        "'tool_calls[].function' must be an object with a string 'name'"
+                    )
+                raw_args = func.get("arguments", "{}")
+                if isinstance(raw_args, str):
+                    try:
+                        args_obj = json.loads(raw_args) if raw_args else {}
+                    except json.JSONDecodeError as exc:
+                        raise InvalidContentError(
+                            f"'tool_calls[].function.arguments' is not valid JSON: {exc}"
+                        ) from exc
+                elif isinstance(raw_args, dict):
+                    args_obj = raw_args
+                else:
+                    raise InvalidContentError(
+                        "'tool_calls[].function.arguments' must be a JSON string or an object"
+                    )
+                converted_calls.append(
+                    {
+                        "id": tc.get("id") or f"call_{uuid.uuid4().hex}",
+                        "type": "function",
+                        "function": {"name": func["name"], "arguments": args_obj},
+                    }
+                )
+            out.append({"role": "assistant", "content": text, "tool_calls": converted_calls})
+            continue
+        if role == "tool":
+            template_msg = {"role": "tool", "content": _content_to_text(m.get("content"))}
+            tcid = m.get("tool_call_id")
+            if tcid is not None:
+                template_msg["tool_call_id"] = tcid
+            name = m.get("name")
+            if name is not None:
+                template_msg["name"] = name
+            out.append(template_msg)
+            continue
+        out.append({"role": role, "content": _content_to_text(m.get("content"))})
+    return out
+
+
+def _normalize_anthropic_messages(messages: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+        if isinstance(content, str) or content is None:
+            out.append({"role": role, "content": _content_to_text(content)})
+            continue
+        if not isinstance(content, list):
+            raise InvalidContentError(
+                f"'content' must be a string or a list of content blocks, got {type(content).__name__}"
+            )
+        text_parts: list[str] = []
+        tool_calls: list[dict] = []
+        tool_result_msgs: list[dict] = []
+        for block in content:
+            if not isinstance(block, dict) or "type" not in block:
+                raise InvalidContentError("each content block must be an object with a 'type'")
+            btype = block["type"]
+            if btype == "text":
+                text = block.get("text")
+                if not isinstance(text, str):
+                    raise InvalidContentError(
+                        "content block of type 'text' must have a string 'text' field"
+                    )
+                text_parts.append(text)
+            elif btype == "tool_use":
+                if role != "assistant":
+                    raise InvalidContentError(
+                        "'tool_use' content blocks are only valid in assistant messages"
+                    )
+                name = block.get("name")
+                if not isinstance(name, str) or not name:
+                    raise InvalidContentError("'tool_use' block must have a non-empty string 'name'")
+                tool_calls.append(
+                    {
+                        "id": block.get("id") or f"toolu_{uuid.uuid4().hex}",
+                        "type": "function",
+                        "function": {"name": name, "arguments": block.get("input", {}) or {}},
+                    }
+                )
+            elif btype == "tool_result":
+                if role != "user":
+                    raise InvalidContentError(
+                        "'tool_result' content blocks are only valid in user messages"
+                    )
+                tuid = block.get("tool_use_id")
+                result_text = _content_to_text(block.get("content", "") or "")
+                tool_result_msgs.append(
+                    {"role": "tool", "content": result_text, "tool_call_id": tuid}
+                )
+            else:
+                raise MultimodalContentError(btype)
+        # tool_result (前ターンの結果) はこのメッセージの通常テキストより
+        # 先に role: "tool" として並べる。同じ user メッセージ内でテキスト
+        # と tool_result が混在するのは稀だが、その場合も出現順を保つ
+        # (tool_result 群 -> このメッセージ自身のテキスト)。
+        out.extend(tool_result_msgs)
+        joined_text = "".join(text_parts)
+        if role == "assistant" and tool_calls:
+            out.append({"role": "assistant", "content": joined_text, "tool_calls": tool_calls})
+        elif joined_text or not tool_result_msgs:
+            out.append({"role": role, "content": joined_text})
+    return out
+
+
 def _naive_prompt_ids(messages: list[dict]):
     """tokenizer にチャットテンプレートが無いモデル向けの素朴なフォールバック。
 
@@ -204,7 +337,9 @@ def _naive_prompt_ids(messages: list[dict]):
     return STATE.tokenizer.encode("\n".join(lines))
 
 
-def _apply_template(messages: list[dict], enable_thinking: bool | None = None):
+def _apply_template(
+    messages: list[dict], enable_thinking: bool | None = None, tools: list | None = None
+):
     """``enable_thinking`` は標準フィールド (reasoning_effort/thinking) から
     解決済みの値。省略時 (None) はテンプレートの既定に任せる — mlx_lm の
     TokenizerWrapper.apply_chat_template は enable_thinking が渡されなければ
@@ -217,11 +352,23 @@ def _apply_template(messages: list[dict], enable_thinking: bool | None = None):
     prompt の接頭辞であることを要求する) が原理的に成立しなくなる。
     enable_thinking=False (reasoning_effort: "none" 等) を渡せばこの型の
     モデルでも再利用の対象に戻る。
+
+    ``tools`` は tool_choice 解決後の OpenAI 形式の tools 配列 (None なら
+    このターンはツールを見せない)。呼び出し側が既に
+    ``_check_tool_calling_support`` で ``tokenizer.has_tool_calling`` を
+    確認済みである前提 — ここでは渡された tools をそのまま
+    ``apply_chat_template(tools=...)`` へ転送するだけ (HF の
+    apply_chat_template は tools を第一級の kwarg として受け付けるので、
+    黙って無視されることはない — 無視されるとしたらそれは
+    has_tool_calling が拾えていないモデルであり、その判定は呼び出し側の
+    責任)。
     """
 
     kwargs = {"add_generation_prompt": True}
     if enable_thinking is not None:
         kwargs["enable_thinking"] = enable_thinking
+    if tools is not None:
+        kwargs["tools"] = tools
     try:
         return STATE.tokenizer.apply_chat_template(messages, **kwargs)
     except TypeError:
@@ -285,6 +432,142 @@ def _resolve_thinking(body: dict, protocol: str) -> tuple[bool | None, int | Non
     return None, None, f"'thinking.type' must be 'enabled' or 'disabled', got {t!r}"
 
 
+# ---------- tool calling: リクエスト側 (tools/tool_choice の検証・解決) ----------
+#
+# tokenizer.apply_chat_template の ``tools=`` に渡す形式は OpenAI 形式
+# (``[{"type": "function", "function": {"name", "description", "parameters"}}]``)
+# に統一する。Anthropic の ``input_schema`` 形式はここで OpenAI 形式へ変換
+# してから渡す (jinja 側のテンプレートはどのみち Qwen 系の json_tools 前提
+# なので、テンプレートへ渡す形は 1 通りに揃えておいたほうが破綻しにくい)。
+# tokenizer.tool_parser (mlx_lm 側で自動選択されるモデル固有パーサ、例:
+# qwen3_coder は tools の parameters.properties から引数の型を引く) もこの
+# OpenAI 形式の tools を期待するので、同じ変換結果を使い回せる。
+
+
+def _validate_openai_tools(tools) -> str | None:
+    if not isinstance(tools, list) or not tools:
+        return "'tools' must be a non-empty array"
+    for t in tools:
+        if not isinstance(t, dict) or t.get("type") != "function":
+            return 'each item in \'tools\' must be an object with "type": "function"'
+        func = t.get("function")
+        if not isinstance(func, dict) or not isinstance(func.get("name"), str) or not func.get("name"):
+            return "each tool's 'function' must be an object with a non-empty string 'name'"
+    return None
+
+
+def _validate_anthropic_tools(tools) -> str | None:
+    if not isinstance(tools, list) or not tools:
+        return "'tools' must be a non-empty array"
+    for t in tools:
+        if not isinstance(t, dict) or not isinstance(t.get("name"), str) or not t.get("name"):
+            return "each item in 'tools' must be an object with a non-empty string 'name'"
+        if "input_schema" in t and not isinstance(t["input_schema"], dict):
+            return "'tools[].input_schema' must be an object"
+    return None
+
+
+def _anthropic_tools_to_openai(tools: list[dict]) -> list[dict]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.get("name"),
+                "description": t.get("description", "") or "",
+                "parameters": t.get("input_schema", {}) or {},
+            },
+        }
+        for t in tools
+    ]
+
+
+def _resolve_tool_choice_openai(body: dict) -> tuple[list | None, str | None]:
+    """``tools``/``tool_choice`` (OpenAI 形式) を読み、apply_chat_template へ
+    渡す tools (OpenAI 形式のまま) を解決する。tools が無い/空なら
+    (None, None) (tool_choice は無視する — 実 API も同様)。
+
+    ``tool_choice: "none"`` は「tools を渡さない」で済ませる (このターンは
+    ツールを見せない、渡された tools 自体は無視)。``"required"`` と特定
+    関数指定は、モデル側を強制する手段が無いので 400 にする (黙って auto
+    として扱わない)。
+    """
+
+    tools = body.get("tools")
+    if not tools:
+        return None, None
+    shape_err = _validate_openai_tools(tools)
+    if shape_err is not None:
+        return None, shape_err
+    choice = body.get("tool_choice", "auto")
+    if choice is None:
+        choice = "auto"
+    if choice == "none":
+        return None, None
+    if choice == "auto":
+        return tools, None
+    if choice == "required":
+        return None, (
+            "'tool_choice: \"required\"' is not supported: this server has no "
+            "mechanism to force the model to call a tool (it can only detect "
+            "tool calls the model chooses to emit on its own)"
+        )
+    if isinstance(choice, dict):
+        return None, (
+            "'tool_choice' selecting a specific function is not supported: this "
+            "server has no mechanism to force the model to call a particular tool"
+        )
+    return None, f"'tool_choice' must be 'auto', 'none', 'required', or a function object; got {choice!r}"
+
+
+def _resolve_tool_choice_anthropic(body: dict) -> tuple[list | None, str | None]:
+    """Anthropic 形式版。戻り値の tools は (Anthropic 形式のままではなく)
+    ``_anthropic_tools_to_openai`` で OpenAI 形式へ変換済みのもの — 呼び出し
+    側は apply_chat_template/tool_parser のどちらにもこれをそのまま渡せる。
+    """
+
+    tools = body.get("tools")
+    if not tools:
+        return None, None
+    shape_err = _validate_anthropic_tools(tools)
+    if shape_err is not None:
+        return None, shape_err
+    choice = body.get("tool_choice")
+    if choice is None:
+        return _anthropic_tools_to_openai(tools), None
+    if not isinstance(choice, dict):
+        return None, "'tool_choice' must be an object with a 'type' field"
+    t = choice.get("type")
+    if t == "none":
+        return None, None
+    if t == "auto":
+        return _anthropic_tools_to_openai(tools), None
+    if t in ("any", "tool"):
+        return None, (
+            f"'tool_choice.type': {t!r} (forced tool calling) is not supported: this "
+            "server has no mechanism to force the model to call a tool"
+        )
+    return None, f"'tool_choice.type' must be 'auto', 'none', 'any', or 'tool'; got {t!r}"
+
+
+def _check_tool_calling_support(resolved_tools) -> str | None:
+    """resolved_tools (tool_choice 解決後、None なら今回はツールを見せない)
+    が None でなければ、tokenizer が tool_call マーカーを持つか
+    (``has_tool_calling``、mlx_lm の TokenizerWrapper がチャットテンプレート
+    文字列から自動検出する — has_thinking と同じ仕組み) を確認する。持た
+    なければ黙って無視せず 400 にする。
+    """
+
+    if resolved_tools is None:
+        return None
+    if not getattr(STATE.tokenizer, "has_tool_calling", False):
+        return (
+            "this model does not support tool calling: no tool-call marker is "
+            "configured for its tokenizer/chat template (tokenizer.has_tool_calling "
+            "is False)"
+        )
+    return None
+
+
 class ThinkingRouter:
     """モデルの生トークン列を reasoning (thinking) / content の 2 チャンネル
     へ振り分ける。マーカーは推測せず、mlx_lm.TokenizerWrapper の公開 API
@@ -321,24 +604,114 @@ class ThinkingRouter:
     ストリーミング/非ストリーミング両経路・SpecRunner/FallbackRunner 両方で
     このチャンク分割を整合させる実装コストとバグ面積が、この機能の価値に
     見合わないと判断し、今回は見送った。)
+
+    tool_calling_enabled (bool): この生成でツール呼び出し検出も行うかどうか
+    (呼び出し側が resolved_tools を渡した = tool_choice が "none" ではなく
+    tools が実際に指定されたか、に対応)。tokenizer 側が tool_call マーカーを
+    持たない場合は無条件で無効になる (``has_thinking`` と同じパターン、
+    ``self.tool_enabled`` 参照)。
+
+    有効なとき、content フェーズの間 ``tokenizer.tool_call_start_tokens``
+    の出現を先読みで監視し (thinking フェーズが end marker を待つのと同じ
+    ローリングウィンドウ方式)、一致したら "tool" フェーズへ入って
+    ``tokenizer.tool_call_end_tokens`` までのテキストを "tool" チャンネルと
+    して返す (マーカー自体はどちらのチャンネルにも含まれない — mlx_lm の
+    ToolCallFormatter/_process_control_tokens と同じ扱い)。1 回の生成内で
+    ツール呼び出しは複数回起こりうるので content <-> tool は何度でも往復
+    する。"tool" フェーズへの出入りはテキストが空でも必ず ("tool_start", "")
+    / ("tool_end", matched: bool) を 1 回ずつ返すので、呼び出し側はそれを
+    境界として個々の呼び出しをグルーピングできる (feed() が空セグメントを
+    省略する都合上、境界自体を独立したイベントにしないと "たまたま前後の
+    テキストが空だった 2 回の呼び出し" を誤って 1 回に結合してしまう)。
+    ``tool_end`` の bool は「本当に終了マーカーで閉じたか」— False は
+    max_tokens 等で強制的に打ち切られたことを示し、呼び出し側は再構成時に
+    終了マーカー文字列を足さない判断に使う。
     """
 
-    def __init__(self, tokenizer, budget: int | None, eos_ids: set):
+    def __init__(
+        self,
+        tokenizer,
+        budget: int | None,
+        eos_ids: set,
+        tool_calling_enabled: bool = False,
+    ):
         self.tokenizer = tokenizer
         self.budget = budget
         self.eos_ids = eos_ids
         self.enabled = bool(getattr(tokenizer, "has_thinking", False)) and budget != 0
+        self.tool_enabled = tool_calling_enabled and bool(
+            getattr(tokenizer, "has_tool_calling", False)
+        )
         self.phase = "detect" if self.enabled else "content"
         self.buf: list[int] = []
+        self.tool_buf: list[int] = []
         self.think_detok = tokenizer.detokenizer
         self.content_detok = tokenizer.detokenizer
+        self.tool_detok = tokenizer.detokenizer
         self.thinking_token_count = 0
         self.budget_exceeded = False
         self._start_tokens = list(tokenizer.think_start_tokens) if self.enabled else []
         self._end_tokens = list(tokenizer.think_end_tokens) if self.enabled else []
+        self._tool_start = (
+            list(tokenizer.tool_call_start_tokens) if self.tool_enabled else []
+        )
+        self._tool_end = (
+            list(tokenizer.tool_call_end_tokens) if self.tool_enabled else []
+        )
 
-    def feed(self, toks) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
+    def _feed_content_token(self, t: int, out: list) -> None:
+        """content フェーズの 1 トークンを処理する。tool ルーティングが
+        無効なら即デコードするだけ (従来どおり)。有効なら
+        ``tool_call_start`` への先読みバッファを持つ ("thinking" フェーズが
+        end marker を待つのと同型のローリングウィンドウ)。"""
+
+        if not self.tool_enabled:
+            self.content_detok.add_token(t)
+            seg = self.content_detok.last_segment
+            if seg:
+                out.append(("content", seg))
+            return
+        self.tool_buf.append(t)
+        if len(self.tool_buf) <= len(self._tool_start):
+            if self.tool_buf == self._tool_start:
+                self.phase = "tool"
+                self.tool_buf = []
+                out.append(("tool_start", ""))
+            return
+        cut = len(self.tool_buf) - len(self._tool_start)
+        flush, self.tool_buf = self.tool_buf[:cut], self.tool_buf[cut:]
+        for ft in flush:
+            self.content_detok.add_token(ft)
+        seg = self.content_detok.last_segment
+        if seg:
+            out.append(("content", seg))
+        if self.tool_buf == self._tool_start:
+            self.phase = "tool"
+            self.tool_buf = []
+            out.append(("tool_start", ""))
+
+    def _feed_tool_token(self, t: int, out: list) -> None:
+        self.tool_buf.append(t)
+        if len(self.tool_buf) <= len(self._tool_end):
+            if self.tool_buf == self._tool_end:
+                self.phase = "content"
+                self.tool_buf = []
+                out.append(("tool_end", True))
+            return
+        cut = len(self.tool_buf) - len(self._tool_end)
+        flush, self.tool_buf = self.tool_buf[:cut], self.tool_buf[cut:]
+        for ft in flush:
+            self.tool_detok.add_token(ft)
+        seg = self.tool_detok.last_segment
+        if seg:
+            out.append(("tool", seg))
+        if self.tool_buf == self._tool_end:
+            self.phase = "content"
+            self.tool_buf = []
+            out.append(("tool_end", True))
+
+    def feed(self, toks) -> list[tuple[str, object]]:
+        out: list[tuple[str, object]] = []
         for t in toks:
             if t in self.eos_ids:
                 continue
@@ -353,14 +726,14 @@ class ThinkingRouter:
                     self.buf = []
                 else:
                     # 冒頭が think_start と一致しない = このターンは考えて
-                    # いない。貯めていた分はすべて content 側へ回す。
+                    # いない。貯めていた分は content フェーズのロジック
+                    # (tool_call_start 監視込み) へそのまま再投入する —
+                    # ここで無条件に content_detok へ流すと、たまたま冒頭が
+                    # tool_call_start の先頭と重なっていた場合を取りこぼす。
                     self.phase = "content"
                     pending, self.buf = self.buf, []
                     for pt in pending:
-                        self.content_detok.add_token(pt)
-                    seg = self.content_detok.last_segment
-                    if seg:
-                        out.append(("content", seg))
+                        self._feed_content_token(pt, out)
                 continue
             if self.phase == "thinking":
                 self.buf.append(t)
@@ -388,23 +761,23 @@ class ThinkingRouter:
                     self.phase = "content"
                     self.buf = []
                 continue
-            # phase == "content"
-            self.content_detok.add_token(t)
-            seg = self.content_detok.last_segment
-            if seg:
-                out.append(("content", seg))
+            if self.phase == "content":
+                self._feed_content_token(t, out)
+                continue
+            # phase == "tool"
+            self._feed_tool_token(t, out)
         return out
 
-    def finalize(self) -> list[tuple[str, str]]:
-        out: list[tuple[str, str]] = []
+    def finalize(self) -> list[tuple[str, object]]:
+        out: list[tuple[str, object]] = []
         if self.budget_exceeded:
             return out
         if self.phase == "detect":
             # マーカー長に届かないまま生成が終わった (極端に短い max_tokens
-            # 等)。安全側で content 扱いにする。
-            for t in self.buf:
-                self.content_detok.add_token(t)
-            self.buf = []
+            # 等)。安全側で content 扱いにする (tool_call_start 監視込み)。
+            pending, self.buf = self.buf, []
+            for t in pending:
+                self._feed_content_token(t, out)
         elif self.phase == "thinking":
             # </think> を出さないまま max_tokens/eos に達した。バッファに
             # 残る未確定トークンは thinking として確定させる。
@@ -416,6 +789,24 @@ class ThinkingRouter:
             seg = self.think_detok.last_segment
             if seg:
                 out.append(("reasoning", seg))
+        elif self.phase == "tool":
+            # </tool_call> を出さないまま max_tokens/eos に達した。バッファに
+            # 残る未確定トークンは tool として確定させ、"tool_end" は
+            # (本当の終了マーカーではないので) False で知らせる。
+            for t in self.tool_buf:
+                self.tool_detok.add_token(t)
+            self.tool_buf = []
+            self.tool_detok.finalize()
+            seg = self.tool_detok.last_segment
+            if seg:
+                out.append(("tool", seg))
+            out.append(("tool_end", False))
+        # content フェーズで tool_call_start の先読み中 (まだ marker と
+        # 確定していないトークン列) のまま生成が終わった分は、確定させて
+        # content 側へ落とす (取りこぼし防止の安全弁)。
+        for t in self.tool_buf:
+            self.content_detok.add_token(t)
+        self.tool_buf = []
         self.content_detok.finalize()
         seg = self.content_detok.last_segment
         if seg:
@@ -756,18 +1147,129 @@ async def _run_generate(
     return await loop.run_in_executor(STATE.executor, fn)
 
 
+def _chunk_string(s: str, size: int = 24) -> list[str]:
+    """引数 JSON 文字列を固定長で分割する。OpenAI/Anthropic どちらの
+    ストリーミング規約も「引数は分割して流れる」形が慣例だが、実際には
+    tool call のテキスト全体をマーカーが閉じるまでバッファしてから初めて
+    JSON として解釈できる (壊れていたら捏造しないため、途中経過のまま
+    部分 JSON を流すことはできない)。そのため、パース確定後にこの関数で
+    人為的に分割してイベント化する — 結合すれば必ず元の JSON 文字列に戻る
+    ので、クライアント側の「断片を連結してから parse する」実装と矛盾しない。
+    """
+
+    if not s:
+        return [""]
+    return [s[i : i + size] for i in range(0, len(s), size)]
+
+
+def _parse_tool_calls_text(raw: str, tools_for_parsing) -> list[dict] | None:
+    """tool_call マーカーの間に挟まれていた生テキストを 1 個以上の構造化
+    tool call へ変換する。``tokenizer.tool_parser`` (mlx_lm がチャット
+    テンプレート文字列から自動選択するモデル固有パーサ、例えば Qwen の
+    素朴な JSON 形式なら ``json.loads`` そのもの、Qwen3-Coder の
+    ``<function=...>`` XML 風なら専用パーサ) をそのまま使う — マーカー
+    文字列の検出は ThinkingRouter が既に済ませているので、ここでは中身の
+    構文解析だけでよい。
+
+    1 個のマーカー区間から複数の呼び出しが取れるパーサ (pythonic 等) にも
+    対応するため、戻り値が list ならそのまま展開する (mlx_lm.server の
+    ToolCallFormatter と同じ扱い)。
+
+    解析に失敗した場合 (JSON 壊れ・name 欠落等) は None を返す — 呼び出し
+    側はこれを「tool call を捏造せず、生テキストをそのまま content として
+    返す」フォールバックのトリガーに使う。
+    """
+
+    parser = getattr(STATE.tokenizer, "tool_parser", None)
+    if parser is None:
+        return None
+    try:
+        parsed = parser(raw, tools_for_parsing)
+    except (ValueError, TypeError, KeyError, AttributeError, IndexError) as exc:
+        print(
+            f"[fastmlx-serve] tool call の解析に失敗 ({type(exc).__name__}: {exc})。"
+            " テキストとしてそのまま返す"
+        )
+        return None
+    if not isinstance(parsed, list):
+        parsed = [parsed]
+    calls = []
+    for tc in parsed:
+        if not isinstance(tc, dict):
+            return None
+        name = tc.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        arguments = tc.get("arguments", {})
+        tc_id = tc.get("id") or f"call_{uuid.uuid4().hex}"
+        calls.append({"name": name, "arguments": arguments, "id": tc_id})
+    return calls
+
+
+class SegmentAssembler:
+    """ThinkingRouter が返す (channel, payload) 列を、呼び出し側が使う
+    高レベルイベント ``("reasoning_delta", text)`` / ``("content_delta",
+    text)`` / ``("tool_call", {"id","name","arguments"})`` へ変換する。
+
+    "tool"/"tool_start"/"tool_end" チャンネルはマーカー区間の生テキストを
+    バッファし、区間が閉じた ("tool_end") 時点で初めて
+    ``_parse_tool_calls_text`` に通す: 成功すれば tool_call イベントを
+    (複数呼び出しなら複数個) 返し、失敗すれば "捏造せず、テキストとして
+    そのまま返す" というサーバー全体の方針どおり、マーカー文字列を含めた
+    生テキストを content_delta として返す (tool_end が実マーカーで閉じて
+    いなければ終了マーカー文字列は付けない — max_tokens 等で打ち切られた
+    ことが分かるように)。
+
+    ストリーミング (on_tokens から都度 push する) ・非ストリーミング
+    (生成後にまとめて push する) のどちらでも同じインスタンスをそのまま
+    使い回せる — 状態は tool_buf (未確定の tool テキスト断片) だけ。
+    """
+
+    def __init__(self, tools_for_parsing):
+        self.tools_for_parsing = tools_for_parsing
+        self._tool_buf: list[str] | None = None
+
+    def push(self, channel: str, payload) -> list[tuple[str, object]]:
+        if channel == "reasoning":
+            return [("reasoning_delta", payload)] if payload else []
+        if channel == "content":
+            return [("content_delta", payload)] if payload else []
+        if channel == "tool_start":
+            self._tool_buf = []
+            return []
+        if channel == "tool":
+            if payload:
+                self._tool_buf.append(payload)
+            return []
+        if channel == "tool_end":
+            matched = bool(payload)
+            raw = "".join(self._tool_buf) if self._tool_buf is not None else ""
+            self._tool_buf = None
+            calls = _parse_tool_calls_text(raw, self.tools_for_parsing)
+            if calls:
+                return [("tool_call", c) for c in calls]
+            start_m = getattr(STATE.tokenizer, "tool_call_start", None) or ""
+            end_m = (getattr(STATE.tokenizer, "tool_call_end", None) or "") if matched else ""
+            text = f"{start_m}{raw}{end_m}"
+            return [("content_delta", text)] if text else []
+        return []
+
+
 def _start_generation(
     prompt_ids,
     max_tokens: int,
     temp: float,
     thinking_budget: int | None,
+    tool_calling_enabled: bool = False,
+    tools_for_parsing=None,
     **sampling_kwargs,
 ):
     """ワーカーを STATE.executor へ投げ、(キュー, Future) を返す。
 
     キューに積まれる要素: ``("reasoning_delta", text)`` / ``("content_delta",
-    text)`` / ``("budget_exceeded", None)`` (予算超過を検知した回だけ 1 回) /
-    ``("done", res)`` / ``("error", exc)``。
+    text)`` / ``("tool_call", {"id","name","arguments"})`` (成功裏に解析
+    できた tool call 1 個ぶん) / ``("budget_exceeded", None)`` (予算超過を
+    検知した回だけ 1 回) / ``("done", res)`` / ``("error", exc)``。
 
     呼び出し側は必ずこの Future を最後まで待つこと (正常終了・エラー・
     クライアント切断のどの経路でも)。そうしないと、まだ実行中のワーカーが
@@ -777,12 +1279,16 @@ def _start_generation(
 
     q: queue.Queue = queue.Queue()
     eos_ids = STATE.eos_ids
-    router = ThinkingRouter(STATE.tokenizer, thinking_budget, eos_ids)
+    router = ThinkingRouter(
+        STATE.tokenizer, thinking_budget, eos_ids, tool_calling_enabled=tool_calling_enabled
+    )
+    assembler = SegmentAssembler(tools_for_parsing)
     signaled = [False]
 
     def on_tokens(toks, text=None):
-        for channel, seg in router.feed(toks):
-            q.put((f"{channel}_delta", seg))
+        for channel, payload in router.feed(toks):
+            for kind, val in assembler.push(channel, payload):
+                q.put((kind, val))
         if router.budget_exceeded and not signaled[0]:
             q.put(("budget_exceeded", None))
             signaled[0] = True
@@ -799,8 +1305,9 @@ def _start_generation(
                 **sampling_kwargs,
             )
             if not router.budget_exceeded:
-                for channel, seg in router.finalize():
-                    q.put((f"{channel}_delta", seg))
+                for channel, payload in router.finalize():
+                    for kind, val in assembler.push(channel, payload):
+                        q.put((kind, val))
             q.put(("done", res))
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as an SSE error event
             q.put(("error", exc))
@@ -824,15 +1331,104 @@ async def _await_worker(future) -> None:
         pass
 
 
-def _split_thinking_final(tokens: list[int], budget: int | None) -> tuple[str, str, bool]:
-    """非ストリーム向け: 最終トークン列をまとめて ThinkingRouter に通し、
-    (reasoning_text, content_text, budget_exceeded) を返す。"""
+def _collect_events(
+    tokens: list[int],
+    budget: int | None,
+    tool_calling_enabled: bool,
+    tools_for_parsing,
+) -> tuple[list[tuple[str, object]], bool]:
+    """非ストリーム向け: 最終トークン列をまとめて ThinkingRouter +
+    SegmentAssembler に通し、順序を保った高レベルイベント列 (``feed()``/
+    ``push()`` と同じ語彙: reasoning_delta/content_delta/tool_call) と
+    budget_exceeded を返す。ストリーミング経路 (_start_generation) が
+    on_tokens のたびに逐次行っているのと同じ変換を、非ストリームでは
+    生成後に一括で行うだけ。"""
 
-    router = ThinkingRouter(STATE.tokenizer, budget, STATE.eos_ids)
+    router = ThinkingRouter(
+        STATE.tokenizer, budget, STATE.eos_ids, tool_calling_enabled=tool_calling_enabled
+    )
     parts = router.feed(tokens) + router.finalize()
-    reasoning_text = "".join(t for ch, t in parts if ch == "reasoning")
-    content_text = "".join(t for ch, t in parts if ch == "content")
-    return reasoning_text, content_text, router.budget_exceeded
+    assembler = SegmentAssembler(tools_for_parsing)
+    events: list[tuple[str, object]] = []
+    for ch, payload in parts:
+        events.extend(assembler.push(ch, payload))
+    return events, router.budget_exceeded
+
+
+def _split_response_final(
+    tokens: list[int],
+    budget: int | None,
+    tool_calling_enabled: bool = False,
+    tools_for_parsing=None,
+) -> tuple[str, str, list[dict], bool]:
+    """OpenAI 非ストリーム向け: (reasoning_text, content_text, tool_calls,
+    budget_exceeded) を返す。tool_calls は成功裏に解析できた呼び出しだけ
+    (解析に失敗したものは content_text 側にマーカーごと生テキストとして
+    含まれる — 捏造しない方針)。"""
+
+    events, budget_exceeded = _collect_events(
+        tokens, budget, tool_calling_enabled, tools_for_parsing
+    )
+    reasoning_text = "".join(v for k, v in events if k == "reasoning_delta")
+    content_text = "".join(v for k, v in events if k == "content_delta")
+    tool_calls = [v for k, v in events if k == "tool_call"]
+    return reasoning_text, content_text, tool_calls, budget_exceeded
+
+
+def _truncate_content_events(
+    events: list[tuple[str, object]], cut_pos: int
+) -> list[tuple[str, object]]:
+    """Anthropic 非ストリーム向け: stop_sequence が content_delta の連結
+    文字列上の ``cut_pos`` で一致したとき、それ以降のイベントを切り捨てる。
+    tool_calls が絡む場合はこの関数を呼ばない (呼び出し側の分岐で保証する
+    — stop_sequence と tool calling の組み合わせは対応範囲外、既知の制限)
+    ので、ここでは reasoning_delta/content_delta しか来ない前提でよい。"""
+
+    out: list[tuple[str, object]] = []
+    acc = 0
+    for k, v in events:
+        if k != "content_delta":
+            out.append((k, v))
+            continue
+        if acc >= cut_pos:
+            break
+        remaining = cut_pos - acc
+        if len(v) <= remaining:
+            out.append((k, v))
+            acc += len(v)
+        else:
+            if remaining > 0:
+                out.append((k, v[:remaining]))
+            break
+    return out
+
+
+def _anthropic_blocks_from_events(events: list[tuple[str, object]]) -> list[dict]:
+    """順序を保った高レベルイベント列を Anthropic の content ブロック列へ
+    組み立てる。連続する content_delta は 1 個の text ブロックへ結合し、
+    tool_call は独立した tool_use ブロックにする (Anthropic の実 API も
+    tool_use を挟むと text ブロックが分かれる)。reasoning_delta はここでは
+    扱わない (呼び出し側が既存どおり thinking ブロックを別途・常に先頭に
+    組み立てる)。"""
+
+    blocks: list[dict] = []
+
+    def push_text(t: str) -> None:
+        if not t:
+            return
+        if blocks and blocks[-1]["type"] == "text":
+            blocks[-1]["text"] += t
+        else:
+            blocks.append({"type": "text", "text": t})
+
+    for kind, val in events:
+        if kind == "content_delta":
+            push_text(val)
+        elif kind == "tool_call":
+            blocks.append(
+                {"type": "tool_use", "id": val["id"], "name": val["name"], "input": val["arguments"]}
+            )
+    return blocks
 
 
 # ---------- OpenAI 互換 ----------
@@ -895,18 +1491,23 @@ async def chat_completions(request: Request):
         return _openai_error(shape_err)
 
     try:
-        norm_messages = [
-            {"role": m.get("role"), "content": _content_to_text(m.get("content"))}
-            for m in messages
-        ]
+        norm_messages = _normalize_openai_messages(messages)
     except ContentNormalizationError as exc:
         return _openai_error(str(exc))
+
+    resolved_tools, tool_err = _resolve_tool_choice_openai(body)
+    if tool_err is not None:
+        return _openai_error(tool_err)
+    unsupported_tools_err = _check_tool_calling_support(resolved_tools)
+    if unsupported_tools_err is not None:
+        return _openai_error(unsupported_tools_err)
+    tool_enabled = resolved_tools is not None
 
     enable_thinking, thinking_budget, err = _resolve_thinking(body, "openai")
     if err is not None:
         return _openai_error(err)
     try:
-        prompt_ids = _apply_template(norm_messages, enable_thinking)
+        prompt_ids = _apply_template(norm_messages, enable_thinking, tools=resolved_tools)
     except Exception as exc:
         return _openai_error(f"failed to render chat template: {exc}")
 
@@ -946,6 +1547,8 @@ async def chat_completions(request: Request):
                 include_usage,
                 thinking_budget,
                 sampling_params,
+                tool_enabled,
+                resolved_tools,
             ),
             media_type="text/event-stream",
         )
@@ -965,12 +1568,14 @@ async def chat_completions(request: Request):
         return _openai_error(str(exc), status=500, err_type="server_error")
     _log_gen_stats(res)
 
-    reasoning_text, content_text, budget_exceeded = _split_thinking_final(
-        res["tokens"], thinking_budget
+    reasoning_text, content_text, tool_calls, budget_exceeded = _split_response_final(
+        res["tokens"], thinking_budget, tool_enabled, resolved_tools
     )
     finish_reason = _finish_reason_openai(res["tokens"])
     if budget_exceeded:
         finish_reason = "length"
+    elif tool_calls:
+        finish_reason = "tool_calls"
     elif stops:
         hit = _find_stop(content_text, stops)
         if hit is not None:
@@ -980,6 +1585,20 @@ async def chat_completions(request: Request):
     message = {"role": "assistant", "content": content_text}
     if reasoning_text:
         message["reasoning_content"] = reasoning_text
+    if tool_calls:
+        message["tool_calls"] = [
+            {
+                "id": tc["id"],
+                "type": "function",
+                "function": {
+                    "name": tc["name"],
+                    "arguments": json.dumps(tc["arguments"], ensure_ascii=False),
+                },
+            }
+            for tc in tool_calls
+        ]
+        if not content_text:
+            message["content"] = None
 
     return {
         "id": req_id,
@@ -1010,10 +1629,18 @@ async def _openai_stream(
     include_usage,
     thinking_budget,
     sampling_params: dict | None = None,
+    tool_enabled: bool = False,
+    tools_for_parsing=None,
 ):
     async with STATE.lock:
         q, future = _start_generation(
-            prompt_ids, max_tokens, temp, thinking_budget, **(sampling_params or {})
+            prompt_ids,
+            max_tokens,
+            temp,
+            thinking_budget,
+            tool_enabled,
+            tools_for_parsing,
+            **(sampling_params or {}),
         )
         try:
             first = {
@@ -1036,9 +1663,62 @@ async def _openai_stream(
             # 空読みし続ける (正確な usage を得るのと、Future を待つ前提を
             # 崩さないため)。budget_exceeded も同様の「転送だけ止める」形。
             budget_exceeded = False
+            made_tool_call = False
+            tool_call_index = 0
             while True:
                 kind, payload = await asyncio.to_thread(q.get)
-                if kind == "reasoning_delta":
+                if kind == "tool_call":
+                    if stopped:
+                        continue
+                    made_tool_call = True
+                    idx = tool_call_index
+                    tool_call_index += 1
+                    name_chunk = {
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": idx,
+                                            "id": payload["id"],
+                                            "type": "function",
+                                            "function": {"name": payload["name"], "arguments": ""},
+                                        }
+                                    ]
+                                },
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                    if include_usage:
+                        name_chunk["usage"] = None
+                    yield f"data: {json.dumps(name_chunk)}\n\n"
+                    args_str = json.dumps(payload["arguments"], ensure_ascii=False)
+                    for piece in _chunk_string(args_str):
+                        args_chunk = {
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [{"index": idx, "function": {"arguments": piece}}]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        if include_usage:
+                            args_chunk["usage"] = None
+                        yield f"data: {json.dumps(args_chunk)}\n\n"
+                elif kind == "reasoning_delta":
                     if stopped or payload == "":
                         continue
                     chunk = {
@@ -1088,6 +1768,8 @@ async def _openai_stream(
                 elif kind == "done":
                     if budget_exceeded:
                         finish_reason = "length"
+                    elif made_tool_call:
+                        finish_reason = "tool_calls"
                     else:
                         finish_reason = "stop" if stopped else _finish_reason_openai(payload["tokens"])
                     n_completion = len(payload["tokens"])
@@ -1159,18 +1841,23 @@ async def anthropic_messages(request: Request):
         system = body.get("system")
         if system:
             norm_messages.append({"role": "system", "content": _content_to_text(system)})
-        for m in messages:
-            norm_messages.append(
-                {"role": m.get("role"), "content": _content_to_text(m.get("content"))}
-            )
+        norm_messages.extend(_normalize_anthropic_messages(messages))
     except ContentNormalizationError as exc:
         return _anthropic_error(str(exc))
+
+    resolved_tools, tool_err = _resolve_tool_choice_anthropic(body)
+    if tool_err is not None:
+        return _anthropic_error(tool_err)
+    unsupported_tools_err = _check_tool_calling_support(resolved_tools)
+    if unsupported_tools_err is not None:
+        return _anthropic_error(unsupported_tools_err)
+    tool_enabled = resolved_tools is not None
 
     enable_thinking, thinking_budget, err = _resolve_thinking(body, "anthropic")
     if err is not None:
         return _anthropic_error(err)
     try:
-        prompt_ids = _apply_template(norm_messages, enable_thinking)
+        prompt_ids = _apply_template(norm_messages, enable_thinking, tools=resolved_tools)
     except Exception as exc:
         return _anthropic_error(f"failed to render chat template: {exc}")
 
@@ -1221,6 +1908,8 @@ async def anthropic_messages(request: Request):
                 stops,
                 thinking_budget,
                 sampling_params,
+                tool_enabled,
+                resolved_tools,
             ),
             media_type="text/event-stream",
         )
@@ -1240,25 +1929,34 @@ async def anthropic_messages(request: Request):
         return _anthropic_error(str(exc), status=500, err_type="server_error")
     _log_gen_stats(res)
 
-    reasoning_text, content_text, budget_exceeded = _split_thinking_final(
-        res["tokens"], thinking_budget
+    events, budget_exceeded = _collect_events(
+        res["tokens"], thinking_budget, tool_enabled, resolved_tools
     )
+    reasoning_text = "".join(v for k, v in events if k == "reasoning_delta")
+    tool_calls = [v for k, v in events if k == "tool_call"]
     stop_reason = _stop_reason_anthropic(res["tokens"])
     matched_stop = None
     if budget_exceeded:
         stop_reason = "max_tokens"
+    elif tool_calls:
+        stop_reason = "tool_use"
     elif stops:
-        hit = _find_stop(content_text, stops)
+        # tool_calls が絡む場合の stop_sequence 対応は既知の制限として
+        # 見送っている (elif で never reached) — 詳細は
+        # _truncate_content_events の docstring を参照。
+        content_text_concat = "".join(v for k, v in events if k == "content_delta")
+        hit = _find_stop(content_text_concat, stops)
         if hit is not None:
-            content_text = content_text[: hit[0]]
+            events = _truncate_content_events(events, hit[0])
             stop_reason = "stop_sequence"
             matched_stop = hit[1]
 
     content_blocks = []
     if reasoning_text:
         content_blocks.append({"type": "thinking", "thinking": reasoning_text})
-    if content_text or not reasoning_text:
-        content_blocks.append({"type": "text", "text": content_text})
+    content_blocks.extend(_anthropic_blocks_from_events(events))
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": ""})
 
     return {
         "id": msg_id,
@@ -1284,13 +1982,21 @@ async def _anthropic_stream(
     stops,
     thinking_budget,
     sampling_params: dict | None = None,
+    tool_enabled: bool = False,
+    tools_for_parsing=None,
 ):
     def sse(event, data):
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
     async with STATE.lock:
         q, future = _start_generation(
-            prompt_ids, max_tokens, temp, thinking_budget, **(sampling_params or {})
+            prompt_ids,
+            max_tokens,
+            temp,
+            thinking_budget,
+            tool_enabled,
+            tools_for_parsing,
+            **(sampling_params or {}),
         )
         try:
             yield sse(
@@ -1321,7 +2027,11 @@ async def _anthropic_stream(
             acc_text = ""
             stopped = False
             budget_exceeded = False
+            made_tool_call = False
             current_block: str | None = None  # None | "reasoning" | "content"
+            any_block_emitted = False  # current_block だけだと「tool_use を
+            # 出し終えて None に戻した」のと「まだ何も出していない」を
+            # 区別できないので、別フラグで持つ。
             next_index = 0
             block_index: dict[str, int] = {}
 
@@ -1341,7 +2051,44 @@ async def _anthropic_stream(
 
             while True:
                 kind, payload = await asyncio.to_thread(q.get)
-                if kind in ("reasoning_delta", "content_delta"):
+                if kind == "tool_call":
+                    if stopped:
+                        continue
+                    made_tool_call = True
+                    any_block_emitted = True
+                    if current_block is not None:
+                        yield sse(
+                            "content_block_stop",
+                            {"type": "content_block_stop", "index": block_index[current_block]},
+                        )
+                        current_block = None
+                    idx = next_index
+                    next_index += 1
+                    yield sse(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": idx,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": payload["id"],
+                                "name": payload["name"],
+                                "input": {},
+                            },
+                        },
+                    )
+                    args_str = json.dumps(payload["arguments"], ensure_ascii=False)
+                    for piece in _chunk_string(args_str):
+                        yield sse(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": idx,
+                                "delta": {"type": "input_json_delta", "partial_json": piece},
+                            },
+                        )
+                    yield sse("content_block_stop", {"type": "content_block_stop", "index": idx})
+                elif kind in ("reasoning_delta", "content_delta"):
                     if stopped:
                         continue
                     channel = "reasoning" if kind == "reasoning_delta" else "content"
@@ -1367,6 +2114,7 @@ async def _anthropic_stream(
                         idx, start_evt = open_block(channel)
                         yield start_evt
                         current_block = channel
+                        any_block_emitted = True
                     delta_field = (
                         {"type": "thinking_delta", "thinking": visible}
                         if channel == "reasoning"
@@ -1386,6 +2134,8 @@ async def _anthropic_stream(
                     n_out = len(payload["tokens"])
                     if budget_exceeded:
                         stop_reason = "max_tokens"
+                    elif made_tool_call:
+                        stop_reason = "tool_use"
                     else:
                         stop_reason = (
                             "stop_sequence" if stopped else _stop_reason_anthropic(payload["tokens"])
@@ -1404,10 +2154,12 @@ async def _anthropic_stream(
                     "content_block_stop",
                     {"type": "content_block_stop", "index": block_index[current_block]},
                 )
-            else:
+            elif not any_block_emitted:
                 # 何も生成されなかった (例: max_tokens が極端に小さい)。
                 # 「content_block が最低 1 つはある」前提を壊さないよう、
-                # 空の text ブロックを開いてすぐ閉じる。
+                # 空の text ブロックを開いてすぐ閉じる。tool_use ブロックを
+                # 1 個以上出し終えて current_block が None に戻っている
+                # だけの場合はここには来ない (any_block_emitted で判別)。
                 idx, start_evt = open_block("content")
                 yield start_evt
                 yield sse("content_block_stop", {"type": "content_block_stop", "index": idx})
@@ -1430,9 +2182,10 @@ async def _anthropic_stream(
 # chat template を通さず、渡された prompt をそのまま生成に流すレガシー
 # エンドポイント。thinking の分離は行わない (raw completion にターン構造が
 # 無いので reasoning_effort の意味を持たせようがない) — thinking_budget=0 を
-# _start_generation/_split_thinking_final に渡すことで ThinkingRouter を
+# _start_generation/_split_response_final に渡すことで ThinkingRouter を
 # 強制的に content-only モードにし (budget=0 は has_thinking の値に関わらず
-# enabled=False)、既存の on_tokens 配線をそのまま再利用する。
+# enabled=False)、既存の on_tokens 配線をそのまま再利用する。tool calling
+# も同様に有効化しない (tool_calling_enabled は既定 False のまま渡さない)。
 
 
 def _prompt_to_ids(prompt) -> tuple[list[int] | None, str | None]:
@@ -1526,7 +2279,7 @@ async def completions(request: Request):
         return _openai_error(str(exc), status=500, err_type="server_error")
     _log_gen_stats(res)
 
-    _reasoning_text, text, _budget_exceeded = _split_thinking_final(res["tokens"], 0)
+    _reasoning_text, text, _tool_calls, _budget_exceeded = _split_response_final(res["tokens"], 0)
     finish_reason = _finish_reason_openai(res["tokens"])
     if stops:
         hit = _find_stop(text, stops)
@@ -1609,9 +2362,10 @@ async def _completions_stream(
                         if include_usage:
                             chunk["usage"] = None
                         yield f"data: {json.dumps(chunk)}\n\n"
-                elif kind == "reasoning_delta" or kind == "budget_exceeded":
-                    # thinking_budget=0 なのでここには来ないはずだが、念の
-                    # ため無視するだけにしておく (クラッシュより安全)。
+                elif kind in ("reasoning_delta", "budget_exceeded", "tool_call"):
+                    # thinking_budget=0・tool_calling_enabled=False (既定)
+                    # なのでここには来ないはずだが、念のため無視するだけに
+                    # しておく (クラッシュより安全)。
                     continue
                 elif kind == "done":
                     finish_reason = "stop" if stopped else _finish_reason_openai(payload["tokens"])
@@ -1752,6 +2506,16 @@ def main() -> None:
         )
     else:
         print("[fastmlx-serve] thinking マーカー検出なし (このモデルでは分離しない)")
+    if getattr(tokenizer, "has_tool_calling", False):
+        print(
+            f"[fastmlx-serve] tool call マーカー検出: {tokenizer.tool_call_start!r} / "
+            f"{tokenizer.tool_call_end!r} (tools/tool_choice に対応)"
+        )
+    else:
+        print(
+            "[fastmlx-serve] tool call マーカー検出なし (このモデルは tool calling 非対応: "
+            "tools を渡すリクエストは 400 になる)"
+        )
 
     if args.allowed_origins:
         origins = [o.strip() for o in args.allowed_origins.split(",") if o.strip()]
