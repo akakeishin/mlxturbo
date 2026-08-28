@@ -5,23 +5,39 @@ uv run fastmlx --prompt "..."        # ワンショット
 """
 
 import argparse
+import os
 import time
 
-import mlx.core as mx
-
-from ._mlx_compat import TextModelArgs, mlx_lm_load, resolve_local_model_path
+from ._mlx_compat import mlx_lm_load, resolve_local_model_path
 from .convert import load_quantized_mtp
 from .mtp import find_snapshot, load_mtp
-from .spec import ChatSession, SpecEngine
+from .runner import build_runner
+from .spec import ChatSession
 
 
-def load_cli_mtp(model_path, config, text_args, original, mtp_bits):
-    """Load bundled MTP when present, otherwise use the raw source checkpoint."""
+def load_cli_mtp(model_path, config, text_args, original, mtp_bits, no_mtp=False):
+    """Load bundled MTP when present, otherwise use the raw source checkpoint.
 
-    if config.get("fastmlx_mtp"):
-        return load_quantized_mtp(resolve_local_model_path(model_path), text_args)
-    quant = {"bits": mtp_bits, "group_size": 64} if mtp_bits else None
-    return load_mtp(find_snapshot(original), text_args, quantize=quant)
+    MTP is optional: when weights aren't available (or ``--no-mtp`` is
+    passed), this returns ``None`` instead of raising. ``SpecEngine`` accepts
+    ``mtp=None`` and falls back to lookup-only (SAM) speculation. We warn
+    once at startup rather than silently losing the MTP speedup.
+    """
+
+    if no_mtp:
+        print("[fastmlx] --no-mtp: MTP を無効化し、lookup のみで投機します")
+        return None
+    try:
+        if config.get("fastmlx_mtp"):
+            return load_quantized_mtp(resolve_local_model_path(model_path), text_args)
+        quant = {"bits": mtp_bits, "group_size": 64} if mtp_bits else None
+        return load_mtp(find_snapshot(original), text_args, quantize=quant)
+    except (FileNotFoundError, RuntimeError) as exc:
+        print(
+            f"[fastmlx] MTP 重みが見つからないため無効化します "
+            f"({type(exc).__name__}: {exc}); lookup のみで投機します"
+        )
+        return None
 
 
 def main() -> None:
@@ -33,6 +49,25 @@ def main() -> None:
     ap.add_argument("--n-draft", type=int, default=3)
     ap.add_argument("--max-draft", type=int, default=8)
     ap.add_argument("--mtp-bits", type=int, default=4)
+    ap.add_argument(
+        "--no-mtp",
+        action="store_true",
+        help="MTP を読み込まず lookup (SAM) のみで投機する",
+    )
+    ap.add_argument(
+        "--no-fused",
+        action="store_true",
+        help="hyper-connections 融合カーネルを無効化する (既定は有効)。"
+        "qwen4_exp (Flash-Next 系) の通常生成経路にのみ効く",
+    )
+    ap.add_argument(
+        "--ngram",
+        default=None,
+        help="n-gram (PLE) 表をチェックポイント本体に持たず外部サイドカーへ"
+        "分離してある変換 (fastmlx/ngram_stream.py) の場合、そのディレクトリ"
+        "を指定する。指定すると FASTMLX_NGRAM_DISK=1 を立ててから読み込み、"
+        "読み込み後に fastmlx.ngram_stream.install() で差し替える",
+    )
     ap.add_argument(
         "--fly-theta",
         type=float,
@@ -51,16 +86,22 @@ def main() -> None:
     args = ap.parse_args()
 
     t0 = time.perf_counter()
+    if args.ngram:
+        # qwen4_exp.py の NGRAM_ON_DISK はモジュール import 時に評価されるので、
+        # (寄り遅延 import される mlx_lm.utils.load 経由でも) 読み込み呼び出し
+        # より前に立てておく必要がある。
+        os.environ["FASTMLX_NGRAM_DISK"] = "1"
     model, tokenizer, config = mlx_lm_load(args.model, return_config=True)
-    text_args = TextModelArgs.from_dict(model.args.text_config)
-    mtp = load_cli_mtp(
-        args.model, config, text_args, args.original, args.mtp_bits
-    )
-    mx.eval(mtp.parameters())
-    engine = SpecEngine(model, mtp)
-    print(f"[fastmlx] loaded in {time.perf_counter() - t0:.1f}s: {args.model}")
+    if args.ngram:
+        from .ngram_stream import install
 
-    eos_ids = {tokenizer.eos_token_id}
+        install(model, args.ngram)
+    print(f"[fastmlx] loaded in {time.perf_counter() - t0:.1f}s: {args.model}")
+    runner = build_runner(
+        model, tokenizer, config, args, n_draft=args.n_draft, max_draft=args.max_draft
+    )
+
+    eos_ids = set(tokenizer.eos_token_ids)
     session = ChatSession()
 
     def run_turn(messages):
@@ -82,11 +123,9 @@ def main() -> None:
                 detok.add_token(t)
             print(detok.last_segment, end="", flush=True)
 
-        res = engine.generate(
+        res = runner.generate(
             prompt_ids,
             max_tokens=args.max_tokens,
-            n_draft=args.n_draft,
-            max_draft=args.max_draft,
             temp=args.temp,
             eos_ids=eos_ids,
             on_tokens=on_tokens,

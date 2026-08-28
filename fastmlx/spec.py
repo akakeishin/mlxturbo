@@ -518,6 +518,14 @@ class SpecEngine:
             raise ValueError("generation limits must be non-negative")
         eos = set(eos_ids)
         prompt_ids = list(prompt_ids)
+        if self.mtp is None:
+            # MTP チェックポイントが無い構成 (cli.py の load_cli_mtp が
+            # None を返した場合)。MTP 連鎖を丸ごと切り、lookup (D3, SAM)
+            # だけで投機を続ける。cap_base をここで潰しておくことで、
+            # 後続の draft ループと D7 拡張分岐 (どちらも self.mtp を呼ぶ)
+            # が発火しなくなる。
+            n_draft = 0
+            max_draft = 0
         use_mtp = n_draft > 0 or max_draft > 0
 
         caches = mtp_cache = None
