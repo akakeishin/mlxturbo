@@ -278,10 +278,63 @@ def install(model, sidecar: str | Path) -> None:
         n += 1
     if n == 0:
         raise ValueError("PLE 層が見つからない")
-    print(f"n-gram をサイドカー参照に差し替えた ({n} 層, {stream.bits}bit, RAM 0)")
+    # backend は環境変数でも決まるので、どちらを取ったかを必ず出す。
+    # FASTMLX_NGRAM_BACKEND=mmap が環境に残っていると 16 行の引きが 5-7 倍
+    # 遅くなる。出力は同じなので、黙って走られると公表値だけがずれる
+    if stream.backend == "pread":
+        how = f"backend=pread threads={stream.n_threads}"
+    else:
+        how = "backend=mmap (既定は pread。FASTMLX_NGRAM_BACKEND を確認すること)"
+    print(
+        f"[fastmlx] n-gram をサイドカー参照に差し替えた "
+        f"({n} 層, {stream.bits}bit, RAM 0, {how}) <- {stream.dir}"
+    )
 
 
-__all__ = ["RamNGram", "StreamNGram", "build_sidecar", "install", "install_ram"]
+def warn_if_not_installed(model) -> bool:
+    """n-gram がサイドカーに差し替わっていない状態を起動時に鳴らす。
+
+    `--ngram` を渡し忘れると `FASTMLX_NGRAM_DISK` が立たず、qwen4_exp の
+    `_ShardedEmbedding` が表を自前で確保する形になる。サイドカーへ分離した
+    チェックポイントには n-gram のテンソルが入っていないので、その表は
+    初期値のままになる。生成そのものは最後まで走るため、黙っていると
+    会話にも計測にも紛れ込む。
+
+    PLE 層を持たないモデル (Llama 等) では何もしない。差し替え済みなら
+    True を返す。
+    """
+
+    layers = getattr(getattr(model, "model", None), "layers", None)
+    if layers is None:
+        return False
+    stale = total = 0
+    for layer in layers:
+        ple = getattr(layer, "ple", None)
+        if ple is None:
+            continue
+        total += 1
+        if not isinstance(ple.ple_embedding.ngram_embedding, (StreamNGram, RamNGram)):
+            stale += 1
+    if total == 0:
+        return False
+    if stale:
+        print(
+            f"[fastmlx] 警告: n-gram 表がサイドカーに差し替わっていない "
+            f"({stale}/{total} 層)。--ngram <サイドカー> を渡していないなら、"
+            "出力は初期値の表で生成されたものになる"
+        )
+        return False
+    return True
+
+
+__all__ = [
+    "RamNGram",
+    "StreamNGram",
+    "build_sidecar",
+    "install",
+    "install_ram",
+    "warn_if_not_installed",
+]
 
 
 class RamNGram:
