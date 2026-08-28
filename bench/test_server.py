@@ -1802,3 +1802,376 @@ _RESPONSES_WEATHER_TOOL = {
 }
 
 
+def _responses_sse_pairs(text: str) -> list[tuple[str | None, dict]]:
+    """Responses API の SSE ボディを (event, data) のリストへパースする。
+    Chat Completions/Anthropic と違い ``data: [DONE]`` は送らない。"""
+
+    pairs: list[tuple[str | None, dict]] = []
+    event = None
+    for line in text.splitlines():
+        if line.startswith("event: "):
+            event = line[len("event: ") :]
+        elif line.startswith("data: "):
+            pairs.append((event, json.loads(line[len("data: ") :])))
+    return pairs
+
+
+def test_responses_nonstream_basic_text(client):
+    tok = FakeTokenizer(vocab={10: "hello", 11: " world"})
+    runner = FakeRunner(tokens_to_emit=[10, 11, 999])  # 999 = eos (自然終了させる)
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post("/v1/responses", json={"model": "test-model", "input": "hi"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["object"] == "response"
+    assert body["status"] == "completed"
+    assert len(body["output"]) == 1
+    item = body["output"][0]
+    assert item["type"] == "message"
+    assert item["role"] == "assistant"
+    assert item["content"] == [{"type": "output_text", "text": "hello world", "annotations": []}]
+    assert body["usage"]["output_tokens"] == 3
+    assert tok.last_apply_chat_template_kwargs["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_responses_instructions_becomes_system_message(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "instructions": "be terse", "input": "hi"},
+    )
+    assert resp.status_code == 200, resp.text
+    messages = tok.last_apply_chat_template_kwargs["messages"]
+    assert messages[0] == {"role": "system", "content": "be terse"}
+    assert messages[1] == {"role": "user", "content": "hi"}
+
+
+def test_responses_typed_input_items(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert tok.last_apply_chat_template_kwargs["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_responses_tools_flat_shape_converted_for_template(client):
+    tok = FakeTokenizer(vocab={10: "ok"}, has_tool_calling=True)
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "weather in tokyo?",
+            "tools": [_RESPONSES_WEATHER_TOOL],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert tok.last_apply_chat_template_kwargs["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "get the weather for a city",
+                "parameters": _RESPONSES_WEATHER_TOOL["parameters"],
+            },
+        }
+    ]
+
+
+def test_responses_tools_on_unsupported_model_is_400(client):
+    tok = FakeTokenizer(vocab={10: "ok"})  # has_tool_calling=False (既定)
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "hi", "tools": [_RESPONSES_WEATHER_TOOL]},
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+
+
+def test_responses_nonstream_function_call_output_item(client):
+    vocab = {10: "Sure, checking. ", 200: _TOOL_CALL_JSON, 11: "!"}
+    tok = _tool_calling_tokenizer(vocab)
+    runner = FakeRunner(tokens_to_emit=[10, 100, 200, 101, 11])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "weather in tokyo?",
+            "tools": [_RESPONSES_WEATHER_TOOL],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    types = [item["type"] for item in body["output"]]
+    # "Sure, checking. " (message) -> get_weather (function_call) -> "!"
+    # (別の message、tool_call を挟んで content_delta のランが分かれるため)
+    assert types == ["message", "function_call", "message"]
+    assert body["output"][0]["content"][0]["text"] == "Sure, checking. "
+    assert body["output"][2]["content"][0]["text"] == "!"
+    fc = body["output"][1]
+    assert fc["name"] == "get_weather"
+    assert fc["call_id"]
+    assert json.loads(fc["arguments"]) == {"city": "Tokyo"}
+
+
+def test_responses_function_call_history_reaches_template(client):
+    tok = FakeTokenizer(vocab={10: "ok"}, has_tool_calling=True)
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "weather in tokyo?"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": json.dumps({"city": "Tokyo"}),
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "sunny"},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    messages = tok.last_apply_chat_template_kwargs["messages"]
+    assert messages[0] == {"role": "user", "content": "weather in tokyo?"}
+    assert messages[1]["role"] == "assistant"
+    assert messages[1]["tool_calls"][0]["function"] == {
+        "name": "get_weather",
+        "arguments": {"city": "Tokyo"},
+    }
+    assert messages[2] == {"role": "tool", "content": "sunny", "tool_call_id": "call_1"}
+
+
+def test_responses_reasoning_item_in_history_is_skipped_not_400(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "thinking..."}]},
+                {"role": "assistant", "content": "hello"},
+                {"role": "user", "content": "continue"},
+            ],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_responses_non_text_input_part_is_400(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": [{"type": "input_image", "image_url": "http://x/y.png"}]},
+            ],
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+
+
+def test_responses_model_mismatch_is_404(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok, model_name="test-model")
+
+    resp = client.post("/v1/responses", json={"model": "other-model", "input": "hi"})
+    assert resp.status_code == 404, resp.text
+    assert not runner.calls
+
+
+def test_responses_previous_response_id_is_400(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "hi", "previous_response_id": "resp_123"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+    assert "previous_response_id" in resp.json()["error"]["message"]
+
+
+def test_responses_store_true_is_400(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "hi", "store": True},
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+
+
+def test_responses_reasoning_effort_produces_reasoning_output_item(client):
+    tok = FakeTokenizer(
+        vocab={10: "pondering. ", 501: "</think>", 11: "42"},
+        has_thinking=True,
+        think_start_tokens=[500],
+        think_end_tokens=[501],
+        prompt_ids=[1, 500],
+    )
+    runner = FakeRunner(tokens_to_emit=[10, 501, 11])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "2+2?", "reasoning": {"effort": "low"}},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    types = [item["type"] for item in body["output"]]
+    assert types == ["reasoning", "message"]
+    assert body["output"][0]["summary"][0]["text"] == "pondering. "
+    assert body["output"][1]["content"][0]["text"] == "42"
+
+
+def test_responses_stream_event_sequence(client):
+    tok = FakeTokenizer(vocab={10: "hello", 11: " world"})
+    runner = FakeRunner(tokens_to_emit=[10, 11, 999])  # 999 = eos (自然終了させる)
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "hi", "stream": True},
+    )
+    assert resp.status_code == 200, resp.text
+    pairs = _responses_sse_pairs(resp.text)
+    events = [e for e, _ in pairs]
+    assert events[0] == "response.created"
+    assert "response.output_item.added" in events
+    assert "response.output_text.delta" in events
+    assert "response.output_item.done" in events
+    assert events[-1] == "response.completed"
+
+    text = "".join(d["delta"] for e, d in pairs if e == "response.output_text.delta")
+    assert text == "hello world"
+
+    completed = next(d for e, d in pairs if e == "response.completed")
+    assert completed["response"]["status"] == "completed"
+    assert completed["response"]["output"][0]["content"][0]["text"] == "hello world"
+
+
+def test_responses_stream_emits_function_call_arguments_delta(client):
+    vocab = {10: "Sure. ", 200: _TOOL_CALL_JSON, 11: "!"}
+    tok = _tool_calling_tokenizer(vocab)
+    runner = FakeRunner(tokens_to_emit=[10, 100, 200, 101, 11])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "weather in tokyo?",
+            "tools": [_RESPONSES_WEATHER_TOOL],
+            "stream": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    pairs = _responses_sse_pairs(resp.text)
+    events = [e for e, _ in pairs]
+    assert "response.function_call_arguments.delta" in events
+
+    args_str = "".join(
+        d["delta"] for e, d in pairs if e == "response.function_call_arguments.delta"
+    )
+    assert json.loads(args_str) == {"city": "Tokyo"}
+
+    completed = next(d for e, d in pairs if e == "response.completed")
+    types = [item["type"] for item in completed["response"]["output"]]
+    # "Sure. " (message) -> get_weather (function_call) -> "!" (別の message)
+    assert types == ["message", "function_call", "message"]
+
+
+def test_responses_stream_emits_reasoning_summary_text_delta(client):
+    """バグ 1 (thinking がプロンプト側で既に開かれている) の修正が
+    Responses API のストリーミング経路にも効いていることを併せて確認する。"""
+
+    tok = FakeTokenizer(
+        vocab={10: "pondering. ", 501: "</think>", 11: "42"},
+        has_thinking=True,
+        think_start_tokens=[500],
+        think_end_tokens=[501],
+        prompt_ids=[1, 500],
+    )
+    runner = FakeRunner(tokens_to_emit=[10, 501, 11])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "2+2?",
+            "reasoning": {"effort": "low"},
+            "stream": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    pairs = _responses_sse_pairs(resp.text)
+    reasoning_text = "".join(
+        d["delta"] for e, d in pairs if e == "response.reasoning_summary_text.delta"
+    )
+    content_text = "".join(d["delta"] for e, d in pairs if e == "response.output_text.delta")
+    assert reasoning_text == "pondering. "
+    assert content_text == "42"
+    assert "</think>" not in content_text
+
+
+def test_responses_stream_first_event_precedes_generation(client):
+    tok = FakeTokenizer(vocab={10: "hi"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    async def run():
+        gen = server._responses_stream(
+            [1, 2, 3], 8, 0.0, "resp_x", 0, "test-model", None
+        )
+        first = await gen.__anext__()
+        assert runner.calls == []
+        assert "response.created" in first
+
+        chunks = [first]
+        async for chunk in gen:
+            chunks.append(chunk)
+        assert runner.calls
+
+    asyncio.run(run())

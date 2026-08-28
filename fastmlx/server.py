@@ -2624,6 +2624,687 @@ async def _completions_stream(
             await _await_worker(future)
 
 
+# ---------- OpenAI 互換 (Responses API, /v1/responses) ----------
+#
+# Codex CLI (2026-02-01 以降) は wire_api として "responses" しか受け付け
+# なくなった (旧 "chat" は削除済み) ので、これを実装しない限り Codex は
+# 動かない。Chat Completions とは構造が別物 (messages ではなく input、
+# choices ではなく output 配列、tools はネストではなくフラット) だが、
+# 生成そのもの・thinking の分離・tool call の解析・サンプリングパラメータ・
+# session 選択・stop 判定は Chat Completions/Anthropic 経路と完全に共有
+# する — ここで新しく書くのは「input を既存の内部 messages 形式へ正規化
+# する」「イベント列 (_collect_events と同じ語彙) を output 配列/SSE
+# イベントへ組み立てる」の 2 つだけで、生成ロジックを 3 つ目のプロトコル
+# として複製しない。
+#
+# store / previous_response_id によるサーバー側での会話継続は実装しない
+# (このサーバーは元々レスポンスを一切永続化しない設計 — 会話履歴は毎ターン
+# クライアントが全文を送り直す前提、モジュール冒頭の docstring 参照)。
+# previous_response_id が来たら黙って無視せず 400 で明示する。
+
+
+def _responses_content_to_text(content) -> str:
+    """Responses API の 1 アイテムぶんの content (文字列、または
+    input_text/output_text/refusal などの型付きパーツの配列) をプレーン
+    テキストへ落とす。``_content_to_text`` (Chat Completions/Anthropic 用)
+    と同じ方針: image/audio/file 系のパーツは黙って読み飛ばさず
+    ``MultimodalContentError`` (400) にする (fastmlx はテキスト専用モデル
+    しか served しないため)。壊れた形 (パーツに type が無い、text が
+    文字列でない等) も同様に ``InvalidContentError`` (400) にする。
+    """
+
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+                continue
+            if not isinstance(part, dict):
+                raise InvalidContentError(
+                    f"each content part must be an object, got {type(part).__name__}"
+                )
+            if "type" not in part:
+                raise InvalidContentError("each content part must have a 'type'")
+            ptype = part["type"]
+            if ptype in ("input_text", "output_text", "text"):
+                text = part.get("text")
+                if not isinstance(text, str):
+                    raise InvalidContentError(
+                        f"content part of type {ptype!r} must have a string 'text' field"
+                    )
+                parts.append(text)
+                continue
+            if ptype == "refusal":
+                # モデル自身が出した refusal ブロックの echo。読み飛ばさず
+                # テキストとして扱う (捏造ではなく、クライアントが実際に
+                # 前ターンで受け取った文字列をそのまま送り返してくる)。
+                refusal = part.get("refusal")
+                if isinstance(refusal, str):
+                    parts.append(refusal)
+                continue
+            raise MultimodalContentError(ptype)
+        return "".join(parts)
+    raise InvalidContentError(
+        f"'content' must be a string or a list of content parts, got {type(content).__name__}"
+    )
+
+
+def _normalize_responses_input(input_value, instructions) -> list[dict]:
+    """Responses API の ``input`` (+ ``instructions``) を、``_apply_template``
+    が受け付ける既存の内部 messages 形式 (``_normalize_openai_messages`` と
+    同じ形: role/content の他、assistant は ``tool_calls``、tool 結果は
+    role: "tool" + ``tool_call_id``) へ変換する。ここで既存形式へ寄せる
+    ことで、これより後ろの経路 (apply_chat_template 以降) を Chat
+    Completions/Anthropic と完全に共有できる。
+
+    ``input`` の各アイテムは type で分岐する (type 省略時は "message" 扱い
+    — Codex CLI 等、素朴な ``{"role":..., "content":...}`` 形で送ってくる
+    クライアントに対応するため):
+
+    - ``message``: role (user/assistant/system/developer) + content。
+      developer は system と同じ扱いにする (このサーバーに system 相当が
+      2 種類ある意味は無い)。
+    - ``function_call``: 前ターンでモデルが行った tool 呼び出し。連続する
+      function_call は 1 個の assistant メッセージの ``tool_calls`` へ
+      まとめる (Chat Completions の assistant.tool_calls と同じ形)。
+    - ``function_call_output``: tool 実行結果。role: "tool" のメッセージへ
+      変換する。
+    - ``reasoning``/``item_reference``: 前ターンの reasoning 要約や
+      (このサーバーが対応しない previous_response_id 前提の) 参照アイテム。
+      再度モデルに読ませる必要は無いので読み飛ばす (bug 2: thinking ブロック
+      の扱いと同じ方針)。
+    - それ以外の未知の type は黙って無視せず 400 にする (壊れた/対応外の
+      入力を空プロンプトとして通さない、というこのサーバー全体の方針に
+      揃える)。
+    """
+
+    out: list[dict] = []
+    if instructions:
+        out.append({"role": "system", "content": _content_to_text(instructions)})
+
+    if input_value is None:
+        raise InvalidContentError("'input' is required")
+    if isinstance(input_value, str):
+        out.append({"role": "user", "content": input_value})
+        return out
+    if not isinstance(input_value, list):
+        raise InvalidContentError(
+            f"'input' must be a string or an array of items, got {type(input_value).__name__}"
+        )
+
+    pending_calls: list[dict] | None = None
+
+    def flush_pending() -> None:
+        nonlocal pending_calls
+        if pending_calls:
+            out.append({"role": "assistant", "content": "", "tool_calls": pending_calls})
+            pending_calls = None
+
+    for item in input_value:
+        if not isinstance(item, dict):
+            raise InvalidContentError("each item in 'input' must be an object")
+        itype = item.get("type", "message")
+
+        if itype == "message":
+            role = item.get("role")
+            if role not in ("user", "assistant", "system", "developer"):
+                raise InvalidContentError(
+                    "message item 'role' must be one of 'user'/'assistant'/'system'/"
+                    f"'developer', got {role!r}"
+                )
+            flush_pending()
+            text = _responses_content_to_text(item.get("content"))
+            norm_role = "system" if role == "developer" else role
+            out.append({"role": norm_role, "content": text})
+            continue
+
+        if itype == "function_call":
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                raise InvalidContentError(
+                    "'function_call' item must have a non-empty string 'name'"
+                )
+            raw_args = item.get("arguments", "{}")
+            if isinstance(raw_args, str):
+                try:
+                    args_obj = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError as exc:
+                    raise InvalidContentError(
+                        f"'function_call.arguments' is not valid JSON: {exc}"
+                    ) from exc
+            elif isinstance(raw_args, dict):
+                args_obj = raw_args
+            else:
+                raise InvalidContentError(
+                    "'function_call.arguments' must be a JSON string or an object"
+                )
+            call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex}"
+            if pending_calls is None:
+                pending_calls = []
+            pending_calls.append(
+                {"id": call_id, "type": "function", "function": {"name": name, "arguments": args_obj}}
+            )
+            continue
+
+        # function_call 以外のアイテムが来たら、直前まで貯めていた
+        # function_call 群をここで確定させる (message アイテムと同じ扱い)。
+        flush_pending()
+
+        if itype == "function_call_output":
+            call_id = item.get("call_id")
+            output_text = _responses_content_to_text(item.get("output", "") or "")
+            out.append({"role": "tool", "content": output_text, "tool_call_id": call_id})
+            continue
+        if itype in ("reasoning", "item_reference"):
+            continue
+        raise InvalidContentError(f"unsupported 'input' item type: {itype!r}")
+
+    flush_pending()
+    return out
+
+
+def _validate_responses_tools(tools) -> str | None:
+    if not isinstance(tools, list) or not tools:
+        return "'tools' must be a non-empty array"
+    for t in tools:
+        if not isinstance(t, dict) or t.get("type") != "function":
+            return 'each item in \'tools\' must be an object with "type": "function"'
+        if not isinstance(t.get("name"), str) or not t.get("name"):
+            return "each tool must have a non-empty string 'name'"
+    return None
+
+
+def _responses_tools_to_openai(tools: list[dict]) -> list[dict]:
+    """Responses API のフラットな tool 定義 (``{"type":"function","name":...,
+    "parameters":...}``) を、``apply_chat_template``/``tool_parser`` が
+    期待する OpenAI (Chat Completions) 形式のネスト
+    (``{"type":"function","function":{"name",...}}``) へ変換する。"""
+
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.get("name"),
+                "description": t.get("description", "") or "",
+                "parameters": t.get("parameters", {}) or {},
+            },
+        }
+        for t in tools
+    ]
+
+
+def _resolve_tool_choice_responses(body: dict) -> tuple[list | None, str | None]:
+    """``_resolve_tool_choice_openai`` の Responses API 版。tools の形が
+    フラットな点以外は解決ロジック (auto/none/required/特定関数指定) は
+    完全に同じ。"""
+
+    tools = body.get("tools")
+    if not tools:
+        return None, None
+    shape_err = _validate_responses_tools(tools)
+    if shape_err is not None:
+        return None, shape_err
+    choice = body.get("tool_choice", "auto")
+    if choice is None:
+        choice = "auto"
+    if choice == "none":
+        return None, None
+    if choice == "auto":
+        return _responses_tools_to_openai(tools), None
+    if choice == "required":
+        return None, (
+            "'tool_choice: \"required\"' is not supported: this server has no "
+            "mechanism to force the model to call a tool (it can only detect "
+            "tool calls the model chooses to emit on its own)"
+        )
+    if isinstance(choice, dict):
+        return None, (
+            "'tool_choice' selecting a specific function is not supported: this "
+            "server has no mechanism to force the model to call a particular tool"
+        )
+    return None, f"'tool_choice' must be 'auto', 'none', 'required', or a function object; got {choice!r}"
+
+
+def _resolve_max_output_tokens(body: dict, cap: int) -> tuple[int, str | None]:
+    raw = body.get("max_output_tokens")
+    if raw is None:
+        return cap, None
+    return _parse_positive_int(raw, cap, "max_output_tokens")
+
+
+def _resolve_thinking_responses(body: dict) -> tuple[bool | None, int | None, str | None]:
+    """``_resolve_thinking`` の Responses API 版。読むフィールドは
+    ``reasoning: {"effort": ...}`` — budget への写し方 (`_REASONING_EFFORT_BUDGET`)
+    は OpenAI 側と共有する。"""
+
+    value = body.get("reasoning")
+    if not value:
+        return None, None, None
+    if not isinstance(value, dict):
+        return None, None, "'reasoning' must be an object"
+    effort = value.get("effort")
+    if effort is None:
+        return None, None, None
+    key = effort.lower() if isinstance(effort, str) else None
+    if key == "none":
+        return False, 0, None
+    budget = _REASONING_EFFORT_BUDGET.get(key, _REASONING_EFFORT_DEFAULT_BUDGET)
+    return True, budget, None
+
+
+def _responses_output_items_from_events(events: list[tuple[str, object]]) -> list[dict]:
+    """順序を保った高レベルイベント列 (``_collect_events`` と同じ語彙:
+    reasoning_delta/content_delta/tool_call) を Responses API の ``output``
+    配列 (型付きアイテム) へ組み立てる。``_anthropic_blocks_from_events``
+    の Responses 版 — 連続する reasoning_delta/content_delta はそれぞれ
+    1 個の reasoning/message アイテムへ結合し、tool_call は独立した
+    function_call アイテムにする。"""
+
+    items: list[dict] = []
+    text_buf: list[str] = []
+    reasoning_buf: list[str] = []
+
+    def flush_text() -> None:
+        if text_buf:
+            items.append(
+                {
+                    "type": "message",
+                    "id": f"msg_{uuid.uuid4().hex}",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        {"type": "output_text", "text": "".join(text_buf), "annotations": []}
+                    ],
+                }
+            )
+            text_buf.clear()
+
+    def flush_reasoning() -> None:
+        if reasoning_buf:
+            items.append(
+                {
+                    "type": "reasoning",
+                    "id": f"rs_{uuid.uuid4().hex}",
+                    "summary": [{"type": "summary_text", "text": "".join(reasoning_buf)}],
+                }
+            )
+            reasoning_buf.clear()
+
+    for kind, val in events:
+        if kind == "reasoning_delta":
+            flush_text()
+            if val:
+                reasoning_buf.append(val)
+        elif kind == "content_delta":
+            flush_reasoning()
+            if val:
+                text_buf.append(val)
+        elif kind == "tool_call":
+            flush_reasoning()
+            flush_text()
+            items.append(
+                {
+                    "type": "function_call",
+                    "id": f"fc_{uuid.uuid4().hex}",
+                    "call_id": val["id"],
+                    "name": val["name"],
+                    "arguments": json.dumps(val["arguments"], ensure_ascii=False),
+                    "status": "completed",
+                }
+            )
+    flush_reasoning()
+    flush_text()
+    return items
+
+
+@app.post("/v1/responses")
+async def responses_endpoint(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _openai_error("request body must be valid JSON")
+    if not isinstance(body, dict):
+        return _openai_error("request body must be a JSON object")
+
+    if body.get("previous_response_id") is not None:
+        return _openai_error(
+            "'previous_response_id' is not supported: this server does not persist "
+            "responses server-side (see server.py docstring — sessions are keyed by "
+            "prefix match on the conversation you resend, not by a stored response "
+            "id). Send the full conversation in 'input' each turn instead."
+        )
+    if body.get("store") is True:
+        return _openai_error(
+            "'store: true' is not supported: this server never persists responses "
+            "server-side, so a stored response would not be retrievable afterwards."
+        )
+
+    model_err = _check_model_openai(body)
+    if model_err is not None:
+        return model_err
+
+    try:
+        norm_messages = _normalize_responses_input(body.get("input"), body.get("instructions"))
+    except ContentNormalizationError as exc:
+        return _openai_error(str(exc))
+
+    resolved_tools, tool_err = _resolve_tool_choice_responses(body)
+    if tool_err is not None:
+        return _openai_error(tool_err)
+    unsupported_tools_err = _check_tool_calling_support(resolved_tools)
+    if unsupported_tools_err is not None:
+        return _openai_error(unsupported_tools_err)
+    tool_enabled = resolved_tools is not None
+
+    enable_thinking, thinking_budget, err = _resolve_thinking_responses(body)
+    if err is not None:
+        return _openai_error(err)
+    try:
+        prompt_ids = _apply_template(norm_messages, enable_thinking, tools=resolved_tools)
+    except Exception as exc:
+        return _openai_error(f"failed to render chat template: {exc}")
+
+    max_tokens, err = _resolve_max_output_tokens(body, STATE.max_tokens_cap)
+    if err is not None:
+        return _openai_error(err)
+    if thinking_budget is not None:
+        thinking_budget = min(thinking_budget, max_tokens)
+    temp, err = _parse_temperature(body, STATE.default_temp)
+    if err is not None:
+        return _openai_error(err)
+    sampling_params, err = _parse_sampling_params(body)
+    if err is not None:
+        return _openai_error(err)
+    unsupported_err = _check_sampling_support(sampling_params)
+    if unsupported_err is not None:
+        return _openai_error(unsupported_err)
+
+    model_id = STATE.model_name
+    stream = bool(body.get("stream", False))
+    resp_id = f"resp_{uuid.uuid4().hex}"
+    created = int(time.time())
+
+    if stream:
+        return StreamingResponse(
+            _responses_stream(
+                prompt_ids,
+                max_tokens,
+                temp,
+                resp_id,
+                created,
+                model_id,
+                thinking_budget,
+                sampling_params,
+                tool_enabled,
+                resolved_tools,
+            ),
+            media_type="text/event-stream",
+        )
+
+    try:
+        async with STATE.lock:
+            session = _select_session(prompt_ids)
+            res = await _run_generate(
+                prompt_ids,
+                max_tokens,
+                temp,
+                STATE.eos_ids,
+                None,
+                session,
+                **sampling_params,
+            )
+    except Exception as exc:
+        return _openai_error(str(exc), status=500, err_type="server_error")
+    _log_gen_stats(res)
+
+    events, budget_exceeded = _collect_events(
+        prompt_ids, res["tokens"], thinking_budget, tool_enabled, resolved_tools
+    )
+    output_items = _responses_output_items_from_events(events)
+    finished_naturally = bool(res["tokens"]) and res["tokens"][-1] in STATE.eos_ids
+    if budget_exceeded or not finished_naturally:
+        status = "incomplete"
+        incomplete_reason = "max_output_tokens"
+    else:
+        status = "completed"
+        incomplete_reason = None
+
+    out = {
+        "id": resp_id,
+        "object": "response",
+        "created_at": created,
+        "status": status,
+        "model": model_id,
+        "output": output_items,
+        "usage": {
+            "input_tokens": len(prompt_ids),
+            "output_tokens": len(res["tokens"]),
+            "total_tokens": len(prompt_ids) + len(res["tokens"]),
+        },
+    }
+    if incomplete_reason is not None:
+        out["incomplete_details"] = {"reason": incomplete_reason}
+    return out
+
+
+async def _responses_stream(
+    prompt_ids,
+    max_tokens,
+    temp,
+    resp_id,
+    created,
+    model_id,
+    thinking_budget,
+    sampling_params: dict | None = None,
+    tool_enabled: bool = False,
+    tools_for_parsing=None,
+):
+    """最低限のイベント列を出す: response.created ->
+    response.output_item.added -> response.output_text.delta /
+    response.reasoning_summary_text.delta / response.function_call_arguments.delta
+    -> response.output_item.done (アイテムごと) -> response.completed。
+
+    受付 (検証) は呼び出し側で StreamingResponse を組み立てる前に完了して
+    いる — OpenAI/Anthropic の既存ストリーミング経路 (server.py の docstring
+    参照) と同じ方針で、生成の開始を待たずに response.created を即座に
+    流す。
+    """
+
+    def sse(event: str, data: dict) -> str:
+        return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+    yield sse(
+        "response.created",
+        {
+            "type": "response.created",
+            "response": {
+                "id": resp_id,
+                "object": "response",
+                "created_at": created,
+                "status": "in_progress",
+                "model": model_id,
+                "output": [],
+                "usage": None,
+            },
+        },
+    )
+
+    async with STATE.lock:
+        session = _select_session(prompt_ids)
+        q, future = _start_generation(
+            prompt_ids,
+            max_tokens,
+            temp,
+            thinking_budget,
+            tool_enabled,
+            tools_for_parsing,
+            session=session,
+            **(sampling_params or {}),
+        )
+        try:
+            output_items: list[dict] = []
+            next_index = 0
+            current_kind: str | None = None  # None | "reasoning" | "content"
+            current_item: dict | None = None
+            current_index = 0
+            budget_exceeded = False
+            final_tokens: list[int] = []
+
+            def close_current():
+                nonlocal current_item, current_kind
+                if current_item is None:
+                    return None
+                item = current_item
+                if item["type"] == "message":
+                    item["status"] = "completed"
+                output_items.append(item)
+                evt = sse(
+                    "response.output_item.done",
+                    {"type": "response.output_item.done", "output_index": current_index, "item": item},
+                )
+                current_item = None
+                current_kind = None
+                return evt
+
+            while True:
+                kind, payload = await asyncio.to_thread(q.get)
+                if kind == "tool_call":
+                    closing = close_current()
+                    if closing:
+                        yield closing
+                    idx = next_index
+                    next_index += 1
+                    call_item = {
+                        "type": "function_call",
+                        "id": f"fc_{uuid.uuid4().hex}",
+                        "call_id": payload["id"],
+                        "name": payload["name"],
+                        "arguments": "",
+                        "status": "in_progress",
+                    }
+                    yield sse(
+                        "response.output_item.added",
+                        {"type": "response.output_item.added", "output_index": idx, "item": dict(call_item)},
+                    )
+                    args_str = json.dumps(payload["arguments"], ensure_ascii=False)
+                    for piece in _chunk_string(args_str):
+                        yield sse(
+                            "response.function_call_arguments.delta",
+                            {
+                                "type": "response.function_call_arguments.delta",
+                                "output_index": idx,
+                                "item_id": call_item["id"],
+                                "delta": piece,
+                            },
+                        )
+                    call_item["arguments"] = args_str
+                    call_item["status"] = "completed"
+                    output_items.append(call_item)
+                    yield sse(
+                        "response.output_item.done",
+                        {"type": "response.output_item.done", "output_index": idx, "item": call_item},
+                    )
+                elif kind in ("reasoning_delta", "content_delta"):
+                    if not payload:
+                        continue
+                    channel = "reasoning" if kind == "reasoning_delta" else "content"
+                    if current_kind != channel:
+                        closing = close_current()
+                        if closing:
+                            yield closing
+                        idx = next_index
+                        next_index += 1
+                        current_index = idx
+                        current_kind = channel
+                        if channel == "reasoning":
+                            current_item = {
+                                "type": "reasoning",
+                                "id": f"rs_{uuid.uuid4().hex}",
+                                "summary": [{"type": "summary_text", "text": ""}],
+                            }
+                        else:
+                            current_item = {
+                                "type": "message",
+                                "id": f"msg_{uuid.uuid4().hex}",
+                                "role": "assistant",
+                                "status": "in_progress",
+                                "content": [{"type": "output_text", "text": "", "annotations": []}],
+                            }
+                        yield sse(
+                            "response.output_item.added",
+                            {"type": "response.output_item.added", "output_index": idx, "item": dict(current_item)},
+                        )
+                    if channel == "reasoning":
+                        current_item["summary"][0]["text"] += payload
+                        yield sse(
+                            "response.reasoning_summary_text.delta",
+                            {
+                                "type": "response.reasoning_summary_text.delta",
+                                "output_index": current_index,
+                                "item_id": current_item["id"],
+                                "delta": payload,
+                            },
+                        )
+                    else:
+                        current_item["content"][0]["text"] += payload
+                        yield sse(
+                            "response.output_text.delta",
+                            {
+                                "type": "response.output_text.delta",
+                                "output_index": current_index,
+                                "item_id": current_item["id"],
+                                "delta": payload,
+                            },
+                        )
+                elif kind == "budget_exceeded":
+                    budget_exceeded = True
+                elif kind == "done":
+                    final_tokens = payload["tokens"]
+                    _log_gen_stats(payload)
+                    break
+                else:  # error
+                    yield sse(
+                        "error",
+                        {"type": "error", "message": str(payload)},
+                    )
+                    return
+
+            closing = close_current()
+            if closing:
+                yield closing
+
+            finished_naturally = bool(final_tokens) and final_tokens[-1] in STATE.eos_ids
+            if budget_exceeded or not finished_naturally:
+                status = "incomplete"
+                incomplete_reason = "max_output_tokens"
+            else:
+                status = "completed"
+                incomplete_reason = None
+
+            final_response = {
+                "id": resp_id,
+                "object": "response",
+                "created_at": created,
+                "status": status,
+                "model": model_id,
+                "output": output_items,
+                "usage": {
+                    "input_tokens": len(prompt_ids),
+                    "output_tokens": len(final_tokens),
+                    "total_tokens": len(prompt_ids) + len(final_tokens),
+                },
+            }
+            if incomplete_reason is not None:
+                final_response["incomplete_details"] = {"reason": incomplete_reason}
+            yield sse("response.completed", {"type": "response.completed", "response": final_response})
+        finally:
+            await _await_worker(future)
+
+
 # ---------- 起動 ----------
 
 
