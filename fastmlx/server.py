@@ -62,6 +62,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ._mlx_compat import mlx_lm_load
@@ -69,6 +70,22 @@ from .runner import Runner, build_runner
 from .spec import ChatSession
 
 app = FastAPI()
+
+
+def _add_cors_middleware(fastapi_app: FastAPI, allowed_origins: list[str]) -> None:
+    """``--allowed-origins`` が指定されたときだけ main() から呼ぶ。既定
+    (未指定) では一切呼ばれない = CORSMiddleware 自体が付かず、ブラウザ
+    からのクロスオリジン fetch は常にブロックされたまま (ローカル専用)。
+    Open WebUI 等、ブラウザで動く UI から直接叩きたい場合に使う。
+    """
+
+    fastapi_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 @dataclass
@@ -464,6 +481,139 @@ def _parse_temperature(body: dict, default: float) -> tuple[float, str | None]:
     return value, None
 
 
+def _parse_optional_float(
+    body: dict, field: str, lo: float | None = None, hi: float | None = None
+) -> tuple[float | None, str | None]:
+    raw = body.get(field)
+    if raw is None:
+        return None, None
+    if isinstance(raw, bool):
+        return None, f"'{field}' must be a number"
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None, f"'{field}' must be a number"
+    if lo is not None and value < lo:
+        return None, f"'{field}' must be at least {lo}"
+    if hi is not None and value > hi:
+        return None, f"'{field}' must be at most {hi}"
+    return value, None
+
+
+def _parse_optional_int(
+    body: dict, field: str, lo: int | None = None
+) -> tuple[int | None, str | None]:
+    raw = body.get(field)
+    if raw is None:
+        return None, None
+    # bool はサブクラスなので明示的に弾く。float はここでは真の整数値
+    # (5.0 等) でも拒否する: int(1.5) は例外を出さず黙って 1 に切り捨てる
+    # ため、"'field' must be an integer" のつもりが静かに違う値を通してしまう。
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None, f"'{field}' must be an integer"
+    if lo is not None and raw < lo:
+        return None, f"'{field}' must be at least {lo}"
+    return raw, None
+
+
+def _parse_logit_bias(body: dict) -> tuple[dict[int, float] | None, str | None]:
+    raw = body.get("logit_bias")
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        return None, "'logit_bias' must be an object mapping token id to bias"
+    try:
+        parsed = {int(k): float(v) for k, v in raw.items()}
+    except (TypeError, ValueError):
+        return None, "'logit_bias' must be an object mapping token id (string) to a numeric bias"
+    return parsed, None
+
+
+# OpenAI と Anthropic のどちらも同じフィールド名 (top_p/top_k/min_p/
+# repetition_penalty/presence_penalty/frequency_penalty/logit_bias/seed) を
+# 使うので、プロトコル分岐なしで共通のパーサ 1 つで足りる (thinking/
+# stop_sequences のように呼び名が違うものだけプロトコル別処理が必要)。
+#
+# 指定されなかったキーは戻り値の dict に含めない — Runner.generate 側の
+# デフォルト引数 (= 無効化された値) にそのまま委ねるため。
+def _parse_sampling_params(body: dict) -> tuple[dict, str | None]:
+    params: dict = {}
+
+    top_p, err = _parse_optional_float(body, "top_p", 0.0, 1.0)
+    if err is not None:
+        return {}, err
+    if top_p is not None:
+        params["top_p"] = top_p
+
+    top_k, err = _parse_optional_int(body, "top_k", 0)
+    if err is not None:
+        return {}, err
+    if top_k is not None:
+        params["top_k"] = top_k
+
+    min_p, err = _parse_optional_float(body, "min_p", 0.0, 1.0)
+    if err is not None:
+        return {}, err
+    if min_p is not None:
+        params["min_p"] = min_p
+
+    repetition_penalty, err = _parse_optional_float(body, "repetition_penalty", 0.0, None)
+    if err is not None:
+        return {}, err
+    if repetition_penalty is not None:
+        params["repetition_penalty"] = repetition_penalty
+
+    presence_penalty, err = _parse_optional_float(body, "presence_penalty")
+    if err is not None:
+        return {}, err
+    if presence_penalty is not None:
+        params["presence_penalty"] = presence_penalty
+
+    frequency_penalty, err = _parse_optional_float(body, "frequency_penalty")
+    if err is not None:
+        return {}, err
+    if frequency_penalty is not None:
+        params["frequency_penalty"] = frequency_penalty
+
+    logit_bias, err = _parse_logit_bias(body)
+    if err is not None:
+        return {}, err
+    if logit_bias is not None:
+        params["logit_bias"] = logit_bias
+
+    seed, err = _parse_optional_int(body, "seed")
+    if err is not None:
+        return {}, err
+    if seed is not None:
+        params["seed"] = seed
+
+    return params, None
+
+
+def _check_sampling_support(params: dict) -> str | None:
+    """現在の Runner (SpecRunner/FallbackRunner) が受け付けないサンプリング
+    パラメータが指定されていれば、理由付きのエラー文字列を返す。SpecRunner
+    が seed 以外を弾く理由は fastmlx/runner.py の SpecRunner docstring
+    (Block Verification の分布保証との関係) を参照。
+    """
+
+    if not params:
+        return None
+    supported = getattr(STATE.runner, "SUPPORTED_SAMPLING_PARAMS", frozenset())
+    unsupported = sorted(set(params) - supported)
+    if not unsupported:
+        return None
+    kind = getattr(STATE.runner, "KIND", type(STATE.runner).__name__)
+    return (
+        f"this model is served via the '{kind}' runner, which does not support: "
+        f"{', '.join(unsupported)}. The speculative-decoding runner only supports "
+        "'seed' among the extended sampling parameters, because its correctness "
+        "guarantee (rejection sampling against the exact target distribution) "
+        "assumes temperature-only sampling; changing the base distribution would "
+        "silently break that guarantee."
+    )
+
+
 def _stop_sequences(body: dict) -> list[str]:
     """OpenAI の ``stop`` (文字列または配列) と Anthropic の
     ``stop_sequences`` (配列) の両方を受け付ける。どちらのエンドポイントでも
@@ -540,6 +690,26 @@ def _stop_reason_anthropic(tokens: list[int]) -> str:
     return "end_turn" if tokens and tokens[-1] in STATE.eos_ids else "max_tokens"
 
 
+def _usage_dict(prompt_tokens: int, completion_tokens: int, cached_tokens: int) -> dict:
+    """OpenAI 形式の usage。``prompt_tokens_details.cached_tokens`` は
+    ChatSession の prefill 再利用実測 (``res["prefill_reused"]``) をそのまま
+    載せる (mlx_lm:1339-1346 / 1567-1575 と同じ形)。0 のとき (再利用なし、
+    または FallbackRunner のように prefill 再利用機構を持たない経路) も
+    キー自体は出す — 「対応しているが今回は 0 件」と「対応していない」を
+    レスポンス形状からは区別しない (mlx_lm も同様、prompt_cache_count が
+    0 以上ならフィールドを出す)。
+    """
+
+    usage = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    if cached_tokens >= 0:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+    return usage
+
+
 def _log_gen_stats(res: dict) -> None:
     """prefill 再利用が効いているかは OpenAI/Anthropic のレスポンス形式には
     無い数値なので、cli.py の表示行と同じ内容を運用者向けに一行ログへ出す。"""
@@ -569,7 +739,9 @@ def _log_gen_stats(res: dict) -> None:
 # (実測で確認済み: server.py の docstring 参照)。
 
 
-async def _run_generate(prompt_ids, max_tokens, temp, eos_ids, on_tokens, session):
+async def _run_generate(
+    prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **sampling_kwargs
+):
     loop = asyncio.get_running_loop()
     fn = functools.partial(
         STATE.runner.generate,
@@ -579,11 +751,18 @@ async def _run_generate(prompt_ids, max_tokens, temp, eos_ids, on_tokens, sessio
         eos_ids=eos_ids,
         on_tokens=on_tokens,
         session=session,
+        **sampling_kwargs,
     )
     return await loop.run_in_executor(STATE.executor, fn)
 
 
-def _start_generation(prompt_ids, max_tokens: int, temp: float, thinking_budget: int | None):
+def _start_generation(
+    prompt_ids,
+    max_tokens: int,
+    temp: float,
+    thinking_budget: int | None,
+    **sampling_kwargs,
+):
     """ワーカーを STATE.executor へ投げ、(キュー, Future) を返す。
 
     キューに積まれる要素: ``("reasoning_delta", text)`` / ``("content_delta",
@@ -617,6 +796,7 @@ def _start_generation(prompt_ids, max_tokens: int, temp: float, thinking_budget:
                 eos_ids=eos_ids,
                 on_tokens=on_tokens,
                 session=STATE.session,
+                **sampling_kwargs,
             )
             if not router.budget_exceeded:
                 for channel, seg in router.finalize():
@@ -673,6 +853,27 @@ async def list_models():
     }
 
 
+@app.get("/health")
+async def health():
+    """mlx_lm の /health (``{"status": "ok"}`` だけ) より詳しく返す: モデル名・
+    ロード済みかどうか・どちらの runner (投機 or 通常生成) か・リクエストを
+    処理中かどうか。処理中かどうかは ``STATE.lock.locked()`` を見るだけ
+    (直列化の設計上、ロックが空いていれば idle、取られていれば busy と等価)。
+    """
+
+    if STATE is None:
+        return JSONResponse(
+            status_code=503, content={"status": "loading", "loaded": False}
+        )
+    return {
+        "status": "ok",
+        "model": STATE.model_name,
+        "loaded": True,
+        "runner": getattr(STATE.runner, "KIND", type(STATE.runner).__name__),
+        "busy": STATE.lock.locked(),
+    }
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     try:
@@ -717,6 +918,12 @@ async def chat_completions(request: Request):
     temp, err = _parse_temperature(body, STATE.default_temp)
     if err is not None:
         return _openai_error(err)
+    sampling_params, err = _parse_sampling_params(body)
+    if err is not None:
+        return _openai_error(err)
+    unsupported_err = _check_sampling_support(sampling_params)
+    if unsupported_err is not None:
+        return _openai_error(unsupported_err)
     stops = _stop_sequences(body)
 
     model_id = STATE.model_name
@@ -738,6 +945,7 @@ async def chat_completions(request: Request):
                 stops,
                 include_usage,
                 thinking_budget,
+                sampling_params,
             ),
             media_type="text/event-stream",
         )
@@ -745,7 +953,13 @@ async def chat_completions(request: Request):
     try:
         async with STATE.lock:
             res = await _run_generate(
-                prompt_ids, max_tokens, temp, STATE.eos_ids, None, STATE.session
+                prompt_ids,
+                max_tokens,
+                temp,
+                STATE.eos_ids,
+                None,
+                STATE.session,
+                **sampling_params,
             )
     except Exception as exc:
         return _openai_error(str(exc), status=500, err_type="server_error")
@@ -779,11 +993,9 @@ async def chat_completions(request: Request):
                 "finish_reason": finish_reason,
             }
         ],
-        "usage": {
-            "prompt_tokens": len(prompt_ids),
-            "completion_tokens": len(res["tokens"]),
-            "total_tokens": len(prompt_ids) + len(res["tokens"]),
-        },
+        "usage": _usage_dict(
+            len(prompt_ids), len(res["tokens"]), res.get("prefill_reused", 0)
+        ),
     }
 
 
@@ -797,9 +1009,12 @@ async def _openai_stream(
     stops,
     include_usage,
     thinking_budget,
+    sampling_params: dict | None = None,
 ):
     async with STATE.lock:
-        q, future = _start_generation(prompt_ids, max_tokens, temp, thinking_budget)
+        q, future = _start_generation(
+            prompt_ids, max_tokens, temp, thinking_budget, **(sampling_params or {})
+        )
         try:
             first = {
                 "id": req_id,
@@ -814,6 +1029,7 @@ async def _openai_stream(
 
             finish_reason = "length"
             n_completion = 0
+            cached_tokens = 0
             acc_text = ""
             stopped = False  # stop 文字列に一致してからはクライアントへの
             # 転送だけ止め、実際の生成が終わる ("done") まではキューを
@@ -875,6 +1091,7 @@ async def _openai_stream(
                     else:
                         finish_reason = "stop" if stopped else _finish_reason_openai(payload["tokens"])
                     n_completion = len(payload["tokens"])
+                    cached_tokens = payload.get("prefill_reused", 0)
                     _log_gen_stats(payload)
                     break
                 else:  # error
@@ -901,11 +1118,7 @@ async def _openai_stream(
                     "created": created,
                     "model": model_id,
                     "choices": [],
-                    "usage": {
-                        "prompt_tokens": len(prompt_ids),
-                        "completion_tokens": n_completion,
-                        "total_tokens": len(prompt_ids) + n_completion,
-                    },
+                    "usage": _usage_dict(len(prompt_ids), n_completion, cached_tokens),
                 }
                 yield f"data: {json.dumps(usage_chunk)}\n\n"
 
@@ -969,6 +1182,12 @@ async def anthropic_messages(request: Request):
     temp, err = _parse_temperature(body, STATE.default_temp)
     if err is not None:
         return _anthropic_error(err)
+    sampling_params, err = _parse_sampling_params(body)
+    if err is not None:
+        return _anthropic_error(err)
+    unsupported_err = _check_sampling_support(sampling_params)
+    if unsupported_err is not None:
+        return _anthropic_error(unsupported_err)
     stops = _stop_sequences(body)
 
     model_id = STATE.model_name
@@ -994,7 +1213,14 @@ async def anthropic_messages(request: Request):
     if stream:
         return StreamingResponse(
             _anthropic_stream(
-                prompt_ids, max_tokens, temp, msg_id, model_id, stops, thinking_budget
+                prompt_ids,
+                max_tokens,
+                temp,
+                msg_id,
+                model_id,
+                stops,
+                thinking_budget,
+                sampling_params,
             ),
             media_type="text/event-stream",
         )
@@ -1002,7 +1228,13 @@ async def anthropic_messages(request: Request):
     try:
         async with STATE.lock:
             res = await _run_generate(
-                prompt_ids, max_tokens, temp, STATE.eos_ids, None, STATE.session
+                prompt_ids,
+                max_tokens,
+                temp,
+                STATE.eos_ids,
+                None,
+                STATE.session,
+                **sampling_params,
             )
     except Exception as exc:
         return _anthropic_error(str(exc), status=500, err_type="server_error")
@@ -1044,13 +1276,22 @@ async def anthropic_messages(request: Request):
 
 
 async def _anthropic_stream(
-    prompt_ids, max_tokens, temp, msg_id, model_id, stops, thinking_budget
+    prompt_ids,
+    max_tokens,
+    temp,
+    msg_id,
+    model_id,
+    stops,
+    thinking_budget,
+    sampling_params: dict | None = None,
 ):
     def sse(event, data):
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
     async with STATE.lock:
-        q, future = _start_generation(prompt_ids, max_tokens, temp, thinking_budget)
+        q, future = _start_generation(
+            prompt_ids, max_tokens, temp, thinking_budget, **(sampling_params or {})
+        )
         try:
             yield sse(
                 "message_start",
@@ -1184,6 +1425,235 @@ async def _anthropic_stream(
             await _await_worker(future)
 
 
+# ---------- OpenAI 互換 (legacy /v1/completions) ----------
+#
+# chat template を通さず、渡された prompt をそのまま生成に流すレガシー
+# エンドポイント。thinking の分離は行わない (raw completion にターン構造が
+# 無いので reasoning_effort の意味を持たせようがない) — thinking_budget=0 を
+# _start_generation/_split_thinking_final に渡すことで ThinkingRouter を
+# 強制的に content-only モードにし (budget=0 は has_thinking の値に関わらず
+# enabled=False)、既存の on_tokens 配線をそのまま再利用する。
+
+
+def _prompt_to_ids(prompt) -> tuple[list[int] | None, str | None]:
+    """``prompt`` は文字列 (tokenizer.encode に通す) か、事前トークナイズ済み
+    の int 配列のどちらかを受け付ける。OpenAI の legacy completions は
+    文字列配列やトークン配列の配列 (バッチ) も許すが、fastmlx はリクエストを
+    直列化する設計 (1 リクエスト = 1 生成) なのでバッチは扱わない。
+    """
+
+    if isinstance(prompt, str):
+        if not prompt:
+            return None, "'prompt' must not be empty"
+        return list(STATE.tokenizer.encode(prompt)), None
+    if isinstance(prompt, list):
+        if not prompt:
+            return None, "'prompt' must not be empty"
+        if all(isinstance(t, int) and not isinstance(t, bool) for t in prompt):
+            return list(prompt), None
+        return None, "'prompt' array must contain only integers (pre-tokenized ids)"
+    return None, "'prompt' must be a string or an array of token ids"
+
+
+@app.post("/v1/completions")
+async def completions(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return _openai_error("request body must be valid JSON")
+    if not isinstance(body, dict):
+        return _openai_error("request body must be a JSON object")
+
+    model_err = _check_model_openai(body)
+    if model_err is not None:
+        return model_err
+
+    if "prompt" not in body:
+        return _openai_error("'prompt' is required")
+    prompt_ids, err = _prompt_to_ids(body["prompt"])
+    if err is not None:
+        return _openai_error(err)
+
+    max_tokens, err = _resolve_max_tokens_openai(body, STATE.max_tokens_cap)
+    if err is not None:
+        return _openai_error(err)
+    temp, err = _parse_temperature(body, STATE.default_temp)
+    if err is not None:
+        return _openai_error(err)
+    sampling_params, err = _parse_sampling_params(body)
+    if err is not None:
+        return _openai_error(err)
+    unsupported_err = _check_sampling_support(sampling_params)
+    if unsupported_err is not None:
+        return _openai_error(unsupported_err)
+    stops = _stop_sequences(body)
+
+    model_id = STATE.model_name
+    stream = bool(body.get("stream", False))
+    req_id = f"cmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+
+    if stream:
+        stream_options = body.get("stream_options") or {}
+        include_usage = bool(stream_options.get("include_usage", False))
+        return StreamingResponse(
+            _completions_stream(
+                prompt_ids,
+                max_tokens,
+                temp,
+                req_id,
+                created,
+                model_id,
+                stops,
+                include_usage,
+                sampling_params,
+            ),
+            media_type="text/event-stream",
+        )
+
+    try:
+        async with STATE.lock:
+            res = await _run_generate(
+                prompt_ids,
+                max_tokens,
+                temp,
+                STATE.eos_ids,
+                None,
+                STATE.session,
+                **sampling_params,
+            )
+    except Exception as exc:
+        return _openai_error(str(exc), status=500, err_type="server_error")
+    _log_gen_stats(res)
+
+    _reasoning_text, text, _budget_exceeded = _split_thinking_final(res["tokens"], 0)
+    finish_reason = _finish_reason_openai(res["tokens"])
+    if stops:
+        hit = _find_stop(text, stops)
+        if hit is not None:
+            text = text[: hit[0]]
+            finish_reason = "stop"
+
+    return {
+        "id": req_id,
+        "object": "text_completion",
+        "created": created,
+        "model": model_id,
+        "choices": [
+            {
+                "index": 0,
+                "text": text,
+                "logprobs": None,
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": _usage_dict(
+            len(prompt_ids), len(res["tokens"]), res.get("prefill_reused", 0)
+        ),
+    }
+
+
+async def _completions_stream(
+    prompt_ids,
+    max_tokens,
+    temp,
+    req_id,
+    created,
+    model_id,
+    stops,
+    include_usage,
+    sampling_params: dict | None = None,
+):
+    async with STATE.lock:
+        # thinking_budget=0: ThinkingRouter を content-only に固定する
+        # (has_thinking に関わらず) ので reasoning_delta は絶対に来ない。
+        q, future = _start_generation(
+            prompt_ids, max_tokens, temp, 0, **(sampling_params or {})
+        )
+        try:
+            finish_reason = "length"
+            n_completion = 0
+            cached_tokens = 0
+            acc_text = ""
+            stopped = False
+            while True:
+                kind, payload = await asyncio.to_thread(q.get)
+                if kind == "content_delta":
+                    if stopped:
+                        continue
+                    visible = payload
+                    if stops:
+                        new_acc = acc_text + payload
+                        hit = _find_stop(new_acc, stops)
+                        if hit is not None:
+                            idx, _matched = hit
+                            keep_len = idx - len(acc_text)
+                            visible = payload[:keep_len] if keep_len > 0 else ""
+                            stopped = True
+                        acc_text = new_acc
+                    if visible:
+                        chunk = {
+                            "id": req_id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "text": visible,
+                                    "logprobs": None,
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        if include_usage:
+                            chunk["usage"] = None
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                elif kind == "reasoning_delta" or kind == "budget_exceeded":
+                    # thinking_budget=0 なのでここには来ないはずだが、念の
+                    # ため無視するだけにしておく (クラッシュより安全)。
+                    continue
+                elif kind == "done":
+                    finish_reason = "stop" if stopped else _finish_reason_openai(payload["tokens"])
+                    n_completion = len(payload["tokens"])
+                    cached_tokens = payload.get("prefill_reused", 0)
+                    _log_gen_stats(payload)
+                    break
+                else:  # error
+                    err = {"error": {"message": str(payload), "type": "server_error"}}
+                    yield f"data: {json.dumps(err)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+            final_chunk = {
+                "id": req_id,
+                "object": "text_completion",
+                "created": created,
+                "model": model_id,
+                "choices": [
+                    {"index": 0, "text": "", "logprobs": None, "finish_reason": finish_reason}
+                ],
+            }
+            if include_usage:
+                final_chunk["usage"] = None
+            yield f"data: {json.dumps(final_chunk)}\n\n"
+
+            if include_usage:
+                usage_chunk = {
+                    "id": req_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": model_id,
+                    "choices": [],
+                    "usage": _usage_dict(len(prompt_ids), n_completion, cached_tokens),
+                }
+                yield f"data: {json.dumps(usage_chunk)}\n\n"
+
+            yield "data: [DONE]\n\n"
+        finally:
+            await _await_worker(future)
+
+
 # ---------- 起動 ----------
 
 
@@ -1221,6 +1691,14 @@ def main() -> None:
         action="store_true",
         help="hyper-connections 融合カーネルを無効化する (既定は有効)。"
         "qwen4_exp (Flash-Next 系) の通常生成経路にのみ効く",
+    )
+    ap.add_argument(
+        "--allowed-origins",
+        default=None,
+        help="ブラウザからのクロスオリジン fetch を許可する Origin をカンマ区切りで"
+        " 指定する (例: http://localhost:3000,https://my-ui.example)。'*' で全許可。"
+        " 既定 (未指定) では CORS ヘッダを一切付けない = ローカル専用のまま"
+        " (Open WebUI 等、ブラウザで動く UI から直接叩きたい場合に指定する)",
     )
     args = ap.parse_args()
 
@@ -1274,6 +1752,13 @@ def main() -> None:
         )
     else:
         print("[fastmlx-serve] thinking マーカー検出なし (このモデルでは分離しない)")
+
+    if args.allowed_origins:
+        origins = [o.strip() for o in args.allowed_origins.split(",") if o.strip()]
+        _add_cors_middleware(app, origins)
+        print(f"[fastmlx-serve] CORS 許可 origin: {', '.join(origins)}")
+    else:
+        print("[fastmlx-serve] CORS 無効 (既定、ローカル専用)")
 
     import uvicorn
 

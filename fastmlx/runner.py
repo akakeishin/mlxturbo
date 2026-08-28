@@ -38,6 +38,15 @@ from .spec import ChatSession, SpecEngine
 
 
 class Runner(Protocol):
+    """``SUPPORTED_SAMPLING_PARAMS`` (class attribute, set of str) は
+    server.py が top_p/top_k/min_p/repetition_penalty/presence_penalty/
+    frequency_penalty/logit_bias/seed のうちどれを ``**sampling_kwargs`` 経由
+    でこの runner に渡してよいかを申告する。宣言に無いキーが指定された
+    リクエストは server.py が生成呼び出し前に 400 で弾く (SpecRunner/
+    FallbackRunner のクラス docstring 参照)。"""
+
+    SUPPORTED_SAMPLING_PARAMS: frozenset
+
     def generate(
         self,
         prompt_ids: list[int],
@@ -46,6 +55,7 @@ class Runner(Protocol):
         eos_ids: set,
         on_tokens,
         session: ChatSession | None,
+        **sampling_kwargs,
     ) -> dict: ...
 
 
@@ -55,14 +65,38 @@ class SpecRunner:
     fly_theta/fly_window は cli.py の --fly-theta/--fly-window 用の任意
     キーワードとして **extra 経由でそのまま SpecEngine.generate へ流す
     (未指定なら SpecEngine 側の既定 0.0/6 が効く)。server.py は渡さない。
+
+    ``SUPPORTED_SAMPLING_PARAMS``: server.py がリクエストのサンプリング
+    パラメータ (top_p/top_k/min_p/repetition_penalty/presence_penalty/
+    frequency_penalty/logit_bias/seed) のうちどれをこの経路へ渡してよいか
+    判定するための宣言。ここでは ``seed`` だけ。理由: SpecEngine.generate は
+    temp>0 のとき Block Verification (arXiv:2403.10444, spec.py
+    ``_block_verify_tau``) で棄却サンプリングと厳密同一分布を保証している。
+    この保証は「ドラフトの提案分布と検証側の target 分布がどちらも生の
+    ``softmax(logits/temp)`` である」ことに依存する閉形式の受理長導出
+    (docs/STATUS.md) の上に立っており、top_p/top_k/min_p でロジットを
+    足切りしたり repetition_penalty 等でロジットを書き換えたりすると
+    target 分布そのものが変わるので、受理長の閉形式が別の式になり、実装を
+    改めない限り分布保証が静かに壊れる。そこを正しく再導出して実装するのは
+    このタスクの範囲外と判断し、これらのパラメータは (b) 案: server.py 側で
+    400 を返して弾く。一方 ``seed`` は乱数の初期状態を変えるだけで分布その
+    ものは変えないので、影響なく素通しできる (engine.generate 自身は seed
+    引数を持たないため、ここで mx.random.seed() を呼んで消費する)。
     """
+
+    KIND = "spec"
+    SUPPORTED_SAMPLING_PARAMS = frozenset({"seed"})
 
     def __init__(self, engine: SpecEngine, n_draft: int, max_draft: int):
         self.engine = engine
         self.n_draft = n_draft
         self.max_draft = max_draft
 
-    def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
+    def generate(
+        self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, seed=None, **extra
+    ):
+        if seed is not None:
+            mx.random.seed(seed)
         return self.engine.generate(
             prompt_ids,
             max_tokens=max_tokens,
@@ -83,17 +117,60 @@ class FallbackRunner:
     投機経路専用の LCP prefill 再利用機構なのでここでは意味を持たず、無視
     する (毎ターン全量 prefill になる)。n_draft/max_draft/fly_* も投機経路
     専用なので **extra で受け取って無視するだけ。
+
+    ``SUPPORTED_SAMPLING_PARAMS``: 投機の分布保証を気にする必要が無い経路
+    なので、mlx_lm.sample_utils がサポートするものは全部そのまま素通しする。
     """
+
+    KIND = "fallback"
+    SUPPORTED_SAMPLING_PARAMS = frozenset(
+        {
+            "top_p",
+            "top_k",
+            "min_p",
+            "repetition_penalty",
+            "presence_penalty",
+            "frequency_penalty",
+            "logit_bias",
+            "seed",
+        }
+    )
 
     def __init__(self, model, tokenizer):
         self.model = model
         self.tokenizer = tokenizer
 
-    def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
+    def generate(
+        self,
+        prompt_ids,
+        max_tokens,
+        temp,
+        eos_ids,
+        on_tokens,
+        session,
+        top_p: float = 0.0,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        repetition_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
+        logit_bias: dict | None = None,
+        seed: int | None = None,
+        **extra,
+    ):
         from mlx_lm.generate import stream_generate
-        from mlx_lm.sample_utils import make_sampler
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
-        sampler = make_sampler(temp=temp)
+        if seed is not None:
+            mx.random.seed(seed)
+
+        sampler = make_sampler(temp=temp, top_p=top_p, min_p=min_p, top_k=top_k)
+        logits_processors = make_logits_processors(
+            logit_bias=logit_bias,
+            repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+        )
         tokens: list[int] = []
         t0 = time.perf_counter()
         ttft = None
@@ -103,7 +180,12 @@ class FallbackRunner:
         # so collecting .token across every yielded response is lossless: no
         # token is skipped or duplicated regardless of why generation stopped.
         for resp in stream_generate(
-            self.model, self.tokenizer, prompt_ids, max_tokens=max_tokens, sampler=sampler
+            self.model,
+            self.tokenizer,
+            prompt_ids,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors,
         ):
             if ttft is None:
                 ttft = time.perf_counter() - t0
