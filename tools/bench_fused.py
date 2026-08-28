@@ -77,11 +77,19 @@ def main():
     def off():
         fused.disable_hyper_connection_kernel()
         fused.disable_rms_norm_gated()
+        fused.disable_moe_route()
 
+    # 構成は積み上げではなく**明示**する。積み上げだと「どのカーネルが効いたか」と
+    # 「組み合わせたときにどうなるか」が分離できない。
+    # RMSNormGated は空振り (-0.01〜-0.11ms) だったので外している
+    # (fastmlx/kernels/rms_norm_gated.py の docstring を参照)
+    HC = fused.enable_hyper_connection_kernel
+    MOE = fused.enable_moe_route
     CONFIGS = [
-        ("融合なし", lambda: None),
-        ("+ hyper-connections", fused.enable_hyper_connection_kernel),
-        ("+ RMSNormGated", fused.enable_rms_norm_gated),
+        ("融合なし", []),
+        ("hyper-connections のみ", [HC]),
+        ("MoE ルーティング のみ", [MOE]),
+        ("HC + MoE", [HC, MOE]),
     ]
 
     print(f"peak={mx.get_peak_memory() / 1e9:.1f}GB  reps={args.reps}")
@@ -94,36 +102,32 @@ def main():
         print(f"  {name:24s} 相対誤差 {rel:.6f}  top1 {top1}", flush=True)
 
     # 数値は**単独で**見る。積み上げだと、どのカーネルがずらしたのか分からない
-    print("\n=== 数値: 単独 (一括 forward、最終位置の logits) ===")
-    for name, enable in CONFIGS[1:]:
+    print("\n=== 数値 (一括 forward、最終位置の logits) ===")
+    for name, enables in CONFIGS:
         off()
-        enable()
-        report(name.replace("+ ", "") + " のみ", logits())
-    print("\n=== 数値: 積み上げ ===")
-    off()
-    for name, enable in CONFIGS:
-        enable()
+        for e in enables:
+            e()
         report(name, logits())
     off()
 
     samples: dict[str, list[float]] = {n: [] for n, _ in CONFIGS}
     for r in range(args.reps):
-        off()
-        for name, enable in CONFIGS:
-            enable()
+        for name, enables in CONFIGS:
+            off()
+            for e in enables:
+                e()
             samples[name].append(measure(model, ids))
         print(f"  速度 ラウンド {r + 1} 完了", flush=True)
     off()
 
-    print("\n=== 速度 (積み上げ、中央値) ===")
-    prev = None
+    print("\n=== 速度 (中央値、融合なしとの差) ===")
+    base_ms = statistics.median(samples[CONFIGS[0][0]])
     for name, _ in CONFIGS:
         med = statistics.median(samples[name])
         spread = max(samples[name]) - min(samples[name])
-        delta = "" if prev is None else f"  {med - prev:+6.2f} ms"
+        delta = "" if name == CONFIGS[0][0] else f"  {med - base_ms:+6.2f} ms"
         print(f"  {name:24s} {med:6.2f} ms/token ({1000 / med:5.2f} tok/s)"
               f"  (振れ {spread:4.2f}){delta}")
-        prev = med
 
     if not args.rebit:
         return
@@ -134,8 +138,8 @@ def main():
 
     before = statistics.median(samples[CONFIGS[-1][0]])
     off()
-    for _, enable in CONFIGS:
-        enable()
+    for e in CONFIGS[-1][1]:
+        e()
     rebit.apply(model, args.rebit)
     after = [measure(model, ids) for _ in range(args.reps)]
     med = statistics.median(after)
