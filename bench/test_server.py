@@ -313,6 +313,7 @@ def _install_state(runner, tokenizer=None, **overrides) -> server.ModelState:
         created_ts=0,
         max_sessions=overrides.get("max_sessions", 8),
         max_context_tokens=overrides.get("max_context_tokens"),
+        model_aliases=overrides.get("model_aliases", frozenset()),
     )
     server.STATE = state
     return state
@@ -807,6 +808,23 @@ def test_health_endpoint_reports_spec_runner(client):
     _install_state(runner)
     resp = client.get("/health")
     assert resp.json()["runner"] == "spec"
+
+
+# ---------- 3b. バグ修正: GET/HEAD /api/hello が 404 だった ----------
+#
+# Claude Code の疎通確認。実装が無いと 404 になる (会話自体は成立するので
+# 実害は小さいが、起動直後のログにノイズが乗る)。中身に意味は無く、200 を
+# 返すことだけが要件。
+
+
+def test_api_hello_get_returns_200(client):
+    resp = client.get("/api/hello")
+    assert resp.status_code == 200, resp.text
+
+
+def test_api_hello_head_returns_200(client):
+    resp = client.head("/api/hello")
+    assert resp.status_code == 200, resp.text
 
 
 # ---------- 4. CORS ----------
@@ -2631,6 +2649,89 @@ def test_responses_model_mismatch_is_404(client):
     assert not runner.calls
 
 
+# ---------- バグ修正: --model-alias で別名の model も受け付ける ----------
+#
+# Claude Code は会話タイトル生成などの裏方処理に別の小さいモデル
+# (claude-3-5-haiku-20241022 等) を使う。サーブ中の名前と不一致なら 404 と
+# いう既定の挙動は OpenAI 準拠の意図的な設計 (_check_model_openai/
+# _check_model_anthropic docstring 参照) なので崩さないが、--model-alias で
+# 明示的に許可した名前だけは通す。未指定 (既定) では従来どおり厳密一致の
+# ままであることも合わせて確認する。
+
+
+def test_model_alias_unset_still_404s_for_other_model(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok, model_name="test-model")  # model_aliases 未指定
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "claude-3-5-haiku-20241022", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 404, resp.text
+    assert not runner.calls
+
+
+def test_model_alias_allows_configured_name_on_chat_completions(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner,
+        tokenizer=tok,
+        model_name="test-model",
+        model_aliases=frozenset({"claude-3-5-haiku-20241022"}),
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "claude-3-5-haiku-20241022", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    # 別名を受け付けても、応答の "model" 欄は常にサーブ中の名前そのもの
+    # (クライアントが送った別名をそのまま echo しない)。
+    assert resp.json()["model"] == "test-model"
+
+
+def test_model_alias_still_404s_for_unlisted_name(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner,
+        tokenizer=tok,
+        model_name="test-model",
+        model_aliases=frozenset({"claude-3-5-haiku-20241022"}),
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"model": "some-other-unlisted-model", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 404, resp.text
+    assert not runner.calls
+
+
+def test_model_alias_allows_configured_name_on_anthropic_messages(client):
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeSpecRunner(tokens_to_emit=[10])
+    _install_state(
+        runner,
+        tokenizer=tok,
+        model_name="test-model",
+        model_aliases=frozenset({"claude-3-5-haiku-20241022"}),
+    )
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "claude-3-5-haiku-20241022",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["model"] == "test-model"
+
+
 def test_protocol_error_envelopes_include_required_metadata(client):
     runner = FakeRunner(tokens_to_emit=[])
     _install_state(runner)
@@ -3160,14 +3261,16 @@ def test_responses_string_input_with_instructions_still_consolidates(client):
 # 実際に確かめると (このモジュール冒頭の調査参照): KV キャッシュを最長
 # 共通接頭辞まで巻き戻す (trim) 操作自体は、GDN ハイブリッドの線形層に
 # 使う ArraysCache では原理的に不可能 (mlx_lm.models.cache.ArraysCache は
-# is_trimmable() を持たず、常に False)。このサーバーが実運用で使う
-# 唯一の 2 経路 (SpecEngine の ChatSession、FallbackRunner の
-# FallbackSession) はどちらも GDN ハイブリッド専用なので、trim は実際には
-# 常に不発に終わり、既存の「全体一致 or 新規スロット」という安全な挙動が
-# そのまま保たれる。以下のテストは、(a) trim が安全に効く汎用的な形
-# (KVCache だけで構成されたキャッシュ、mlx_lm.models.cache の本物を使う)
-# と、(b) 実運用どおり ArraysCache が混ざっていて trim が不発に終わる形の
-# 両方を、実際の mlx_lm キャッシュ実装に対して確認する。
+# is_trimmable() を持たず、常に False)。このサーバーが実運用で使う唯一の
+# 2 経路 (SpecEngine の ChatSession、FallbackRunner の FallbackSession) は
+# どちらも GDN ハイブリッド専用なので、この trim (exact-trim) だけに頼ると
+# 常に不発に終わり、「全体一致 or 新規スロット」に落ちる。以下のテストは、
+# (a) trim が安全に効く汎用的な形 (KVCache だけで構成されたキャッシュ、
+# mlx_lm.models.cache の本物を使う) と、(b) 実運用どおり ArraysCache が
+# 混ざっていて trim が不発に終わる形の両方を、実際の mlx_lm キャッシュ
+# 実装に対して確認する。GDN ハイブリッド構成でも再利用そのものを諦めない
+# チェックポイント経由の復元は 12b 節 (_try_checkpoint_restore_session_
+# cache) を参照。
 
 
 def _real_kv_cache(offset: int):
@@ -3275,6 +3378,231 @@ def test_select_session_full_match_still_preferred_over_partial(client):
 
     assert got is full
     assert got.processed == [1, 2, 3]  # 変更されていない (追記のみ)
+
+
+# ---------- 12b. バグ修正: チェックポイントによる部分一致からの復元 ----------
+#
+# 12 節の trim (exact-trim) は GDN ハイブリッド (ArraysCache が混ざる、この
+# サーバーの実運用構成そのもの) では常に不発に終わる。「巻き戻せないものは
+# スナップショットで持てばよい」という方針で、fastmlx/spec.py の
+# _prefill_hidden がプレフィルのチャンク境界ごとに ArraysCache 層の状態を
+# ChatSession.checkpoints へ退避しておき、trim が効かない場合の代替として
+# _try_checkpoint_restore_session_cache がそこから最も近い位置まで復元する。
+#
+# もう 1 点、実運用で trim が「効いても無駄になる」既存の落とし穴も一緒に
+# 直した: generate() 側の再利用判定が KV/GDN の再利用可否と MTP 連鎖の
+# 継続可否を同じフラグ (mtp_valid) で束ねていたため、MTP を常用するこの
+# サーバーでは公開済み session が生成直後ほぼ常に mtp_valid=True になり、
+# (a) _try_trim_session_cache 自体が mtp_valid=True を理由に最初から諦める
+# うえ、(b) 仮にそこを通っても generate() 側が「MTP 継続できないなら KV も
+# 使わない」という設計だったため、trim の成果が丸ごと捨てられていた。
+# generate() 側を「KV/GDN の再利用は session.mtp_valid と無関係に行い、MTP
+# 連鎖だけ mtp_valid のときだけ引き継ぐ (そうでなければ次ターン開始位置
+# から作り直す)」よう分離したことで、mtp_valid=True (実運用の通常状態) の
+# ままチェックポイント経由の復元が機能するようになった。
+
+
+def test_checkpoint_restore_picks_nearest_checkpoint_at_or_below_lcp():
+    """複数チェックポイントがあるとき、lcp 以下で最も近い位置を選ぶ。trim
+    できるレイヤー (KVCache) はそのチェックポイント位置まで trim され、
+    trim できないレイヤー (ArraysCache) はスナップショットの中身がそのまま
+    書き戻る。mtp_valid=True (実運用の通常状態) でも弾かれない。"""
+
+    from mlx_lm.models.cache import ArraysCache
+
+    arr = ArraysCache(size=2)
+    arr.cache = [mx.array([9.0]), mx.array([99.0])]  # 「今」の (使われない) 状態
+
+    sess = ChatSession()
+    sess.processed = list(range(10))
+    sess.caches = [_real_kv_cache(10), arr]
+    sess.mtp_valid = True
+    sess.checkpoints = [
+        (4, [(1, [mx.array([4.0]), mx.array([44.0])], None, None)]),
+        (7, [(1, [mx.array([7.0]), mx.array([77.0])], None, None)]),
+    ]
+
+    cp_pos = server._try_checkpoint_restore_session_cache(sess, lcp=8)
+
+    assert cp_pos == 7
+    assert sess.caches[0].offset == 7  # チェックポイント位置 (7) まで trim された
+    assert [float(x.item()) for x in sess.caches[1].cache] == [7.0, 77.0]
+
+
+def test_checkpoint_restore_returns_none_when_no_checkpoint_at_or_below_lcp():
+    """使えるチェックポイントが無ければ何も変更せず諦める (呼び出し側が
+    新規スロットへ倒せるように、半端な状態を残さない)。"""
+
+    from mlx_lm.models.cache import ArraysCache
+
+    arr = ArraysCache(size=1)
+    arr.cache = [mx.array([1.0])]
+    sess = ChatSession()
+    sess.processed = list(range(10))
+    sess.caches = [_real_kv_cache(10), arr]
+    sess.checkpoints = [(9, [(1, [mx.array([9.0])], None, None)])]
+
+    cp_pos = server._try_checkpoint_restore_session_cache(sess, lcp=3)
+
+    assert cp_pos is None
+    assert sess.caches[0].offset == 10  # 触られていない
+    assert float(sess.caches[1].cache[0].item()) == 1.0  # 触られていない
+
+
+def test_checkpoint_restore_returns_none_without_checkpoints():
+    """session.checkpoints が空 (real prefill を一度も通っていない、または
+    12 節のテストのように手作業で caches だけ差し込んだ) なら、trim 不可の
+    レイヤーがあってもチェックポイント経由でも復元しようがなく None。"""
+
+    from mlx_lm.models.cache import ArraysCache
+
+    sess = ChatSession()
+    sess.processed = [1, 2, 3, 4, 5]
+    sess.caches = [_real_kv_cache(5), ArraysCache(size=1)]
+
+    assert server._try_checkpoint_restore_session_cache(sess, lcp=3) is None
+
+
+def test_select_session_reuses_via_checkpoint_when_trim_is_not_possible_even_with_mtp_valid():
+    """ArraysCache が混ざっていて exact-trim が不可能でも、チェックポイント
+    があればそこまで復元して同じスロットを再利用する。mtp_valid=True
+    (実運用の通常状態) でも弾かれない -- KV/GDN の再利用を MTP 連鎖の生死
+    から切り離した効果そのもの。MTP 連鎖用の状態は復元後の位置に対応しない
+    ので必ず捨てられ、mtp_valid も False に落ちる。"""
+
+    from mlx_lm.models.cache import ArraysCache
+
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    arr = ArraysCache(size=1)
+    arr.cache = [mx.array([9.0])]
+
+    sess = ChatSession()
+    sess.processed = [1, 2, 3, 4, 5]
+    sess.caches = [_real_kv_cache(5), arr]
+    sess.mtp_valid = True
+    sess.mtp_cache = object()
+    sess.h_last = object()
+    sess.checkpoints = [
+        (3, [(1, [mx.array([3.0])], None, None)]),
+        (4, [(1, [mx.array([4.0])], None, None)]),  # lcp=3 より後ろなので使えない
+    ]
+    server.STATE.session_pool[0] = sess
+
+    got = server._select_session([1, 2, 3, 9, 9])
+
+    assert got is sess
+    assert got.processed == [1, 2, 3]
+    assert got.caches[0].offset == 3
+    assert float(got.caches[1].cache[0].item()) == 3.0
+    assert got.mtp_cache is None
+    assert got.h_last is None
+    assert got.mtp_valid is False
+    assert [pos for pos, _ in got.checkpoints] == [3]  # cp_pos より後ろは捨てる
+
+
+def test_checkpoint_restore_end_to_end_matches_full_rebuild_with_mtp():
+    """実運用に近い形の統合確認。長いプロンプトを複数チャンクに分けて
+    prefill し (チェックポイントが複数できる)、MTP を使って何トークンか
+    生成する (session.mtp_valid=True になる -- 実運用の通常状態)。2 ターン
+    目のプロンプトが処理済み列の末尾わずかに食い違う (thinking マーカー
+    再オープンと同じ形の不一致、このモジュール冒頭の調査で実測した
+    「末尾 2 トークンだけ一致しない」を模す) とき、
+    _try_checkpoint_restore_session_cache 経由で直近チェックポイントまで
+    復元してから続きを prefill した結果 (prefill_reused > 0) が、同じ
+    プロンプトを何も再利用せずまっさらに処理した結果と完全一致することを
+    確認する -- これがこの節の合否基準そのもの (一致したときと、新規に
+    作り直したときで、生成が一致すること)。"""
+
+    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+    from fastmlx.mtp import MTPModule
+
+    mx.random.seed(0)
+    args = TextModelArgs(
+        model_type="qwen3_5",
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=6,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=48,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        full_attention_interval=3,
+        head_dim=8,
+        tie_word_embeddings=True,
+    )
+    text_model = TextModel(args)
+    mx.eval(text_model.parameters())
+    mtp = MTPModule(args)
+    mx.eval(mtp.parameters())
+    fake_model = SimpleNamespace(language_model=text_model)
+    engine = SpecEngine(fake_model, mtp=mtp, prefill_step_size=3)
+
+    turn1_prompt = list(range(12))  # step=3 で 4 チャンク: 境界 3,6,9,12
+
+    sess = ChatSession()
+    r1 = engine.generate(
+        turn1_prompt,
+        max_tokens=4,
+        n_draft=2,
+        max_draft=2,
+        lookup_len=0,
+        temp=0.0,
+        eos_ids=set(),
+        session=sess,
+    )
+    assert sess.mtp_valid is True  # 実運用の通常状態を再現できていることの確認
+    assert [pos for pos, _ in sess.checkpoints] == [3, 6, 9, 12]
+
+    full_history = turn1_prompt + r1["tokens"]
+    turn2_prompt = full_history[:-2] + [40, 41]  # 末尾 2 トークンだけ違う
+
+    lcp = 0
+    n = min(len(sess.processed), len(turn2_prompt))
+    while lcp < n and sess.processed[lcp] == turn2_prompt[lcp]:
+        lcp += 1
+    assert lcp == len(full_history) - 2  # 末尾だけ食い違っている想定どおり
+    assert lcp not in (3, 6, 9, 12)  # チェックポイント境界そのものではない
+
+    cp_pos = server._try_checkpoint_restore_session_cache(sess, lcp)
+    assert cp_pos == 12  # 生成部分にはチェックポイントが無いので prefill の
+    # 最後のチェックポイントまでしか戻れない -- それで十分機能する。
+
+    sess.processed = sess.processed[:cp_pos]
+    sess.checkpoints = [c for c in sess.checkpoints if c[0] <= cp_pos]
+    sess.mtp_cache = None
+    sess.h_last = None
+    sess.mtp_valid = False
+
+    r2_reused = engine.generate(
+        turn2_prompt,
+        max_tokens=4,
+        n_draft=2,
+        max_draft=2,
+        lookup_len=0,
+        temp=0.0,
+        eos_ids=set(),
+        session=sess,
+    )
+    assert r2_reused["prefill_reused"] == cp_pos  # 全量再構築ではない
+
+    r2_fresh = engine.generate(
+        turn2_prompt,
+        max_tokens=4,
+        n_draft=2,
+        max_draft=2,
+        lookup_len=0,
+        temp=0.0,
+        eos_ids=set(),
+        session=None,
+    )
+
+    assert r2_reused["tokens"] == r2_fresh["tokens"]
 
 
 class FakeChatSessionRunner:

@@ -97,7 +97,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ._mlx_compat import mlx_lm_load
 from .runner import FallbackSession, Runner, build_runner
-from .spec import PREFILL_STEP_SIZE, ChatSession
+from .spec import PREFILL_STEP_SIZE, ChatSession, restore_untrimmable_caches
 
 app = FastAPI()
 
@@ -146,6 +146,12 @@ class ModelState:
     # で参照する。
     max_context_tokens: int | None = None
     session_key_seq: Iterator[int] = field(default_factory=lambda: itertools.count())
+    # model 不一致は既定で 404 (OpenAI 準拠の意図的な設計、_check_model_openai/
+    # _check_model_anthropic 参照)。クライアントが裏方処理 (例: Claude Code の
+    # 会話タイトル生成) で別の小さいモデル名を送ってくることがあり、それも
+    # 弾かれてしまう場合に --model-alias を起動時に (複数回) 指定して明示的に
+    # 許可するための集合。既定は空 = 既存の挙動のまま何も変わらない。
+    model_aliases: frozenset[str] = frozenset()
 
 
 STATE: ModelState | None = None
@@ -225,6 +231,93 @@ def _try_trim_session_cache(sess, n_trim: int) -> bool:
     return trimmed == n_trim
 
 
+def _try_checkpoint_restore_session_cache(sess, lcp: int) -> int | None:
+    """``_try_trim_session_cache`` が不発に終わる構成 (ArraysCache が混ざる
+    GDN ハイブリッド — このサーバーの実運用構成そのもの) 向けの代替経路。
+
+    ``sess`` (ChatSession) が ``fastmlx.spec._prefill_hidden`` の途中で
+    残しているチェックポイント (``sess.checkpoints`` — プレフィルのチャンク
+    境界ごとの、巻き戻せないレイヤーだけのスナップショット) の中から
+    ``lcp`` 以下で最も近い位置を選び、そこまで復元する: trim できるレイヤー
+    (attention の KVCache) はそのチェックポイント位置まで ``.trim()`` し、
+    trim できないレイヤー (ArraysCache) はスナップショットの状態をそのまま
+    書き戻す。チェックポイント位置と ``lcp`` の間の差分は、この関数の呼び
+    出し元が ``sess.processed`` をチェックポイント位置へ切り詰めることで、
+    続く generate() 側の通常の (チャンク分割) prefill 経路が forward 計算で
+    自然に埋める — ここでは位置を巻き戻すだけで forward は一切行わない。
+
+    ``_try_trim_session_cache`` と違い、``sess.mtp_valid`` では弾かない。
+    MTP を常用するこのサーバーの実運用では、公開済みの session は生成直後
+    ほぼ常に ``mtp_valid=True`` になる (fastmlx/spec.py の ChatSession.publish
+    参照) ので、そこで弾くとこの経路自体が実運用で永久に不発になる。
+    代わりに、MTP 連鎖用の h_last/mtp_cache は復元後の位置に対応する状態を
+    持たない (``_try_trim_session_cache`` と同じ理由) ため、この関数自体は
+    それらに一切触れず、成功時は呼び出し側が ``sess.mtp_valid`` を落とす —
+    続く generate() 側はそれを見て MTP チェーンを最初から作り直す (KV/GDN
+    の再利用そのものは失わない。fastmlx/spec.py の generate() docstring
+    参照)。
+
+    復元前に、trim できるレイヤー全てで ``n_trim <= offset`` (= trim が必ず
+    要求どおりの量だけ成功する) を確認してから初めて実際の変更を始める。
+    1 レイヤーでも要件を満たさなければ何も変更せず None を返す — 中途半端
+    に trim/復元した状態のスロットを残さない。
+
+    成功すれば復元後の位置 (選んだチェックポイントの位置。``lcp`` そのもの
+    ではないことに注意 — 呼び出し側は ``sess.processed`` をこの戻り値まで
+    切り詰めること) を、使えるチェックポイントが無ければ None を返す。
+    """
+
+    checkpoints = getattr(sess, "checkpoints", None)
+    if not checkpoints:
+        return None
+    cache_list = getattr(sess, "caches", None)
+    if not isinstance(cache_list, list) or not cache_list:
+        return None
+    processed_len = len(sess.processed)
+    if not (0 <= lcp < processed_len):
+        return None
+
+    cp_pos = None
+    cp_snapshot = None
+    for pos, snapshot in checkpoints:
+        if pos <= lcp and (cp_pos is None or pos > cp_pos):
+            cp_pos = pos
+            cp_snapshot = snapshot
+    if not cp_pos:  # None または 0 (0 は「何も進んでいない」= 得るものが無い)
+        return None
+
+    trimmable_idx = [i for i, c in enumerate(cache_list) if c.is_trimmable()]
+    non_trimmable_idx = {i for i in range(len(cache_list)) if i not in trimmable_idx}
+    snapshot_idx = {i for i, *_ in cp_snapshot}
+    # スナップショットが対象にしているレイヤー集合が、今の caches の
+    # trim 可否の割り振りと食い違っていたら (構成が変わるはずは無いが)
+    # 安全側に倒して復元しない。
+    if snapshot_idx != non_trimmable_idx:
+        return None
+
+    n_trim = processed_len - cp_pos
+    for i in trimmable_idx:
+        offset = getattr(cache_list[i], "offset", None)
+        if offset is None or offset < n_trim:
+            return None
+
+    # ここから先は全レイヤーで trim が要求どおりに成功することを確認済み。
+    for i in trimmable_idx:
+        trimmed = cache_list[i].trim(n_trim)
+        if trimmed != n_trim:
+            # 事前の offset チェックと矛盾する = 想定外の cache 実装。
+            # 既にこのレイヤーは trim してしまっているが、processed/
+            # checkpoints はまだ書き換えていないので、呼び出し側には
+            # 「不発」として伝える (この特定の slot はもう安全に再利用
+            # できない可能性があるが、それは呼び出し側が新規スロットへ
+            # 倒すことで吸収する範囲外の話ではない — 実際に踏むことは
+            # ここまでの事前チェックがある限り無いはず)。
+            return None
+
+    restore_untrimmable_caches(cache_list, cp_snapshot)
+    return cp_pos
+
+
 def _select_session(prompt_ids: list[int]):
     """新しいプロンプトに対して使う session (ChatSession/FallbackSession) を
     ``STATE.session_pool`` から選ぶ。
@@ -240,14 +333,29 @@ def _select_session(prompt_ids: list[int]):
     状況では最長一致を優先する。
 
     全体一致が無ければ、部分一致 (処理済み列の一部だけが新プロンプトの
-    接頭辞) の中で LCP が長い順に、KV キャッシュをその LCP まで実際に
-    巻き戻せるか試す (llama.cpp と同様、最長共通接頭辞まで再利用してから
-    trim する発想)。巻き戻し可否の判定は ``_try_trim_session_cache`` に
-    委ねており、巻き戻せた場合だけそのスロットを使い、``processed`` を
-    LCP 長へ切り詰める。1 つも巻き戻せなければ (GDN ハイブリッド層を含む
-    構成では常にこうなる — 上記 docstring 参照) 部分一致は諦め、従来
-    どおり新規スロットへ倒す。誤った/半端な状態のスロットを掴んで壊れる
-    ことは無い。
+    接頭辞) の中で LCP が長い順に、2 段階で再利用を試す (llama.cpp と同様、
+    最長共通接頭辞まで再利用してから戻す発想):
+
+    1. KV キャッシュをその LCP まで実際に巻き戻せるか (``_try_trim_session_
+       cache``)。構成する全レイヤーが trim 可能なときだけ成功し、成功すれば
+       ``processed`` を LCP 長へちょうど切り詰められる (差分 prefill が
+       一切要らない、最も安い経路)。GDN ハイブリッド層 (ArraysCache) が
+       混ざる構成では常に不発に終わる (上記 docstring 参照)。
+    2. 1 が不発なら、``_try_checkpoint_restore_session_cache`` で LCP 以下の
+       直近チェックポイントまで戻せるか試す。trim できるレイヤーはその
+       チェックポイント位置まで trim し、trim できないレイヤー (ArraysCache)
+       はスナップショットを書き戻す — 巻き戻せないものはスナップショットで
+       持つ、という考え方 (fastmlx/spec.py の CHECKPOINT_RETENTION 参照)。
+       戻れるのはチェックポイント位置までなので、``processed`` はその位置
+       (LCP そのものではない) へ切り詰め、LCP までの差分は続く generate()
+       の通常のチャンク prefill が forward 計算で埋める。MTP 連鎖用の
+       h_last/mtp_cache は復元後の位置に対応する状態を持たないので、成功
+       時は必ず捨てる (``mtp_valid`` も落とす) — KV/GDN の再利用は失わない
+       が、MTP チェーンは次ターン最初から作り直す。
+
+    どちらも不発なら (使えるチェックポイントも無ければ) この候補は諦め、
+    次点の LCP 候補へ、それも尽きれば従来どおり新規スロットへ倒す。誤った/
+    半端な状態のスロットを掴んで壊れることは無い。
 
     候補が 1 つも無ければ、プールが上限未満なら新規スロットを、上限なら
     最も長く未使用のスロット (先頭 = LRU) を追い出して新規スロットを
@@ -303,6 +411,20 @@ def _select_session(prompt_ids: list[int]):
                 sess.mtp_cache = None
             if hasattr(sess, "h_last"):
                 sess.h_last = None
+            pool.move_to_end(key)
+            return sess
+
+        cp_pos = _try_checkpoint_restore_session_cache(sess, lcp)
+        if cp_pos is not None:
+            sess.processed = sess.processed[:cp_pos]
+            if hasattr(sess, "checkpoints"):
+                sess.checkpoints = [c for c in sess.checkpoints if c[0] <= cp_pos]
+            if hasattr(sess, "mtp_cache"):
+                sess.mtp_cache = None
+            if hasattr(sess, "h_last"):
+                sess.h_last = None
+            if hasattr(sess, "mtp_valid"):
+                sess.mtp_valid = False
             pool.move_to_end(key)
             return sess
 
@@ -1485,14 +1607,25 @@ def _anthropic_error(message: str, status: int = 400, err_type: str = "invalid_r
     )
 
 
+def _model_name_allowed(requested: str) -> bool:
+    """サーブ中の名前そのもの、または起動時に --model-alias で明示的に
+    許可した別名のどちらかと一致すれば通す。既定 (--model-alias 未指定) は
+    STATE.model_aliases が空集合なので、従来どおりサーブ中の名前だけを許可
+    する厳密一致のまま変わらない — 「不一致は 404」という OpenAI 準拠の
+    意図的な設計そのものは崩さず、黙って何でも受け付ける形にはしない。"""
+
+    return requested == STATE.model_name or requested in STATE.model_aliases
+
+
 def _check_model_openai(body: dict):
-    """リクエストの model がサーブ中のモデルと違えば 404 (OpenAI の
-    model_not_found 相当)。省略時は許容。一致してもしなくても、応答の
-    "model" 欄には常に STATE.model_name (サーブ中の名前) を入れる — クライ
-    アントが送った文字列をそのまま echo しない。"""
+    """リクエストの model がサーブ中のモデル (または --model-alias で許可
+    した別名) と違えば 404 (OpenAI の model_not_found 相当)。省略時は許容。
+    一致してもしなくても、応答の "model" 欄には常に STATE.model_name (サーブ
+    中の名前) を入れる — クライアントが送った文字列 (別名含む) をそのまま
+    echo しない。"""
 
     requested = body.get("model")
-    if requested is not None and requested != STATE.model_name:
+    if requested is not None and not _model_name_allowed(requested):
         return _openai_error(
             f"The model `{requested}` does not exist or you do not have access to it.",
             status=404,
@@ -1504,7 +1637,7 @@ def _check_model_openai(body: dict):
 
 def _check_model_anthropic(body: dict):
     requested = body.get("model")
-    if requested is not None and requested != STATE.model_name:
+    if requested is not None and not _model_name_allowed(requested):
         return _anthropic_error(
             f"model: {requested} not found", status=404, err_type="not_found_error"
         )
@@ -2008,6 +2141,16 @@ async def health():
         "runner": getattr(STATE.runner, "KIND", type(STATE.runner).__name__),
         "busy": STATE.lock.locked(),
     }
+
+
+@app.get("/api/hello")
+@app.head("/api/hello")
+async def api_hello():
+    """Claude Code の疎通確認 (GET/HEAD /api/hello) 用。実装が無いと 404 に
+    なり (会話自体は成立するので実害は無いが)、起動直後のログにノイズが
+    乗る。中身に意味は無く、200 を返すことだけが要件。"""
+
+    return {"status": "ok"}
 
 
 @app.post("/v1/chat/completions")
@@ -4002,6 +4145,18 @@ def main() -> None:
         " (_resolve_default_max_context_tokens 参照)。どちらも取れなければ"
         " ガード無効 (無制限)",
     )
+    ap.add_argument(
+        "--model-alias",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="--served-model-name 以外にも、リクエストの model 欄にこの名前が"
+        " 来たら 404 にせず受け付ける (繰り返し指定可)。クライアントが裏方"
+        " 処理 (例: Claude Code の会話タイトル生成) で別の小さいモデル名"
+        " (例: claude-3-5-haiku-20241022) を送ってくる場合に使う。既定"
+        " (未指定) では従来どおりサーブ中の名前と厳密一致しないと 404 の"
+        " まま — 黙って何でも受け付ける形にはしない",
+    )
     args = ap.parse_args()
 
     global STATE
@@ -4075,11 +4230,14 @@ def main() -> None:
         created_ts=int(time.time()),
         max_sessions=args.max_sessions,
         max_context_tokens=max_context_tokens,
+        model_aliases=frozenset(args.model_alias),
     )
     print(
         f"[fastmlx-serve] served model name: {served_name} "
         f"(session pool: {session_factory.__name__}, max {args.max_sessions} 会話)"
     )
+    if args.model_alias:
+        print(f"[fastmlx-serve] model alias (404 を回避): {', '.join(args.model_alias)}")
     if getattr(tokenizer, "has_thinking", False):
         print(
             f"[fastmlx-serve] thinking マーカー検出: {tokenizer.think_start!r} / "

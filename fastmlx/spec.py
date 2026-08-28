@@ -110,12 +110,84 @@ RESPEC_MAX_BUCKET = 8
 PREFILL_STEP_SIZE = 2048
 
 
+# ---------- 巻き戻せないレイヤーのチェックポイント ----------
+#
+# GDN ハイブリッドの線形層 (mlx_lm.models.cache.ArraysCache: 再帰状態 + conv
+# 窓) は attention の KVCache と違い、任意の位置まで trim で戻す手段を
+# 持たない (is_trimmable() が常に False)。巻き戻せないものはスナップショット
+# で持てばよい、という方針で、_prefill_hidden がプレフィルのチャンク境界
+# ごと (このモジュール冒頭 PREFILL_STEP_SIZE と同じ刻み、新しい刻みは作らない)
+# にこれらのレイヤーだけの状態を退避しておく。次ターンの新プロンプトが
+# 処理済み列の途中 (チャンク境界より前) で分岐しても、直近のチェックポイント
+# まで復元してそこから差分だけ prefill し直せる (fastmlx/server.py の
+# _try_checkpoint_restore_session_cache が消費する)。trim できるレイヤー
+# (KVCache) はスナップショット不要 — .trim() で任意の位置へ戻せる。
+#
+# 保持数とその根拠: text_config 実測 (docs/KERNEL-BRIEF-MOE-GDN.md 系列で
+# 確認済みの構成) で 40 層中 30 層が linear_attention。1 チェックポイント
+# あたり ~66MB (再帰状態: linear_num_value_heads=32 * linear_key_head_dim=128
+# * linear_value_head_dim=128, mamba_ssm_dtype=float32 で層あたり ~2.1MB、
+# + conv 状態: linear_conv_kernel_dim=4 で層あたり ~131KB、30 層分の合計)。
+# 直近 CHECKPOINT_RETENTION=8 件だけ残す (STATE.max_sessions の既定値と
+# 揃えた数 — 8 session が同時に上限まで抱えても保持コストが同じ桁になる
+# ようにしただけで、それ以上の意味は無い): 1 session あたり最大 ~528MB、
+# 8 session (プール上限) 全てが同時に最大量を抱えても ~4.2GB — 128GB 機
+# では誤差。8 * PREFILL_STEP_SIZE = 16,384 トークン分は直近のターン内で
+# 確実にカバーできるので、実際に直したい症状 (thinking マーカー再オープン
+# による末尾わずかなトークンのずれ) は確実に射程に入る。それより手前
+# (古いチェックポイントが押し出された範囲) まで戻る必要がある場合は、
+# 単に一致するチェックポイントが見つからず新規スロットへ倒れる (安全側)。
+CHECKPOINT_RETENTION = 8
+
+
+def snapshot_untrimmable_caches(caches) -> list[tuple[int, object, object, object]]:
+    """``caches`` のうち trim できないレイヤー (``is_trimmable()`` が False
+    — GDN ハイブリッドでは ArraysCache) の状態だけを退避する。trim できる
+    レイヤー (KVCache 等) は ``.trim()`` で任意の位置へ戻せるのでここでは
+    触らない。
+
+    ``c.state`` が返す値がリスト (ArraysCache がそう) の場合、その getter は
+    内部の可変リストをそのまま返す — 後で ``cache[i] = new_array`` のように
+    別の位置が更新されても、参照だけ持っていると "スナップショット" のはず
+    が最新状態にすり替わってしまう (個々の mx.array 自体は不変だが、それを
+    指すリストのスロットは差し替えられるため)。ここで ``list(state)`` して
+    リスト自体は複製し、要素 (mx.array) は複製しない (mx.array は
+    ``__setitem__`` で明示的に書き換えない限り不変なので、要素の共有は安全)。
+    """
+
+    snapshot = []
+    for i, c in enumerate(caches):
+        if c.is_trimmable():
+            continue
+        state = c.state
+        if isinstance(state, list):
+            state = list(state)
+        snapshot.append(
+            (i, state, getattr(c, "left_padding", None), getattr(c, "lengths", None))
+        )
+    return snapshot
+
+
+def restore_untrimmable_caches(caches, snapshot) -> None:
+    """``snapshot_untrimmable_caches`` で退避した状態を書き戻す。"""
+
+    for i, state, left_padding, lengths in snapshot:
+        c = caches[i]
+        c.state = state
+        if left_padding is not None:
+            c.left_padding = left_padding
+        if lengths is not None:
+            c.lengths = lengths
+
+
 class ChatSession:
     """ターンをまたいで KV と線形状態を持ち越すための入れ物。
 
-    新プロンプトが処理済み列の純粋な追記なら差分だけ prefill する。
-    追記でなければ (テンプレートが履歴を書き換えた等) 全再構築に落ちる。
-    線形アテンションの状態は途中位置へ巻き戻せないため、この二択になる。
+    新プロンプトが処理済み列の純粋な追記なら差分だけ prefill する。追記
+    でなければ (テンプレートが履歴を書き換えた等)、``checkpoints`` に直近の
+    プレフィルチャンク境界のスナップショットがあれば、そこまで復元して
+    差分だけ prefill し直す (fastmlx/server.py の _select_session 参照)。
+    どちらも使えなければ全再構築に落ちる。
     """
 
     def __init__(self):
@@ -124,6 +196,10 @@ class ChatSession:
         self.mtp_valid = False
         self.processed = []
         self.h_last = None
+        # [(position, snapshot), ...] position 昇順。snapshot は
+        # snapshot_untrimmable_caches() の戻り値。直近 CHECKPOINT_RETENTION
+        # 件だけ保持する (_prefill_hidden 側で切り詰める)。
+        self.checkpoints: list[tuple[int, list]] = []
 
     def invalidate(self):
         """Drop every published field before aliased caches are mutated."""
@@ -133,8 +209,9 @@ class ChatSession:
         self.mtp_valid = False
         self.processed = []
         self.h_last = None
+        self.checkpoints = []
 
-    def publish(self, caches, mtp_cache, mtp_valid, processed, h_last):
+    def publish(self, caches, mtp_cache, mtp_valid, processed, h_last, checkpoints=None):
         """Publish one internally consistent session snapshot after success."""
 
         self.caches = caches
@@ -142,6 +219,7 @@ class ChatSession:
         self.mtp_valid = mtp_valid
         self.processed = processed
         self.h_last = h_last
+        self.checkpoints = checkpoints if checkpoints is not None else []
 
 
 class SpecEngine:
@@ -205,7 +283,13 @@ class SpecEngine:
                     h = layer(h, mask=fa_mask, cache=c)
         return h, sink
 
-    def _prefill_hidden(self, tokens: mx.array, caches) -> mx.array:
+    def _prefill_hidden(
+        self,
+        tokens: mx.array,
+        caches,
+        checkpoints: list | None = None,
+        base_pos: int = 0,
+    ) -> mx.array:
         """新規プロンプト分をチャンク分割して forward する (generate() の
         最初の一括 prefill 専用)。
 
@@ -223,6 +307,13 @@ class SpecEngine:
         ここが保証するのは同一チャンク幅での決定性と、投機の受理判定が
         実際に計算された target logits と整合していることの 2 点であって、
         分割なし処理とのビット一致ではない。
+
+        ``checkpoints`` (省略時 None): 指定されていれば、チャンク境界ごとに
+        巻き戻せないレイヤーの状態スナップショット (snapshot_untrimmable_
+        caches 参照) をこのリストへ in-place で追記する。位置は
+        ``base_pos`` (呼び出し元にとってこの呼び出し開始位置 = セッション
+        の再利用済みトークン数) を足した絶対位置。CHECKPOINT_RETENTION 件
+        を超えたら古いものから追い出す。
         """
         n = tokens.shape[0]
         step = getattr(self, "prefill_step_size", PREFILL_STEP_SIZE)
@@ -239,6 +330,9 @@ class SpecEngine:
                     mx.eval(state)
             mx.clear_cache()
             i = j
+            if checkpoints is not None:
+                checkpoints.append((base_pos + i, snapshot_untrimmable_caches(caches)))
+                del checkpoints[:-CHECKPOINT_RETENTION]
         return chunks[0] if len(chunks) == 1 else mx.concatenate(chunks, axis=1)
 
     def _linear_capture(self, layer, x, cache, sink, mask=None):
@@ -594,33 +688,48 @@ class SpecEngine:
         caches = mtp_cache = None
         reused = 0
         reused_h_last = None
+        # session が無い呼び出し (bench/gate.py 等、直接 SpecEngine.generate
+        # を叩く経路) では次ターンという概念自体が無いのでチェックポイント
+        # も追わない (None なら _prefill_hidden がスナップショット取得ごと
+        # 丸ごとスキップする)。session があれば、新規スロットでも継続でも
+        # 必ず追う (公開は generate() の最後、session.publish 経由)。
+        checkpoints: list | None = [] if session is not None else None
         if session is not None and session.caches is not None:
             pl = session.processed
             n = min(len(pl), len(prompt_ids))
             lcp = 0
             while lcp < n and pl[lcp] == prompt_ids[lcp]:
                 lcp += 1
-            mtp_reusable = not use_mtp or session.mtp_valid
-            if lcp == len(pl) and lcp < len(prompt_ids) and mtp_reusable:
-                caches, mtp_cache = session.caches, session.mtp_cache
-                reused_h_last = session.h_last
+            if lcp == len(pl) and lcp < len(prompt_ids):
+                # KV/GDN 状態の再利用は MTP 連鎖の生死と切り離す — 対応する
+                # h_last の無い mtp_cache を引き継ぐと後段の concat で
+                # 落ちる (mtp_valid が False の session は h_last/mtp_cache
+                # が巻き戻し後の位置と対応しない、fastmlx/server.py の
+                # _try_checkpoint_restore_session_cache 参照) ので、MTP は
+                # session.mtp_valid のときだけ引き継ぎ、そうでなければ後段
+                # の use_mtp ブロックが「セッション再利用なし」と同じ経路
+                # (prompt[1:] から作り直す) へ自然に落ちる。
+                caches = session.caches
+                checkpoints = session.checkpoints
                 reused = lcp
+                if session.mtp_valid:
+                    mtp_cache = session.mtp_cache
+                    reused_h_last = session.h_last
                 # The local variables now own these mutable caches.  Any error,
                 # including KeyboardInterrupt or a callback failure, leaves the
                 # public session invalid instead of half-published.
                 session.invalidate()
         if caches is None:
             caches = self.text.make_cache()
-            mtp_cache = KVCache()
-        elif mtp_cache is None:
+        if mtp_cache is None:
             mtp_cache = KVCache()
 
         prompt = mx.array(prompt_ids[reused:])
 
         t0 = time.perf_counter()
-        h_all = self._prefill_hidden(prompt, caches)
+        h_all = self._prefill_hidden(prompt, caches, checkpoints=checkpoints, base_pos=reused)
         if use_mtp:
-            if reused:
+            if reused and reused_h_last is not None:
                 mtp_hiddens = mx.concatenate(
                     [reused_h_last, h_all[:, :-1]], axis=1
                 )
@@ -634,7 +743,7 @@ class SpecEngine:
             ttft = time.perf_counter() - t0
             if session is not None:
                 session.publish(
-                    caches, mtp_cache, use_mtp, list(prompt_ids), h_last
+                    caches, mtp_cache, use_mtp, list(prompt_ids), h_last, checkpoints
                 )
             return {
                 "prefill_reused": reused,
@@ -954,6 +1063,7 @@ class SpecEngine:
                 use_mtp,
                 prompt_ids + fed_gen,
                 h_last,
+                checkpoints,
             )
         return {
             "prefill_reused": reused,
