@@ -159,10 +159,32 @@ class FakeRunner:
 
 
 class FakeSpecRunner(FakeRunner):
-    """SpecRunner を模す: seed しかサポートしない。"""
+    """SpecRunner を模す: seed しかサポートしない。
+
+    実物の SpecRunner.generate は seed 以外を **extra 経由でそのまま
+    fastmlx.spec.SpecEngine.generate() に渡すが、SpecEngine.generate は
+    **kwargs を持たない固定シグネチャなので、未知のキーワード引数を渡すと
+    TypeError で落ちる (実サーバーで実測: "SpecEngine.generate() got an
+    unexpected keyword argument 'top_p'")。FakeRunner の generate は
+    **extra を無条件に飲み込んでこの挙動を再現しないため、
+    _check_and_strip_sampling_params 側が恒等値なのに params から
+    ストリップし忘れた場合でもテストが 200 のまま通ってしまう (実際に
+    このバグが一度この形で実サーバーまで抜けた)。ここで TypeError を
+    投げることで、同じ穴が再発してもテストが検出できるようにする。
+    """
 
     KIND = "spec"
     SUPPORTED_SAMPLING_PARAMS = SpecRunner.SUPPORTED_SAMPLING_PARAMS
+
+    def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
+        unexpected = sorted(set(extra) - self.SUPPORTED_SAMPLING_PARAMS)
+        if unexpected:
+            raise TypeError(
+                f"SpecEngine.generate() got an unexpected keyword argument '{unexpected[0]}'"
+            )
+        return super().generate(
+            prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra
+        )
 
 
 class FakeReusingRunner:
@@ -425,6 +447,154 @@ def test_spec_runner_allows_seed(client):
     )
     assert resp.status_code == 200, resp.text
     assert runner.calls[0]["seed"] == 7
+
+
+# ---------- 2b. SpecRunner 経路でも恒等値 (分布を変えない既定値) は通す ----------
+#
+# opencode / OpenAI SDK など実クライアントは top_p=1.0 や frequency_penalty=0
+# のような「未指定と等価」な値をキー付きで送ってくる。これらは分布を一切
+# 変えないので、SUPPORTED_SAMPLING_PARAMS に無いキーでも 400 にしてはいけない
+# (このバグの実測: opencode を spec runner のモデルに繋ぐと最初のリクエストで
+# 即 400 になっていた)。
+#
+# ただし 400 にしないだけでは足りない: SpecRunner.generate は seed 以外の
+# kwarg を fastmlx.spec.SpecEngine.generate() へそのまま **extra 経由で
+# 渡すが、SpecEngine.generate は **kwargs を持たない固定シグネチャなので、
+# 恒等値であっても runner がサポートしないキーをそのまま渡すと
+# "unexpected keyword argument" で 500 になる (実サーバーでの実測)。
+# なので _check_and_strip_sampling_params は「400 にしない」だけでなく
+# 「runner が知らないキーを params から取り除く」まで行う必要があり、
+# 以下は 200 になることに加えて runner が実際に受け取った引数からその
+# キーが消えていることまで確認する。
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"top_p": 1.0},
+        {"top_k": 0},
+        {"min_p": 0.0},
+        {"frequency_penalty": 0.0},
+        {"presence_penalty": 0.0},
+        {"repetition_penalty": 1.0},
+        {"logit_bias": {}},
+    ],
+)
+def test_spec_runner_allows_identity_sampling_values(client, params):
+    runner = FakeSpecRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    body = {"messages": [{"role": "user", "content": "hi"}], **params}
+    resp = client.post("/v1/chat/completions", json=body)
+    assert resp.status_code == 200, resp.text
+    assert runner.calls
+    # 恒等値だが SpecRunner.SUPPORTED_SAMPLING_PARAMS (= {"seed"}) には
+    # 無いキーなので、runner.generate が実際に受け取った kwargs から
+    # 消えていなければならない (残っていれば実物では TypeError -> 500)。
+    (key,) = params.keys()
+    assert key not in runner.calls[0]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "top_p",
+        "min_p",
+        "repetition_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "logit_bias",
+    ],
+)
+def test_spec_runner_allows_explicit_null(client, field):
+    """明示的な JSON null (未指定と区別しないクライアントがいる) も、
+    _parse_sampling_params 側で「未指定」扱いになって params dict に入らない
+    ため、そもそも _check_sampling_support に渡らずに通る。"""
+
+    runner = FakeSpecRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], field: None},
+    )
+    assert resp.status_code == 200, resp.text
+    assert runner.calls
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"top_p": 0.9},
+        {"top_k": 10},
+        {"min_p": 0.1},
+        {"repetition_penalty": 1.1},
+        {"presence_penalty": 0.5},
+        {"frequency_penalty": 0.3},
+        {"logit_bias": {"1": 1.0}},
+    ],
+)
+def test_spec_runner_still_rejects_non_identity_sampling_values(client, params):
+    """恒等値判定を入れても、実際に分布を変える値は今まで通り 400。"""
+
+    runner = FakeSpecRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    body = {"messages": [{"role": "user", "content": "hi"}], **params}
+    resp = client.post("/v1/chat/completions", json=body)
+    assert resp.status_code == 400, resp.text
+    assert "spec" in resp.json()["error"]["message"]
+    assert not runner.calls
+
+
+def test_spec_runner_error_lists_only_non_identity_params(client):
+    """恒等値と非恒等値を同時に送ったとき、エラーメッセージに挙がるのは
+    非恒等値のものだけ (恒等値のキー名が紛れ込まない)。"""
+
+    runner = FakeSpecRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": 1.0,  # 恒等値: メッセージに出てはいけない
+            "frequency_penalty": 0.0,  # 恒等値: メッセージに出てはいけない
+            "presence_penalty": 0.5,  # 非恒等値: メッセージに出るべき
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    message = resp.json()["error"]["message"]
+    # 「non-default values for: <listed>. The speculative-decoding runner ...」
+    # の <listed> 部分だけを見る — 説明文中の例示 (top_p=1.0 等) を誤検出
+    # しないように、リスト部分を切り出してから判定する。
+    listed = message.split("non-default values for: ", 1)[1].split(". The speculative-decoding", 1)[0]
+    assert listed == "presence_penalty"
+    assert not runner.calls
+
+
+def test_fallback_runner_still_allows_everything(client):
+    """FallbackRunner は元から SUPPORTED_SAMPLING_PARAMS に全キーを宣言して
+    いるので、恒等値判定の追加による影響を受けない (念のための確認)。"""
+
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": 0.9,
+            "top_k": 40,
+            "min_p": 0.05,
+            "repetition_penalty": 1.1,
+            "presence_penalty": 0.5,
+            "frequency_penalty": 0.3,
+            "logit_bias": {"5": 2.0},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert runner.calls
 
 
 def test_spec_runner_rejects_unsupported_params_on_completions_endpoint(client):

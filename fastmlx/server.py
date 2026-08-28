@@ -1155,28 +1155,84 @@ def _parse_sampling_params(body: dict) -> tuple[dict, str | None]:
     return params, None
 
 
-def _check_sampling_support(params: dict) -> str | None:
+# サンプリングパラメータの「恒等値」(分布を一切変えない既定値) の一覧。
+# 例えば top_p=1.0 は確率質量を 100% 残すので分布を変えない。SpecRunner が
+# SUPPORTED_SAMPLING_PARAMS に挙げていないキーでも、実際に渡ってきた値が
+# ここに列挙された恒等値なら投機デコードの分布保証を何も脅かさないので、
+# _check_and_strip_sampling_params は 400 で弾かない。マジックナンバーを条件式へ散らさず
+# ここへ集約する。logit_bias は「None または空 dict」が恒等値なので、
+# 値そのものではなく _is_identity_sampling_value 側で特別扱いする。
+#
+# top_k の -1 は現状 _parse_optional_int(..., lo=0) が事前に 400 で弾くため
+# 実際にはここへ到達しないが、"top_k を無効化する" 値として一般的なので
+# 恒等値の定義としては含めておく (無害)。
+_IDENTITY_SAMPLING_VALUES: dict[str, tuple] = {
+    "top_p": (1.0,),
+    "top_k": (0, -1),
+    "min_p": (0.0,),
+    "frequency_penalty": (0.0,),
+    "presence_penalty": (0.0,),
+    "repetition_penalty": (1.0,),
+}
+
+
+def _is_identity_sampling_value(name: str, value) -> bool:
+    """``value`` が ``name`` というサンプリングパラメータにとって恒等値
+    (分布を一切変えない値) なら True。未指定 (None) は _parse_sampling_params
+    が params dict に入れない設計だが、防御的にここでも通す。"""
+
+    if value is None:
+        return True
+    if name == "logit_bias":
+        return not value  # None または {} (空 dict) はバイアス無し
+    return value in _IDENTITY_SAMPLING_VALUES.get(name, ())
+
+
+def _check_and_strip_sampling_params(params: dict) -> str | None:
     """現在の Runner (SpecRunner/FallbackRunner) が受け付けないサンプリング
-    パラメータが指定されていれば、理由付きのエラー文字列を返す。SpecRunner
-    が seed 以外を弾く理由は fastmlx/runner.py の SpecRunner docstring
-    (Block Verification の分布保証との関係) を参照。
+    パラメータが、かつ分布を変える値で指定されていれば、理由付きのエラー
+    文字列を返す。値が恒等値 (例: top_p=1.0, frequency_penalty=0.0) なら
+    キーが SUPPORTED_SAMPLING_PARAMS に無くても分布を変えないため 400 には
+    しない — opencode や OpenAI SDK など、既定値をキー付きで送ってくる実
+    クライアントが spec runner のモデルを使えなくなることを避けるため。
+    SpecRunner が非恒等値を弾く理由は fastmlx/runner.py の SpecRunner
+    docstring (Block Verification の分布保証との関係) を参照。
+
+    副作用: エラーを返さずに通す場合、``params`` を破壊的に書き換えて、
+    「runner がサポートしないが恒等値なので通したキー」を削除する。
+    SpecEngine.generate() のように **kwargs を持たない generate() へ
+    そのまま渡すと未知のキーワード引数で TypeError (-> 500) になるため —
+    「無変換」という意味を、そのキーを一切渡さないことで正確に表現する。
+    呼び出し側は 4 箇所あるが、ここで dict を直接変更することで各所に
+    ストリップ処理を書かずに済ませる。
     """
 
     if not params:
         return None
     supported = getattr(STATE.runner, "SUPPORTED_SAMPLING_PARAMS", frozenset())
-    unsupported = sorted(set(params) - supported)
-    if not unsupported:
+    unrecognized = set(params) - supported
+    if not unrecognized:
         return None
-    kind = getattr(STATE.runner, "KIND", type(STATE.runner).__name__)
-    return (
-        f"this model is served via the '{kind}' runner, which does not support: "
-        f"{', '.join(unsupported)}. The speculative-decoding runner only supports "
-        "'seed' among the extended sampling parameters, because its correctness "
-        "guarantee (rejection sampling against the exact target distribution) "
-        "assumes temperature-only sampling; changing the base distribution would "
-        "silently break that guarantee."
+    non_identity = sorted(
+        name for name in unrecognized if not _is_identity_sampling_value(name, params[name])
     )
+    if non_identity:
+        kind = getattr(STATE.runner, "KIND", type(STATE.runner).__name__)
+        return (
+            f"this model is served via the '{kind}' runner, which does not support "
+            f"non-default values for: {', '.join(non_identity)}. The speculative-decoding "
+            "runner only supports 'seed' (plus identity values that leave the sampling "
+            "distribution unchanged, e.g. top_p=1.0 or frequency_penalty=0.0) among the "
+            "extended sampling parameters, because its correctness guarantee (rejection "
+            "sampling against the exact target distribution) assumes temperature-only "
+            "sampling; changing the base distribution would silently break that guarantee."
+        )
+    # ここに残っているのは全て「runner がサポートしないが恒等値」のキー。
+    # 分布を変えないので拒否はしないが、runner.generate() が知らない
+    # キーワード引数として受け取らないよう、渡す前に落としておく。
+    for name in unrecognized:
+        del params[name]
+    return None
 
 
 def _stop_sequences(body: dict) -> list[str]:
@@ -1717,7 +1773,7 @@ async def chat_completions(request: Request):
     sampling_params, err = _parse_sampling_params(body)
     if err is not None:
         return _openai_error(err)
-    unsupported_err = _check_sampling_support(sampling_params)
+    unsupported_err = _check_and_strip_sampling_params(sampling_params)
     if unsupported_err is not None:
         return _openai_error(unsupported_err)
     stops = _stop_sequences(body)
@@ -2075,7 +2131,7 @@ async def anthropic_messages(request: Request):
     sampling_params, err = _parse_sampling_params(body)
     if err is not None:
         return _anthropic_error(err)
-    unsupported_err = _check_sampling_support(sampling_params)
+    unsupported_err = _check_and_strip_sampling_params(sampling_params)
     if unsupported_err is not None:
         return _anthropic_error(unsupported_err)
     stops = _stop_sequences(body)
@@ -2448,7 +2504,7 @@ async def completions(request: Request):
     sampling_params, err = _parse_sampling_params(body)
     if err is not None:
         return _openai_error(err)
-    unsupported_err = _check_sampling_support(sampling_params)
+    unsupported_err = _check_and_strip_sampling_params(sampling_params)
     if unsupported_err is not None:
         return _openai_error(unsupported_err)
     stops = _stop_sequences(body)
@@ -3019,7 +3075,7 @@ async def responses_endpoint(request: Request):
     sampling_params, err = _parse_sampling_params(body)
     if err is not None:
         return _openai_error(err)
-    unsupported_err = _check_sampling_support(sampling_params)
+    unsupported_err = _check_and_strip_sampling_params(sampling_params)
     if unsupported_err is not None:
         return _openai_error(unsupported_err)
 
