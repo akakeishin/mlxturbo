@@ -14,14 +14,18 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
+import queue as queue_mod
 import threading
+import time
 from collections import OrderedDict
 from types import SimpleNamespace
+from unittest import mock
 
 import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
 
+import fastmlx.cli as cli_module
 import fastmlx.server as server
 from fastmlx.runner import FallbackRunner, FallbackSession, SpecRunner
 from fastmlx.spec import ChatSession, SpecEngine
@@ -314,6 +318,10 @@ def _install_state(runner, tokenizer=None, **overrides) -> server.ModelState:
         max_sessions=overrides.get("max_sessions", 8),
         max_context_tokens=overrides.get("max_context_tokens"),
         model_aliases=overrides.get("model_aliases", frozenset()),
+        api_keys=overrides.get("api_keys", frozenset()),
+        max_queue=overrides.get("max_queue", 8),
+        queue_depth=overrides.get("queue_depth", 0),
+        version=overrides.get("version", "0.0.0-test"),
     )
     server.STATE = state
     return state
@@ -4072,3 +4080,661 @@ def test_context_length_guard_streaming_400_returns_before_any_sse_event(client)
     assert not runner.calls
     assert "text/event-stream" not in resp.headers.get("content-type", "")
     assert not resp.text.startswith("data: ")
+
+
+# ---------- 13. --api-key 認証 ----------
+
+
+def test_api_key_disabled_by_default(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+    resp = client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_api_key_missing_returns_401_openai(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner, tokenizer=FakeTokenizer(vocab={10: "x"}), api_keys=frozenset({"secret"})
+    )
+    resp = client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert resp.status_code == 401, resp.text
+    assert not runner.calls
+    err = resp.json()["error"]
+    assert err["code"] == "invalid_api_key"
+
+
+def test_api_key_wrong_returns_401_openai(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner, tokenizer=FakeTokenizer(vocab={10: "x"}), api_keys=frozenset({"secret"})
+    )
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": "Bearer wrong-key"},
+    )
+    assert resp.status_code == 401, resp.text
+    assert not runner.calls
+
+
+def test_api_key_correct_via_bearer_on_openai_route(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner, tokenizer=FakeTokenizer(vocab={10: "x"}), api_keys=frozenset({"secret"})
+    )
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": "Bearer secret"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_api_key_correct_via_x_api_key_on_openai_route(client):
+    # 両ヘッダともどちらの経路でも受け付ける (クライアント実装の揺れがあるため)。
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner, tokenizer=FakeTokenizer(vocab={10: "x"}), api_keys=frozenset({"secret"})
+    )
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers={"x-api-key": "secret"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_api_key_v1_models_requires_auth(client):
+    runner = FakeRunner(tokens_to_emit=[])
+    _install_state(runner, api_keys=frozenset({"secret"}))
+    resp = client.get("/v1/models")
+    assert resp.status_code == 401, resp.text
+    resp_ok = client.get("/v1/models", headers={"Authorization": "Bearer secret"})
+    assert resp_ok.status_code == 200, resp_ok.text
+
+
+def test_api_key_missing_returns_401_anthropic_format(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner, tokenizer=FakeTokenizer(vocab={10: "x"}), api_keys=frozenset({"secret"})
+    )
+    resp = client.post(
+        "/v1/messages",
+        json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 16},
+    )
+    assert resp.status_code == 401, resp.text
+    assert not runner.calls
+    body = resp.json()
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "authentication_error"
+
+
+def test_api_key_correct_via_x_api_key_on_anthropic_route(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner, tokenizer=FakeTokenizer(vocab={10: "x"}), api_keys=frozenset({"secret"})
+    )
+    resp = client.post(
+        "/v1/messages",
+        json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 16},
+        headers={"x-api-key": "secret"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_api_key_correct_via_bearer_on_anthropic_route(client):
+    # 逆方向のクロスオーバーも同様に受け付ける。
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner, tokenizer=FakeTokenizer(vocab={10: "x"}), api_keys=frozenset({"secret"})
+    )
+    resp = client.post(
+        "/v1/messages",
+        json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 16},
+        headers={"Authorization": "Bearer secret"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+def test_api_key_health_and_hello_bypass_auth(client):
+    runner = FakeRunner(tokens_to_emit=[])
+    _install_state(runner, api_keys=frozenset({"secret"}))
+    assert client.get("/health").status_code == 200
+    assert client.get("/api/hello").status_code == 200
+    assert client.head("/api/hello").status_code == 200
+
+
+def test_api_key_multiple_keys_any_match(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(
+        runner,
+        tokenizer=FakeTokenizer(vocab={10: "x"}),
+        api_keys=frozenset({"key-a", "key-b"}),
+    )
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": "Bearer key-b"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+# ---------- 14. --max-queue / キュー枠 ----------
+
+
+def test_max_queue_returns_503_when_at_capacity_openai(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}), max_queue=0)
+    resp = client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert resp.status_code == 503, resp.text
+    assert not runner.calls
+    assert resp.headers.get("retry-after")
+    err = resp.json()["error"]
+    assert err["code"] == "server_busy"
+
+
+def test_max_queue_returns_503_when_at_capacity_anthropic(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}), max_queue=0)
+    resp = client.post(
+        "/v1/messages",
+        json={"messages": [{"role": "user", "content": "hi"}], "max_tokens": 16},
+    )
+    assert resp.status_code == 503, resp.text
+    assert not runner.calls
+    assert resp.headers.get("retry-after")
+    body = resp.json()
+    assert body["type"] == "error"
+    assert body["error"]["type"] == "overloaded_error"
+
+
+def test_max_queue_returns_503_for_completions_and_responses(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}), max_queue=0)
+
+    resp1 = client.post("/v1/completions", json={"prompt": "hi"})
+    assert resp1.status_code == 503, resp1.text
+
+    resp2 = client.post("/v1/responses", json={"input": "hi"})
+    assert resp2.status_code == 503, resp2.text
+
+
+def test_max_queue_streaming_returns_503_before_any_sse_event(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}), max_queue=0)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    assert resp.status_code == 503, resp.text
+    assert "text/event-stream" not in resp.headers.get("content-type", "")
+
+
+def test_health_reports_queue_depth(client):
+    runner = FakeRunner(tokens_to_emit=[])
+    state = _install_state(runner, queue_depth=3)
+    resp = client.get("/health")
+    assert resp.json()["queue_depth"] == 3
+    assert state.max_queue == 8  # 既定値
+
+
+def test_queue_slot_released_after_non_stream_request(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    state = _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}), max_queue=1)
+    resp = client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert resp.status_code == 200, resp.text
+    assert state.queue_depth == 0
+
+
+def test_queue_slot_released_after_stream_request(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    state = _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}), max_queue=1)
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+    assert resp.status_code == 200, resp.text
+    # TestClient は StreamingResponse のジェネレータを最後まで読み切ってから
+    # 戻る (aclose まで含む) ので、この時点で finally は必ず実行済み。
+    assert state.queue_depth == 0
+
+
+def test_reserve_and_release_queue_slot_unit():
+    runner = FakeRunner(tokens_to_emit=[])
+    state = _install_state(runner, max_queue=2)
+    assert server._try_reserve_queue_slot() is True
+    assert state.queue_depth == 1
+    assert server._try_reserve_queue_slot() is True
+    assert state.queue_depth == 2
+    assert server._try_reserve_queue_slot() is False
+    assert state.queue_depth == 2
+    server._release_queue_slot()
+    assert state.queue_depth == 1
+    server._release_queue_slot()
+    server._release_queue_slot()  # 0 未満に落ちない
+    assert state.queue_depth == 0
+
+
+# ---------- 15. SSE keepalive ----------
+
+
+def test_await_with_keepalive_yields_periodic_lines_then_result():
+    async def _run():
+        async def slow():
+            await asyncio.sleep(0.12)
+            return "done-value"
+
+        keepalives = []
+        result = None
+        async for kind, val in server._await_with_keepalive(slow(), interval=0.03):
+            if kind == "keepalive":
+                keepalives.append(val)
+            else:
+                result = val
+        return keepalives, result
+
+    keepalives, result = asyncio.run(_run())
+    assert result == "done-value"
+    assert len(keepalives) >= 2
+    assert all(k == server._SSE_KEEPALIVE_LINE for k in keepalives)
+
+
+def test_await_with_keepalive_returns_immediately_without_keepalive_when_fast():
+    async def _run():
+        async def fast():
+            return "quick"
+
+        keepalives = []
+        result = None
+        async for kind, val in server._await_with_keepalive(fast(), interval=5.0):
+            if kind == "keepalive":
+                keepalives.append(val)
+            else:
+                result = val
+        return keepalives, result
+
+    keepalives, result = asyncio.run(_run())
+    assert result == "quick"
+    assert keepalives == []
+
+
+def test_await_with_keepalive_cancels_pending_task_on_early_close():
+    async def _run():
+        cancelled = {"v": False}
+
+        async def slow():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cancelled["v"] = True
+                raise
+
+        agen = server._await_with_keepalive(slow(), interval=0.02)
+        kind, _val = await agen.__anext__()
+        assert kind == "keepalive"
+        await agen.aclose()
+        await asyncio.sleep(0.05)
+        return cancelled["v"]
+
+    assert asyncio.run(_run()) is True
+
+
+def test_requeue_front_preserves_order():
+    q: queue_mod.Queue = queue_mod.Queue()
+    q.put(("b", 2))
+    q.put(("c", 3))
+    server._requeue_front(q, ("a", 1))
+    assert q.get() == ("a", 1)
+    assert q.get() == ("b", 2)
+    assert q.get() == ("c", 3)
+
+
+def test_chat_completions_stream_emits_keepalive_before_first_token(client):
+    class SlowRunner(FakeRunner):
+        def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
+            time.sleep(0.05)
+            return super().generate(
+                prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra
+            )
+
+    runner = SlowRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    # _await_with_keepalive の既定 interval (15s) は使えないので、呼び出し側
+    # (server.py の各 _*_stream) が interval= を明示しない前提のまま、関数
+    # object の既定値だけ差し替える。
+    original_defaults = server._await_with_keepalive.__defaults__
+    server._await_with_keepalive.__defaults__ = (0.01,)
+    try:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+    finally:
+        server._await_with_keepalive.__defaults__ = original_defaults
+
+    assert resp.status_code == 200, resp.text
+    assert server._SSE_KEEPALIVE_LINE in resp.text
+    events = _sse_events(resp.text)
+    text_chunks = [
+        e["choices"][0]["delta"].get("content", "")
+        for e in events
+        if e.get("choices") and "content" in e["choices"][0].get("delta", {})
+    ]
+    assert "".join(text_chunks) == "x"
+
+
+def test_anthropic_messages_stream_emits_keepalive_before_first_token(client):
+    class SlowRunner(FakeRunner):
+        def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
+            time.sleep(0.05)
+            return super().generate(
+                prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra
+            )
+
+    runner = SlowRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    original_defaults = server._await_with_keepalive.__defaults__
+    server._await_with_keepalive.__defaults__ = (0.01,)
+    try:
+        resp = client.post(
+            "/v1/messages",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 16,
+                "stream": True,
+            },
+        )
+    finally:
+        server._await_with_keepalive.__defaults__ = original_defaults
+
+    assert resp.status_code == 200, resp.text
+    assert server._SSE_KEEPALIVE_LINE in resp.text
+
+
+# ---------- 16. graceful shutdown ----------
+
+
+def test_shutting_down_flag_returns_503_for_new_requests(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+    server._SHUTTING_DOWN = True
+    try:
+        resp = client.post(
+            "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+        )
+    finally:
+        server._SHUTTING_DOWN = False
+    assert resp.status_code == 503, resp.text
+    assert resp.headers.get("retry-after")
+    assert not runner.calls
+
+
+def test_shutting_down_flag_still_allows_health_and_hello(client):
+    runner = FakeRunner(tokens_to_emit=[])
+    _install_state(runner)
+    server._SHUTTING_DOWN = True
+    try:
+        health_resp = client.get("/health")
+        hello_resp = client.get("/api/hello")
+    finally:
+        server._SHUTTING_DOWN = False
+    assert health_resp.status_code == 200
+    assert hello_resp.status_code == 200
+
+
+class _FakeUvicornServer:
+    """本物の uvicorn.Server の代わりに ``_install_graceful_shutdown`` /
+    ``_drain_and_exit`` が触る属性・メソッドだけを最小限で持つ fake。
+    ``startup`` を持たない fake だと ``_install_graceful_shutdown`` が
+    ``server_obj.startup`` の取得で AttributeError になる (実物の Server は
+    必ず持つ) ので、ここで揃えておく。"""
+
+    def __init__(self):
+        self.force_exit = False
+        self.should_exit = False
+        self.startup_calls = 0
+        self.handle_exit_calls: list = []
+
+    def handle_exit(self, sig, frame):
+        self.handle_exit_calls.append((sig, frame))
+
+    async def startup(self, sockets=None):
+        self.startup_calls += 1
+
+
+def test_install_graceful_shutdown_first_signal_sets_flag_not_force_exit():
+    fake = _FakeUvicornServer()
+    server._SHUTTING_DOWN = False
+    try:
+        server._install_graceful_shutdown(fake)
+        fake.handle_exit(15, None)
+        assert server._SHUTTING_DOWN is True
+        assert fake.force_exit is False
+        assert fake.should_exit is False
+        # 1 回目は uvicorn 本体の should_exit をまだ立てない (リスナーを
+        # 開けたまま _gate_requests に 503 を返させるため — should_exit は
+        # _drain_and_exit がキューの空きを見てから立てる。
+        # _install_graceful_shutdown の docstring 参照)。fake.handle_exit
+        # (元の uvicorn ハンドラ相当) 自体もこの実装ではもう呼ばれない。
+        assert fake.handle_exit_calls == []
+    finally:
+        server._SHUTTING_DOWN = False
+
+
+def test_install_graceful_shutdown_second_signal_force_exits_process_immediately():
+    # 2 回目は os._exit で OS レベルの即時終了に落とす (force_exit だけでは
+    # 生成中の非 daemon ワーカースレッドの完了待ちが残ってしまい「即時」に
+    # ならないことを実機で確認済み — server.py の docstring 参照)。テスト
+    # プロセスを実際に殺されては困るので os._exit をモックで差し替える。
+    fake = _FakeUvicornServer()
+    server._SHUTTING_DOWN = False
+    try:
+        server._install_graceful_shutdown(fake)
+        fake.handle_exit(15, None)  # SIGTERM (1 回目)
+        with mock.patch("os._exit") as exit_mock:
+            fake.handle_exit(2, None)  # SIGINT (別種でも2回目なので即時終了)
+            exit_mock.assert_called_once_with(1)
+        assert fake.force_exit is True
+        # os._exit をモックしたので実際には終了しない (テスト用の代替経路)。
+        assert fake.handle_exit_calls == []
+    finally:
+        server._SHUTTING_DOWN = False
+
+
+def test_install_graceful_shutdown_wraps_startup_to_launch_drain_watcher():
+    fake = _FakeUvicornServer()
+    server._SHUTTING_DOWN = False
+    try:
+        server._install_graceful_shutdown(fake)
+
+        async def _run():
+            await fake.startup()
+
+        asyncio.run(_run())
+        assert fake.startup_calls == 1
+    finally:
+        server._SHUTTING_DOWN = False
+
+
+def test_drain_and_exit_waits_for_queue_depth_before_setting_should_exit():
+    runner = FakeRunner(tokens_to_emit=[])
+    state = _install_state(runner, queue_depth=2)
+    fake = _FakeUvicornServer()
+    server._SHUTTING_DOWN = True
+    try:
+
+        async def _run():
+            task = asyncio.create_task(server._drain_and_exit(fake))
+            await asyncio.sleep(0.05)
+            # まだキューが空いていないので should_exit はまだ立たない。
+            assert fake.should_exit is False
+            state.queue_depth = 0
+            await asyncio.wait_for(task, timeout=1.0)
+
+        asyncio.run(_run())
+        assert fake.should_exit is True
+    finally:
+        server._SHUTTING_DOWN = False
+
+
+def test_drain_and_exit_short_circuits_on_force_exit():
+    fake = _FakeUvicornServer()
+    fake.force_exit = True
+    server._SHUTTING_DOWN = False
+    try:
+        asyncio.run(asyncio.wait_for(server._drain_and_exit(fake), timeout=1.0))
+        assert fake.should_exit is False
+    finally:
+        server._SHUTTING_DOWN = False
+
+
+# ---------- 17. バージョン ----------
+
+
+def test_health_includes_version(client):
+    runner = FakeRunner(tokens_to_emit=[])
+    _install_state(runner, version="9.9.9-test")
+    resp = client.get("/health")
+    assert resp.json()["version"] == "9.9.9-test"
+
+
+def test_list_models_includes_version(client):
+    runner = FakeRunner(tokens_to_emit=[])
+    _install_state(runner, version="9.9.9-test")
+    resp = client.get("/v1/models")
+    assert resp.json()["version"] == "9.9.9-test"
+
+
+def test_health_before_load_still_reports_a_version():
+    previous = server.STATE
+    server.STATE = None
+    try:
+        c = TestClient(server.app)
+        resp = c.get("/health")
+    finally:
+        server.STATE = previous
+    assert resp.status_code == 503
+    assert resp.json()["version"] == server._FASTMLX_VERSION
+
+
+def test_fastmlx_version_matches_pyproject():
+    # importlib.metadata 経由で pyproject.toml の version をそのまま返す
+    # (別ファイルに二重管理しない)。
+    assert server._FASTMLX_VERSION == server._fastmlx_version()
+    assert server._FASTMLX_VERSION != ""
+
+
+# ---------- 18. --mtp サイドカーのパス (cli.py: load_cli_mtp) ----------
+
+
+def test_load_cli_mtp_explicit_path_takes_priority_over_bundled_and_search():
+    sentinel = object()
+    with (
+        mock.patch.object(cli_module, "load_mtp_file", return_value=sentinel) as load_file,
+        mock.patch.object(cli_module, "load_quantized_mtp") as load_bundled,
+        mock.patch.object(cli_module, "find_snapshot") as find_original,
+    ):
+        actual = cli_module.load_cli_mtp(
+            "artifact-repo",
+            {"fastmlx_mtp": True},  # 通常ならバンドル済みアーティファクト経路
+            object(),
+            "raw-repo",
+            4,
+            mtp_path="/some/sidecar.safetensors",
+        )
+    assert actual is sentinel
+    load_file.assert_called_once()
+    assert load_file.call_args[0][0] == "/some/sidecar.safetensors"
+    load_bundled.assert_not_called()
+    find_original.assert_not_called()
+
+
+def test_load_cli_mtp_env_var_fallback_when_path_kwarg_omitted(monkeypatch):
+    sentinel = object()
+    monkeypatch.setenv(cli_module.MTP_PATH_ENV, "/env/sidecar.safetensors")
+    with mock.patch.object(cli_module, "load_mtp_file", return_value=sentinel) as load_file:
+        actual = cli_module.load_cli_mtp("repo", {}, object(), "raw-repo", 4)
+    assert actual is sentinel
+    assert load_file.call_args[0][0] == "/env/sidecar.safetensors"
+
+
+def test_load_cli_mtp_explicit_path_kwarg_wins_over_env_var(monkeypatch):
+    sentinel = object()
+    monkeypatch.setenv(cli_module.MTP_PATH_ENV, "/env/sidecar.safetensors")
+    with mock.patch.object(cli_module, "load_mtp_file", return_value=sentinel) as load_file:
+        actual = cli_module.load_cli_mtp(
+            "repo", {}, object(), "raw-repo", 4, mtp_path="/explicit/sidecar.safetensors"
+        )
+    assert actual is sentinel
+    assert load_file.call_args[0][0] == "/explicit/sidecar.safetensors"
+
+
+def test_load_cli_mtp_unreadable_sidecar_disables_mtp_without_fallback(capsys):
+    with (
+        mock.patch.object(
+            cli_module, "load_mtp_file", side_effect=ValueError("bad tensor names")
+        ),
+        mock.patch.object(cli_module, "load_quantized_mtp") as load_bundled,
+        mock.patch.object(cli_module, "find_snapshot") as find_original,
+    ):
+        actual = cli_module.load_cli_mtp(
+            "repo",
+            {"fastmlx_mtp": True},
+            object(),
+            "raw-repo",
+            4,
+            mtp_path="/bad/sidecar.safetensors",
+        )
+    assert actual is None
+    load_bundled.assert_not_called()
+    find_original.assert_not_called()
+    out = capsys.readouterr().out
+    assert "/bad/sidecar.safetensors" in out
+    assert "ValueError" in out
+
+
+def test_load_cli_mtp_no_mtp_flag_wins_even_with_explicit_path(monkeypatch):
+    monkeypatch.setenv(cli_module.MTP_PATH_ENV, "/env/sidecar.safetensors")
+    with mock.patch.object(cli_module, "load_mtp_file") as load_file:
+        actual = cli_module.load_cli_mtp(
+            "repo", {}, object(), "raw-repo", 4, no_mtp=True, mtp_path="/explicit/path"
+        )
+    assert actual is None
+    load_file.assert_not_called()
+
+
+def test_load_cli_mtp_nonexistent_path_does_not_touch_search_paths(capsys):
+    # 実在しないパスは load_mtp_file 内部で例外になる (FileNotFoundError 系) —
+    # ここではモックせず、本物の mx.load に読みに行かせて失敗させる。5.2GB の
+    # 実サイドカーには一切アクセスしない。
+    with (
+        mock.patch.object(cli_module, "load_quantized_mtp") as load_bundled,
+        mock.patch.object(cli_module, "find_snapshot") as find_original,
+    ):
+        actual = cli_module.load_cli_mtp(
+            "repo",
+            {},
+            object(),
+            "raw-repo",
+            4,
+            mtp_path="/no/such/sidecar.safetensors",
+        )
+    assert actual is None
+    load_bundled.assert_not_called()
+    find_original.assert_not_called()
+    assert "/no/such/sidecar.safetensors" in capsys.readouterr().out
+
+
+def test_server_module_shares_mtp_path_env_var_with_cli():
+    assert server.MTP_PATH_ENV == cli_module.MTP_PATH_ENV == "FASTMLX_MTP_PATH"

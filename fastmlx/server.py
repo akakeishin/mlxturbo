@@ -83,10 +83,12 @@ import itertools
 import json
 import os
 import queue
+import secrets
 import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from importlib import metadata as _importlib_metadata
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -96,10 +98,111 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ._mlx_compat import mlx_lm_load
+from .cli import MTP_PATH_ENV
 from .runner import FallbackSession, Runner, build_runner
 from .spec import PREFILL_STEP_SIZE, ChatSession, restore_untrimmable_caches
 
 app = FastAPI()
+
+
+def _fastmlx_version() -> str:
+    """配布物としてのバージョン。pyproject.toml の ``[project] version`` を
+    (パッケージがインストールされた環境なら) ``importlib.metadata`` 経由で
+    そのまま返す — 別ファイルに二重管理しない。未インストール実行 (稀) は
+    フォールバックする。"""
+
+    try:
+        return _importlib_metadata.version("fastmlx")
+    except _importlib_metadata.PackageNotFoundError:
+        return "0.0.0-unknown"
+
+
+_FASTMLX_VERSION = _fastmlx_version()
+
+# --api-key / graceful shutdown が素通しする経路。監視・疎通用なので、鍵が
+# 立っていても・shutdown 中でも常に 200 を返す (main() docstring 相当の方針)。
+_UNGATED_PATHS = frozenset({"/health", "/api/hello"})
+
+# main() が SIGTERM/SIGINT の1回目で立てる。ゲートミドルウェアがこれを見て
+# 新規リクエストを 503 で断る (uvicorn 自身の graceful shutdown が処理中の
+# リクエストの完了を待つのとは別に、ASGI 層でも新規受付を止める必要がある —
+# 既存の keep-alive 接続に乗って来たリクエストは uvicorn がソケットを閉じる
+# だけでは弾けないため)。
+_SHUTTING_DOWN = False
+
+
+def _protocol_for_path(path: str) -> str:
+    return "anthropic" if path == "/v1/messages" else "openai"
+
+
+def _busy_response(protocol: str, message: str) -> JSONResponse:
+    """503 (queue 上限 / graceful shutdown 中の新規リクエスト) をプロトコル
+    別の形で返す。クライアントがリトライを試せるよう Retry-After を付ける。"""
+
+    if protocol == "anthropic":
+        resp = _anthropic_error(message, status=503, err_type="overloaded_error")
+    else:
+        resp = _openai_error(message, status=503, err_type="server_error", code="server_busy")
+    resp.headers["Retry-After"] = "1"
+    return resp
+
+
+def _extract_api_key(request: Request) -> str | None:
+    """``Authorization: Bearer <key>`` と ``x-api-key: <key>`` の両方を、
+    どちらの経路 (OpenAI 系/Anthropic 系) でも受け付ける (クライアント実装の
+    揺れがあるため — server.py 冒頭の方針どおり)。"""
+
+    auth = request.headers.get("authorization")
+    if auth and auth.lower().startswith("bearer "):
+        token = auth[len("bearer ") :].strip()
+        if token:
+            return token
+    x_api_key = request.headers.get("x-api-key")
+    if x_api_key:
+        return x_api_key
+    return None
+
+
+def _unauthorized_response(protocol: str) -> JSONResponse:
+    if protocol == "anthropic":
+        return _anthropic_error(
+            "invalid x-api-key", status=401, err_type="authentication_error"
+        )
+    return _openai_error(
+        "Incorrect API key provided.",
+        status=401,
+        err_type="invalid_request_error",
+        code="invalid_api_key",
+    )
+
+
+@app.middleware("http")
+async def _gate_requests(request: Request, call_next):
+    """認証 (``--api-key``) と graceful shutdown 中の新規リクエスト拒否を、
+    ``/health``・``/api/hello`` を除く全経路の入り口でまとめて行う。
+
+    どちらも各エンドポイント内の個別バリデーション (400 系) より手前、
+    リクエストを受け付けるかどうかの最初の関門として効く。認証キーは
+    ``STATE.api_keys`` (未起動時は空扱い = 認証なし、既定の挙動を変えない)。
+    """
+
+    if request.url.path in _UNGATED_PATHS:
+        return await call_next(request)
+
+    protocol = _protocol_for_path(request.url.path)
+
+    if _SHUTTING_DOWN:
+        return _busy_response(protocol, "server is shutting down")
+
+    api_keys = STATE.api_keys if STATE is not None else frozenset()
+    if api_keys:
+        supplied = _extract_api_key(request)
+        if supplied is None or not any(
+            secrets.compare_digest(supplied, k) for k in api_keys
+        ):
+            return _unauthorized_response(protocol)
+
+    return await call_next(request)
 
 
 def _add_cors_middleware(fastapi_app: FastAPI, allowed_origins: list[str]) -> None:
@@ -152,6 +255,16 @@ class ModelState:
     # 弾かれてしまう場合に --model-alias を起動時に (複数回) 指定して明示的に
     # 許可するための集合。既定は空 = 既存の挙動のまま何も変わらない。
     model_aliases: frozenset[str] = frozenset()
+    # --api-key (複数可)。空集合 (既定) = 認証なし、ローカル専用の従来挙動の
+    # まま。_gate_requests がこれを見て Authorization: Bearer / x-api-key の
+    # どちらか一致すれば通す (secrets.compare_digest で比較)。
+    api_keys: frozenset[str] = frozenset()
+    # 直列化ロックの待ち行列の上限 (--max-queue、既定 8)。queue_depth が
+    # これに達したリクエストは 503 (Retry-After 付き) で断る
+    # (_try_reserve_queue_slot/_release_queue_slot 参照)。
+    max_queue: int = 8
+    queue_depth: int = 0
+    version: str = ""
 
 
 STATE: ModelState | None = None
@@ -434,6 +547,78 @@ def _select_session(prompt_ids: list[int]):
     session = STATE.session_factory()
     pool[key] = session
     return session
+
+
+def _try_reserve_queue_slot() -> bool:
+    """``STATE.lock`` を使う (=生成を伴う) 4 経路が、実際に待ち行列へ並ぶ
+    前に呼ぶ。``STATE.queue_depth`` は「ロック待ち + 現在処理中」の合計
+    (直列化ロックの容量が 1 なので、単純にこの数だけで待ち行列の深さを
+    表せる)。上限 (``--max-queue``、既定 8) に達していれば枠を確保せず
+    False を返す (呼び出し側は 503 を返す)。
+
+    非ストリーミングはエンドポイント関数自身の finally で、ストリーミングは
+    生成側 (``_openai_stream`` 等) の finally で ``_release_queue_slot`` を
+    呼んで対にする — ストリーミングは StreamingResponse を組み立てる前
+    (この関数の直後) で確保するが、解放は実際に生成が終わる/切断される
+    ジェネレータ側でしか検知できないため。
+    """
+
+    if STATE.queue_depth >= STATE.max_queue:
+        return False
+    STATE.queue_depth += 1
+    return True
+
+
+def _release_queue_slot() -> None:
+    STATE.queue_depth = max(0, STATE.queue_depth - 1)
+
+
+_SSE_KEEPALIVE_INTERVAL = 15.0
+_SSE_KEEPALIVE_LINE = ": keepalive\n\n"
+
+
+async def _await_with_keepalive(coro, interval: float = _SSE_KEEPALIVE_INTERVAL):
+    """``coro`` の完了を待つ間、``interval`` 秒おきに SSE keepalive コメント行
+    (``("keepalive", line)``) を yield し、完了したら最後に
+    ``("result", 戻り値)`` を yield して終わる async generator。
+
+    実クライアント (プレフィル支配のワークロード、実測: Claude Code の 97k
+    トークンで約 3 分) が最初のトークンが出るまでの間コネクションをタイム
+    アウトで切るのを防ぐ (server.py 冒頭の docstring 参照)。SSE のコメント行
+    (``:`` で始まる行) は仕様上クライアントに無視されるため、ストリーミング
+    中のどこに混ざっても安全。
+
+    呼び出し側 (StreamingResponse を返すジェネレータ) が ``aclose()`` される
+    (クライアント切断) と ``GeneratorExit`` がここへ届く。``CancelledError``
+    と合わせて ``BaseException`` で受けて ``task`` を確実にキャンセルしてから
+    再送出する — 握り潰したまま放置すると ``task`` (ロック取得や
+    ``queue.Queue.get`` の待ち) が孤児のまま残る。
+    """
+
+    task = asyncio.ensure_future(coro)
+    try:
+        while True:
+            done, _pending = await asyncio.wait({task}, timeout=interval)
+            if task in done:
+                break
+            yield ("keepalive", _SSE_KEEPALIVE_LINE)
+    except BaseException:
+        if not task.done():
+            task.cancel()
+        raise
+    yield ("result", task.result())
+
+
+def _requeue_front(q: "queue.Queue", item) -> None:
+    """keepalive 待ちのために ``q.get()`` で覗き見た最初の1件を、順序を
+    保ったまま ``q`` の先頭へ戻す小細工。既存の ``while True: kind, payload =
+    await asyncio.to_thread(q.get)`` ループ本体を一切変更せず、次の
+    ``q.get()`` で同じ要素をもう一度取れるようにする。``worker()`` スレッドは
+    ``q.put`` でしか触らないので、消費側だけのこの操作に ``q.mutex`` を
+    取れば競合しない。"""
+
+    with q.mutex:
+        q.queue.appendleft(item)
 
 
 # ---------- 入力の正規化・検証 ----------
@@ -2119,6 +2304,7 @@ async def list_models():
                 "owned_by": "fastmlx",
             }
         ],
+        "version": STATE.version,
     }
 
 
@@ -2126,13 +2312,15 @@ async def list_models():
 async def health():
     """mlx_lm の /health (``{"status": "ok"}`` だけ) より詳しく返す: モデル名・
     ロード済みかどうか・どちらの runner (投機 or 通常生成) か・リクエストを
-    処理中かどうか。処理中かどうかは ``STATE.lock.locked()`` を見るだけ
-    (直列化の設計上、ロックが空いていれば idle、取られていれば busy と等価)。
+    処理中かどうか・待ち行列の深さ・バージョン。処理中かどうかは
+    ``STATE.lock.locked()`` を見るだけ (直列化の設計上、ロックが空いていれば
+    idle、取られていれば busy と等価)。
     """
 
     if STATE is None:
         return JSONResponse(
-            status_code=503, content={"status": "loading", "loaded": False}
+            status_code=503,
+            content={"status": "loading", "loaded": False, "version": _FASTMLX_VERSION},
         )
     return {
         "status": "ok",
@@ -2140,6 +2328,8 @@ async def health():
         "loaded": True,
         "runner": getattr(STATE.runner, "KIND", type(STATE.runner).__name__),
         "busy": STATE.lock.locked(),
+        "queue_depth": STATE.queue_depth,
+        "version": STATE.version,
     }
 
 
@@ -2218,9 +2408,15 @@ async def chat_completions(request: Request):
     req_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
+    if not _try_reserve_queue_slot():
+        return _busy_response("openai", "server is busy: too many queued requests")
+
     if stream:
         stream_options = body.get("stream_options") or {}
         include_usage = bool(stream_options.get("include_usage", False))
+        # _openai_stream 側 (finally) がこのリクエストぶんのキュー枠を解放
+        # する — StreamingResponse は生成器を最後まで読み切る/aclose する
+        # ことが保証されているため、ここでの解放は不要 (むしろ二重解放になる)。
         return StreamingResponse(
             _openai_stream(
                 prompt_ids,
@@ -2253,6 +2449,8 @@ async def chat_completions(request: Request):
             )
     except Exception as exc:
         return _openai_error(str(exc), status=500, err_type="server_error")
+    finally:
+        _release_queue_slot()
     _log_gen_stats(res)
 
     reasoning_text, content_text, tool_calls, budget_exceeded = _split_response_final(
@@ -2335,7 +2533,19 @@ async def _openai_stream(
         first["usage"] = None
     yield f"data: {json.dumps(first)}\n\n"
 
-    async with STATE.lock:
+    # ロック待ちの間も keepalive を流す (queue が詰まっていると、ここが実質
+    # 「最初のトークンが出るまで」の大半を占めることがある)。まだロックを
+    # 獲得していない時点で切断/例外になった場合はここでキュー枠を解放して
+    # 抜ける — 以降のロック確保後の finally とは別に処理する必要がある。
+    try:
+        async for _ka_kind, _ka_val in _await_with_keepalive(STATE.lock.acquire()):
+            if _ka_kind == "keepalive":
+                yield _ka_val
+    except BaseException:
+        _release_queue_slot()
+        raise
+
+    try:
         session = _select_session(prompt_ids)
         q, future = _start_generation(
             prompt_ids,
@@ -2348,6 +2558,18 @@ async def _openai_stream(
             **(sampling_params or {}),
         )
         try:
+            # 生成開始 (ワーカー投入) 自体は即座に終わるが、最初のキュー
+            # 要素が届くまで (= プレフィル中) は同様に keepalive を流す。
+            # 覗き見た最初の1件は _requeue_front で q の先頭へ戻し、以下の
+            # while ループを一切変更せず同じ経路でもう一度処理させる。
+            first_item = None
+            async for _ka_kind, _ka_val in _await_with_keepalive(asyncio.to_thread(q.get)):
+                if _ka_kind == "keepalive":
+                    yield _ka_val
+                else:
+                    first_item = _ka_val
+            _requeue_front(q, first_item)
+
             finish_reason = "length"
             n_completion = 0
             cached_tokens = 0
@@ -2510,6 +2732,9 @@ async def _openai_stream(
             # クライアント切断 (GeneratorExit) でここに来た場合も含め、
             # ワーカーが実際に終わるまでロックを離さない。
             await _await_worker(future)
+    finally:
+        STATE.lock.release()
+        _release_queue_slot()
 
 
 # ---------- Anthropic 互換 ----------
@@ -2622,7 +2847,12 @@ async def anthropic_messages(request: Request):
             "usage": {"input_tokens": len(prompt_ids), "output_tokens": 0},
         }
 
+    if not _try_reserve_queue_slot():
+        return _busy_response("anthropic", "server is busy: too many queued requests")
+
     if stream:
+        # _anthropic_stream 側 (finally) がこのリクエストぶんのキュー枠を
+        # 解放する (openai 経路の chat_completions と同じ理由)。
         return StreamingResponse(
             _anthropic_stream(
                 prompt_ids,
@@ -2653,6 +2883,8 @@ async def anthropic_messages(request: Request):
             )
     except Exception as exc:
         return _anthropic_error(str(exc), status=500, err_type="server_error")
+    finally:
+        _release_queue_slot()
     _log_gen_stats(res)
 
     events, budget_exceeded = _collect_events(
@@ -2743,7 +2975,15 @@ async def _anthropic_stream(
     )
     yield sse("ping", {"type": "ping"})
 
-    async with STATE.lock:
+    try:
+        async for _ka_kind, _ka_val in _await_with_keepalive(STATE.lock.acquire()):
+            if _ka_kind == "keepalive":
+                yield _ka_val
+    except BaseException:
+        _release_queue_slot()
+        raise
+
+    try:
         session = _select_session(prompt_ids)
         q, future = _start_generation(
             prompt_ids,
@@ -2756,6 +2996,14 @@ async def _anthropic_stream(
             **(sampling_params or {}),
         )
         try:
+            first_item = None
+            async for _ka_kind, _ka_val in _await_with_keepalive(asyncio.to_thread(q.get)):
+                if _ka_kind == "keepalive":
+                    yield _ka_val
+                else:
+                    first_item = _ka_val
+            _requeue_front(q, first_item)
+
             # content_block_start は最初のデルタが来てから、その channel
             # (thinking が起きたかどうか) に応じて出す。事前には分からない
             # ため (実 API も、最初のブロックを送る直前に content_block_start
@@ -2941,6 +3189,9 @@ async def _anthropic_stream(
             yield sse("message_stop", {"type": "message_stop"})
         finally:
             await _await_worker(future)
+    finally:
+        STATE.lock.release()
+        _release_queue_slot()
 
 
 # ---------- OpenAI 互換 (legacy /v1/completions) ----------
@@ -3015,9 +3266,14 @@ async def completions(request: Request):
     req_id = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
+    if not _try_reserve_queue_slot():
+        return _busy_response("openai", "server is busy: too many queued requests")
+
     if stream:
         stream_options = body.get("stream_options") or {}
         include_usage = bool(stream_options.get("include_usage", False))
+        # _completions_stream 側 (finally) がこのリクエストぶんのキュー枠を
+        # 解放する (openai chat 経路と同じ理由)。
         return StreamingResponse(
             _completions_stream(
                 prompt_ids,
@@ -3047,6 +3303,8 @@ async def completions(request: Request):
             )
     except Exception as exc:
         return _openai_error(str(exc), status=500, err_type="server_error")
+    finally:
+        _release_queue_slot()
     _log_gen_stats(res)
 
     _reasoning_text, text, _tool_calls, _budget_exceeded = _split_response_final(
@@ -3089,7 +3347,15 @@ async def _completions_stream(
     include_usage,
     sampling_params: dict | None = None,
 ):
-    async with STATE.lock:
+    try:
+        async for _ka_kind, _ka_val in _await_with_keepalive(STATE.lock.acquire()):
+            if _ka_kind == "keepalive":
+                yield _ka_val
+    except BaseException:
+        _release_queue_slot()
+        raise
+
+    try:
         session = _select_session(prompt_ids)
         # thinking_budget=0: ThinkingRouter を content-only に固定する
         # (has_thinking に関わらず) ので reasoning_delta は絶対に来ない。
@@ -3097,6 +3363,14 @@ async def _completions_stream(
             prompt_ids, max_tokens, temp, 0, session=session, **(sampling_params or {})
         )
         try:
+            first_item = None
+            async for _ka_kind, _ka_val in _await_with_keepalive(asyncio.to_thread(q.get)):
+                if _ka_kind == "keepalive":
+                    yield _ka_val
+                else:
+                    first_item = _ka_val
+            _requeue_front(q, first_item)
+
             finish_reason = "length"
             n_completion = 0
             cached_tokens = 0
@@ -3179,6 +3453,9 @@ async def _completions_stream(
             yield "data: [DONE]\n\n"
         finally:
             await _await_worker(future)
+    finally:
+        STATE.lock.release()
+        _release_queue_slot()
 
 
 # ---------- OpenAI 互換 (Responses API, /v1/responses) ----------
@@ -3652,7 +3929,12 @@ async def responses_endpoint(request: Request):
     resp_id = f"resp_{uuid.uuid4().hex}"
     created = int(time.time())
 
+    if not _try_reserve_queue_slot():
+        return _busy_response("openai", "server is busy: too many queued requests")
+
     if stream:
+        # _responses_stream 側 (finally) がこのリクエストぶんのキュー枠を
+        # 解放する (他の openai 経路と同じ理由)。
         return StreamingResponse(
             _responses_stream(
                 prompt_ids,
@@ -3683,6 +3965,8 @@ async def responses_endpoint(request: Request):
             )
     except Exception as exc:
         return _openai_error(str(exc), status=500, err_type="server_error")
+    finally:
+        _release_queue_slot()
     _log_gen_stats(res)
 
     events, budget_exceeded = _collect_events(
@@ -3762,7 +4046,15 @@ async def _responses_stream(
         },
     )
 
-    async with STATE.lock:
+    try:
+        async for _ka_kind, _ka_val in _await_with_keepalive(STATE.lock.acquire()):
+            if _ka_kind == "keepalive":
+                yield _ka_val
+    except BaseException:
+        _release_queue_slot()
+        raise
+
+    try:
         session = _select_session(prompt_ids)
         q, future = _start_generation(
             prompt_ids,
@@ -3775,6 +4067,14 @@ async def _responses_stream(
             **(sampling_params or {}),
         )
         try:
+            first_item = None
+            async for _ka_kind, _ka_val in _await_with_keepalive(asyncio.to_thread(q.get)):
+                if _ka_kind == "keepalive":
+                    yield _ka_val
+                else:
+                    first_item = _ka_val
+            _requeue_front(q, first_item)
+
             output_items: list[dict] = []
             next_index = 0
             current_kind: str | None = None  # None | "reasoning" | "content"
@@ -3998,6 +4298,9 @@ async def _responses_stream(
             )
         finally:
             await _await_worker(future)
+    finally:
+        STATE.lock.release()
+        _release_queue_slot()
 
 
 # ---------- 起動 ----------
@@ -4083,8 +4386,88 @@ def _resolve_default_max_context_tokens(config: dict) -> int | None:
     return min(candidates) if candidates else None
 
 
+def _install_graceful_shutdown(server_obj: "uvicorn.Server") -> None:
+    """SIGTERM/SIGINT の 1 回目: ``_SHUTTING_DOWN`` を立てて (以後の新規
+    リクエストは ``_gate_requests`` が 503 で断る) が、uvicorn 本体の
+    ``should_exit`` はまだ立てない。
+
+    実機で確認した理由: uvicorn の ``Server.shutdown()`` は最初の一手で
+    リスニングソケットを閉じる (``for server in self.servers: server.close()``)。
+    これは ``should_exit`` が立った直後の ``main_loop`` 終了とほぼ同時に走る
+    ため、シグナルの数百ミリ秒後には新規の TCP 接続そのものが
+    「connection refused」になり、ASGI 層 (``_gate_requests``) が 503 を
+    返す機会が無いまま終わる (実測: SIGTERM 送出 0.2 秒後の新規リクエストが
+    HTTP レベルにすら届かず接続失敗になることを確認)。
+
+    そこで ``_drain_and_exit`` (``startup`` をラップして常駐させる監視
+    タスク) が ``STATE.queue_depth`` (処理中の生成リクエスト数) が 0 に
+    なるまでリスナーを開けたまま待ち、その間の新規リクエストは
+    ``_gate_requests`` が実際の 503 レスポンスとして断れるようにする。
+    キューが空になった時点で初めて ``should_exit`` を立て、uvicorn 本体の
+    通常のシャットダウン (リスナーを閉じて残り接続を待つ) に入る。
+
+    2 回目のシグナル (種類は問わない) は ``os._exit`` で即時終了する。
+    uvicorn 自身の ``should_exit``/``force_exit`` 経由の終了は、生成中の
+    ワーカースレッド (``STATE.executor``、既定非 daemon) が MLX の同期
+    生成コードを実行中だと、通常のインタプリタ終了処理がそのスレッドの
+    完了を待ってしまい「即時」にならない (実測で確認: 500 トークン生成の
+    完了を待ってからプロセスが終了した)。"""
+
+    original_startup = server_obj.startup
+    signal_count = {"n": 0}
+
+    def handle_exit(sig, frame):
+        global _SHUTTING_DOWN
+        signal_count["n"] += 1
+        if signal_count["n"] == 1:
+            _SHUTTING_DOWN = True
+            print(
+                "[fastmlx-serve] シグナル受信: graceful shutdown 開始 "
+                "(新規リクエストは 503、処理中のリクエストは完了を待つ)"
+            )
+            # ここでは original_handle_exit を呼ばない (= uvicorn 本体の
+            # should_exit をまだ立てない)。上の docstring 参照 —
+            # _drain_and_exit がキューの空きを見てから立てる。
+        else:
+            # os._exit で OS レベルの即時終了に落とす (理由は docstring 参照)。
+            # ASGI lifespan の shutdown もこの後は一切走らない。
+            print("[fastmlx-serve] 2 度目のシグナルを受信: 即時終了します", flush=True)
+            server_obj.force_exit = True
+            os._exit(1)
+
+    async def startup_with_drain_watcher(sockets=None):
+        await original_startup(sockets=sockets)
+        asyncio.create_task(_drain_and_exit(server_obj))
+
+    server_obj.handle_exit = handle_exit
+    server_obj.startup = startup_with_drain_watcher
+
+
+async def _drain_and_exit(server_obj: "uvicorn.Server") -> None:
+    """``_install_graceful_shutdown`` が起動時に常駐させる監視タスク。
+
+    ``_SHUTTING_DOWN`` が立つ (1 回目のシグナル) まで待ち、そこから
+    ``STATE.queue_depth`` (生成系 4 経路の処理中リクエスト数) が 0 になる
+    まで待ってから、初めて uvicorn 本体の ``should_exit`` を立てる (=
+    リスニングソケットを閉じさせる)。2 回目のシグナル (``force_exit``) が
+    先に来た場合はキューの状態に関わらず即座に抜ける。"""
+
+    while not _SHUTTING_DOWN and not server_obj.force_exit:
+        await asyncio.sleep(0.1)
+    if server_obj.force_exit:
+        return
+    while STATE is not None and STATE.queue_depth > 0 and not server_obj.force_exit:
+        await asyncio.sleep(0.1)
+    server_obj.should_exit = True
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--version",
+        action="version",
+        version=f"fastmlx-serve {_FASTMLX_VERSION}",
+    )
     ap.add_argument("--model", required=True)
     ap.add_argument("--original", default="Qwen/Qwen3.8-27B")
     ap.add_argument(
@@ -4157,6 +4540,36 @@ def main() -> None:
         " (未指定) では従来どおりサーブ中の名前と厳密一致しないと 404 の"
         " まま — 黙って何でも受け付ける形にはしない",
     )
+    ap.add_argument(
+        "--api-key",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="このサーバーを叩ける API キー (繰り返し指定可)。OpenAI 系"
+        " (/v1/chat/completions, /v1/completions, /v1/responses, /v1/models)"
+        " は Authorization: Bearer <key>、Anthropic 系 (/v1/messages) は"
+        " x-api-key: <key> で送る (どちらのヘッダもどちらの経路でも受け付ける)。"
+        " 既定 (未指定) では認証なし — ローカル専用の従来挙動のまま変えない。"
+        " /health と /api/hello は鍵の有無に関わらず常に認証なしで通す",
+    )
+    ap.add_argument(
+        "--max-queue",
+        type=int,
+        default=8,
+        help="直列化ロックの待ち行列の上限 (既定 8)。生成系 4 経路 (chat/"
+        "completions/messages/responses) でこれに達したリクエストは"
+        " 503 (Retry-After 付き) で断る。/health の queue_depth で現在値を見れる",
+    )
+    ap.add_argument(
+        "--mtp",
+        default=None,
+        metavar="PATH",
+        help="MTP (multi-token prediction) ヘッドを単一 safetensors サイドカー"
+        " から読み込む場合のパス。指定すると --original の生チェックポイント"
+        " からの探索やバンドル済みアーティファクトより優先する。テンソル名"
+        " などの形式が既存のロード処理と合わなければ、無理に合わせず読めない"
+        " 旨をログに出して MTP 無しで起動する (重み欠損時と同じ姿勢)",
+    )
     args = ap.parse_args()
 
     global STATE
@@ -4178,6 +4591,12 @@ def main() -> None:
             # ので、読み込み呼び出しより前に立てておく必要がある (cli.py と
             # 同じ理由)。
             os.environ["FASTMLX_NGRAM_DISK"] = "1"
+        if args.mtp:
+            # build_runner (fastmlx/runner.py) は load_cli_mtp を固定の位置
+            # 引数だけで呼ぶため、--mtp のパスを直接渡す口が無い。cli.py の
+            # load_cli_mtp がこの環境変数を読む (MTP_PATH_ENV 参照) — --ngram
+            # と同じ、呼び出し元を編集せずに配線する手筋。
+            os.environ[MTP_PATH_ENV] = args.mtp
         model, tokenizer, config = mlx_lm_load(args.model, return_config=True)
         if args.ngram:
             from .ngram_stream import install
@@ -4231,11 +4650,20 @@ def main() -> None:
         max_sessions=args.max_sessions,
         max_context_tokens=max_context_tokens,
         model_aliases=frozenset(args.model_alias),
+        api_keys=frozenset(args.api_key),
+        max_queue=args.max_queue,
+        version=_FASTMLX_VERSION,
     )
+    print(f"[fastmlx-serve] version {_FASTMLX_VERSION}")
     print(
         f"[fastmlx-serve] served model name: {served_name} "
         f"(session pool: {session_factory.__name__}, max {args.max_sessions} 会話)"
     )
+    print(f"[fastmlx-serve] 待ち行列の上限 (--max-queue): {args.max_queue}")
+    if args.api_key:
+        print(f"[fastmlx-serve] API キー認証: 有効 ({len(args.api_key)} 件)")
+    else:
+        print("[fastmlx-serve] API キー認証: 無効 (既定、--api-key 未指定)")
     if args.model_alias:
         print(f"[fastmlx-serve] model alias (404 を回避): {', '.join(args.model_alias)}")
     if getattr(tokenizer, "has_thinking", False):
@@ -4265,7 +4693,10 @@ def main() -> None:
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    config = uvicorn.Config(app, host=args.host, port=args.port)
+    server_obj = uvicorn.Server(config)
+    _install_graceful_shutdown(server_obj)
+    server_obj.run()
 
 
 if __name__ == "__main__":
