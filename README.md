@@ -43,7 +43,7 @@ uv sync
 ## モデルの入手
 
 - `fallback` / `spec` 経路: 通常の mlx-lm 互換チェックポイント（Hugging Face repo ID かローカルパス）をそのまま指定できる
-- `flash_spec` 経路（Qwen3.8-Flash-Next）: 元 checkpoint からの変換とMTP抽出が要る。手順は [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) と `mlxturbo/convert_flash.py --help`（`install-arch` / `estimate` / `extract-mtp` / `convert` の各サブコマンド）を参照
+- `flash_spec` 経路（Qwen3.8-Flash-Next）: 元 checkpoint からの変換とMTP抽出が要る。手順は [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) と `mlxturbo/convert_flash.py --help`（`estimate` / `extract-mtp` / `convert` の各サブコマンド）を参照。`qwen4_exp` アーキテクチャは mlx-lm 本体に無いが、`mlxturbo` を import した時点で自動的に解決される（利用者の mlx-lm パッケージへは何も書き込まない）
 
 ## 起動
 

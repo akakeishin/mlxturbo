@@ -5,15 +5,19 @@ Phase Q (docs/STATUS.md)。bf16 アーカイブ (外付け SSD) から、128GB M
 バイト予算表 (STATUS の Phase Q 節) と、後続の感度スキャンで更新する。
 
 サブコマンド:
-  install-arch  vendored qwen4_exp.py を site-packages の mlx_lm へ配置
   estimate      重みを読まずにレシピ適用後のサイズを見積もる (ヘッダのみ)
   extract-mtp   mtp.* テンソルをサイドカー safetensors へ抽出 (bf16 のまま。
                 量子化はエンジン読込時の --mtp-bits に任せる、27B と同じ規約)
   convert       mlx_lm.convert + クラス別 quant_predicate で本体を変換
   build-ngram   n-gram 表を量子化してサイドカーへ出す (ディスク運用向け)
 
+qwen4_exp のモデルクラスは `mlxturbo` を import した時点で
+(`mlxturbo._arch_registry`) 自動的に解決できるようになる。以前あった
+`install-arch` サブコマンド (vendored qwen4_exp.py を利用者の site-packages
+へ物理コピーする) は撤廃した — 利用者の mlx_lm パッケージを書き換える副作用
+があったため。詳細は _arch_registry.py のモジュール docstring を参照。
+
 使い方 (例):
-  uv run python -m mlxturbo.convert_flash install-arch
   uv run python -m mlxturbo.convert_flash estimate --recipe v0-95
   uv run python -m mlxturbo.convert_flash extract-mtp \
       --src "/Volumes/Mobile SSD/models/Qwen3.8-Flash-Next" \
@@ -27,12 +31,8 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import struct
 from pathlib import Path
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-VENDOR_ARCH = REPO_ROOT / "tools" / "vendor" / "qwen4_exp.py"
 
 # ---------------------------------------------------------------------------
 # レシピ
@@ -353,17 +353,6 @@ def cmd_estimate(args):
     print(f"{'TOTAL':10s} {sum(totals.values()) / 1e9:8.1f} GB")
 
 
-def cmd_install_arch(args):
-    import mlx_lm.models as models_pkg
-
-    dest = Path(models_pkg.__file__).parent / "qwen4_exp.py"
-    if dest.exists() and not args.force:
-        print(f"already installed: {dest} (--force で上書き)")
-        return
-    shutil.copyfile(VENDOR_ARCH, dest)
-    print(f"installed: {dest}")
-
-
 def cmd_extract_mtp(args):
     import mlx.core as mx
 
@@ -407,10 +396,11 @@ def cmd_convert(args):
         # シャード 2 の保存で再現)。CPU には同じ監視が無い
         mx.set_default_device(mx.cpu)
 
-    # vendor 側を編集したまま古いコピーが site-packages に残ると、旗も
-    # 修正も効かないまま焼き上がる (n-gram が落ちず 169GB まで膨らんだ)。
-    # vendor が正本なので毎回上書きする
-    cmd_install_arch(argparse.Namespace(force=True))
+    # qwen4_exp のクラス解決は mlxturbo._arch_registry が sys.meta_path 経由で
+    # 常に vendor (tools/vendor/qwen4_exp.py) を直接読む。site-packages への
+    # コピーが無いのでコピーの取り違え (旧 install-arch 時代に踏んだ、古い
+    # コピーが残って FASTMLX_NGRAM_DISK が効かないまま 169GB に膨らんだ事故)
+    # はそもそも起きない
     convert(
         hf_path=args.src,
         mlx_path=args.out,
@@ -443,10 +433,6 @@ def cmd_build_ngram(args):
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-
-    p = sub.add_parser("install-arch")
-    p.add_argument("--force", action="store_true")
-    p.set_defaults(fn=cmd_install_arch)
 
     p = sub.add_parser("estimate")
     p.add_argument("--recipe", choices=sorted(RECIPES), required=True)

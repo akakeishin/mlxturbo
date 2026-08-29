@@ -43,7 +43,7 @@ uv sync
 ## Getting a model
 
 - `fallback` / `spec` routes: point directly at a normal mlx-lm-compatible checkpoint (a Hugging Face repo ID or a local path)
-- `flash_spec` route (Qwen3.8-Flash-Next): requires converting from the original checkpoint and extracting MTP. See [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) and `mlxturbo/convert_flash.py --help` (subcommands `install-arch` / `estimate` / `extract-mtp` / `convert`)
+- `flash_spec` route (Qwen3.8-Flash-Next): requires converting from the original checkpoint and extracting MTP. See [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) and `mlxturbo/convert_flash.py --help` (subcommands `estimate` / `extract-mtp` / `convert`). The `qwen4_exp` architecture isn't in mlx-lm upstream, but importing `mlxturbo` resolves it automatically — nothing is written to your mlx-lm package
 
 ## Running it
 

@@ -317,6 +317,43 @@ class FallbackSession:
         self.checkpoints = checkpoints if checkpoints is not None else []
 
 
+def _logprob_entry(resp, tokenizer, top_n: int) -> dict:
+    """mlx_lm の ``GenerationResponse`` 1 個分を、OpenAI 形の logprobs
+    レコードへ変換する (Kimi K3 レビュー項目 17、``FallbackRunner.generate``
+    専用)。
+
+    ``resp.logprobs`` は ``mlx_lm.generate.generate_step``/
+    ``speculative_generate_step`` がサンプリングの直前に計算する、その
+    デコードステップの語彙全体に対する log_softmax ベクトル
+    (``logits - logsumexp(logits)``、mlx_lm/generate.py 420/549 行目参照)。
+    実際にサンプルされたトークンの logprob も、top-N の代替候補も、この
+    同じベクトルから読むだけで済む — 追加の forward は要らない。
+    """
+
+    token_logprob = float(resp.logprobs[resp.token])
+    entry = {
+        "token": tokenizer.decode([resp.token]),
+        "logprob": token_logprob,
+        "token_id": resp.token,
+    }
+    top_n = max(top_n, 0)
+    if top_n > 0:
+        vocab = resp.logprobs.shape[-1]
+        k = min(top_n, vocab)
+        top_idx = mx.argsort(resp.logprobs)[::-1][:k].tolist()
+        entry["top_logprobs"] = [
+            {
+                "token": tokenizer.decode([idx]),
+                "logprob": float(resp.logprobs[idx]),
+                "token_id": idx,
+            }
+            for idx in top_idx
+        ]
+    else:
+        entry["top_logprobs"] = []
+    return entry
+
+
 class FallbackRunner:
     """SpecEngine が受け付けないモデル向けの普通の (非投機) 生成経路。
 
@@ -333,6 +370,20 @@ class FallbackRunner:
 
     ``SUPPORTED_SAMPLING_PARAMS``: 投機の分布保証を気にする必要が無い経路
     なので、mlx_lm.sample_utils がサポートするものは全部そのまま素通しする。
+
+    ``logprobs``/``top_logprobs`` (Kimi K3 レビュー項目 17): 要求されたとき
+    だけ (``logprobs=True``) 収集する — 常に集めるとメモリと速度に響くため、
+    既定は収集しない (``logprobs=False``、結果 dict に ``"logprobs"`` キー
+    自体が現れない)。収集する場合、``res["logprobs"]`` は生成トークン列
+    ``res["tokens"]`` と 1:1 対応する ``list[dict]`` (各要素は
+    ``_logprob_entry`` 参照)。これは ``SUPPORTED_SAMPLING_PARAMS`` の恒等値
+    判定の対象ではない — server.py 側は ``_resolve_runner_for_request`` の
+    別枠の ``logprobs_requested`` 引数でルーティングを決める (投機経路で
+    logprobs が要求されたら、この runner へ降格させる — SpecRunner/
+    FlashSpecRunner/DraftSpecRunner の投機は分布保証の数式が top_p 等と同じ
+    理由でロジット処理を前提にしていない/していても閉形式が別なため、
+    生成後に「これが本当にサンプルされた分布の logprob だ」と言い切れる
+    のはこの非投機経路だけ)。
 
     ``fallback_reason``: build_runner がこの runner を選んだ理由 (str)。
     build_runner が直接構築する場合のみ渡される — 単体テストが
@@ -375,6 +426,8 @@ class FallbackRunner:
         frequency_penalty: float | None = None,
         logit_bias: dict | None = None,
         seed: int | None = None,
+        logprobs: bool = False,
+        top_logprobs: int = 0,
         **extra,
     ):
         from mlx_lm.generate import stream_generate
@@ -423,6 +476,11 @@ class FallbackRunner:
         remaining_prompt = prompt_ids[reused:]
 
         tokens: list[int] = []
+        # 要求されたときだけ集める (項目 17、このクラスの docstring 参照) —
+        # None のままなら以下で一度も append されず、戻り値の dict に
+        # "logprobs" キー自体が現れない (常に集めてメモリと速度に響かせない
+        # ため)。
+        collected_logprobs: list[dict] | None = [] if logprobs else None
         t0 = time.perf_counter()
         ttft = None
         stream_kwargs = {}
@@ -451,6 +509,8 @@ class FallbackRunner:
             if ttft is None:
                 ttft = time.perf_counter() - t0
             tokens.append(resp.token)
+            if collected_logprobs is not None:
+                collected_logprobs.append(_logprob_entry(resp, self.tokenizer, top_logprobs))
             if on_tokens:
                 # stream_generate already ran this token through its own
                 # internal detokenizer to produce resp.text (correctly
@@ -467,7 +527,7 @@ class FallbackRunner:
             # cache へ feed してから出す (EOS で早期終了しても同様) ので、
             # tokens はそのまま prompt_cache へ feed 済みの生成列と一致する。
             session.publish(prompt_cache, list(prompt_ids) + tokens)
-        return {
+        result = {
             "tokens": tokens,
             "ttft_s": ttft or 0.0,
             "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
@@ -476,6 +536,151 @@ class FallbackRunner:
             # 投機なしなので 1 ステップ = 1 トークン固定。cli.py の表示行が
             # どちらの経路でも同じ res.keys() を仮定できるよう埋めておく。
             "tokens_per_step": 1.0,
+        }
+        if collected_logprobs is not None:
+            result["logprobs"] = collected_logprobs
+        return result
+
+
+class DraftSpecRunner:
+    """mlx_lm 自身の draft-model 投機デコード (``mlx_lm.generate.
+    speculative_generate_step``、``stream_generate(..., draft_model=...)``)
+    をそのまま使う、アーキテクチャ非依存の投機経路 (Kimi K3 レビュー項目 13)。
+
+    ``mlxturbo.spec.SpecEngine``/``mlxturbo.spec_flash.FlashSpecEngine`` は
+    どちらも特定のモデル形状 (GDN ハイブリッドの qwen3_5/qwen4_exp、
+    ``validate_spec_model_contract`` が検査する層構成) に強く依存した専用
+    実装で、Llama/Gemma/Mistral/Mixtral のような素の dense transformer には
+    一切効かない (このモジュール冒頭の docstring 参照)。mlx_lm はそれとは
+    独立に、「小さいドラフトモデルで提案し、本命モデルで検証する」classical
+    な投機デコードを ``draft_model`` 引数として既に持っている
+    (``mlx_lm/generate.py`` の ``speculative_generate_step``) —
+    アーキテクチャを一切見ないので、対応表を作らずに任意の HF/MLX 変換済み
+    モデルへ投機を届けられる。自前でカーネルや検証ロジックを書く必要がなく、
+    upstream の実装をそのまま使う。
+
+    ``SUPPORTED_SAMPLING_PARAMS``: ``FallbackRunner`` と同じ全キー
+    (top_p/top_k/min_p/repetition_penalty/presence_penalty/
+    frequency_penalty/logit_bias/seed) を宣言する。``SpecRunner``/
+    ``FlashSpecRunner`` が top_p 等を弾く理由 (投機側が「生の
+    softmax(logits/temp) が検証対象分布」という前提の上で閉形式の受理長を
+    自前導出しているため、ロジット処理を挟むとその前提が壊れる) はここには
+    存在しない。``speculative_generate_step`` (mlx_lm/generate.py 473 行目〜)
+    を読むと、``sampler``/``logits_processors`` はドラフト側の
+    ``_step(draft_model, draft_cache, y)`` と検証側の ``_step(model,
+    model_cache, y, num_draft_tokens + 1)`` の両方に同一のクロージャで通り、
+    受理判定は「検証側が (同じ sampler で) その時点の真の接頭辞に対して
+    実際に独立サンプルした結果が、たまたまドラフト側の値と一致するか」だけ
+    を見る (626 行目 ``if tn != dtn: break``)。一致すればドラフト値がそのまま
+    emit されるが、それは検証側が独立に出したサンプルと同値なので target
+    分布からのサンプルそのものであり、不一致ならその場で検証側がサンプルした
+    ``tokens[n]`` を emit する (634 行目) — つまりどちらの分岐でも emit
+    されるトークンは「検証モデルの、その時点の真の接頭辞に対する sampler
+    適用後の 1 サンプル」であり続ける。ドラフトが当たった/外れたに関わらず
+    target 分布から生成し続けるので、top_p/top_k/repetition_penalty 等で
+    ロジットを変形しても分布保証は壊れない (SpecRunner/FlashSpecRunner の
+    ような閉形式の受理長導出には依存していない)。``repetition_penalty``/
+    ``presence_penalty``/``frequency_penalty`` が必要とする「これまでの
+    生成列」の状態 (``prev_tokens``) も、ドラフト段階で先食いした分を検証
+    直前に trim して二重カウントを避ける処理がライブラリ側に既にある
+    (616 行目 ``prev_tokens = prev_tokens[: ...]``)。
+
+    以上はすべて mlx_lm 側の実装 (このタスクでは書いていない、読んだだけ) の
+    挙動読解に基づく判断であり、この読解自体をこのタスクで実証してはいない —
+    実機で確認したのは「壊れた出力にならないこと」(貪欲一致、self-draft
+    構成) までで、非貪欲サンプリングの厳密な分布一致は実測していない
+    (docs/ 配下は今回の変更範囲外なので、この判断根拠はここに書く)。
+
+    session (会話ごとの prompt cache 再利用) は当面やらない: draft/target で
+    2 本の KV cache を一体で持ち運ぶ必要があり、``FallbackSession``
+    (``.cache`` 単数形) の契約に合わない。session が渡されても無視し、毎回
+    両モデルとも全量プレフィルする — 遅くはなるが誤動作はしない。
+    """
+
+    KIND = "draft_spec"
+    SUPPORTED_SAMPLING_PARAMS = FallbackRunner.SUPPORTED_SAMPLING_PARAMS
+
+    def __init__(self, model, draft_model, tokenizer, num_draft_tokens: int):
+        self.model = model
+        self.draft_model = draft_model
+        self.tokenizer = tokenizer
+        self.num_draft_tokens = num_draft_tokens
+        self.fallback_reason = None
+
+    def generate(
+        self,
+        prompt_ids,
+        max_tokens,
+        temp,
+        eos_ids,
+        on_tokens,
+        session,
+        top_p: float = 0.0,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        repetition_penalty: float | None = None,
+        presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
+        logit_bias: dict | None = None,
+        seed: int | None = None,
+        **extra,
+    ):
+        from mlx_lm.generate import stream_generate
+        from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+        if seed is not None:
+            mx.random.seed(seed)
+
+        sampler = make_sampler(temp=temp, top_p=top_p, min_p=min_p, top_k=top_k)
+        logits_processors = make_logits_processors(
+            logit_bias=logit_bias,
+            repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+        )
+
+        tokens: list[int] = []
+        t0 = time.perf_counter()
+        ttft = None
+        n_from_draft = 0
+        # stream_generate yields exactly one GenerationResponse per generated
+        # token (FallbackRunner.generate と同じ前提、その docstring 参照)。
+        for resp in stream_generate(
+            self.model,
+            self.tokenizer,
+            prompt_ids,
+            max_tokens=max_tokens,
+            draft_model=self.draft_model,
+            num_draft_tokens=self.num_draft_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            prefill_step_size=PREFILL_STEP_SIZE,
+        ):
+            if ttft is None:
+                ttft = time.perf_counter() - t0
+            tokens.append(resp.token)
+            if resp.from_draft:
+                n_from_draft += 1
+            if on_tokens:
+                on_tokens([resp.token], resp.text)
+        decode_time = time.perf_counter() - t0 - (ttft or 0.0)
+        n_decode = max(len(tokens) - 1, 0)
+        # mlx_lm の speculative_generate_step は round ごとに 0 個以上の
+        # from_draft=True (ドラフト的中) と、たかだか 1 個の from_draft=False
+        # (検証モデル自身がサンプルした、その round の締めのトークン) を yield
+        # する。厳密な round 数は stream_generate の外から見えないので、
+        # from_draft=False の個数を round 数の近似として使う (SpecRunner/
+        # FlashSpecRunner の tokens_per_step と同じ「1 ラウンドあたりの実効
+        # トークン数」を近似する observability 用の値であって、正しさには
+        # 関わらない)。
+        n_verify_rounds = max(len(tokens) - n_from_draft, 1)
+        return {
+            "tokens": tokens,
+            "ttft_s": ttft or 0.0,
+            "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
+            "prefill_reused": 0,
+            "prefill_new": len(prompt_ids),
+            "tokens_per_step": (n_decode / n_verify_rounds) if tokens else 0.0,
         }
 
 
@@ -570,8 +775,19 @@ def _discover_flash_mtp_source(model_dir: Path) -> tuple[str, dict | str] | None
 
 #: build_runner が返しうる Runner.KIND の全値。server.py の --require-runner
 #: がこの集合を choices に使う (KIND 文字列がここと build_runner の実際の
-#: 分岐とで散らばらないようにするための唯一の定義元)。
-RUNNER_KINDS = frozenset({SpecRunner.KIND, FlashSpecRunner.KIND, FallbackRunner.KIND})
+#: 分岐とで散らばらないようにするための唯一の定義元)。"lookup_spec"
+#: (mlxturbo.lookup_spec.LookupSpecRunner) はここでは文字列リテラルで足す —
+#: 循環 import を避けるため (lookup_spec.py が runner.py の FallbackRunner を
+#: import するので、逆方向の import はできない)。
+RUNNER_KINDS = frozenset(
+    {
+        SpecRunner.KIND,
+        FlashSpecRunner.KIND,
+        FallbackRunner.KIND,
+        DraftSpecRunner.KIND,
+        "lookup_spec",
+    }
+)
 
 
 def build_runner(
@@ -583,7 +799,104 @@ def build_runner(
     max_draft: int = 8,
     log_prefix: str = "[mlxturbo]",
 ) -> Runner:
+    """``args.draft_model``/``args.lookup_spec`` の 2 つを、既存の spec/
+    flash_spec/fallback 選択 (``_build_base_runner``、この関数の従来の本体)
+    より手前で扱う薄いラッパー (Kimi K3 レビュー項目 13/12)。
+
+    - ``args.draft_model`` (str | None) が指定されたときだけ ``DraftSpecRunner``
+      経路に入り、``_build_base_runner`` の分岐 (qwen4_exp/SpecEngine/
+      FallbackRunner の選択) には一切触れない — 未指定なら従来どおりの選択
+      順序をそのまま通る。ドラフトモデルは ``mlx_lm.load`` でこの関数の中で
+      読み込む (本体モデルとは独立にロードする、2 本目のモデル)。トークナイザ
+      の vocab_size が本体と食い違う場合は ``mlx_lm.generate`` の CLI 自身が
+      する検査と同じ理由 (draft は本体と同じトークナイザである前提)
+      で ``SystemExit(1)`` する — ``--mtp`` の明示指定と同じ「逃げ道なし」
+      の扱い。同じモデルを draft に指定する self-draft (速くはならないが
+      配線の確認にはなる) も、この検査は素通りする (vocab_size が一致する
+      ため)。
+    - ``args.lookup_spec`` (bool) は ``_build_base_runner`` が選んだ結果が
+      ``FallbackRunner`` (= spec/flash_spec 契約に合わないモデル) のときだけ
+      ``mlxturbo.lookup_spec.LookupSpecRunner`` へ差し替える (Kimi K3 レビュー
+      項目 12)。spec/flash_spec が選ばれた場合は何もしない — 既にモデル
+      専用の投機が効いているので、n-gram lookup を上乗せする動機が無い。
+
+    ``args`` は ``model``/``original``/``mtp_bits``/``no_mtp``/``no_fused``/
+    ``draft_model``/``num_draft_tokens``/``lookup_spec``/``lookup_max_draft``/
+    ``lookup_min_match`` を持つ argparse.Namespace (cli.py / server.py の
+    どちらの引数もこの形。cli.py はこれらの新規フラグを持たないため、
+    ``getattr(..., None)``/``getattr(..., False)`` で欠落を許容する)。
+    """
+
+    draft_model_path = getattr(args, "draft_model", None)
+    if draft_model_path:
+        from mlx_lm import load as mlx_lm_load
+
+        num_draft_tokens = getattr(args, "num_draft_tokens", None) or 4
+        print(
+            f"{log_prefix} --draft-model {draft_model_path}: mlx_lm draft-model 投機"
+            f" (アーキテクチャ非依存、DraftSpecRunner) を構築します"
+            f" (num_draft_tokens={num_draft_tokens})"
+        )
+        draft_model, draft_tokenizer = mlx_lm_load(draft_model_path)
+        model_vocab = getattr(tokenizer, "vocab_size", None)
+        draft_vocab = getattr(draft_tokenizer, "vocab_size", None)
+        if draft_vocab != model_vocab:
+            print(
+                f"{log_prefix} --draft-model {draft_model_path} のトークナイザが本体"
+                f" モデルと一致しません (vocab_size {draft_vocab} != {model_vocab})。"
+                " draft モデルは本体と同じトークナイザ (同系統モデル、self-draft を"
+                " 含む) である必要があります。終了します。"
+            )
+            raise SystemExit(1)
+        print(
+            f"{log_prefix} draft-model 投機デコード有効 (DraftSpecRunner, "
+            f"draft={draft_model_path})"
+        )
+        return DraftSpecRunner(model, draft_model, tokenizer, num_draft_tokens=num_draft_tokens)
+
+    resolved = _build_base_runner(
+        model, tokenizer, config, args, n_draft=n_draft, max_draft=max_draft, log_prefix=log_prefix
+    )
+
+    if getattr(args, "lookup_spec", False) and resolved.KIND == FallbackRunner.KIND:
+        from .lookup_spec import LookupSpecRunner
+
+        wrapped = LookupSpecRunner(
+            model,
+            tokenizer,
+            max_draft=getattr(args, "lookup_max_draft", None) or 8,
+            min_match=getattr(args, "lookup_min_match", None) or 2,
+        )
+        # 元の FallbackRunner が持っていた理由 (「なぜ spec/flash_spec が
+        # 選ばれなかったか」) は引き継ぐ — /health の fallback_reason はこの
+        # 経路でも意味のある情報のまま (「黙って fallback に落ちて気づけ
+        # ない」を防ぐ方針、build_runner の元の docstring 参照)。
+        wrapped.fallback_reason = resolved.fallback_reason
+        note = (
+            "有効"
+            if wrapped.trimmable
+            else "無効 (このモデルの KV キャッシュが trim 不可のため、通常生成のまま)"
+        )
+        print(f"{log_prefix} n-gram lookup 投機 (LookupSpecRunner) を有効化: {note}")
+        return wrapped
+
+    return resolved
+
+
+def _build_base_runner(
+    model,
+    tokenizer,
+    config,
+    args,
+    n_draft: int = 3,
+    max_draft: int = 8,
+    log_prefix: str = "[mlxturbo]",
+) -> Runner:
     """SpecEngine の構築を試み、モデルの形が合わなければ通常生成へ落とす。
+
+    ``build_runner`` (この関数のもとの名前、``--draft-model``/
+    ``--lookup-spec`` を横取りする薄いラッパーが追加されたので分離した)
+    から呼ばれる、qwen4_exp/SpecEngine/FallbackRunner を選ぶ本体。
 
     ``args`` は ``model``/``original``/``mtp_bits``/``no_mtp``/``no_fused`` を
     持つ argparse.Namespace (cli.py / server.py のどちらの引数もこの形)。

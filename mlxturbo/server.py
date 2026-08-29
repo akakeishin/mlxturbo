@@ -1896,6 +1896,99 @@ def _resolve_runner_for_request(
     return STATE.runner, None, None
 
 
+def _parse_logprobs_openai_chat(body: dict) -> tuple[bool, int, str | None]:
+    """OpenAI chat-completions の logprobs 契約: ``logprobs: bool`` (既定
+    false) + ``logprobs: true`` のときだけ意味を持つ ``top_logprobs: int``
+    (0-20)。Kimi K3 レビュー項目 17。"""
+
+    raw = body.get("logprobs", False)
+    if not isinstance(raw, bool):
+        return False, 0, "'logprobs' must be a boolean"
+    top_n, err = _parse_optional_int(body, "top_logprobs", 0)
+    if err is not None:
+        return False, 0, err
+    if top_n is not None:
+        if top_n > 20:
+            return False, 0, "'top_logprobs' must be at most 20"
+        if not raw:
+            return False, 0, "'top_logprobs' requires 'logprobs': true"
+    return raw, (top_n or 0), None
+
+
+def _parse_logprobs_openai_legacy(body: dict) -> tuple[bool, int, str | None]:
+    """OpenAI 旧 ``/v1/completions`` の logprobs 契約: ``logprobs: int | null``
+    そのものが top-N の件数を兼ねる (chat 版のような別の bool は無い)。"""
+
+    top_n, err = _parse_optional_int(body, "logprobs", 0)
+    if err is not None:
+        return False, 0, err
+    if top_n is None:
+        return False, 0, None
+    if top_n > 20:
+        return False, 0, "'logprobs' must be at most 20"
+    return True, top_n, None
+
+
+def _utf8_bytes_or_none(token: str) -> list[int] | None:
+    try:
+        return list(token.encode("utf-8"))
+    except Exception:
+        return None
+
+
+def _build_chat_logprobs(entries: list[dict] | None) -> dict | None:
+    """``FallbackRunner.generate`` が返す ``res["logprobs"]``
+    (mlxturbo/runner.py の ``_logprob_entry`` 参照、生成トークン列と 1:1
+    対応する) を OpenAI chat-completions の ``choices[].logprobs`` 形へ
+    変換する。要求されていない/対応していない runner なら呼び出し側が
+    そもそもこれを呼ばない (``res`` に ``"logprobs"`` キー自体が無い)。"""
+
+    if not entries:
+        return None
+    content = []
+    for e in entries:
+        item = {
+            "token": e["token"],
+            "logprob": e["logprob"],
+            "bytes": _utf8_bytes_or_none(e["token"]),
+            "top_logprobs": [
+                {
+                    "token": t["token"],
+                    "logprob": t["logprob"],
+                    "bytes": _utf8_bytes_or_none(t["token"]),
+                }
+                for t in e.get("top_logprobs", [])
+            ],
+        }
+        content.append(item)
+    return {"content": content}
+
+
+def _build_legacy_logprobs(entries: list[dict] | None) -> dict | None:
+    """同じ ``res["logprobs"]`` を旧 ``/v1/completions`` の
+    ``choices[].logprobs`` 形 (``tokens``/``token_logprobs``/``top_logprobs``/
+    ``text_offset`` の並列配列) へ変換する。"""
+
+    if not entries:
+        return None
+    tokens = [e["token"] for e in entries]
+    token_logprobs = [e["logprob"] for e in entries]
+    top_logprobs = [
+        {t["token"]: t["logprob"] for t in e.get("top_logprobs", [])} for e in entries
+    ]
+    text_offset = []
+    acc = 0
+    for t in tokens:
+        text_offset.append(acc)
+        acc += len(t)
+    return {
+        "tokens": tokens,
+        "token_logprobs": token_logprobs,
+        "top_logprobs": top_logprobs,
+        "text_offset": text_offset,
+    }
+
+
 def _stop_sequences(body: dict) -> list[str]:
     """OpenAI の ``stop`` (文字列または配列) と Anthropic の
     ``stop_sequences`` (配列) の両方を受け付ける。どちらのエンドポイントでも
@@ -2738,13 +2831,43 @@ async def chat_completions(request: Request):
     response_format_err = _check_response_format(body)
     if response_format_err is not None:
         return _openai_error(response_format_err)
-    gen_runner, downgrade_reason, unsupported_err = _resolve_runner_for_request(sampling_params)
+    logprobs_requested, top_logprobs_n, lp_err = _parse_logprobs_openai_chat(body)
+    if lp_err is not None:
+        return _openai_error(lp_err)
+    stream = bool(body.get("stream", False))
+    if logprobs_requested and stream:
+        # 項目 17 (Kimi K3 レビュー): logprobs はストリーミングでは実装して
+        # いない (per-chunk の逐次 logprobs は ThinkingRouter/SegmentAssembler
+        # のチャンネル分岐・バッファリングと token 単位で正しく対応付けるのが
+        # 難しく、今回のタスクの範囲では見送った — 黙って null を返すより、
+        # 明示的に 400 で断る方が「要求したのに何も返らない」より誠実)。
+        # 非ストリームなら以下でそのまま処理する。
+        return _openai_error(
+            "'logprobs' is not supported together with 'stream': true in this server "
+            "(yet); request without streaming to get logprobs"
+        )
+    gen_runner, downgrade_reason, unsupported_err = _resolve_runner_for_request(
+        sampling_params, logprobs_requested=logprobs_requested
+    )
     if unsupported_err is not None:
         return _openai_error(unsupported_err)
+    if logprobs_requested and gen_runner.KIND == FallbackRunner.KIND:
+        # logprobs は SUPPORTED_SAMPLING_PARAMS の恒等値チェックの外にある
+        # 別枠のフラグ (_resolve_runner_for_request の logprobs_requested 引数)
+        # なので、ここで初めて sampling_params に足す。要求されていて、かつ
+        # 実際に解決された runner が FallbackRunner (非投機) のときだけ足す —
+        # SpecRunner/FlashSpecRunner/DraftSpecRunner/LookupSpecRunner の
+        # generate() はこのキーワードを知らない構成があり得る (SpecEngine.
+        # generate/generate_stream は **kwargs を持たない固定シグネチャ)。
+        # logprobs が要求されたリクエストは _resolve_runner_for_request が
+        # 必ず fallback へ降格させる (降格先が無い場合だけ、STATE.runner
+        # 自体が既に fallback) ので、通常はここに来る runner は常に
+        # FallbackRunner のはずだが、それでも二重に確認しておく。
+        sampling_params["logprobs"] = True
+        sampling_params["top_logprobs"] = top_logprobs_n
     stops = _stop_sequences(body)
 
     model_id = STATE.model_name
-    stream = bool(body.get("stream", False))
     req_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
@@ -2817,6 +2940,7 @@ async def chat_completions(request: Request):
         prompt_ids, res["tokens"], thinking_budget, tool_enabled, resolved_tools
     )
     finish_reason = _finish_reason_openai(res["tokens"])
+    content_truncated_by_stop = False
     if budget_exceeded:
         finish_reason = "length"
     elif tool_calls:
@@ -2826,6 +2950,21 @@ async def chat_completions(request: Request):
         if hit is not None:
             content_text = content_text[: hit[0]]
             finish_reason = "stop"
+            content_truncated_by_stop = True
+
+    # res["logprobs"] (FallbackRunner.generate、mlxturbo/runner.py 参照) は
+    # 生の生成トークン列 res["tokens"] と 1:1 対応する。reasoning/tool_calls
+    # が絡む、または stop 文字列でコンテンツが文字位置で切り詰められた場合、
+    # 「どの生トークンが実際に content に残ったか」を正しく再導出するには
+    # _split_response_final 側にトークン単位の分割情報を持たせる変更が要り、
+    # このタスクの範囲を超える (捏造したデータを返すよりは null の方が
+    # 誠実、という判断 — 見送りの理由をここに書く)。それ以外 (プレーンな
+    # 生成で、reasoning/tool_calls/stop 切り詰めのいずれも無い) なら
+    # res["logprobs"] は content の全トークンとそのまま 1:1 対応するので、
+    # そのまま使う。
+    choice_logprobs = None
+    if logprobs_requested and not (reasoning_text or tool_calls or content_truncated_by_stop):
+        choice_logprobs = _build_chat_logprobs(res.get("logprobs"))
 
     message = {"role": "assistant", "content": content_text}
     if reasoning_text:
@@ -2854,6 +2993,7 @@ async def chat_completions(request: Request):
             {
                 "index": 0,
                 "message": message,
+                "logprobs": choice_logprobs,
                 "finish_reason": finish_reason,
             }
         ],
@@ -3689,13 +3829,28 @@ async def completions(request: Request):
     sampling_params, err = _parse_sampling_params(body)
     if err is not None:
         return _openai_error(err)
-    gen_runner, downgrade_reason, unsupported_err = _resolve_runner_for_request(sampling_params)
+    logprobs_requested, top_logprobs_n, lp_err = _parse_logprobs_openai_legacy(body)
+    if lp_err is not None:
+        return _openai_error(lp_err)
+    stream = bool(body.get("stream", False))
+    if logprobs_requested and stream:
+        # chat_completions と同じ理由 (項目 17 の docstring 参照): logprobs
+        # のストリーミング per-chunk 対応は今回見送った。
+        return _openai_error(
+            "'logprobs' is not supported together with 'stream': true in this server "
+            "(yet); request without streaming to get logprobs"
+        )
+    gen_runner, downgrade_reason, unsupported_err = _resolve_runner_for_request(
+        sampling_params, logprobs_requested=logprobs_requested
+    )
     if unsupported_err is not None:
         return _openai_error(unsupported_err)
+    if logprobs_requested and gen_runner.KIND == FallbackRunner.KIND:
+        sampling_params["logprobs"] = True
+        sampling_params["top_logprobs"] = top_logprobs_n
     stops = _stop_sequences(body)
 
     model_id = STATE.model_name
-    stream = bool(body.get("stream", False))
     req_id = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
@@ -3754,15 +3909,24 @@ async def completions(request: Request):
         _release_queue_slot()
     _log_gen_stats(res)
 
-    _reasoning_text, text, _tool_calls, _budget_exceeded = _split_response_final(
+    reasoning_text, text, tool_calls, _budget_exceeded = _split_response_final(
         prompt_ids, res["tokens"], 0
     )
     finish_reason = _finish_reason_openai(res["tokens"])
+    content_truncated_by_stop = False
     if stops:
         hit = _find_stop(text, stops)
         if hit is not None:
             text = text[: hit[0]]
             finish_reason = "stop"
+            content_truncated_by_stop = True
+
+    # chat_completions と同じ制限 (その docstring 参照): reasoning/tool_call
+    # マーカーが混ざった、または stop 文字列で文字位置切り詰めが起きた場合は
+    # res["logprobs"] (生トークン列と 1:1) と text の対応が崩れるので null。
+    choice_logprobs = None
+    if logprobs_requested and not (reasoning_text or tool_calls or content_truncated_by_stop):
+        choice_logprobs = _build_legacy_logprobs(res.get("logprobs"))
 
     out = {
         "id": req_id,
@@ -3773,7 +3937,7 @@ async def completions(request: Request):
             {
                 "index": 0,
                 "text": text,
-                "logprobs": None,
+                "logprobs": choice_logprobs,
                 "finish_reason": finish_reason,
             }
         ],
@@ -5114,6 +5278,52 @@ def main() -> None:
     ap.add_argument("--mtp-bits", type=int, default=4)
     ap.add_argument(
         "--no-mtp", action="store_true", help="MTP を読み込まず lookup (SAM) のみで投機する"
+    )
+    ap.add_argument(
+        "--draft-model",
+        default=None,
+        metavar="PATH",
+        help="Kimi K3 レビュー項目 13: mlx_lm 自身の draft-model 投機デコード"
+        " (mlx_lm.generate.speculative_generate_step) をアーキテクチャ非依存で使う。"
+        " 指定すると mlxturbo.runner.DraftSpecRunner が有効になり、spec/flash_spec/"
+        " fallback の既存の選択順序 (qwen3_5/qwen4_exp 専用) には一切入らない —"
+        " Llama/Gemma/Mistral/Mixtral のような素の dense モデルにも投機を届けるための"
+        " 経路。ドラフトはこのパスから mlx_lm.load で別途読み込む (本体より小さい"
+        " モデルを想定するが、同じモデルを指定する self-draft でも動く — 速くは"
+        " ならないが配線の確認にはなる)。トークナイザの vocab_size が本体と食い違う"
+        " 場合は起動を中止する (exit 1)",
+    )
+    ap.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        default=4,
+        help="--draft-model 指定時、1 ラウンドでドラフトモデルに生成させるトークン数"
+        " (mlx_lm.generate の num_draft_tokens そのまま)。既定 4",
+    )
+    ap.add_argument(
+        "--lookup-spec",
+        action="store_true",
+        help="Kimi K3 レビュー項目 12: n-gram lookup (SAM, mlxturbo/sam.py) だけを使う"
+        " モデル非依存の投機 (mlxturbo.lookup_spec.LookupSpecRunner) を有効化する。"
+        " spec/flash_spec の契約を満たさないモデル (= 通常なら FallbackRunner) に"
+        " だけかぶせる — 既に専用の投機があるモデルには何もしない。KV キャッシュが"
+        " trim 不可なモデル、または temperature>0/repetition_penalty 等が要求された"
+        " リクエストでは、内部で黙って通常生成にフォールバックする (壊れた出力を"
+        " 出すよりは速度で妥協する判断、mlxturbo/lookup_spec.py 参照)。--draft-model"
+        " と同時指定した場合は --draft-model が優先され、この経路には入らない",
+    )
+    ap.add_argument(
+        "--lookup-max-draft",
+        type=int,
+        default=8,
+        help="--lookup-spec 指定時、1 ラウンドで提案する n-gram ドラフトの最大長。既定 8",
+    )
+    ap.add_argument(
+        "--lookup-min-match",
+        type=int,
+        default=2,
+        help="--lookup-spec 指定時、ドラフトを提案するのに必要な最小の一致 (n-gram) 長。"
+        " 既定 2 (2 トークン以上の繰り返しが無ければドラフトしない)",
     )
     ap.add_argument(
         "--ngram",

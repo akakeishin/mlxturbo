@@ -145,6 +145,11 @@ v-fast6 が両者の上位互換 (v-stream 比で -2.47ms、KLD は 0.00260 -> 0
 - vendored arch を差し替える必要が出たら、親に言うこと。
   **`install-arch --force` を打たないと site-packages に届かない**
   (これで 169GB まで膨らませた前科がある)
+  — **(2026-08-30 追記) `install-arch` は撤廃した。**利用者の mlx_lm を
+  書き換える副作用が判明したため、`mlxturbo` を import した時点で
+  `sys.meta_path` 経由で vendor (`tools/vendor/qwen4_exp.py`) を直接解決する
+  方式に置き換えている (`mlxturbo/_arch_registry.py`)。site-packages への
+  コピーはもう発生しないので、上の「打たないと届かない」は現在は当てはまらない
 
 ## 次の標的 — 融合で取れるのはここだけ (2026-08-27 追記)
 

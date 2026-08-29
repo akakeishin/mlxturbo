@@ -27,7 +27,16 @@ from fastapi.testclient import TestClient
 
 import mlxturbo.cli as cli_module
 import mlxturbo.server as server
-from mlxturbo.runner import FallbackRunner, FallbackSession, FlashSpecRunner, SpecRunner
+from mlxturbo.lookup_spec import LookupSpecRunner
+from mlxturbo.runner import (
+    RUNNER_KINDS,
+    DraftSpecRunner,
+    FallbackRunner,
+    FallbackSession,
+    FlashSpecRunner,
+    SpecRunner,
+    build_runner,
+)
 from mlxturbo.spec import ChatSession, SpecEngine
 
 
@@ -134,14 +143,27 @@ class FakeTokenizer:
 
 class FakeRunner:
     """generate() に渡された kwargs をすべて記録する。tokens_to_emit を
-    on_tokens 経由で 1 個ずつ流し、最後に res dict を返す。"""
+    on_tokens 経由で 1 個ずつ流し、最後に res dict を返す。
+
+    ``logprobs_to_emit`` (項目 17 用、任意): 渡しておくと、呼び出し側が
+    ``logprobs=True`` を extra 経由で渡してきたときだけ、実際に emit された
+    トークン数ぶんに切り詰めて ``res["logprobs"]`` に入れる — 本物の
+    ``FallbackRunner.generate`` (mlxturbo/runner.py の ``_logprob_entry``)
+    と同じ「要求されたときだけ・トークン列と 1:1」という契約を、server.py
+    側 (choices[].logprobs への変換) のテストのために最小限で真似る。"""
 
     KIND = "fallback"
     SUPPORTED_SAMPLING_PARAMS = FallbackRunner.SUPPORTED_SAMPLING_PARAMS
 
-    def __init__(self, tokens_to_emit: list[int], prefill_reused: int = 0):
+    def __init__(
+        self,
+        tokens_to_emit: list[int],
+        prefill_reused: int = 0,
+        logprobs_to_emit: list[dict] | None = None,
+    ):
         self.tokens_to_emit = tokens_to_emit
         self.prefill_reused = prefill_reused
+        self.logprobs_to_emit = logprobs_to_emit
         self.calls: list[dict] = []
 
     def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
@@ -165,7 +187,7 @@ class FakeRunner:
                 on_tokens([t])
             if t in eos_ids:
                 break
-        return {
+        result = {
             "tokens": toks,
             "ttft_s": 0.001,
             "decode_tps": 100.0,
@@ -173,6 +195,9 @@ class FakeRunner:
             "prefill_new": len(prompt_ids) - self.prefill_reused,
             "tokens_per_step": 1.0,
         }
+        if extra.get("logprobs") and self.logprobs_to_emit is not None:
+            result["logprobs"] = self.logprobs_to_emit[: len(toks)]
+        return result
 
 
 class FakeSpecRunner(FakeRunner):
@@ -784,9 +809,17 @@ def test_spec_runner_rejects_unsupported_params_on_completions_endpoint(client):
 
 
 class _FakeGenResponse:
-    def __init__(self, token, text):
+    """``mlx_lm.generate.GenerationResponse`` の最小限のフェイク。
+
+    ``logprobs`` (項目 17 用) と ``from_draft`` (項目 13 用) は任意 —
+    既存呼び出し (``_FakeGenResponse(val, str(val))``) は 2 引数のままで
+    壊れない。"""
+
+    def __init__(self, token, text, logprobs=None, from_draft: bool = False):
         self.token = token
         self.text = text
+        self.logprobs = logprobs
+        self.from_draft = from_draft
 
 
 def test_fallback_runner_seed_makes_output_reproducible(monkeypatch):
@@ -6557,3 +6590,735 @@ def test_anthropic_cache_control_on_system_block_is_accepted_and_ignored(client)
         },
     )
     assert resp.status_code == 200, resp.text
+
+
+# ---------- 項目 13: DraftSpecRunner (mlx_lm 自身の draft-model 投機) ----------
+
+
+def test_draft_spec_runner_supported_sampling_params_matches_fallback():
+    """FallbackRunner と同じ全キーを宣言している (DraftSpecRunner の
+    docstring 参照: speculative_generate_step はドラフト/検証の両方に同じ
+    sampler/logits_processors を通すので、top_p 等でも分布保証は壊れない)。"""
+
+    assert DraftSpecRunner.SUPPORTED_SAMPLING_PARAMS == FallbackRunner.SUPPORTED_SAMPLING_PARAMS
+
+
+def test_draft_spec_runner_passes_draft_model_and_num_draft_tokens_through(monkeypatch):
+    import importlib
+
+    mlx_generate = importlib.import_module("mlx_lm.generate")
+    captured: dict = {}
+
+    def fake_stream_generate(
+        model,
+        tokenizer,
+        prompt,
+        max_tokens,
+        draft_model=None,
+        num_draft_tokens=None,
+        sampler=None,
+        logits_processors=None,
+        **kwargs,
+    ):
+        captured["draft_model"] = draft_model
+        captured["num_draft_tokens"] = num_draft_tokens
+        captured["prompt"] = list(prompt)
+        for tok, from_draft in [(10, False), (11, True), (12, False)]:
+            yield _FakeGenResponse(tok, f"<{tok}>", from_draft=from_draft)
+
+    monkeypatch.setattr(mlx_generate, "stream_generate", fake_stream_generate)
+
+    target_model = object()
+    draft_model = object()
+    runner = DraftSpecRunner(target_model, draft_model, tokenizer=object(), num_draft_tokens=5)
+
+    observed: list[int] = []
+    result = runner.generate(
+        [1, 2, 3],
+        max_tokens=10,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=lambda toks, text=None: observed.extend(toks),
+        session=None,
+    )
+    assert captured["draft_model"] is draft_model
+    assert captured["num_draft_tokens"] == 5
+    assert captured["prompt"] == [1, 2, 3]
+    assert result["tokens"] == [10, 11, 12]
+    assert observed == [10, 11, 12]
+    # n_decode = 2 (先頭を除く), from_draft=False が 2 個 (10, 12) なので
+    # n_verify_rounds の近似も 2 -> tokens_per_step == 1.0。
+    assert result["tokens_per_step"] == pytest.approx(1.0)
+
+
+def test_draft_spec_runner_seed_calls_mx_random_seed(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mx.random, "seed", calls.append)
+
+    import importlib
+
+    mlx_generate = importlib.import_module("mlx_lm.generate")
+    monkeypatch.setattr(mlx_generate, "stream_generate", lambda *a, **k: iter(()))
+
+    runner = DraftSpecRunner(object(), object(), tokenizer=object(), num_draft_tokens=4)
+    runner.generate(
+        [1], max_tokens=0, temp=0.0, eos_ids=set(), on_tokens=None, session=None, seed=99
+    )
+    assert calls == [99]
+
+
+def test_runner_kinds_includes_draft_spec_and_lookup_spec():
+    assert "draft_spec" in RUNNER_KINDS
+    assert "lookup_spec" in RUNNER_KINDS
+
+
+def test_health_endpoint_reports_draft_spec_runner(client):
+    class _FakeDraftSpecRunner(FakeRunner):
+        KIND = "draft_spec"
+        SUPPORTED_SAMPLING_PARAMS = DraftSpecRunner.SUPPORTED_SAMPLING_PARAMS
+
+    runner = _FakeDraftSpecRunner(tokens_to_emit=[])
+    _install_state(runner)
+    resp = client.get("/health")
+    assert resp.json()["runner"] == "draft_spec"
+
+
+def test_enforce_required_runner_accepts_matching_draft_spec_kind():
+    class _R:
+        KIND = "draft_spec"
+        fallback_reason = None
+
+    server._enforce_required_runner(_R(), "draft_spec")  # 例外が出なければ良い
+
+
+def test_enforce_required_runner_rejects_mismatched_draft_spec_requirement():
+    class _R:
+        KIND = "fallback"
+        fallback_reason = "some reason"
+
+    with pytest.raises(SystemExit):
+        server._enforce_required_runner(_R(), "draft_spec")
+
+
+def test_build_runner_selects_draft_spec_runner_when_draft_model_given(monkeypatch):
+    import mlx_lm as mlx_lm_pkg
+
+    draft_model_obj = object()
+    draft_tokenizer_obj = SimpleNamespace(vocab_size=100)
+    captured: dict = {}
+
+    def fake_load(path):
+        captured["path"] = path
+        return draft_model_obj, draft_tokenizer_obj
+
+    monkeypatch.setattr(mlx_lm_pkg, "load", fake_load)
+
+    model = object()
+    tokenizer = SimpleNamespace(vocab_size=100)
+    args = SimpleNamespace(
+        model="main/model",
+        draft_model="some/draft-path",
+        num_draft_tokens=6,
+        lookup_spec=False,
+    )
+    runner = build_runner(model, tokenizer, config={}, args=args)
+    assert isinstance(runner, DraftSpecRunner)
+    assert runner.KIND == "draft_spec"
+    assert runner.model is model
+    assert runner.draft_model is draft_model_obj
+    assert runner.num_draft_tokens == 6
+    assert runner.fallback_reason is None
+    assert captured["path"] == "some/draft-path"
+
+
+def test_build_runner_draft_model_vocab_mismatch_exits(monkeypatch):
+    import mlx_lm as mlx_lm_pkg
+
+    monkeypatch.setattr(
+        mlx_lm_pkg, "load", lambda path: (object(), SimpleNamespace(vocab_size=999))
+    )
+
+    model = object()
+    tokenizer = SimpleNamespace(vocab_size=100)
+    args = SimpleNamespace(model="m", draft_model="d", num_draft_tokens=4, lookup_spec=False)
+    with pytest.raises(SystemExit):
+        build_runner(model, tokenizer, config={}, args=args)
+
+
+def test_build_runner_draft_model_takes_precedence_over_qwen4_exp_selection(monkeypatch):
+    """--draft-model が指定されたら qwen4_exp/SpecEngine の既存選択には一切
+    入らない (build_runner の docstring 参照) — qwen4_exp モデルでも
+    DraftSpecRunner が選ばれる。"""
+
+    import mlx_lm as mlx_lm_pkg
+
+    monkeypatch.setattr(
+        mlx_lm_pkg, "load", lambda path: (object(), SimpleNamespace(vocab_size=100))
+    )
+    model = _fake_qwen4_exp_model()
+    tokenizer = SimpleNamespace(vocab_size=100)
+    args = SimpleNamespace(
+        model="fake-model", draft_model="some/draft", num_draft_tokens=4, lookup_spec=False
+    )
+    runner = build_runner(model, tokenizer, config={}, args=args)
+    assert isinstance(runner, DraftSpecRunner)
+
+
+# ---------- 項目 12: LookupSpecRunner (n-gram lookup (SAM) だけの投機) ----------
+
+
+class _TrimTrackingCache:
+    """LookupSpecRunner が呼ぶ trim_prompt_cache と噛み合う最小限のフェイク
+    cache。``seen`` が「今 _ScriptedGreedyModel が真に確定済みとみなして
+    いるトークン数」を表し、trim(k) が正しく末尾 k 個を巻き戻す。"""
+
+    def __init__(self):
+        self.seen: list[int] = []
+
+    def trim(self, k):
+        del self.seen[len(self.seen) - k :]
+        return k
+
+    def is_trimmable(self):
+        return True
+
+    @property
+    def state(self):
+        return mx.array(0)
+
+
+class _ScriptedGreedyModel:
+    """テスト用の「モデル」: 位置 i (0-indexed, フィード累計本数) の次トー
+    クンを固定配列 ``true_seq[i]`` から読むだけの、実際の重みを持たない
+    フェイク。``cache[0].seen`` (= trim で正しく巻き戻る想定の「確定済み」
+    カウント) を経由してのみ位置を決めるので、LookupSpecRunner 側の受理/
+    拒否/trim の会計が 1 個でもずれれば真の出力列と食い違って検出できる。"""
+
+    def __init__(self, true_seq: list[int], vocab: int = 16):
+        self.true_seq = true_seq
+        self.vocab = vocab
+
+    def make_cache(self):
+        return [_TrimTrackingCache()]
+
+    def __call__(self, ids, cache=None):
+        c = cache[0]
+        toks = ids[0].tolist()
+        rows = []
+        for t in toks:
+            c.seen.append(t)
+            nxt = self.true_seq[len(c.seen)]
+            row = [0.0] * self.vocab
+            row[nxt] = 100.0
+            rows.append(row)
+        return mx.array([rows])
+
+
+def test_lookup_spec_runner_accepts_correct_multi_token_draft():
+    """真の継続が周期的 (= 繰り返しが多い) なら、1 ラウンドで複数トークン
+    を受理できる (tokens_per_step > 1)。"""
+
+    pattern = [1, 2, 3, 4]
+    true_seq = [pattern[i % 4] for i in range(13)]
+    prompt_ids = true_seq[:7]  # [1,2,3,4,1,2,3]
+    model = _ScriptedGreedyModel(true_seq)
+    runner = LookupSpecRunner(model, tokenizer=object(), max_draft=8, min_match=2)
+    assert runner.trimmable is True
+
+    collected: list[int] = []
+    result = runner.generate(
+        prompt_ids,
+        max_tokens=6,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=collected.extend,
+        session=None,
+    )
+    expected = true_seq[7:13]
+    assert result["tokens"] == expected
+    assert collected == expected
+    assert result["tokens_per_step"] > 1.0
+
+
+def test_lookup_spec_runner_corrects_a_wrong_draft():
+    """SAM が過去の再帰から続きを提案しても、今回はそこで分岐する
+    ("false friend" な繰り返し) 場合、最終出力は貪欲デコードの真値と一致
+    する — 受理チェックが誤りを検出し、trim で正しく巻き戻すことの確認。"""
+
+    true_seq = [1, 2, 3, 4, 1, 2, 3] + [4, 1, 9, 2, 3, 4]
+    prompt_ids = true_seq[:7]
+    model = _ScriptedGreedyModel(true_seq)
+    runner = LookupSpecRunner(model, tokenizer=object(), max_draft=8, min_match=2)
+
+    collected: list[int] = []
+    result = runner.generate(
+        prompt_ids,
+        max_tokens=6,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=collected.extend,
+        session=None,
+    )
+    expected = true_seq[7:13]
+    assert expected == [4, 1, 9, 2, 3, 4]
+    assert result["tokens"] == expected
+    assert collected == expected
+
+
+def test_lookup_spec_runner_matches_plain_greedy_when_no_repeat_exists():
+    """繰り返しが無いプロンプトでは draft が一度も見つからず、1 トークン
+    ずつの貪欲デコードと同じ出力・同じ round 数になる (「効かない場面で
+    遅くならない」の根拠 — 余計な forward を積み増さない)。"""
+
+    true_seq = [1, 2, 3, 5, 9, 2, 7]
+    prompt_ids = true_seq[:3]
+    model = _ScriptedGreedyModel(true_seq)
+    runner = LookupSpecRunner(model, tokenizer=object(), max_draft=8, min_match=2)
+
+    result = runner.generate(
+        prompt_ids, max_tokens=4, temp=0.0, eos_ids=set(), on_tokens=None, session=None
+    )
+    expected = true_seq[3:7]
+    assert result["tokens"] == expected
+    # 一致が一度も起きなければ 1 round = 1 token (4 round で 4 token) になる
+    # ので、n_decode/rounds = (4-1)/4 = 0.75 -- SpecRunner/FlashSpecRunner と
+    # 同じ「先頭を除く」定義のままなら、これが「一度も加速しなかった」場合の
+    # 唯一の値になる (FallbackRunner 自身の定数 1.0 とは定義が違う点に注意)。
+    assert result["tokens_per_step"] == pytest.approx((len(expected) - 1) / len(expected))
+
+
+def test_lookup_spec_runner_stops_at_eos_mid_round():
+    """draft の途中で eos が確定した場合、それ以降 (同じラウンド内で既に
+    teacher-forcing 済みのトークンを含む) は出力に出さない。"""
+
+    # プロンプトは周期パターンの 1 周分 + 1 (SAM が [1,2,3,4] の巡回を見つけ
+    # られるだけの繰り返し)。継続側は一意な番兵 99 を eos として使う —
+    # パターン値そのもの (1/2/3/4) を eos にすると周期的に何度も出てきて
+    # しまい「途中で打ち切る」ことの検証にならない。継続の並びはドラフト
+    # ([4,1,2,3], SAM がプロンプトの巡回から提案するはず) の 4 番目
+    # (0-indexed 3 番目) が 99 に化けている「途中で外れる」設計: 最初の 3 個
+    # (4,1,2) は受理され、4 個目で不一致 (真値は 99) となり、その 99 が
+    # eos なのでそこで打ち切る — 受理・trim・eos 打ち切りを 1 ラウンドで
+    # 同時に確認できる。
+    prompt_ids = [1, 2, 3, 4, 1, 2, 3]
+    continuation = [4, 1, 2, 99, 3, 4, 1, 2]
+    true_seq = prompt_ids + continuation
+    model = _ScriptedGreedyModel(true_seq, vocab=128)
+    runner = LookupSpecRunner(model, tokenizer=object(), max_draft=8, min_match=2)
+
+    eos_token = 99
+    collected: list[int] = []
+    result = runner.generate(
+        prompt_ids,
+        max_tokens=10,
+        temp=0.0,
+        eos_ids={eos_token},
+        on_tokens=collected.extend,
+        session=None,
+    )
+    assert result["tokens"] == [4, 1, 2, 99]
+    assert result["tokens"][-1] == eos_token
+    assert eos_token not in result["tokens"][:-1]
+    assert collected == result["tokens"]
+
+
+def test_lookup_spec_runner_uses_lookup_path_for_identity_sampling_values():
+    """恒等値 (top_p=1.0 等) は lookup 経路を妨げない — plain へ落ちるのは
+    実際にロジットを変える値が来たときだけ。"""
+
+    pattern = [1, 2, 3, 4]
+    true_seq = [pattern[i % 4] for i in range(13)]
+    prompt_ids = true_seq[:7]
+    model = _ScriptedGreedyModel(true_seq)
+    runner = LookupSpecRunner(model, tokenizer=object())
+    result = runner.generate(
+        prompt_ids,
+        max_tokens=6,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=None,
+        top_p=1.0,
+        repetition_penalty=1.0,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        logit_bias={},
+    )
+    assert result["tokens"] == true_seq[7:13]
+    assert result["tokens_per_step"] > 1.0
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"temp": 0.7},
+        {"repetition_penalty": 1.1},
+        {"presence_penalty": 0.2},
+        {"frequency_penalty": 0.2},
+        {"logit_bias": {"1": 2.0}},
+    ],
+)
+def test_lookup_spec_runner_falls_back_to_plain_when_distribution_altering_params_given(extra):
+    model = _ScriptedGreedyModel([0] * 5)
+    runner = LookupSpecRunner(model, tokenizer=object())
+
+    called = []
+
+    def fake_fallback_generate(*a, **k):
+        called.append((a, k))
+        return {
+            "tokens": [],
+            "ttft_s": 0.0,
+            "decode_tps": 0.0,
+            "prefill_reused": 0,
+            "prefill_new": 0,
+            "tokens_per_step": 0.0,
+        }
+
+    runner._fallback.generate = fake_fallback_generate
+    kwargs = {"temp": 0.0, **extra}
+    runner.generate([1, 2], max_tokens=3, eos_ids=set(), on_tokens=None, session=None, **kwargs)
+    assert called
+
+
+def test_lookup_spec_runner_falls_back_to_plain_when_cache_not_trimmable():
+    class _NonTrimmableCache:
+        def is_trimmable(self):
+            return False
+
+    class _NonTrimmableModel(_ScriptedGreedyModel):
+        def make_cache(self):
+            return [_NonTrimmableCache()]
+
+    model = _NonTrimmableModel([1, 2, 3, 4, 5])
+    runner = LookupSpecRunner(model, tokenizer=object())
+    assert runner.trimmable is False
+
+    called = []
+
+    def fake_fallback_generate(*a, **k):
+        called.append(1)
+        return {
+            "tokens": [1],
+            "ttft_s": 0.0,
+            "decode_tps": 0.0,
+            "prefill_reused": 0,
+            "prefill_new": 0,
+            "tokens_per_step": 1.0,
+        }
+
+    runner._fallback.generate = fake_fallback_generate
+    result = runner.generate(
+        [1], max_tokens=1, temp=0.0, eos_ids=set(), on_tokens=None, session=None
+    )
+    assert called
+    assert result["tokens"] == [1]
+
+
+def test_build_runner_wraps_fallback_with_lookup_spec_runner_when_flagged():
+    model = SimpleNamespace(
+        args=SimpleNamespace(model_type="llama"), layers=[object(), object()]
+    )
+    args = SimpleNamespace(
+        model="fake-llama",
+        original="fake-original",
+        mtp_bits=4,
+        no_mtp=True,
+        no_fused=True,
+        lookup_spec=True,
+        lookup_max_draft=6,
+        lookup_min_match=3,
+    )
+    runner = build_runner(model, tokenizer=object(), config={}, args=args)
+    assert isinstance(runner, LookupSpecRunner)
+    assert runner.KIND == "lookup_spec"
+    assert runner.max_draft == 6
+    assert runner.min_match == 3
+    assert runner.trimmable is True
+    # base FallbackRunner が選ばれた理由 (text_config なし) を引き継ぐ。
+    assert runner.fallback_reason is not None
+
+
+def test_build_runner_does_not_wrap_when_lookup_spec_flag_is_false():
+    model = SimpleNamespace(
+        args=SimpleNamespace(model_type="llama"), layers=[object(), object()]
+    )
+    args = SimpleNamespace(
+        model="fake-llama",
+        original="fake-original",
+        mtp_bits=4,
+        no_mtp=True,
+        no_fused=True,
+        lookup_spec=False,
+    )
+    runner = build_runner(model, tokenizer=object(), config={}, args=args)
+    assert isinstance(runner, FallbackRunner)
+    assert not isinstance(runner, LookupSpecRunner)
+
+
+def test_build_runner_lookup_spec_does_not_apply_when_flash_spec_selected(monkeypatch):
+    """spec/flash_spec が選ばれた場合、--lookup-spec を指定しても何もしない
+    (既にモデル専用の投機が効いているため、build_runner の docstring 参照)。"""
+
+    import mlxturbo.mtp_flash as mtp_flash_module
+
+    class DummyMTP:
+        def parameters(self):
+            return {}
+
+    monkeypatch.setattr(mtp_flash_module, "load_flash_mtp", lambda *a, **k: DummyMTP())
+
+    model = _fake_qwen4_exp_model()
+    args = SimpleNamespace(
+        model="fake-model",
+        original="fake-original",
+        mtp="fake-sidecar.safetensors",
+        mtp_bits=4,
+        no_mtp=False,
+        no_fused=True,
+        lookup_spec=True,
+    )
+    runner = build_runner(model, tokenizer=object(), config={}, args=args)
+    assert isinstance(runner, FlashSpecRunner)
+
+
+# ---------- 項目 17: logprobs (fallback / 降格経路限定) ----------
+
+
+def test_fallback_runner_collects_logprobs_when_requested(monkeypatch):
+    import importlib
+
+    mlx_generate = importlib.import_module("mlx_lm.generate")
+
+    def fake_stream_generate(model, tokenizer, prompt, max_tokens, sampler=None,
+                              logits_processors=None, **_kwargs):
+        raw0 = mx.array([0.0, -1.0, -2.0, -3.0, -4.0])
+        lp0 = raw0 - mx.logsumexp(raw0)
+        yield _FakeGenResponse(0, "a", logprobs=lp0)
+        raw1 = mx.array([-5.0, 0.0, -1.0, -2.0, -3.0])
+        lp1 = raw1 - mx.logsumexp(raw1)
+        yield _FakeGenResponse(1, "b", logprobs=lp1)
+
+    monkeypatch.setattr(mlx_generate, "stream_generate", fake_stream_generate)
+
+    tok = FakeTokenizer(vocab={0: "A", 1: "B", 2: "C", 3: "D", 4: "E"})
+    runner = FallbackRunner(model=object(), tokenizer=tok)
+    result = runner.generate(
+        [9],
+        max_tokens=2,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=None,
+        logprobs=True,
+        top_logprobs=2,
+    )
+    entries = result["logprobs"]
+    assert len(entries) == 2
+    assert entries[0]["token"] == "A"
+    assert entries[0]["token_id"] == 0
+    assert len(entries[0]["top_logprobs"]) == 2
+    assert entries[0]["top_logprobs"][0]["token_id"] == 0
+    assert entries[0]["top_logprobs"][0]["logprob"] >= entries[0]["top_logprobs"][1]["logprob"]
+    assert entries[1]["token"] == "B"
+    assert entries[1]["token_id"] == 1
+
+
+def test_fallback_runner_omits_logprobs_when_not_requested(monkeypatch):
+    import importlib
+
+    mlx_generate = importlib.import_module("mlx_lm.generate")
+    monkeypatch.setattr(
+        mlx_generate,
+        "stream_generate",
+        lambda *a, **k: iter([_FakeGenResponse(0, "a", logprobs=mx.array([0.0, -1.0]))]),
+    )
+    runner = FallbackRunner(model=object(), tokenizer=FakeTokenizer())
+    result = runner.generate(
+        [9], max_tokens=1, temp=0.0, eos_ids=set(), on_tokens=None, session=None
+    )
+    assert "logprobs" not in result
+
+
+def test_chat_completions_returns_logprobs_when_requested(client):
+    runner = FakeRunner(
+        tokens_to_emit=[10, 11],
+        logprobs_to_emit=[
+            {
+                "token": "hello",
+                "logprob": -0.1,
+                "token_id": 10,
+                "top_logprobs": [{"token": "hello", "logprob": -0.1, "token_id": 10}],
+            },
+            {
+                "token": " world",
+                "logprob": -0.2,
+                "token_id": 11,
+                "top_logprobs": [],
+            },
+        ],
+    )
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "hello", 11: " world"}))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": True,
+            "top_logprobs": 1,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["choices"][0]["message"]["content"] == "hello world"
+    lp = body["choices"][0]["logprobs"]
+    assert lp is not None
+    assert len(lp["content"]) == 2
+    assert lp["content"][0]["token"] == "hello"
+    assert lp["content"][0]["logprob"] == -0.1
+    assert lp["content"][0]["top_logprobs"][0]["token"] == "hello"
+    call = runner.calls[0]
+    assert call["logprobs"] is True
+    assert call["top_logprobs"] == 1
+
+
+def test_chat_completions_logprobs_null_by_default(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+    resp = client.post(
+        "/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]}
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["choices"][0]["logprobs"] is None
+    assert "logprobs" not in runner.calls[0]
+
+
+def test_chat_completions_logprobs_downgrades_spec_runner(client):
+    spec_runner = FakeSpecRunner(tokens_to_emit=[10])
+    fallback_runner = FakeRunner(
+        tokens_to_emit=[10],
+        logprobs_to_emit=[{"token": "x", "logprob": -0.5, "token_id": 10, "top_logprobs": []}],
+    )
+    _install_state(
+        spec_runner, tokenizer=FakeTokenizer(vocab={10: "x"}), downgrade_runner=fallback_runner
+    )
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "logprobs": True},
+    )
+    assert resp.status_code == 200, resp.text
+    assert not spec_runner.calls
+    assert fallback_runner.calls
+    assert fallback_runner.calls[0]["logprobs"] is True
+    body = resp.json()
+    assert body["downgrade_reason"] is not None
+    assert "logprobs" in body["downgrade_reason"]
+    assert body["choices"][0]["logprobs"] is not None
+
+
+@pytest.mark.parametrize(
+    "body_extra",
+    [
+        {"logprobs": "yes"},
+        {"logprobs": True, "top_logprobs": 25},
+        {"top_logprobs": 3},
+    ],
+)
+def test_chat_completions_logprobs_validation_errors(client, body_extra):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], **body_extra},
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+
+
+def test_chat_completions_logprobs_with_stream_is_400(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": True,
+            "stream": True,
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+
+
+def test_chat_completions_logprobs_null_when_stop_truncates_content(client):
+    runner = FakeRunner(
+        tokens_to_emit=[10, 11, 12],
+        logprobs_to_emit=[
+            {"token": "foo", "logprob": -0.1, "token_id": 10, "top_logprobs": []},
+            {"token": "STOP", "logprob": -0.2, "token_id": 11, "top_logprobs": []},
+            {"token": "bar", "logprob": -0.3, "token_id": 12, "top_logprobs": []},
+        ],
+    )
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "foo", 11: "STOP", 12: "bar"}))
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": True,
+            "stop": "STOP",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["choices"][0]["message"]["content"] == "foo"
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["choices"][0]["logprobs"] is None
+
+
+def test_completions_legacy_returns_logprobs_int_format(client):
+    runner = FakeRunner(
+        tokens_to_emit=[10, 11],
+        logprobs_to_emit=[
+            {
+                "token": "hello",
+                "logprob": -0.1,
+                "token_id": 10,
+                "top_logprobs": [
+                    {"token": "hello", "logprob": -0.1, "token_id": 10},
+                    {"token": "hi", "logprob": -1.5, "token_id": 99},
+                ],
+            },
+            {"token": " world", "logprob": -0.2, "token_id": 11, "top_logprobs": []},
+        ],
+    )
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "hello", 11: " world"}))
+    resp = client.post("/v1/completions", json={"prompt": "hi", "logprobs": 2})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    lp = body["choices"][0]["logprobs"]
+    assert lp is not None
+    assert lp["tokens"] == ["hello", " world"]
+    assert lp["token_logprobs"] == [-0.1, -0.2]
+    assert lp["top_logprobs"][0] == {"hello": -0.1, "hi": -1.5}
+    assert lp["text_offset"] == [0, 5]
+    call = runner.calls[0]
+    assert call["logprobs"] is True
+    assert call["top_logprobs"] == 2
+
+
+def test_completions_legacy_logprobs_with_stream_is_400(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+    resp = client.post(
+        "/v1/completions", json={"prompt": "hi", "logprobs": 1, "stream": True}
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+
+
+def test_completions_legacy_logprobs_validation_error_over_20(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+    resp = client.post("/v1/completions", json={"prompt": "hi", "logprobs": 25})
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls

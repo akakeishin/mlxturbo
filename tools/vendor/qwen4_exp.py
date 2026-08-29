@@ -9,8 +9,11 @@
 #   6. FASTMLX_NGRAM_DISK=1 で n-gram 表を持たない (ディスクから行を引く)
 # (mlx-lm 本体は MTP モジュールを持たないため strict load が失敗する。
 #  MTP は mlxturbo/convert_flash.py extract-mtp でサイドカーへ抽出して使う)。
-# インストール: mlxturbo/convert_flash.py install-arch が
-# site-packages/mlx_lm/models/qwen4_exp.py へコピーする。
+# 解決: `mlxturbo` を import すると `mlxturbo/_arch_registry.py` が
+# `sys.meta_path` フックを積み、`mlx_lm.models.qwen4_exp` の import を
+# このファイルへ直接差し替える。利用者の site-packages / mlx_lm 本体には
+# 一切書き込まない (旧 install-arch は site-packages へ物理コピーしていたが、
+# 利用者の mlx_lm を汚す副作用があったため撤廃した)。
 # MLX port of Qwen3.8-Flash-Next (HF model_type: qwen4_exp)
 # New compared to qwen3_next: QSA sparse attention, gated residual
 # (hyper-connections), sharded n-gram / PLE embedding, split deltanet projections.
