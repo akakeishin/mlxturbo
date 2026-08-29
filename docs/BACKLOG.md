@@ -53,6 +53,24 @@
 
 prefill は 290〜325 tok/s しか出ない (デコードの約 11 倍でしかない)。Claude Code は毎ターン 54k 超を送るので、初回 TTFT を支配する。prompt cache の再利用 (fadadf7) で 2 ターン目以降は 9 割超を飛ばせるようになったが、**初回とキャッシュミス時はまるごと食らう**。バッチ化では縮まない (B に線形)。カーネル側の課題として未着手。
 
+## 6. LoRA アダプタ対応 (`adapter_path`)
+
+**mlx_lm 側の受け口は既に揃っている。fastmlx/mlxturbo 側は未配線**。以下は調査のみで、実装はしていない (`runner.py` / `server.py` が別レーンで編集中のため)。
+
+mlx_lm の受け口:
+
+`mlx_lm/utils.py` の `load(path_or_hf_repo, tokenizer_config=None, model_config=None, adapter_path=None, lazy=False, return_config=False, revision=None)` (453-502行) は `adapter_path` をキーワード引数として直接受け取り、非 None なら 492-494行で `model = load_adapters(model, adapter_path); model.eval()` を呼ぶ。`load_adapters` (utils.py 423-426行) は `mlx_lm/tuner/utils.py` の実体 (113-138行) へのラッパーで、`adapter_path/adapter_config.json` を読んで `fine_tune_type` (既定 `"lora"`) を見つつ `linear_to_lora_layers()` (同ファイル 38-110行) でモデルの `Linear`/`Embedding`/`SwitchLinear` を `LoRALinear` 系へ差し替え、その後 `model.load_weights(adapter_path/adapters.safetensors, strict=False)` で重みを流し込む。ディレクトリ構成は `adapter_config.json` + `adapters.safetensors` の組で固定。`mlx_lm/generate.py` の CLI は `--adapter-path` フラグ (81-83行) からそのまま `load(model_path, adapter_path=args.adapter_path, ...)` (2008-2012行) へ渡すだけ。
+
+fastmlx/mlxturbo 側の現状:
+
+`mlxturbo/_mlx_compat.py:90-93` の契約チェック (`_require_signature`) が `mlx_lm_load` のシグネチャに `adapter_path` が含まれることを検査しているだけで、実際に値を渡している呼び出しはリポジトリ内のどこにも無い。`mlxturbo/cli.py:122`、`mlxturbo/server.py:101,4792` の `mlx_lm_load(args.model, return_config=True)` はいずれも `adapter_path` 未指定。`grep -rn -i "adapter\|lora" mlxturbo/*.py` でヒットするのはこの契約チェックの1箇所と、無関係な英語コメント2箇所 (`fast_qmm.py:377` の「adapters」は量子化レイヤー再利用の話、`server.py:1962` の「adapter」は一般名詞) のみ。`runner.py` (`build_runner` 以下) にも adapter_path/LoRA を受け取る引数・分岐は無い。
+
+配線先と見積もり:
+
+`--adapter-path` フラグ自体は `cli.py`/`server.py` どちらの argparse にも追加できる (前者は編集可能、後者は今回のレーン境界で触れない)。値を実際に効かせるには、`mlx_lm_load(args.model, adapter_path=..., return_config=True)` という形で呼び出しに1引数足すだけで済む — この呼び出しは `build_runner` より前、まだモデルをロードしている段階 (`cli.py:122` / `server.py:101,4792`) にあるので、`build_runner` 自体のシグネチャを変える必要は無い。ただし `server.py` 側は今回のレーン境界外なので着手できない。`cli.py` 側だけなら技術的には可能だが、対話 CLI だけ先に対応してもサーバー経由の運用 (本来の主用途) には効かないため、今回は見送って調査止まりとした。
+
+分岐点として、**実行時に `adapter_path` を渡すだけ (LoRALinear のまま使う) か、事前に `mlx_lm` 付属の `fuse.py` でオフライン fuse 済みのモデルディレクトリを用意してそれを読ませるか**で影響範囲が変わる。前者は `SpecEngine`/`FlashSpecEngine` が構築される前にモデルの `named_modules` 構造が `<parent>.linear.weight` 型に変わる (`LoRALinear.from_base()` が元の `Linear` を `self.linear` として内包する) ため、`_mlx_compat.py` の契約チェックや `spec_flash.py` の MTP サイドカーのテンソル名突合に影響しないか未検証。後者 (`mlx_lm.tuner.fuse`) は `LoRALinear.fuse()` でマージ後の平のテンソルに戻してから保存するため (`fuse.py:60-75`)、テンソル名・形状は元のモデルと同じに戻り、既存の契約チェック・MTP 探索への影響はほぼ無いはず。着手するなら後者 (オフライン fuse → 通常のモデルとして読み込む) の方が安全側で、見積もりも軽い (`cli.py`/`server.py` へのフラグ追加 + 呼び出し1箇所の引数追加のみ)。前者 (実行時 LoRA、fuse 無し) は `_mlx_compat.py` の契約チェックと `spec_flash.py` 側の名前突合を実地で確認する一手間が追加で要る。
+
 ---
 
 ## 済み (BACKLOG から出たもの)

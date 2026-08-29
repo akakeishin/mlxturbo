@@ -1,8 +1,12 @@
 # mlxturbo
 
+[English](README.en.md) | 日本語
+
 Apple Silicon (MLX) 上のローカル推論エンジンと、OpenAI / Anthropic / Responses 互換の HTTP サーバー。
 
 **速いのは特定の2アーキテクチャだけ**で、それ以外のモデルは素の [mlx-lm](https://github.com/ml-explore/mlx-lm) と同速で動く汎用ランタイムです（後述の対応表を参照）。「汎用高速化ランタイム」ではありません。
+
+Ollama や LM Studio から来た人が最初に踏む差分: **1 プロセスにつき 1 モデルしかロードしない。** モデルの切り替えはプロセスの再起動が要る（複数モデルの同時ホストは非対応）。詳しくは後述の「制約」を参照。
 
 ## これは何か
 
@@ -14,7 +18,7 @@ Apple Silicon (MLX) 上のローカル推論エンジンと、OpenAI / Anthropic
 
 | 経路 | 対象 | 投機 | 実測倍率（mlx-lm 比、後述の再現コマンド参照） |
 |---|---|---|---|
-| `flash_spec` | Qwen3.8-Flash-Next (`qwen4_exp` アーキテクチャ) + MTP サイドカー | あり（MTP 深さ1 + hyper-connections 融合カーネル） | 1.12x〜1.26x（プロンプト内容依存、後述） |
+| `flash_spec` | Qwen3.8-Flash-Next (`qwen4_exp` アーキテクチャ) + MTP サイドカー | あり（MTP 深さ1 + hyper-connections 融合カーネル） | 約 1.25x〜1.39x（課題の種類に依存、後述） |
 | `spec` | `qwen3_5` 契約を満たすモデル（例: Qwen3.8-27B 系） | あり（MTP チェイン + suffix-lookup 混成） | 1.3x〜2.2x（プロンプト内容依存、後述） |
 | `fallback` | 上記以外の全モデル | なし | 1.0x（素の mlx-lm と同速） |
 
@@ -74,25 +78,32 @@ uv run mlxturbo-serve --model <path-or-repo-id> --served-model-name mymodel --po
 | 条件 | decode tok/s | 対 mlx-lm |
 |---|---|---|
 | mlx-lm 素（フォールバック相当） | 21〜23 | 1.0x |
-| 自己投機・易しい内容（序盤32tok） | 40〜51 | 1.7〜2.2x |
 | 自己投機・難しい内容持続（code） | 31.9 | 1.49x |
 | 自己投機・難しい内容持続（prose） | 28.3 | 1.32x |
 
 再現: `uv run mlxturbo --model <model> --prompt "<prompt>"`（生成の後に `decode tok/s` が自動で出力される）。mlx-lm 素との対照は `uv run python bench/baseline.py <model-id>`。
 
-### `flash_spec` 経路（Qwen3.8-Flash-Next、v-l レシピ + MTP 4bit、greedy、48 tok）
+### `flash_spec` 経路（Qwen3.8-Flash-Next、v-l レシピ + MTP 4bit、greedy）
 
-| プロンプト | 受理率 | 貪欲 tok/s | 投機 tok/s | 倍率 |
-|---|---|---|---|---|
-| 日本語 | 0.741 | 26.94 | 33.92 | 1.26x |
-| 英語 | 0.516 | 26.78 | 30.02 | 1.12x |
+受理率は 160 トークン × 10 課題で測った（反復 200 以上）。
 
-受理率は課題の種類（コード/散文/手順など）によっても変わる。詳細と再現コマンドは [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) の「道具」節（`tools/spec_flash_bench.py` 等）を参照。
+| 課題 | 受理率 | 倍率 |
+|---|---|---|
+| 散文（英語 0.720 ± 0.046 / 日本語 0.682 ± 0.047） | 約 0.70 | 約 1.39x |
+| コード | 0.564 ± 0.068 | 約 1.25x |
+
+投機なしは 31.14 ms/token。**効くかどうかは言語ではなく課題の種類で決まり、コードが最も低い**（信頼区間が重ならない）。どの課題でも投機は効く。
+
+短い試行（48 トークン、反復 30 前後）では言語差があるように見えるが、標準誤差が ±0.09 あり有意ではない。**受理率は反復 300 以上で見ること。**経緯は [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) を参照。
+
+再現: `tools/spec_flash_accept.py`（受理率）と `tools/spec_flash_bench.py`（速度）。コマンドは [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) の「道具」節。
 
 ## その他のドキュメント
 
 - [`docs/README.md`](docs/README.md) — ドキュメント全体の索引
 - [`docs/SERVER.md`](docs/SERVER.md) — サーバーの起動・オプション・接続方法・制約
+- [`docs/OPERATIONS.md`](docs/OPERATIONS.md) — 公開インスタンスの運用（リバースプロキシ・`/health` 監視・ログの読み方・launchd 常駐）
+- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — この README の実測値がどのコマンド・どの結果 JSON から来ているか
 - [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) — Flash-Next の MTP 投機デコード設計
 - [`docs/BACKLOG.md`](docs/BACKLOG.md) — やりたいが未着手のもの
 - [`docs/RELEASE.md`](docs/RELEASE.md) — 公開時にやること

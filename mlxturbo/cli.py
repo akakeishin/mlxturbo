@@ -102,7 +102,7 @@ def main() -> None:
         default=0.0,
         help="D6 (FLy) 緩和検証の正規化エントロピー閾値。0 で無効 (既定、"
         "厳密検証)。論文既定は 0.3。有効にすると greedy 出力は厳密で"
-        "なくなる (品質 >=99% 主張は論文値、うちの計測レーンでは未検証)",
+        "なくなる (品質 99%%以上という主張は論文値、うちの計測レーンでは未検証)",
     )
     ap.add_argument("--fly-window", type=int, default=6)
     ap.add_argument("--prompt", default=None)
