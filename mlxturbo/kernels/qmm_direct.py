@@ -1,6 +1,6 @@
 """Small-M quantized matmul, B fragment built by per-lane direct reads.
 
-fast_qmm (fastmlx/fast_qmm.py) の B ステージング (threadgroup スラブ +
+fast_qmm (mlxturbo/fast_qmm.py) の B ステージング (threadgroup スラブ +
 simdgroup_barrier 2 本 + ストライド 8 のスカラー store 16 本) が hot ループの
 約 250 命令 / 412 を占める (docs/ISA-DIFF.md §2)。この実装は ISA 検証済みの
 v_direct probe (tools/isa/variants.py、hot 314 = fast_qmm 比 -24%) の構造を

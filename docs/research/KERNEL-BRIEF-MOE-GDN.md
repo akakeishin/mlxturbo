@@ -1,6 +1,54 @@
 # KERNEL-BRIEF-MOE-GDN — MoE ルーティングと GDN (2026-08-27)
 
-hyper-connections の次の標的。前提と道具は docs/KERNEL-HANDOFF-HC.md を先に読むこと。
+hyper-connections の次の標的。前提と道具は docs/research/KERNEL-HANDOFF-HC.md を先に読むこと。
+
+## 現状 (2026-08-28、このレーンの締め)
+
+**出荷したのは hyper-connections の融合カーネル 1 本だけ。**v-fast6 で
+48.22 -> 32.08 ms/token (20.74 -> 31.17 tok/s)、-16.13ms。
+`fastmlx.fused.enable_hyper_connection_kernel()`、既定 off。
+
+**それ以外に書いた 2 本はどちらも純損で、有効にしてはいけない。**
+
+| カーネル | 見立て | 実測 | 状態 |
+|---|---|---|---|
+| `hyper_connection.py` | 18.1ms | **-16.13ms** | 採用 (既定 off、明示的に有効化) |
+| `rms_norm_gated.py` | 2.37ms | -0.01〜-0.11ms | **使わない** |
+| `moe_route.py` | 2.75ms | **+0.34ms (悪化)** | **使わない** |
+
+外した 2 本に共通するのは「**素の op が既に安く、削れるのはディスパッチ費用
+だけ**」という形。HC の 15 op は 1 op ごとに 10240 要素を触るので GPU 実働も
+あったが、`argpartition` (512 要素) や `RMSNormGated` (48x128 要素) は
+GPU 側がほぼ無料で、自作カーネルの実働時間がディスパッチの削減を食い潰す。
+
+**次に小さい標的を狙うときは、素の op が「バイトを動かしているか」を先に見ること。**
+動かしていないなら融合しても勝てない。
+
+### 残っている検証済みの標的は 1 つだけ
+
+`gather_qmm` の固定費 **1.5ms/token** (密な行列積との差 10us x 144 回)。
+32.08ms の 4.7%。**私の推奨は追わないこと** — 上の 2 連敗と同じ形
+(バイトではなく固定費) だから。やるなら専用の量子化 gather-matvec が要る。
+
+## 焼きのレーンへ渡すもの
+
+`tools/predict_recipe.py` を書いた。**rebit は experts を打ち直せない**
+(gdn/hc/attn/head/router/shared だけ) が、experts は v-fast6 の 97.5GB のうち
+85.6GB を占めるので、容量の話はここを動かせないと始まらない。この道具は
+experts を層別に打ち直せる。
+
+    tools/biglock.sh uv run python tools/predict_recipe.py \
+        --model ~/models/qwen38fn-mlx-v-fast6 --ngram ~/models/qwen38fn-ngram-4bit \
+        --experts 4 --experts-hi 6 --hi-layers spread:10 --tag sp10
+
+容量の算術は実測と一致した (experts 1 層の 6bit と 4bit の差 = 0.629GB。
+40 層で 25.2GB、実測 -25.17GB)。**`experts_hi_layers: _spread(n)` は
+1 層 0.629GB の連続したつまみ**で、v-fast6 と v-96 は二択ではない。
+
+`--hi-layers` に spread / edge / first / last / mid を指定できるので、
+**同じ層数・同じバイト数で選び方だけ変えた比較**ができる。`_spread` も
+`_FIRST5_LAST5` も folklore が根拠で層別感度は未測定 (STATUS の積み残し) なので、
+ここが焼きの前に潰せる。
 
 ## 着手前の見立て (実装より先に測る)
 

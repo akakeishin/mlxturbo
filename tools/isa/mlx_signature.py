@@ -122,7 +122,7 @@ template [[host_name("{host}")]] [[kernel]] decltype({inst}) {inst};
 
 
 def qmm_metal_file(*, name: str, body: str, dtype: str, k: int, n: int) -> str:
-    """Signature used by ``fastmlx.kernels.qmm_skinny_mma``."""
+    """Signature used by ``mlxturbo.kernels.qmm_skinny_mma``."""
 
     return build_metal_file(
         name=name,

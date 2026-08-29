@@ -1,4 +1,4 @@
-"""fastmlx/kernels/qmv_wide_nocap.py の正しさと性能を確認するスクリプト。
+"""mlxturbo/kernels/qmv_wide_nocap.py の正しさと性能を確認するスクリプト。
 
 対象は mlx v0.32.2 の qmv_wide カーネル (`quantized.h` の `qmv_wide_impl`) を
 タイル5本上限なしで移植した `qmv_wide_nocap`。M(検証幅)=6〜12 で量子化重みの
@@ -28,7 +28,7 @@ import time
 
 import mlx.core as mx
 
-from fastmlx.kernels.qmv_wide_nocap import qmv_wide_nocap
+from mlxturbo.kernels.qmv_wide_nocap import qmv_wide_nocap
 
 K = 5120
 SHAPES = {"mlp_up": 17408, "attn_q": 12288}  # K -> N, bench/skinny_qmm.py と同じ命名

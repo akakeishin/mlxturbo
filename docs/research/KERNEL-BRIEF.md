@@ -1,13 +1,13 @@
 # KERNEL-BRIEF — カーネル専門セッションへの引き継ぎ (2026-08-27)
 
 このファイルはカーネル専門セッションの起点。親セッション (エンジン/計測/製品担当)
-とはファイル境界で分業する。ここに書いていない背景は docs/KERNEL-INTEL.md、
-docs/ISA-NOTES.md、docs/STATUS.md を読むこと。
+とはファイル境界で分業する。ここに書いていない背景は docs/research/KERNEL-INTEL.md、
+docs/research/ISA-NOTES.md、docs/research/STATUS.md を読むこと。
 
 ## ミッション
 
 検証 1 ステップの GPU コストを下げ、MTPLX recommended との残ギャップ
-(code -10% / prose -13% / edit -31%、docs/STATUS.md の正式ベンチ v1) を
+(code -10% / prose -13% / edit -31%、docs/research/STATUS.md の正式ベンチ v1) を
 カーネル側から詰める。受理率 (tok/step 4.44/2.65/3.19) は決定的で反復間
 完全一致なので、per-step 時間だけが変数。
 
@@ -41,14 +41,14 @@ docs/ISA-NOTES.md、docs/STATUS.md を読むこと。
 - bench/test_dispatch.py: 全 45 形状で数値一致 (normalized_max 0.0) を維持。
   較正主張をするときは静音窓で 2 ラン、両ラン 5% 超一致行のみ
 - 経路表を変えたら bench/gate.py で baseline_all_identical: True を確認
-- GPU 計測は同時 1 プロセス (docs/STATUS.md の GPU gate queue 節)
+- GPU 計測は同時 1 プロセス (docs/research/STATUS.md の GPU gate queue 節)
 - 性能の最終判定は依存チェーン実測 (bench/ の依存チェーン系スクリプト)。
   単発スループットと勝者が入れ替わった前例あり (M=6/7)
 
 ## 使える道具
 
 - ISA 解析: tools/isa/ (metal-tt オフライン AGX コード生成、applegpu 逆アセンブラ
-  G13)。手順は docs/ISA-NOTES.md / ISA-DIFF.md
+  G13)。手順は docs/research/ISA-NOTES.md / ISA-DIFF.md
 - ブリッジ: tools/bridge/ (DLPack→MTLBuffer、bench_chain.py)。検証ステップの
   直接エンコード (libmlx get_command_encoder 経路) は着手済み未完 (B1 続き)
 - 参照実装: tools/reference/e120/ (Layr-Labs アリーナ、MIT。threadgroup/

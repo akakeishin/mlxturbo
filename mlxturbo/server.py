@@ -1,6 +1,6 @@
 """OpenAI 互換 / Anthropic 互換 HTTP サーバー。
 
-既存の投機デコードエンジン (fastmlx.spec.SpecEngine) をそのまま使う。モデルは
+既存の投機デコードエンジン (mlxturbo.spec.SpecEngine) をそのまま使う。モデルは
 起動時に 1 回だけロードして常駐させ、リクエストはグローバルなロックで直列化
 する: 91GB 級のモデルを 128GB 機に載せている前提なので、同時実行 (並列
 バッチング) はまだしない (BatchGenerator ベースのスケジューラは次段)。待機中
@@ -8,8 +8,8 @@
 するだけ)、ロックが空くまで待たせる。
 
 会話履歴はクライアントが毎ターン全文を送り直す (OpenAI/Anthropic どちらの
-API も無状態) ので、session (SpecEngine 経路なら fastmlx.spec.ChatSession、
-FallbackRunner 経路なら fastmlx.runner.FallbackSession) はリクエスト単位で
+API も無状態) ので、session (SpecEngine 経路なら mlxturbo.spec.ChatSession、
+FallbackRunner 経路なら mlxturbo.runner.FallbackSession) はリクエスト単位で
 所有権を持つ ``STATE.session_pool`` (会話ごとの LRU プール、``_select_session``
 参照) から都度引き当てる。新しいプロンプトの先頭が既存スロットの処理済み
 トークン列全体と一致すれば (= 純粋な追記なら) そのスロットを引き当てて
@@ -29,12 +29,12 @@ session を破壊しなくなる (ロックを外すこと自体は次のスケ�
 外す際はプール操作自体にも別途排他が要る。
 
 SpecEngine が受け付けないモデル (Llama/Gemma/dense Qwen や、GDN ハイブリッド
-でもレイアウトが異なるもの) では、起動時に fastmlx.runner.build_runner が
+でもレイアウトが異なるもの) では、起動時に mlxturbo.runner.build_runner が
 mlx_lm.generate.stream_generate による普通の (非投機) 生成に自動でフォール
 バックする。どちらの経路でも HTTP 層から見た形は同一 (Runner.generate が
 同じ dict を返す) で、起動時にどちらの経路が有効かを一行ログで出す。
 FallbackRunner も (SpecEngine と同じ LCP 契約で) mlx_lm の prompt_cache を
-session 経由で再利用する。詳細は fastmlx/runner.py を参照。
+session 経由で再利用する。詳細は mlxturbo/runner.py を参照。
 
 MLX の計算グラフ (モデルの重み・KV キャッシュを含む) はロードしたスレッドに
 紐づく。asyncio.to_thread や汎用スレッドプールで別スレッドへ逃がすと
@@ -62,7 +62,7 @@ Future を待ってからロックを解放する。そうしないと、まだ�
 に完了している)。
 
 thinking (推論過程) の扱い: OpenAI の ``reasoning_effort`` / Anthropic の
-``thinking`` だけを読む (fastmlx 独自フィールドは無い)。値はトークン予算
+``thinking`` だけを読む (mlxturbo 独自フィールドは無い)。値はトークン予算
 (budget) に写し、``ThinkingRouter`` が生トークン列を reasoning/content の
 2 チャンネルへ振り分ける。マーカーは mlx_lm.TokenizerWrapper の公開 API
 (``has_thinking``/``think_start_tokens``/``think_end_tokens``) から引き、
@@ -106,19 +106,19 @@ from .spec import PREFILL_STEP_SIZE, ChatSession, restore_untrimmable_caches
 app = FastAPI()
 
 
-def _fastmlx_version() -> str:
+def _mlxturbo_version() -> str:
     """配布物としてのバージョン。pyproject.toml の ``[project] version`` を
     (パッケージがインストールされた環境なら) ``importlib.metadata`` 経由で
     そのまま返す — 別ファイルに二重管理しない。未インストール実行 (稀) は
     フォールバックする。"""
 
     try:
-        return _importlib_metadata.version("fastmlx")
+        return _importlib_metadata.version("mlxturbo")
     except _importlib_metadata.PackageNotFoundError:
         return "0.0.0-unknown"
 
 
-_FASTMLX_VERSION = _fastmlx_version()
+_FASTMLX_VERSION = _mlxturbo_version()
 
 # --api-key / graceful shutdown が素通しする経路。監視・疎通用なので、鍵が
 # 立っていても・shutdown 中でも常に 200 を返す (main() docstring 相当の方針)。
@@ -270,7 +270,7 @@ class ModelState:
 
 STATE: ModelState | None = None
 
-_THINKING_SIGNATURE_PREFIX = "fastmlx_v1:"
+_THINKING_SIGNATURE_PREFIX = "mlxturbo_v1:"
 _THINKING_SIGNATURE_KEY = os.urandom(32)
 _THINKING_SIGNATURE_KEY_ID = hashlib.sha256(_THINKING_SIGNATURE_KEY).hexdigest()[:16]
 
@@ -307,8 +307,8 @@ def _try_trim_session_cache(sess, n_trim: int) -> bool:
 
     個々のキャッシュ実装 (mlx_lm.models.cache の ``KVCache`` は巻き戻せる。
     GDN ハイブリッドの線形層に使う ``ArraysCache`` は再帰状態を途中位置へ
-    戻す手段が無く巻き戻せない — fastmlx/spec.py の ChatSession docstring、
-    fastmlx/runner.py の FallbackSession docstring 参照) をこの関数自身は
+    戻す手段が無く巻き戻せない — mlxturbo/spec.py の ChatSession docstring、
+    mlxturbo/runner.py の FallbackSession docstring 参照) をこの関数自身は
     一切知らない。判定・実行はどちらも mlx_lm.models.cache の
     ``can_trim_prompt_cache``/``trim_prompt_cache`` にそのまま委ねる —
     構成する全レイヤーが ``is_trimmable()`` を申告したときだけ実際に trim
@@ -349,26 +349,43 @@ def _try_checkpoint_restore_session_cache(sess, lcp: int) -> int | None:
     """``_try_trim_session_cache`` が不発に終わる構成 (ArraysCache が混ざる
     GDN ハイブリッド — このサーバーの実運用構成そのもの) 向けの代替経路。
 
-    ``sess`` (ChatSession) が ``fastmlx.spec._prefill_hidden`` の途中で
-    残しているチェックポイント (``sess.checkpoints`` — プレフィルのチャンク
-    境界ごとの、巻き戻せないレイヤーだけのスナップショット) の中から
-    ``lcp`` 以下で最も近い位置を選び、そこまで復元する: trim できるレイヤー
-    (attention の KVCache) はそのチェックポイント位置まで ``.trim()`` し、
-    trim できないレイヤー (ArraysCache) はスナップショットの状態をそのまま
-    書き戻す。チェックポイント位置と ``lcp`` の間の差分は、この関数の呼び
-    出し元が ``sess.processed`` をチェックポイント位置へ切り詰めることで、
-    続く generate() 側の通常の (チャンク分割) prefill 経路が forward 計算で
-    自然に埋める — ここでは位置を巻き戻すだけで forward は一切行わない。
+    ``sess`` (ChatSession/FallbackSession のどちらでもよい — この関数は
+    ``.checkpoints``/``.caches`` or ``.cache``/``.processed`` を duck typing
+    で見るだけで runner の種類を知らない) が ``mlxturbo.spec._prefill_hidden``
+    (SpecEngine 経路) や ``mlxturbo.spec_flash.FlashSpecEngine.generate_stream``
+    (Flash-Next 経路) の途中で残しているチェックポイント (``sess.checkpoints``
+    — プレフィルのチャンク境界ごとの、巻き戻せないレイヤーだけのスナップ
+    ショット) の中から ``lcp`` 以下で最も近い位置を選び、そこまで復元する:
+    trim できるレイヤー (attention の KVCache) はそのチェックポイント位置
+    まで ``.trim()`` し、trim できないレイヤー (ArraysCache) はスナップ
+    ショットの状態をそのまま書き戻す。チェックポイント位置と ``lcp`` の間の
+    差分は、この関数の呼び出し元が ``sess.processed`` をチェックポイント
+    位置へ切り詰めることで、続く generate() 側の通常の (チャンク分割)
+    prefill 経路が forward 計算で自然に埋める — ここでは位置を巻き戻すだけ
+    で forward は一切行わない。
+
+    trim できるレイヤーが Flash-Next の ``_AttnCache`` (KVCache 派生 +
+    ``.indexer``、mlxturbo/spec_flash.py 冒頭の表「KV と indexer」参照) の
+    ときは、``.trim()`` 自体は KV の offset しか戻さず indexer の生 keys
+    (``.indexer.keys``、QSAIndexer が毎 forward 1 回 ``.update()`` で積み
+    増すだけで trim も advance も持たない) には触れない。ただし indexer は
+    KV と常に同じ forward 呼び出しで同じ長さぶん更新される (qwen4_exp の
+    ``Attention.__call__`` — オフセットと indexer 長は単一系列では常に一致)
+    ので、trim 後にその層の ``.offset`` と同じ長さへ切り詰め直すだけで
+    KV/indexer が再び揃う (mlxturbo/spec_flash.py の ``rollback()`` が検証
+    forward 1 ラウンドぶんについて行っているのと同じ操作を、チェックポイント
+    という粒度でここでも行う)。``.indexer`` を持たない構成 (ChatSession が
+    実運用で使う 27B/qwen3_5) では単に no-op。
 
     ``_try_trim_session_cache`` と違い、``sess.mtp_valid`` では弾かない。
     MTP を常用するこのサーバーの実運用では、公開済みの session は生成直後
-    ほぼ常に ``mtp_valid=True`` になる (fastmlx/spec.py の ChatSession.publish
+    ほぼ常に ``mtp_valid=True`` になる (mlxturbo/spec.py の ChatSession.publish
     参照) ので、そこで弾くとこの経路自体が実運用で永久に不発になる。
     代わりに、MTP 連鎖用の h_last/mtp_cache は復元後の位置に対応する状態を
     持たない (``_try_trim_session_cache`` と同じ理由) ため、この関数自体は
     それらに一切触れず、成功時は呼び出し側が ``sess.mtp_valid`` を落とす —
     続く generate() 側はそれを見て MTP チェーンを最初から作り直す (KV/GDN
-    の再利用そのものは失わない。fastmlx/spec.py の generate() docstring
+    の再利用そのものは失わない。mlxturbo/spec.py の generate() docstring
     参照)。
 
     復元前に、trim できるレイヤー全てで ``n_trim <= offset`` (= trim が必ず
@@ -384,7 +401,11 @@ def _try_checkpoint_restore_session_cache(sess, lcp: int) -> int | None:
     checkpoints = getattr(sess, "checkpoints", None)
     if not checkpoints:
         return None
+    # ChatSession は複数形 .caches、FallbackSession (FlashSpecRunner が使う)
+    # は単数形 .cache — _try_trim_session_cache と同じフォールバック。
     cache_list = getattr(sess, "caches", None)
+    if cache_list is None:
+        cache_list = getattr(sess, "cache", None)
     if not isinstance(cache_list, list) or not cache_list:
         return None
     processed_len = len(sess.processed)
@@ -417,7 +438,8 @@ def _try_checkpoint_restore_session_cache(sess, lcp: int) -> int | None:
 
     # ここから先は全レイヤーで trim が要求どおりに成功することを確認済み。
     for i in trimmable_idx:
-        trimmed = cache_list[i].trim(n_trim)
+        c = cache_list[i]
+        trimmed = c.trim(n_trim)
         if trimmed != n_trim:
             # 事前の offset チェックと矛盾する = 想定外の cache 実装。
             # 既にこのレイヤーは trim してしまっているが、processed/
@@ -427,6 +449,13 @@ def _try_checkpoint_restore_session_cache(sess, lcp: int) -> int | None:
             # 倒すことで吸収する範囲外の話ではない — 実際に踏むことは
             # ここまでの事前チェックがある限り無いはず)。
             return None
+        # Flash-Next の _AttnCache は .indexer (生 keys、trim を持たない) を
+        # 抱える。KV と indexer は常に同じ長さぶん進むので、trim 後の offset
+        # に合わせて indexer の keys も切り詰め直せば揃う (このモジュール
+        # docstring 参照)。.indexer を持たない構成では no-op。
+        indexer = getattr(c, "indexer", None)
+        if indexer is not None and getattr(indexer, "keys", None) is not None:
+            indexer.keys = indexer.keys[:, : c.offset]
 
     restore_untrimmable_caches(cache_list, cp_snapshot)
     return cp_pos
@@ -441,7 +470,7 @@ def _select_session(prompt_ids: list[int]):
     あれば、キャッシュには一切触れずそのまま使う。会話の身元を messages
     の内容から推測する (システムプロンプトのハッシュ等) のではなく、
     SpecEngine の ChatSession が単一セッションで既にやっている LCP 判定
-    (fastmlx/spec.py) をプール全体に広げただけなので、動的に変化しうる
+    (mlxturbo/spec.py) をプール全体に広げただけなので、動的に変化しうる
     システムプロンプト (現在時刻の埋め込み等) が混ざっていても「一致
     しなければ次点へ」に自然に倒れる。一致するスロットが複数ありうる
     状況では最長一致を優先する。
@@ -459,7 +488,7 @@ def _select_session(prompt_ids: list[int]):
        直近チェックポイントまで戻せるか試す。trim できるレイヤーはその
        チェックポイント位置まで trim し、trim できないレイヤー (ArraysCache)
        はスナップショットを書き戻す — 巻き戻せないものはスナップショットで
-       持つ、という考え方 (fastmlx/spec.py の CHECKPOINT_RETENTION 参照)。
+       持つ、という考え方 (mlxturbo/spec.py の CHECKPOINT_RETENTION 参照)。
        戻れるのはチェックポイント位置までなので、``processed`` はその位置
        (LCP そのものではない) へ切り詰め、LCP までの差分は続く generate()
        の通常のチャンク prefill が forward 計算で埋める。MTP 連鎖用の
@@ -687,7 +716,7 @@ class ContentNormalizationError(ValueError):
 
 class MultimodalContentError(ContentNormalizationError):
     """content にテキスト以外のブロック (image_url/image/input_audio 等) が
-    含まれていた。fastmlx はテキスト専用 (convert_flash.py が変換時に
+    含まれていた。mlxturbo はテキスト専用 (convert_flash.py が変換時に
     vision_tower.*/model.visual.* を落としている) なので、黙って読み飛ばすと
     クライアントは画像が読まれたと思って会話を続けてしまう。400 で明示する。
     """
@@ -889,7 +918,7 @@ def _normalize_anthropic_messages(messages: list[dict]) -> list[dict]:
                 # 返している (このモジュール内で "thinking" ブロックを組み
                 # 立てている箇所を参照) ので、tool を使う複数ターンの会話を
                 # 送り返すクライアント (例: Claude Code) は確実にこの型を
-                # 履歴へ含めてくる。fastmlx 自身が発行した thinking signature
+                # 履歴へ含めてくる。mlxturbo 自身が発行した thinking signature
                 # は改変されていないことを確認する (他 provider の opaque
                 # signature は解釈できないので、そのまま受け付ける)。
                 if btype == "thinking":
@@ -983,7 +1012,7 @@ def _apply_template(
         return _naive_prompt_ids(messages)
 
 
-# reasoning_effort -> thinking トークン予算の目安。fastmlx は思考の深さを
+# reasoning_effort -> thinking トークン予算の目安。mlxturbo は思考の深さを
 # 直接は調整できないので、予算 (ThinkingRouter が数える生成済みトークン数の
 # 上限) に写して実際に効かせる。未知の値は 400 にせず medium 相当とする
 # (将来 effort の値が増えても壊れない)。
@@ -1000,7 +1029,7 @@ _REASONING_EFFORT_DEFAULT_BUDGET = _REASONING_EFFORT_BUDGET["medium"]
 
 def _resolve_thinking(body: dict, protocol: str) -> tuple[bool | None, int | None, str | None]:
     """標準フィールドだけを読み、(enable_thinking 用の kwarg, 予算, エラー)
-    を返す。fastmlx 独自フィールドは無い — 何も指定が無ければ
+    を返す。mlxturbo 独自フィールドは無い — 何も指定が無ければ
     (None, None, None) (テンプレート任せ・予算強制なし)。
 
     予算: None = 強制なし (自然に終わるまで待つ)、0 = thinking 完全オフ、
@@ -1755,7 +1784,7 @@ def _check_and_strip_sampling_params(params: dict) -> str | None:
     キーが SUPPORTED_SAMPLING_PARAMS に無くても分布を変えないため 400 には
     しない — opencode や OpenAI SDK など、既定値をキー付きで送ってくる実
     クライアントが spec runner のモデルを使えなくなることを避けるため。
-    SpecRunner が非恒等値を弾く理由は fastmlx/runner.py の SpecRunner
+    SpecRunner が非恒等値を弾く理由は mlxturbo/runner.py の SpecRunner
     docstring (Block Verification の分布保証との関係) を参照。
 
     副作用: エラーを返さずに通す場合、``params`` を破壊的に書き換えて、
@@ -1965,7 +1994,7 @@ def _log_gen_stats(res: dict) -> None:
     無い数値なので、cli.py の表示行と同じ内容を運用者向けに一行ログへ出す。"""
 
     print(
-        f"[fastmlx-serve] prefill reused={res.get('prefill_reused', 0)} "
+        f"[mlxturbo-serve] prefill reused={res.get('prefill_reused', 0)} "
         f"new={res.get('prefill_new', 0)} decode={res.get('decode_tps', 0.0):.1f}tok/s"
     )
 
@@ -2070,7 +2099,7 @@ def _parse_tool_calls_text(raw: str, tools_for_parsing) -> list[dict] | None:
         parsed = parser(raw, tools_for_parsing)
     except Exception as exc:  # noqa: BLE001 - model output drives third-party parsers
         print(
-            f"[fastmlx-serve] tool call の解析に失敗 ({type(exc).__name__}: {exc})。"
+            f"[mlxturbo-serve] tool call の解析に失敗 ({type(exc).__name__}: {exc})。"
             " テキストとしてそのまま返す"
         )
         return None
@@ -2389,7 +2418,7 @@ async def list_models():
                 "id": STATE.model_name,
                 "object": "model",
                 "created": STATE.created_ts,
-                "owned_by": "fastmlx",
+                "owned_by": "mlxturbo",
             }
         ],
         "version": STATE.version,
@@ -2405,7 +2434,7 @@ async def health():
     idle、取られていれば busy と等価)。
 
     runner が fallback (非投機) のときだけ ``fallback_reason`` を追加する
-    (fastmlx.runner.build_runner が理由文字列を runner に持たせる — 「黙って
+    (mlxturbo.runner.build_runner が理由文字列を runner に持たせる — 「黙って
     fallback に落ちて気づけない」を防ぐためのもの)。fallback でなければ
     このキー自体を出さない。
     """
@@ -3310,7 +3339,7 @@ async def _anthropic_stream(
 def _prompt_to_ids(prompt) -> tuple[list[int] | None, str | None]:
     """``prompt`` は文字列 (tokenizer.encode に通す) か、事前トークナイズ済み
     の int 配列のどちらかを受け付ける。OpenAI の legacy completions は
-    文字列配列やトークン配列の配列 (バッチ) も許すが、fastmlx はリクエストを
+    文字列配列やトークン配列の配列 (バッチ) も許すが、mlxturbo はリクエストを
     直列化する設計 (1 リクエスト = 1 生成) なのでバッチは扱わない。
     """
 
@@ -3590,7 +3619,7 @@ def _responses_content_to_text(content) -> str:
     input_text/output_text/refusal などの型付きパーツの配列) をプレーン
     テキストへ落とす。``_content_to_text`` (Chat Completions/Anthropic 用)
     と同じ方針: image/audio/file 系のパーツは黙って読み飛ばさず
-    ``MultimodalContentError`` (400) にする (fastmlx はテキスト専用モデル
+    ``MultimodalContentError`` (400) にする (mlxturbo はテキスト専用モデル
     しか served しないため)。壊れた形 (パーツに type が無い、text が
     文字列でない等) も同様に ``InvalidContentError`` (400) にする。
     """
@@ -3777,11 +3806,11 @@ def _flatten_responses_tools(tools: list) -> list:
       展開してトップレベルへ引き上げる。入れ子になっている場合に備えて
       再帰的に展開する。
     - ``{"type": "web_search", ...}``: このサーバーには web 検索を実行する
-      主体が無い (fastmlx はローカルモデルへの単純な forward しか持たない)
+      主体が無い (mlxturbo はローカルモデルへの単純な forward しか持たない)
       ので、渡されても実行できない。黙って握りつぶすとクライアントは
       検索が使えると思ったまま話を進めてしまうので、落としたことを
       運用者向けログへ残してから除く (_log_gen_stats と同じ
-      ``[fastmlx-serve]`` 一行ログの作法)。
+      ``[mlxturbo-serve]`` 一行ログの作法)。
 
     ``function`` 型はそのまま素通しする (後続の ``_validate_responses_tools``
     がその形自体を検証する)。
@@ -3800,7 +3829,7 @@ def _flatten_responses_tools(tools: list) -> list:
             continue
         if ttype != "function":
             print(
-                f"[fastmlx-serve] dropping unsupported tool in 'tools': "
+                f"[mlxturbo-serve] dropping unsupported tool in 'tools': "
                 f"type={ttype!r} name={t.get('name')!r} — this server has no "
                 "execution backend for it"
             )
@@ -4439,7 +4468,7 @@ def _metal_safe_prefill_limit(config: dict) -> int | None:
     """SpecEngine が新規プロンプトを forward できる、Metal の実際の確保上限
     から逆算したトークン数上限。
 
-    SpecEngine (fastmlx/spec.py) は新規プロンプトを PREFILL_STEP_SIZE
+    SpecEngine (mlxturbo/spec.py) は新規プロンプトを PREFILL_STEP_SIZE
     (既定 2048) トークンずつチャンク分割して forward する
     (``SpecEngine._prefill_hidden``)。そのため 1 回の forward で確保される
     注意スコア行列は ``num_attention_heads * PREFILL_STEP_SIZE * T *
@@ -4529,7 +4558,7 @@ def _install_graceful_shutdown(server_obj: "uvicorn.Server") -> None:
         if signal_count["n"] == 1:
             _SHUTTING_DOWN = True
             print(
-                "[fastmlx-serve] シグナル受信: graceful shutdown 開始 "
+                "[mlxturbo-serve] シグナル受信: graceful shutdown 開始 "
                 "(新規リクエストは 503、処理中のリクエストは完了を待つ)"
             )
             # ここでは original_handle_exit を呼ばない (= uvicorn 本体の
@@ -4538,7 +4567,7 @@ def _install_graceful_shutdown(server_obj: "uvicorn.Server") -> None:
         else:
             # os._exit で OS レベルの即時終了に落とす (理由は docstring 参照)。
             # ASGI lifespan の shutdown もこの後は一切走らない。
-            print("[fastmlx-serve] 2 度目のシグナルを受信: 即時終了します", flush=True)
+            print("[mlxturbo-serve] 2 度目のシグナルを受信: 即時終了します", flush=True)
             server_obj.force_exit = True
             os._exit(1)
 
@@ -4569,7 +4598,7 @@ async def _drain_and_exit(server_obj: "uvicorn.Server") -> None:
 
 
 def _enforce_required_runner(
-    runner: Runner, required_kind: str | None, log_prefix: str = "[fastmlx-serve]"
+    runner: Runner, required_kind: str | None, log_prefix: str = "[mlxturbo-serve]"
 ) -> None:
     """``--require-runner`` が指定されているのに解決された runner の
     ``KIND`` が一致しなければ、フォールバックせず理由を明示して
@@ -4577,7 +4606,7 @@ def _enforce_required_runner(
 
     未指定 (``required_kind is None``) なら何もしない — 従来どおり黙って
     fallback を許すが、fallback なら ``/health`` の ``fallback_reason`` で
-    見える (fastmlx.runner.build_runner のクラス docstring 参照)。
+    見える (mlxturbo.runner.build_runner のクラス docstring 参照)。
     """
 
     if required_kind is None:
@@ -4611,7 +4640,7 @@ def main() -> None:
     ap.add_argument(
         "--version",
         action="version",
-        version=f"fastmlx-serve {_FASTMLX_VERSION}",
+        version=f"mlxturbo-serve {_FASTMLX_VERSION}",
     )
     ap.add_argument("--model", required=True)
     ap.add_argument("--original", default="Qwen/Qwen3.8-27B")
@@ -4638,7 +4667,7 @@ def main() -> None:
         "--ngram",
         default=None,
         help="n-gram (PLE) 表を外部サイドカーへ分離してある変換の場合、そのディレクトリを指定する"
-        " (fastmlx/ngram_stream.py)。cli.py の --ngram と同じ",
+        " (mlxturbo/ngram_stream.py)。cli.py の --ngram と同じ",
     )
     ap.add_argument(
         "--no-fused",
@@ -4727,7 +4756,7 @@ def main() -> None:
         default=None,
         choices=sorted(RUNNER_KINDS),
         metavar="KIND",
-        help="起動時に解決された runner (fastmlx.runner の KIND: "
+        help="起動時に解決された runner (mlxturbo.runner の KIND: "
         + "/".join(sorted(RUNNER_KINDS))
         + ") がこれと一致しなければ、フォールバックせず理由を表示して起動を"
         " 中止する (exit 1)。未指定 (既定) では従来どおり黙って fallback を"
@@ -4744,7 +4773,7 @@ def main() -> None:
     # 自体もここで行う。max_workers=1 でスレッドは 1 本だけ、プロセス生涯
     # 使い回す。
     executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="fastmlx-mlx"
+        max_workers=1, thread_name_prefix="mlxturbo-mlx"
     )
 
     def _load():
@@ -4755,7 +4784,7 @@ def main() -> None:
             # 同じ理由)。
             os.environ["FASTMLX_NGRAM_DISK"] = "1"
         if args.mtp:
-            # build_runner (fastmlx/runner.py) は load_cli_mtp を固定の位置
+            # build_runner (mlxturbo/runner.py) は load_cli_mtp を固定の位置
             # 引数だけで呼ぶため、--mtp のパスを直接渡す口が無い。cli.py の
             # load_cli_mtp がこの環境変数を読む (MTP_PATH_ENV 参照) — --ngram
             # と同じ、呼び出し元を編集せずに配線する手筋。
@@ -4765,8 +4794,8 @@ def main() -> None:
             from .ngram_stream import install
 
             install(model, args.ngram)
-        print(f"[fastmlx-serve] loaded in {time.perf_counter() - t0:.1f}s: {args.model}")
-        runner = build_runner(model, tokenizer, config, args, log_prefix="[fastmlx-serve]")
+        print(f"[mlxturbo-serve] loaded in {time.perf_counter() - t0:.1f}s: {args.model}")
+        runner = build_runner(model, tokenizer, config, args, log_prefix="[mlxturbo-serve]")
         _enforce_required_runner(runner, args.require_runner)
         if args.max_context_tokens is not None:
             max_context_tokens, source = args.max_context_tokens, "--max-context-tokens"
@@ -4784,11 +4813,11 @@ def main() -> None:
     runner, tokenizer, max_context_tokens, source = executor.submit(_load).result()
     if max_context_tokens is not None:
         print(
-            f"[fastmlx-serve] プロンプト長の上限: {max_context_tokens} トークン ({source})"
+            f"[mlxturbo-serve] プロンプト長の上限: {max_context_tokens} トークン ({source})"
         )
     else:
         print(
-            "[fastmlx-serve] プロンプト長の上限: 検出できず (ガード無効 — config に"
+            "[mlxturbo-serve] プロンプト長の上限: 検出できず (ガード無効 — config に"
             " max_position_embeddings が見当たらず、Metal 側の逆算もできなかった。"
             " --max-context-tokens で指定可)"
         )
@@ -4818,42 +4847,42 @@ def main() -> None:
         max_queue=args.max_queue,
         version=_FASTMLX_VERSION,
     )
-    print(f"[fastmlx-serve] version {_FASTMLX_VERSION}")
+    print(f"[mlxturbo-serve] version {_FASTMLX_VERSION}")
     print(
-        f"[fastmlx-serve] served model name: {served_name} "
+        f"[mlxturbo-serve] served model name: {served_name} "
         f"(session pool: {session_factory.__name__}, max {args.max_sessions} 会話)"
     )
-    print(f"[fastmlx-serve] 待ち行列の上限 (--max-queue): {args.max_queue}")
+    print(f"[mlxturbo-serve] 待ち行列の上限 (--max-queue): {args.max_queue}")
     if args.api_key:
-        print(f"[fastmlx-serve] API キー認証: 有効 ({len(args.api_key)} 件)")
+        print(f"[mlxturbo-serve] API キー認証: 有効 ({len(args.api_key)} 件)")
     else:
-        print("[fastmlx-serve] API キー認証: 無効 (既定、--api-key 未指定)")
+        print("[mlxturbo-serve] API キー認証: 無効 (既定、--api-key 未指定)")
     if args.model_alias:
-        print(f"[fastmlx-serve] model alias (404 を回避): {', '.join(args.model_alias)}")
+        print(f"[mlxturbo-serve] model alias (404 を回避): {', '.join(args.model_alias)}")
     if getattr(tokenizer, "has_thinking", False):
         print(
-            f"[fastmlx-serve] thinking マーカー検出: {tokenizer.think_start!r} / "
+            f"[mlxturbo-serve] thinking マーカー検出: {tokenizer.think_start!r} / "
             f"{tokenizer.think_end!r} (reasoning_content/thinking ブロック分離が有効)"
         )
     else:
-        print("[fastmlx-serve] thinking マーカー検出なし (このモデルでは分離しない)")
+        print("[mlxturbo-serve] thinking マーカー検出なし (このモデルでは分離しない)")
     if getattr(tokenizer, "has_tool_calling", False):
         print(
-            f"[fastmlx-serve] tool call マーカー検出: {tokenizer.tool_call_start!r} / "
+            f"[mlxturbo-serve] tool call マーカー検出: {tokenizer.tool_call_start!r} / "
             f"{tokenizer.tool_call_end!r} (tools/tool_choice に対応)"
         )
     else:
         print(
-            "[fastmlx-serve] tool call マーカー検出なし (このモデルは tool calling 非対応: "
+            "[mlxturbo-serve] tool call マーカー検出なし (このモデルは tool calling 非対応: "
             "tools を渡すリクエストは 400 になる)"
         )
 
     if args.allowed_origins:
         origins = [o.strip() for o in args.allowed_origins.split(",") if o.strip()]
         _add_cors_middleware(app, origins)
-        print(f"[fastmlx-serve] CORS 許可 origin: {', '.join(origins)}")
+        print(f"[mlxturbo-serve] CORS 許可 origin: {', '.join(origins)}")
     else:
-        print("[fastmlx-serve] CORS 無効 (既定、ローカル専用)")
+        print("[mlxturbo-serve] CORS 無効 (既定、ローカル専用)")
 
     import uvicorn
 

@@ -1,4 +1,4 @@
-"""mlx-lm 素 vs fastmlx vs MTPLX の同一マシン・同一プロンプト速度比較ハーネス。
+"""mlx-lm 素 vs mlxturbo vs MTPLX の同一マシン・同一プロンプト速度比較ハーネス。
 
 docs/PLAN.md Phase E2 の準備物。各エンジンを直列 subprocess で起動し、
 decode tok/s・TTFT（prefill 時間の代理指標）・生成トークン数を JSON へ書き出す。
@@ -8,21 +8,21 @@ decode tok/s・TTFT（prefill 時間の代理指標）・生成トークン数�
   用意だけして実行しないタスクの一部として作成された。
 
 前提:
-- mlx-lm 素・fastmlx は fastmlx 既存の .venv をそのまま使う
+- mlx-lm 素・mlxturbo は mlxturbo 既存の .venv をそのまま使う
   （`uv run --project <repo>` 経由。.venv は汚さない）。
 - MTPLX は tools/compare/mtplx-venv/ にインストール済みの独立 venv を使う
-  （PyPI 版 mtplx、fastmlx 側の依存とは完全分離）。
+  （PyPI 版 mtplx、mlxturbo 側の依存とは完全分離）。
 - 同一プロンプト集合は bench/spec_bench.py の PROMPTS をそのまま import する
-  （import すると fastmlx/mlx-lm も import されるため、このスクリプト自体は
-  fastmlx の .venv 内で実行すること。GPU 計算は発生しない、モジュール読み込みのみ）。
+  （import すると mlxturbo/mlx-lm も import されるため、このスクリプト自体は
+  mlxturbo の .venv 内で実行すること。GPU 計算は発生しない、モジュール読み込みのみ）。
 
 2 つの比較モード:
 - same-quant: 3 エンジンとも lmstudio-community/Qwen3.8-27B-MLX-4bit を使う。
   MTPLX 側はこの checkpoint に MTP ヘッドが同梱されていないため --no-mtp
   （AR-only）で走らせる。つまりこの行はカーネル/実装の生の速度比較であって
   MTPLX の投機デコード機能そのものの比較ではない。
-- recommended: mlx-lm 素とfastmlx は同一 checkpoint のまま
-  （fastmlx は自前抽出+量子化した MTP を足すのが「推奨構成」そのものなので
+- recommended: mlx-lm 素とmlxturbo は同一 checkpoint のまま
+  （mlxturbo は自前抽出+量子化した MTP を足すのが「推奨構成」そのものなので
   base checkpoint は変わらない）。MTPLX だけ公式推奨の
   Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed（4bit dynamic quant、
   約20.4GB、実効5.807bit/weight。HF で実在確認済み）+ --mtp に切り替える。
@@ -31,7 +31,7 @@ decode tok/s・TTFT（prefill 時間の代理指標）・生成トークン数�
 
     uv run --project /Users/ht/dev/fastmlx python bench/compare_engines.py \\
         --modes same-quant recommended \\
-        --engines mlx-lm fastmlx mtplx \\
+        --engines mlx-lm mlxturbo mtplx \\
         --prompts all \\
         --max-tokens 512 \\
         --cooldown-sec 60 \\
@@ -62,16 +62,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# bench/spec_bench.py は import 時点で mlx.core / mlx_lm / fastmlx.mtp /
-# fastmlx.spec を import する（クラス定義のみで推論は走らない）。そのため
-# このハーネス自体は fastmlx の .venv 内で実行される前提。
+# bench/spec_bench.py は import 時点で mlx.core / mlx_lm / mlxturbo.mtp /
+# mlxturbo.spec を import する（クラス定義のみで推論は走らない）。そのため
+# このハーネス自体は mlxturbo の .venv 内で実行される前提。
 from bench.spec_bench import PROMPTS  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # デフォルト値
 # ---------------------------------------------------------------------------
 
-# README / fastmlx/cli.py のデフォルトと同一（比較対象の backbone を揃える）
+# README / mlxturbo/cli.py のデフォルトと同一（比較対象の backbone を揃える）
 LMSTUDIO_4BIT = "lmstudio-community/Qwen3.8-27B-MLX-4bit"
 QWEN38_ORIGINAL = "Qwen/Qwen3.8-27B"
 # MTPLX 公式カタログの推奨構成。HF API で実在確認済み
@@ -84,7 +84,7 @@ DEFAULT_MAX_TOKENS = 512  # README の実測表と同じ長さ
 DEFAULT_COOLDOWN_SEC = 60
 DEFAULT_TIMEOUT_SEC = 1800  # モデルロード + 512 tok 生成の上限目安
 
-ENGINE_CHOICES = ("mlx-lm", "fastmlx", "mtplx")
+ENGINE_CHOICES = ("mlx-lm", "mlxturbo", "mtplx")
 MODE_CHOICES = ("same-quant", "recommended")
 
 
@@ -138,12 +138,12 @@ def build_mlx_lm_command(args: argparse.Namespace, model: str, prompt: str) -> l
     return cmd
 
 
-def build_fastmlx_command(args: argparse.Namespace, prompt: str) -> list[str]:
+def build_mlxturbo_command(args: argparse.Namespace, prompt: str) -> list[str]:
     cmd = [
         "uv", "run", "--project", str(REPO_ROOT),
-        "fastmlx",
-        "--model", args.fastmlx_model,
-        "--original", args.fastmlx_original,
+        "mlxturbo",
+        "--model", args.mlxturbo_model,
+        "--original", args.mlxturbo_original,
         "--temp", str(args.temp),
         "--max-tokens", str(args.max_tokens),
         "--n-draft", str(args.n_draft),
@@ -151,7 +151,7 @@ def build_fastmlx_command(args: argparse.Namespace, prompt: str) -> list[str]:
         "--mtp-bits", str(args.mtp_bits),
         "--prompt", prompt,
     ]
-    # fastmlx/cli.py に --seed は無い（temp=0 なら決定的なので実害なし）
+    # mlxturbo/cli.py に --seed は無い（temp=0 なら決定的なので実害なし）
     if args.no_think:
         cmd.append("--no-think")
     return cmd
@@ -216,14 +216,14 @@ def parse_mlx_lm(stdout: str) -> dict[str, Any]:
     return result
 
 
-_FASTMLX_LOAD_RE = re.compile(r"\[fastmlx\] loaded in ([\d.]+)s")
+_FASTMLX_LOAD_RE = re.compile(r"\[mlxturbo\] loaded in ([\d.]+)s")
 _FASTMLX_STATS_RE = re.compile(
     r"\[([\d.]+) tok/s \| ([\d.]+) tok/step \| ttft ([\d.]+)s \| "
     r"prefill 再利用 (\d+) / 新規 (\d+)\]"
 )
 
 
-def parse_fastmlx(stdout: str, wall_time_s: float) -> dict[str, Any]:
+def parse_mlxturbo(stdout: str, wall_time_s: float) -> dict[str, Any]:
     result: dict[str, Any] = {}
     m = _FASTMLX_LOAD_RE.search(stdout)
     load_s = float(m.group(1)) if m else None
@@ -238,18 +238,18 @@ def parse_fastmlx(stdout: str, wall_time_s: float) -> dict[str, Any]:
         result["ttft_s"] = ttft_s
         result["prefill_reused"] = int(m.group(4))
         result["prefill_new"] = int(m.group(5))
-        # fastmlx/cli.py は生成トークン総数を出力しないため、壁時計から概算する。
+        # mlxturbo/cli.py は生成トークン総数を出力しないため、壁時計から概算する。
         # load 時間・ttft を差し引いた残りを decode_tok_s で割り戻す粗い推定値。
-        # 既存ファイル (fastmlx/cli.py) は変更不可のためこの近似で代用する。
+        # 既存ファイル (mlxturbo/cli.py) は変更不可のためこの近似で代用する。
         if load_s is not None:
             decode_elapsed = max(wall_time_s - load_s - ttft_s, 0.0)
             result["generated_tokens_estimate"] = round(decode_tps * decode_elapsed)
             result["generated_tokens_estimate_basis"] = (
                 "(wall_time_s - load_s - ttft_s) * decode_tok_s による概算。"
-                "fastmlx CLI が生成トークン数を直接出力しないための代替"
+                "mlxturbo CLI が生成トークン数を直接出力しないための代替"
             )
     else:
-        result["parse_error"] = "fastmlx CLI の統計行が見つからない"
+        result["parse_error"] = "mlxturbo CLI の統計行が見つからない"
     return result
 
 
@@ -370,8 +370,8 @@ def run_subprocess(cmd: list[str], timeout: float) -> tuple[int, str, str, float
 def build_command(args: argparse.Namespace, engine: str, mode: str, prompt: str) -> list[str]:
     if engine == "mlx-lm":
         return build_mlx_lm_command(args, args.mlx_lm_model, prompt)
-    if engine == "fastmlx":
-        return build_fastmlx_command(args, prompt)
+    if engine == "mlxturbo":
+        return build_mlxturbo_command(args, prompt)
     if engine == "mtplx":
         return build_mtplx_command(args, prompt, mode)
     raise ValueError(f"unknown engine: {engine}")
@@ -380,8 +380,8 @@ def build_command(args: argparse.Namespace, engine: str, mode: str, prompt: str)
 def parse_output(engine: str, stdout: str, wall_time_s: float) -> dict[str, Any]:
     if engine == "mlx-lm":
         return parse_mlx_lm(stdout)
-    if engine == "fastmlx":
-        return parse_fastmlx(stdout, wall_time_s)
+    if engine == "mlxturbo":
+        return parse_mlxturbo(stdout, wall_time_s)
     if engine == "mtplx":
         return parse_mtplx(stdout)
     raise ValueError(f"unknown engine: {engine}")
@@ -481,7 +481,7 @@ def run_all(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description=(
-            "mlx-lm 素 / fastmlx / MTPLX の同一マシン・同一プロンプト速度比較。"
+            "mlx-lm 素 / mlxturbo / MTPLX の同一マシン・同一プロンプト速度比較。"
             "実行すると GPU 推論が走る。--dry-run でまずコマンド列だけ確認すること。"
         )
     )
@@ -508,8 +508,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--dry-run", action="store_true", help="コマンドを組み立てて表示するだけ。実行しない")
 
     ap.add_argument("--mlx-lm-model", default=LMSTUDIO_4BIT)
-    ap.add_argument("--fastmlx-model", default=LMSTUDIO_4BIT)
-    ap.add_argument("--fastmlx-original", default=QWEN38_ORIGINAL)
+    ap.add_argument("--mlxturbo-model", default=LMSTUDIO_4BIT)
+    ap.add_argument("--mlxturbo-original", default=QWEN38_ORIGINAL)
     ap.add_argument("--n-draft", type=int, default=3)
     ap.add_argument("--max-draft", type=int, default=8)
     ap.add_argument("--mtp-bits", type=int, default=4)

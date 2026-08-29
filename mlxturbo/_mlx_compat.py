@@ -1,6 +1,6 @@
-"""The supported mlx / mlx-lm compatibility boundary for fastmlx.
+"""The supported mlx / mlx-lm compatibility boundary for mlxturbo.
 
-fastmlx intentionally relies on a small set of mlx-lm implementation details.  Keep
+mlxturbo intentionally relies on a small set of mlx-lm implementation details.  Keep
 those imports and the executable version/signature checks here so an upstream change
 fails loudly instead of silently changing speculative decoding semantics.
 """

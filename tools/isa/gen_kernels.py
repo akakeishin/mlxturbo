@@ -30,7 +30,7 @@ DEFAULT_N = 17408
 def _cases(k: int, n: int) -> dict[str, str]:
     out: dict[str, str] = {}
 
-    # Shipped kernel, exactly as fastmlx builds it.  bf16 is the benchmarked
+    # Shipped kernel, exactly as mlxturbo builds it.  bf16 is the benchmarked
     # dtype, so base_m8_bf16 is the kernel behind the 1.04x number.
     for m in (6, 8, 12, 16):
         out[f"base_m{m}_bf16"] = qmm_metal_file(
@@ -65,7 +65,7 @@ def _cases(k: int, n: int) -> dict[str, str]:
 
 
 def _current_kernel() -> dict[str, str]:
-    """Whatever fastmlx.kernels currently builds, on the same pipeline.
+    """Whatever mlxturbo.kernels currently builds, on the same pipeline.
 
     The A2 kernels above come from a snapshot so their numbers stay comparable;
     this entry tracks the working tree so a new design can be measured against
@@ -73,7 +73,7 @@ def _current_kernel() -> dict[str, str]:
     """
 
     try:
-        from fastmlx.kernels import _qmm_skinny_mma_source as cur
+        from mlxturbo.kernels import _qmm_skinny_mma_source as cur
     except Exception as exc:  # noqa: BLE001 - a broken working tree is not fatal
         print(f"current kernel skipped: {exc}")
         return {}
@@ -108,7 +108,7 @@ def _fastqmm_reference(k: int, n: int) -> dict[str, str]:
     than imported so this script never has to load mlx.
     """
 
-    path = ROOT / "fastmlx" / "fast_qmm.py"
+    path = ROOT / "mlxturbo" / "fast_qmm.py"
     if not path.exists():
         return {}
     bodies = dict(_SRC_RE.findall(path.read_text()))

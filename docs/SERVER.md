@@ -1,15 +1,15 @@
-# fastmlx-serve — 配布・接続ガイド
+# mlxturbo-serve — 配布・接続ガイド
 
-`fastmlx-serve` は OpenAI 互換 (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`) と
+`mlxturbo-serve` は OpenAI 互換 (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`) と
 Anthropic 互換 (`/v1/messages`) の両方を話す HTTP サーバー。モデルは起動時に 1 回だけロードして常駐させ、
-リクエストは内部で直列化する (`fastmlx/server.py` 冒頭の docstring 参照)。このドキュメントは配布物として
+リクエストは内部で直列化する (`mlxturbo/server.py` 冒頭の docstring 参照)。このドキュメントは配布物として
 接続方法・運用上の制約をまとめる。既定の `127.0.0.1` はローカル利用向け。LAN/WAN に公開する場合は、
 後述のとおり TLS を終端する reverse proxy または SSH tunnel を必ず併用する。
 
 ## 起動
 
 ```
-uv run fastmlx-serve --model mlx-community/Qwen3.6-35B-A3B-4bit --served-model-name qwen36 --port 8765
+uv run mlxturbo-serve --model mlx-community/Qwen3.6-35B-A3B-4bit --served-model-name qwen36 --port 8765
 ```
 
 `--model` 以外は全て省略可。ロードには数秒〜十数秒かかる (モデルサイズ依存)。起動ログに
@@ -18,7 +18,7 @@ uv run fastmlx-serve --model mlx-community/Qwen3.6-35B-A3B-4bit --served-model-n
 Flash-Next の投機デコードが必須なら、黙って通常生成へ落ちないよう起動条件も固定する:
 
 ```
-uv run fastmlx-serve --model /path/to/qwen38fn-mlx-v-l --ngram /path/to/qwen38fn-ngram-4bit \
+uv run mlxturbo-serve --model /path/to/qwen38fn-mlx-v-l --ngram /path/to/qwen38fn-ngram-4bit \
   --served-model-name qwen38fn --require-runner flash_spec --port 8765
 ```
 
@@ -31,7 +31,7 @@ curl -sS http://127.0.0.1:8765/v1/models
 
 ### オプション一覧
 
-`uv run fastmlx-serve --help` が正。以下は主要オプションの抜粋:
+`uv run mlxturbo-serve --help` が正。以下は主要オプションの抜粋:
 
 | オプション | 既定 | 内容 |
 |---|---|---|
@@ -61,7 +61,7 @@ curl -sS http://127.0.0.1:8765/v1/models
 **未指定なら今までどおり認証なし** (ローカル専用の既定を変えない)。
 
 ```
-uv run fastmlx-serve --model ... --api-key sk-fastmlx-xxxxxxxx
+uv run mlxturbo-serve --model ... --api-key sk-mlxturbo-xxxxxxxx
 ```
 
 - OpenAI 系 (`/v1/chat/completions` / `/v1/completions` / `/v1/responses` / `/v1/models`) は
@@ -113,7 +113,7 @@ Flash-Next (`qwen4_exp`) では、次の優先順で MTP を解決する。
 場所に置く場合だけ `--mtp` を使う:
 
 ```
-uv run fastmlx-serve --model ... --mtp "/Volumes/Mobile SSD/models/qwen38fn-mtp.safetensors"
+uv run mlxturbo-serve --model ... --mtp "/Volumes/Mobile SSD/models/qwen38fn-mtp.safetensors"
 ```
 
 - `--mtp` を明示したのに2回のロード試行とも失敗した場合は、通常生成へ落とさず理由を出して **exit 1** する。
@@ -134,18 +134,18 @@ uv run fastmlx-serve --model ... --mtp "/Volumes/Mobile SSD/models/qwen38fn-mtp.
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "fastmlx/qwen36",
+  "model": "mlxturbo/qwen36",
   "provider": {
-    "fastmlx": {
+    "mlxturbo": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "fastmlx (local)",
+      "name": "mlxturbo (local)",
       "options": {
         "baseURL": "http://127.0.0.1:8765/v1",
-        "apiKey": "{env:FASTMLX_API_KEY}"
+        "apiKey": "{env:MLXTURBO_API_KEY}"
       },
       "models": {
         "qwen36": {
-          "name": "Qwen3.6-35B-A3B (fastmlx)"
+          "name": "Qwen3.6-35B-A3B (mlxturbo)"
         }
       }
     }
@@ -157,19 +157,19 @@ uv run fastmlx-serve --model ... --mtp "/Volumes/Mobile SSD/models/qwen38fn-mtp.
 選択できるようになる。
 
 ```
-FASTMLX_API_KEY=dummy opencode run --pure "Return exactly: fastmlx-ok"
+MLXTURBO_API_KEY=dummy opencode run --pure "Return exactly: mlxturbo-ok"
 ```
 
 ### Codex CLI
 
 Codex CLI (2026-02-01 以降) は `wire_api` として `"responses"` しか受け付けない (`"chat"` は削除済み) —
-fastmlx-serve は `/v1/responses` を実装しているのでこれで問題ない。`model_providers` はユーザーレベルの
+mlxturbo-serve は `/v1/responses` を実装しているのでこれで問題ない。`model_providers` はユーザーレベルの
 `~/.codex/config.toml` でのみ有効 (プロジェクトローカルの `.codex/config.toml` では無視される)。
 
 他の Codex 設定と混ぜたくない場合は `CODEX_HOME` で丸ごと隔離できる:
 
 ```
-export CODEX_HOME=/tmp/codex-fastmlx
+export CODEX_HOME=/tmp/codex-mlxturbo
 mkdir -p "$CODEX_HOME"
 ```
 
@@ -177,21 +177,21 @@ mkdir -p "$CODEX_HOME"
 
 ```toml
 model = "qwen36"
-model_provider = "fastmlx"
+model_provider = "mlxturbo"
 
-[model_providers.fastmlx]
-name = "fastmlx (local)"
+[model_providers.mlxturbo]
+name = "mlxturbo (local)"
 base_url = "http://127.0.0.1:8765/v1"
-env_key = "FASTMLX_API_KEY"
+env_key = "MLXTURBO_API_KEY"
 wire_api = "responses"
 ```
 
 `--api-key` を立てていない場合も `env_key` に何かしらの環境変数を割り当てておく (Codex は
-`Authorization: Bearer <値>` を必ず送るが、fastmlx 側は鍵未設定なら見ないので値は何でもよい)。
+`Authorization: Bearer <値>` を必ず送るが、mlxturbo 側は鍵未設定なら見ないので値は何でもよい)。
 
 ```
-CODEX_HOME=/tmp/codex-fastmlx FASTMLX_API_KEY=dummy \
-  codex exec --skip-git-repo-check "Return exactly: fastmlx-ok" < /dev/null
+CODEX_HOME=/tmp/codex-mlxturbo MLXTURBO_API_KEY=dummy \
+  codex exec --skip-git-repo-check "Return exactly: mlxturbo-ok" < /dev/null
 ```
 
 ### Claude Code
@@ -200,12 +200,12 @@ CODEX_HOME=/tmp/codex-fastmlx FASTMLX_API_KEY=dummy \
 
 ```
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
-export ANTHROPIC_AUTH_TOKEN=sk-fastmlx-xxxxxxxx   # --api-key 未設定なら任意の値でよい
+export ANTHROPIC_AUTH_TOKEN=sk-mlxturbo-xxxxxxxx   # --api-key 未設定なら任意の値でよい
 export ANTHROPIC_MODEL=qwen36
 ```
 
 ```
-claude -p "Return exactly: fastmlx-ok" --model qwen36
+claude -p "Return exactly: mlxturbo-ok" --model qwen36
 ```
 
 Claude Code は会話タイトル生成などの裏方処理で、メインモデルと別の小さいモデル名
@@ -213,9 +213,9 @@ Claude Code は会話タイトル生成などの裏方処理で、メインモ�
 ため、これを許可するには起動時に `--model-alias claude-3-5-haiku-20241022` を足す (複数回指定可)。
 
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` に注意: Claude Code は非 Anthropic モデルの実際の文脈長を検出できない
-ため、この環境変数で申告しないと既定の 200k を前提に auto-compaction 等が動く。fastmlx-serve 側の
+ため、この環境変数で申告しないと既定の 200k を前提に auto-compaction 等が動く。mlxturbo-serve 側の
 `--max-context-tokens` (または自動検出値、起動ログに出る) と数値を揃えておくこと — ここがずれると、
-Claude Code 側が「まだ十分空きがある」と判断したのに fastmlx-serve 側は 400 (`context_length_exceeded`)
+Claude Code 側が「まだ十分空きがある」と判断したのに mlxturbo-serve 側は 400 (`context_length_exceeded`)
 を返す、という不整合が起こる。
 
 ### Chatbox
@@ -226,7 +226,7 @@ Claude Code 側が「まだ十分空きがある」と判断したのに fastmlx
 
 ## 制約
 
-- **リクエストは直列処理。** `fastmlx-serve` は 91GB 級のモデルを 128GB 機に載せている前提で、1 リクエスト
+- **リクエストは直列処理。** `mlxturbo-serve` は 91GB 級のモデルを 128GB 機に載せている前提で、1 リクエスト
   = 1 生成に直列化する設計 (継続バッチングは未実装)。複数クライアントを同時に繋ぐ場合、後着のリクエスト
   は先着の生成が終わるまで待たされる (`--max-queue` を超えると 503)。
 - **token logprobs は未対応。** Chat/Completions/Responses のレスポンス中の `logprobs` は `null` または空配列

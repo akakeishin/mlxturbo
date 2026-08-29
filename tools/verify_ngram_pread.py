@@ -33,7 +33,7 @@ def main():
     import mlx.core as mx
     import numpy as np
 
-    from fastmlx.ngram_stream import StreamNGram
+    from mlxturbo.ngram_stream import StreamNGram
 
     sidecar = Path(args.sidecar).expanduser()
     mmap_stream = StreamNGram(sidecar, backend="mmap")

@@ -11,8 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import mlx.core as mx
 from mlx_lm import load
 
-from fastmlx.kernels import dispatch
-from fastmlx.spec import SpecEngine
+from mlxturbo.kernels import dispatch
+from mlxturbo.spec import SpecEngine
 
 
 def main():

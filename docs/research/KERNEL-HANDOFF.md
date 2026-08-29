@@ -1,7 +1,7 @@
 # KERNEL-HANDOFF — カーネルセッションから親セッションへの申し送り
 
 このファイルはカーネルセッションが更新する。新しい項目は上に足す。
-詳細な根拠はそれぞれ docs/ISA-DIFF.md §9 と docs/BRIDGE-NOTES.md §5.1 にある。
+詳細な根拠はそれぞれ docs/research/ISA-DIFF.md §9 と docs/research/BRIDGE-NOTES.md §5.1 にある。
 
 ## 2026-08-27
 

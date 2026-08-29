@@ -2,7 +2,7 @@
 
 Each entry changes exactly one mechanism against the shipped baseline so an
 instruction-count delta can be attributed.  Nothing here is imported by
-``fastmlx`` -- these bodies exist only to be compiled and disassembled.
+``mlxturbo`` -- these bodies exist only to be compiled and disassembled.
 
 Hypothesis mapping (docs/HYPOTHESES-A2.md):
   v_uint4        H4  packed weight read width: 8x uint32 -> 2x uint4 per group
@@ -16,7 +16,7 @@ Hypothesis mapping (docs/HYPOTHESES-A2.md):
                      threadgroup slab is needed to place the B fragment
 
 E120 lineage (docs/ISA-DIFF.md).  These are not MMA kernels at all; they are
-the register-only vec4 QMV that ``fastmlx.kernels`` ships, flattened for one
+the register-only vec4 QMV that ``mlxturbo.kernels`` ships, flattened for one
 width so its m=8 hot loop can be counted against the MMA ones:
   v_e120_notable     v4 with USE_TABLE off (sums recomputed per 4-row block)
   v_e120_table       v4 as dispatched at m>=4 (sums read from the xsums table)
@@ -31,8 +31,8 @@ GROUP_SIZE = 64
 BITS = 4
 SPLIT_K = 8
 
-# fastmlx/kernels/_qmm_skinny_mma_source.py, kept in step by hand so this file
-# stays importable without fastmlx on the path.
+# mlxturbo/kernels/_qmm_skinny_mma_source.py, kept in step by hand so this file
+# stays importable without mlxturbo on the path.
 E120_INPUTS_PER_GROUP = {2: 2, 3: 3, 4: 4, 5: 5, 6: 3, 7: 4, 8: 4, 9: 3}
 
 
@@ -452,7 +452,7 @@ def direct_body(m: int) -> str:
 def _e120_body(m: int, *, na: int, rows_per_simd: int, table: bool) -> str:
     """The E120 register-only QMV, flattened for one width.
 
-    Transcribed from ``fastmlx/kernels/_qmm_skinny_mma_source.py``
+    Transcribed from ``mlxturbo/kernels/_qmm_skinny_mma_source.py``
     (Layr-Labs/qwen-3.8-mtp-challenge, MIT; LICENSE vendored under
     ``tools/reference/e120/``).  Two deliberate departures from the shipped
     source, neither of which touches the loop body being counted:

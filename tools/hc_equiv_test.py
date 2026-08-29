@@ -84,11 +84,11 @@ def main():
 
     import mlx_lm.models.qwen4_exp as Q
 
-    from fastmlx import fused
+    from mlxturbo import fused
 
     model, tok = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, args.ngram)
     ids = tok.apply_chat_template(

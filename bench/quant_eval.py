@@ -62,11 +62,11 @@ def _load(model_ref: str, ngram: str | None = None, rebit_spec: str | None = Non
 
     model, tok = load(model_ref)
     if ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, ngram)
     if rebit_spec:
-        from fastmlx import rebit
+        from mlxturbo import rebit
 
         rebit.apply(model, rebit_spec)
     return model, tok
@@ -290,7 +290,7 @@ def cmd_sweep(args):
             best = dt if best is None else min(best, dt)
         return best
 
-    from fastmlx import rebit
+    from mlxturbo import rebit
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out = RESULTS_DIR / f"sweep-{args.tag}.json"

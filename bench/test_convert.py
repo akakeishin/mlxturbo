@@ -1,4 +1,4 @@
-"""fastmlx.convert の dry-run 経路を検証するテスト兼ベンチ。
+"""mlxturbo.convert の dry-run 経路を検証するテスト兼ベンチ。
 
 プロジェクトの依存に pytest が無い（pyproject.toml は変更しない方針）ため、
 plain assert + unittest.SkipTest だけで書いてある。pytest が入っている環境なら
@@ -9,15 +9,15 @@ plain assert + unittest.SkipTest だけで書いてある。pytest が入って�
 
 で直接実行できる。どちらの経路でも、ローカルに Qwen/Qwen3.8-27B の
 スナップショットが無い環境では全体をスキップする（フル 56GB のダウンロードは
-発生しない — fastmlx.mtp.find_snapshot はローカルキャッシュしか見ない）。
+発生しない — mlxturbo.mtp.find_snapshot はローカルキャッシュしか見ない）。
 
 検証内容:
   1. --dry-run で本体の先頭 DRY_RUN_LAYERS 層 + mtp.* だけを変換する
-     (56GB 全体は読まない。fastmlx.convert.truncate_layers が mlx の遅延評価を
+     (56GB 全体は読まない。mlxturbo.convert.truncate_layers が mlx の遅延評価を
      利用して未使用層のシャード読み込みを避けている)
   2. 出力ディレクトリが mlx_lm.load() でそのまま読め、forward が NaN/Inf なしで通る
      (mtp.* は qwen3_5.py の sanitize が捨てるので本体ロードは壊れない)
-  3. mtp.* が fastmlx.convert.load_quantized_mtp で量子化済みのまま読み戻せる
+  3. mtp.* が mlxturbo.convert.load_quantized_mtp で量子化済みのまま読み戻せる
   4. 量子化した mtp.fc / layer0.mlp.down_proj を無量子化の参照重みと比較し、
      逆量子化誤差 (mean abs / relative L1 / max abs) を測る
   5. group_size=64 と 128 を比較し、128 の方が出力バイト数が小さいことを確認する
@@ -40,15 +40,15 @@ from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_lm_load
 from mlx_lm.models.qwen3_5 import TextModelArgs
 
-from fastmlx._mlx_compat import QWEN35_SHIFTED_NORM_SUFFIXES
-from fastmlx.convert import (
+from mlxturbo._mlx_compat import QWEN35_SHIFTED_NORM_SUFFIXES
+from mlxturbo.convert import (
     convert,
     load_quantized_mtp,
     normalize_quantization,
     validate_dry_run_layers,
 )
-from fastmlx.mtp import find_snapshot, load_mtp
-import fastmlx.cli as cli_module
+from mlxturbo.mtp import find_snapshot, load_mtp
+import mlxturbo.cli as cli_module
 
 HF_PATH = "Qwen/Qwen3.8-27B"
 # full_attention_interval (Qwen3.8-27B では 4) 以上が必須。qwen3_5 の forward は
@@ -57,7 +57,7 @@ HF_PATH = "Qwen/Qwen3.8-27B"
 DRY_RUN_LAYERS = 4
 FULL_NUM_LAYERS = 64  # Qwen3.8-27B の実層数。フル変換サイズ推定に使う。
 
-_TMP_ROOT = Path(tempfile.mkdtemp(prefix="fastmlx_convert_test_"))
+_TMP_ROOT = Path(tempfile.mkdtemp(prefix="mlxturbo_convert_test_"))
 
 
 def _cleanup_tmp_root() -> None:
@@ -183,7 +183,7 @@ def _dry_run(group_size: int) -> dict:
         for name, value in source_norms.items()
     ), "source-loaded and output-reloaded RMSNorm weights differ"
 
-    # 2) mtp.* が量子化済みとしてそのまま読める（fastmlx.mtp.load_mtp 相当の量子化版）
+    # 2) mtp.* が量子化済みとしてそのまま読める（mlxturbo.mtp.load_mtp 相当の量子化版）
     text_args = TextModelArgs.from_dict(config["text_config"])
     mtp_q = load_quantized_mtp(out_dir, text_args)
     mx.eval(mtp_q.parameters())
@@ -312,7 +312,7 @@ def _fmt_bytes(n: float) -> str:
 
 
 def _print_report(results: dict) -> None:
-    print("\n=== fastmlx.convert dry-run report ===")
+    print("\n=== mlxturbo.convert dry-run report ===")
     for gs in sorted(results):
         r = results[gs]
         print(f"\n-- group_size={gs} --")

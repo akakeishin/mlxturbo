@@ -1,6 +1,6 @@
 # 比較実行キュー（Phase E2 準備）
 
-docs/PLAN.md Phase E2「mlx-lm 素 vs fastmlx vs MTPLX の同一マシン・同一プロンプト比較」
+docs/research/PLAN.md Phase E2「mlx-lm 素 vs fastmlx vs MTPLX の同一マシン・同一プロンプト比較」
 と Phase C1（KLD 品質ゲート）の実行準備。**このファイル自体は準備記録であって、
 実行はしていない**（インストール・DL開始・ハーネス作成のみ。GPU ベンチ実行禁止の
 指示のもとで作成）。
@@ -45,11 +45,11 @@ docs/PLAN.md Phase E2「mlx-lm 素 vs fastmlx vs MTPLX の同一マシン・同�
 - 同 FP16 版: `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16`（M1/M2 用。今回は未使用）
 - PyPI `mtplx` 最新版 = 2.9.2 = clone の `pyproject.toml` と同一
 
-## 注意: docs/KERNEL-INTEL.md に「KLD 計測レーン」という見出しは無かった
+## 注意: docs/research/KERNEL-INTEL.md に「KLD 計測レーン」という見出しは無かった
 
-依頼文にあった「docs/KERNEL-INTEL.md の『KLD 計測レーン』の注意（token_ids を
+依頼文にあった「docs/research/KERNEL-INTEL.md の『KLD 計測レーン』の注意（token_ids を
 同一性レーンに使う等）」を探したが、2026-08-26 時点の同ファイルにその見出しは
-存在しない。最も近い記述は docs/PLAN.md Phase C1:
+存在しない。最も近い記述は docs/research/PLAN.md Phase C1:
 
 > 品質ゲートは KLD を主指標にする: bf16 参照に対する出力分布の KL divergence を
 > 固定評価セットで測り、閾値超えは速度がどうであれ不合格。greedy 一致率と logit
@@ -63,9 +63,9 @@ argmax で分岐すると、KLD が分布差ではなく文脈差を測ってし
 
 ## GPU キューの衝突に注意
 
-`docs/STATUS.md` の「GPU gate queue」に Phase A2/A3 の未実行ゲート
+`docs/research/STATUS.md` の「GPU gate queue」に Phase A2/A3 の未実行ゲート
 （例: `bench/test_qmm_skinny_mma.py --dtype bfloat16 ...`）が並んでいる。
-GPU は同時 1 プロセストラフィックが前提（docs/PLAN.md 契約 5）。
+GPU は同時 1 プロセストラフィックが前提（docs/research/PLAN.md 契約 5）。
 下記の比較コマンドを実行する前に、STATUS.md の GPU gate queue を先に片付けるか、
 少なくとも同時に走らせないこと。
 
@@ -111,7 +111,7 @@ MTPLX の same-quant 行はモデル未対応で失敗する可能性がある
 
 ### 1. 正式実行（静音プロトコル後）
 
-docs/PLAN.md Phase E1「正式ベンチプロトコル」（再起動直後・Spotlight 静止・
+docs/research/PLAN.md Phase E1「正式ベンチプロトコル」（再起動直後・Spotlight 静止・
 電源接続・他プロセス最小）はまだ `bench/PROTOCOL.md` として明文化されていない。
 それが無い間は最低限、以下を実行前に確認すること:
 
@@ -197,7 +197,7 @@ KERNEL-INTEL.md の Phase C 初期レシピが引用している MTPLX Optimized
   込みの MTPLX を見るなら recommended 行（Optimized-Speed, `--depth 3 --mtp`）
   を見る。
 - **mlx-lm の `stream_generate` は既知の非決定 quirk がある**
-  （`docs/STATUS.md` Phase B2 実測）: 手動 greedy ループとは位置 49 あたりで
+  （`docs/research/STATUS.md` Phase B2 実測）: 手動 greedy ループとは位置 49 あたりで
   準同点 argmax が入れ替わることがあり、原因は `stream_generate` 側の
   専用 stream/wired_limit/非同期パイプラインで fastmlx 側の不具合ではないと
   切り分け済み。速度比較には影響しないが、出力テキストが 1 トークン単位で

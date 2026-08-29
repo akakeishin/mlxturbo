@@ -9,7 +9,7 @@
 
 RAM は減る方向に動く (元の重みを捨ててから新しいのを置く)。
 
-    from fastmlx import rebit
+    from mlxturbo import rebit
     rebit.apply(model, "gdn=4,hc=4")
 
 クラス名は byte_budget.py の分類と揃えてある:

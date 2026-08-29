@@ -67,7 +67,7 @@ S_e=3\cdot6144\cdot2048\cdot4.5/8
    =M_{\rm usable}-W_{\rm core}-KV-A(m)-M_{\rm staging}-M_{\rm OS}
    \]
 
-   PLAN上、fastmlx の検証状態だけでも \(m=32\) では約4.8 GBです。[docs/PLAN.md](/Users/ht/dev/fastmlx/docs/PLAN.md:197)
+   PLAN上、fastmlx の検証状態だけでも \(m=32\) では約4.8 GBです。[docs/research/PLAN.md](/Users/ht/dev/fastmlx/docs/research/PLAN.md:197)
 
    政策は次を推奨します。
 
@@ -148,7 +148,7 @@ p_{\rm route}(e)\cdot
 \|y_e^{q}-y_e^{ref}\|
 \]
 
-で感度を測るべきです。既存PLANのKLD gateと統合できます。[docs/PLAN.md](/Users/ht/dev/fastmlx/docs/PLAN.md:98)
+で感度を測るべきです。既存PLANのKLD gateと統合できます。[docs/research/PLAN.md](/Users/ht/dev/fastmlx/docs/research/PLAN.md:98)
 
 ## 2. 投機との相乗の定量見積もり
 
@@ -160,7 +160,7 @@ fastmlxでは1回の検証で出力するtoken数は、通常
 c=1+\mathbb E[a]
 \]
 
-です。したがって償却分母はdraft受理数 \(a\) ではなく \(1+a\) です。現行実測は mean accepted 1.38、tokens/step 2.38です。[D2-RESULTS.md](/Users/ht/dev/fastmlx/docs/D2-RESULTS.md:23)
+です。したがって償却分母はdraft受理数 \(a\) ではなく \(1+a\) です。現行実測は mean accepted 1.38、tokens/step 2.38です。[D2-RESULTS.md](/Users/ht/dev/fastmlx/docs/research/D2-RESULTS.md:23)
 
 \[
 B_{\rm AR}
@@ -451,7 +451,7 @@ B_{\rm cold/out}
 - swap発生またはp95 stallが1秒を超える
 - cache状態依存のbit切替が必要になる
 
-なお現PLAN記載の内蔵SSD空き267 GBでは316 GB artifact自体が入りません。[docs/PLAN.md](/Users/ht/dev/fastmlx/docs/PLAN.md:174) 外部SSDを使うなら、内蔵SSDの5–7 GB/sではなく外部SSDの実測値が判断基準です。
+なお現PLAN記載の内蔵SSD空き267 GBでは316 GB artifact自体が入りません。[docs/research/PLAN.md](/Users/ht/dev/fastmlx/docs/research/PLAN.md:174) 外部SSDを使うなら、内蔵SSDの5–7 GB/sではなく外部SSDの実測値が判断基準です。
 
 独立した Sol xhigh レビューでも、「短期のpre-download測定のみconditional GO、production戦線は現時点NO-GO」という同じ判定でした。ファイル変更は行っていません。
 

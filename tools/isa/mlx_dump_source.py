@@ -61,10 +61,10 @@ def dump_a2_mma() -> None:
 
 
 def dump_current() -> None:
-    """The kernel fastmlx currently ships, if its host module can build one."""
+    """The kernel mlxturbo currently ships, if its host module can build one."""
 
     try:
-        from fastmlx.kernels import _qmm_skinny_mma_source as cur
+        from mlxturbo.kernels import _qmm_skinny_mma_source as cur
     except Exception as exc:  # noqa: BLE001
         print(f"// current kernel unavailable: {exc}")
         return
@@ -99,5 +99,5 @@ def dump_current() -> None:
 if __name__ == "__main__":
     print("//////// A2 skinny MMA (snapshot) ////////")
     dump_a2_mma()
-    print("//////// current fastmlx kernel ////////")
+    print("//////// current mlxturbo kernel ////////")
     dump_current()

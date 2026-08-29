@@ -11,7 +11,7 @@ m=2 の検証は m=1 の 1.04 倍しかかからない(実測)ので、受理さ
 
 Phase D 汎用パック (docs/RESEARCH.md, docs/KERNEL-INTEL.md「深度制御」節):
 D1 は MTP 連鎖の深度ラダーを AdaEDL 型の確信度 + 位置別受理率 EMA の
-継続/停止ゲートへ置換、D3 は文脈 lookup を suffix automaton (fastmlx/sam.py)
+継続/停止ゲートへ置換、D3 は文脈 lookup を suffix automaton (mlxturbo/sam.py)
 化して仲裁を ReSpec 流のエントロピー起動 + 候補 EMA へ置換、D4 は temp>0 の
 棄却サンプリングを Block Verification (arXiv:2403.10444) へ置換した。
 いずれも訓練不要・分布保証は不変 (D1/D3 は深度と提案元の選び方だけを変える
@@ -47,7 +47,7 @@ from .sam import SuffixAutomaton
 # 確信度信号にし、KERNEL-INTEL.md「深度制御」の位置別受理率 EMA + 期待利得
 # 閾値 (reach *= p_d, threshold = h*(1+expected)/(1+d*h)) と等重み平均で
 # 併用する。gamma=0.2 は論文の既定値。h=0.19 は checkpoint 型巻き戻し
-# (fastmlx の全位置状態保持) のレンジ 0.18-0.20 の中央値。
+# (mlxturbo の全位置状態保持) のレンジ 0.18-0.20 の中央値。
 ADAEDL_GAMMA = 0.2
 GATE_ROLLBACK_COST = 0.19
 GATE_EMA_ALPHA = 0.2
@@ -73,7 +73,7 @@ def _pos_accept_prior(d: int) -> float:
 # 最大遡り長 l=3 をそのまま採用 (語彙サイズが異なるため較正の余地あり、
 # docs/STATUS.md に注記)。lambda_e (エントロピーと長さのトレードオフ) と
 # EMA 更新率 alpha, 品質閾値 theta_score=0.5 は論文本文に具体値の記載が
-# なかったため fastmlx 側で選んだ較正値。
+# なかったため mlxturbo 側で選んだ較正値。
 RESPEC_LOOKBACK = 3
 RESPEC_LAMBDA_E = 1.0
 RESPEC_ENTROPY_THETA = 1.5
@@ -92,11 +92,11 @@ RESPEC_MAX_BUCKET = 8
 # で失敗)。PREFILL_STEP_SIZE トークンずつ流せば、そのチャンクの注意スコア
 # 行列は heads * chunk * S * 2 (S に対して線形) で収まる。
 #
-# fastmlx/runner.py の FallbackRunner (mlx_lm.generate.stream_generate) が
+# mlxturbo/runner.py の FallbackRunner (mlx_lm.generate.stream_generate) が
 # 既にこの値で prefill を分割しており、Flash-Next の出荷経路はそちらを
 # 通っている。SpecEngine 側だけ別の刻み幅にすると「同じプロンプトなのに
 # 経路によって出力が違う」を自作することになるので、値はここ 1 箇所だけに
-# 置き、fastmlx/runner.py はこの定数をそのまま import して両経路で共有する。
+# 置き、mlxturbo/runner.py はこの定数をそのまま import して両経路で共有する。
 #
 # 決定性の範囲: mx.quantized_matmul は行データが同じでもバッチ長 (M) が
 # 違うと異なる丸めを返す (実測で確認済み — 4-bit 量子化モデルの層 1 回の
@@ -119,7 +119,7 @@ PREFILL_STEP_SIZE = 2048
 # ごと (このモジュール冒頭 PREFILL_STEP_SIZE と同じ刻み、新しい刻みは作らない)
 # にこれらのレイヤーだけの状態を退避しておく。次ターンの新プロンプトが
 # 処理済み列の途中 (チャンク境界より前) で分岐しても、直近のチェックポイント
-# まで復元してそこから差分だけ prefill し直せる (fastmlx/server.py の
+# まで復元してそこから差分だけ prefill し直せる (mlxturbo/server.py の
 # _try_checkpoint_restore_session_cache が消費する)。trim できるレイヤー
 # (KVCache) はスナップショット不要 — .trim() で任意の位置へ戻せる。
 #
@@ -186,7 +186,7 @@ class ChatSession:
     新プロンプトが処理済み列の純粋な追記なら差分だけ prefill する。追記
     でなければ (テンプレートが履歴を書き換えた等)、``checkpoints`` に直近の
     プレフィルチャンク境界のスナップショットがあれば、そこまで復元して
-    差分だけ prefill し直す (fastmlx/server.py の _select_session 参照)。
+    差分だけ prefill し直す (mlxturbo/server.py の _select_session 参照)。
     どちらも使えなければ全再構築に落ちる。
     """
 
@@ -297,7 +297,7 @@ class SpecEngine:
         確保され Metal の上限を超える (モジュール冒頭の PREFILL_STEP_SIZE
         docstring 参照)。PREFILL_STEP_SIZE トークンずつ常に (短いプロンプト
         でも 1 チャンクとして) 流し、チャンクごとに mx.eval + mx.clear_cache()
-        してから次へ進む — fastmlx/runner.py の FallbackRunner が使う
+        してから次へ進む — mlxturbo/runner.py の FallbackRunner が使う
         mlx_lm.generate の prefill ループと同じ形、同じ刻み幅。caches は
         capture=False の通常経路 (KVCache.update_and_fetch / GDN の
         cache.advance) でチャンクをまたいで状態を引き継ぐ。
@@ -573,7 +573,7 @@ class SpecEngine:
     ) -> int:
         """SAM の一致長を EMA ランキングのバケットへ量子化する。
 
-        fastmlx の lookup 候補は SAM が返す単一候補 (最長一致の最新出現) な
+        mlxturbo の lookup 候補は SAM が返す単一候補 (最長一致の最新出現) な
         ので、ReSpec の「一致位置ごとの EMA」を「一致長バケットごとの EMA」
         に対応させる: 一致が長いほど再出現が偶然でない可能性が高く、
         バケット単位で信頼度を学習するのが自然な単一候補版の類推になる。
@@ -587,7 +587,7 @@ class SpecEngine:
         """Block Verification (Sun et al., arXiv:2403.10444, Algorithm 2 /
         Eq. 4-5) specialized to a deterministic (delta) draft proposal.
 
-        fastmlx's draft tokens (MTP argmax chain and SAM lookup) are always
+        mlxturbo's draft tokens (MTP argmax chain and SAM lookup) are always
         a fixed, deterministic proposal, i.e. Ms(x | c, X^i) = 1 for the
         drafted token and 0 otherwise. Substituting this delta distribution
         into the paper's general formulas collapses the running joint-
@@ -611,7 +611,7 @@ class SpecEngine:
         is what lets it accept at least as many tokens in expectation
         without ever accepting fewer (paper Theorem 2); for a genuinely
         stochastic draft distribution this raises expected accepted length,
-        while for fastmlx's deterministic draft the two samplers are
+        while for mlxturbo's deterministic draft the two samplers are
         provably (and empirically, see the Monte Carlo test) identically
         distributed, since a degenerate proposal leaves no joint-coupling
         slack for block verification to exploit -- see docs/STATUS.md for
@@ -657,7 +657,7 @@ class SpecEngine:
         送るリンク数を決める (``_gate_depth``)。深度上限は
         ``max_draft if max_draft > 0 else n_draft`` を流用する。
 
-        文脈 lookup (source="lookup"): fastmlx/sam.py の suffix automaton が
+        文脈 lookup (source="lookup"): mlxturbo/sam.py の suffix automaton が
         O(1) 償却で最長一致を追跡する。直近 confirmed トークンの target
         エントロピー履歴が ReSpec の entropy-guided trigger
         (``_respec_trigger``) を満たし、かつ一致長バケットの受理率 EMA が
@@ -704,7 +704,7 @@ class SpecEngine:
                 # KV/GDN 状態の再利用は MTP 連鎖の生死と切り離す — 対応する
                 # h_last の無い mtp_cache を引き継ぐと後段の concat で
                 # 落ちる (mtp_valid が False の session は h_last/mtp_cache
-                # が巻き戻し後の位置と対応しない、fastmlx/server.py の
+                # が巻き戻し後の位置と対応しない、mlxturbo/server.py の
                 # _try_checkpoint_restore_session_cache 参照) ので、MTP は
                 # session.mtp_valid のときだけ引き継ぎ、そうでなければ後段
                 # の use_mtp ブロックが「セッション再利用なし」と同じ経路

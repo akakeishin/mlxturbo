@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def test_spec_engine_has_verification_only_dispatch_wiring():
-    path = Path(__file__).resolve().parent.parent / "fastmlx" / "spec.py"
+    path = Path(__file__).resolve().parent.parent / "mlxturbo" / "spec.py"
     tree = ast.parse(path.read_text())
     spec_engine = next(
         node

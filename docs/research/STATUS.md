@@ -182,7 +182,7 @@
 ## Phase D 汎用パック (D1 + D3 + D4) — 実装完了、GPU gate 通過
 
 対象は `fastmlx/spec.py`（唯一の編集者として担当）と新規 `fastmlx/sam.py`。
-設計根拠は docs/RESEARCH.md、docs/KERNEL-INTEL.md「深度制御」節。3 本とも
+設計根拠は docs/research/RESEARCH.md、docs/research/KERNEL-INTEL.md「深度制御」節。3 本とも
 WebFetch で一次ソース本文（AdaEDL 2410.18351、Block Verification 2403.10444、
 ReSpec 2511.01282）を確認してから式を採用した（HTML 版が数式を落とすケースが
 あったため、arXiv PDF を `pdftotext -layout` で落として本文を読んだ）。
@@ -375,11 +375,11 @@ TV 距離が 0.013〜0.019（閾値 0.03 未満）であることを確認、別
 - phase_s のキー (`draft`/`verify`/`maint`) と accept 統計のスキーマ
   (`accept_hist`/`accept_trace`/`src_hist`/`steps`/`mean_accepted`/
   `tokens_per_step`) は変更していない。
-- 測定中に並行エージェントが `fastmlx/kernels/` と `docs/STATUS.md` を
+- 測定中に並行エージェントが `fastmlx/kernels/` と `docs/research/STATUS.md` を
   同一ワークツリーで並行編集していたことを確認した（`git worktree add`
   でコミット済み過去版を別チェックアウトし比較する形で、working tree の
   `git stash` 等破壊的操作は使わずに旧実装との A/B を行った）。この
-  節を追記する前に `docs/STATUS.md` を読み直し、既存の追記内容を保持した
+  節を追記する前に `docs/research/STATUS.md` を読み直し、既存の追記内容を保持した
   まま末尾に追加している。
 
 ## spec 出力の同点 flip — 調査完了、バグではないと判定 (2026-08-26)
@@ -1172,7 +1172,7 @@ v-fast6 の rebit 予測 KLD 0.00432 に対し、実際に焼いたら **0.00378
 
 ### 融合の効きが申し送りの数字と合わない
 
-docs/KERNEL-HANDOFF-HC.md は v-stream で 52.32 -> 35.09 ms (-17.23ms) と
+docs/research/KERNEL-HANDOFF-HC.md は v-stream で 52.32 -> 35.09 ms (-17.23ms) と
 報告している。同じモデル・同じ n-gram サイドカーで測り直すと
 **51.99 -> 41.38 ms (-10.6ms)** にしかならない。
 

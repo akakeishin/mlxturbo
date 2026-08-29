@@ -100,7 +100,7 @@ class Runner:
             import sys
 
             sys.path.insert(0, str(REPO_ROOT))
-            from fastmlx.ngram_stream import install
+            from mlxturbo.ngram_stream import install
 
             install(self.model, ngram)
 

@@ -1,7 +1,7 @@
 """Production source builder for the clean-room A2 v5 skinny MMA kernel.
 
 The implementation follows ``docs/ISA-DIFF.md`` and the ``v_direct`` probe in
-``tools/isa/variants.py``.  It is independent of ``fastmlx.fast_qmm``.
+``tools/isa/variants.py``.  It is independent of ``mlxturbo.fast_qmm``.
 """
 
 GROUP_SIZE = 64

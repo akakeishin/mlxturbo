@@ -1,6 +1,6 @@
-"""Executable startup contract for fastmlx's audited mlx-lm internals."""
+"""Executable startup contract for mlxturbo's audited mlx-lm internals."""
 
-from fastmlx._mlx_compat import (
+from mlxturbo._mlx_compat import (
     MLX_LM_MAX_EXCLUSIVE,
     MLX_LM_MIN,
     MLX_MAX_EXCLUSIVE,

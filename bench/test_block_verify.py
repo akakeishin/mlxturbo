@@ -1,6 +1,6 @@
 """Monte Carlo distribution-equivalence test for D4 Block Verification.
 
-``SpecEngine._block_verify_tau`` (fastmlx/spec.py) is pure Python (no mlx
+``SpecEngine._block_verify_tau`` (mlxturbo/spec.py) is pure Python (no mlx
 arrays), so this only needs ``random`` -- no Metal device required.
 
 D4 acceptance criterion (a): with a synthetic small-vocab distribution,
@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastmlx.spec import SpecEngine
+from mlxturbo.spec import SpecEngine
 
 
 def sequential_tau(p_l, u_l, n_avail):
@@ -82,7 +82,7 @@ def _monte_carlo_case(seed, vocab, n_avail, n_samples, tv_threshold):
     rng_setup = random.Random(seed)
     target_rows = [_row_dist(rng_setup, vocab) for _ in range(n_avail + 1)]
     # Deterministic drafted tokens: argmax of a *different* fixed
-    # distribution, exactly like fastmlx's MTP/lookup draft is a fixed
+    # distribution, exactly like mlxturbo's MTP/lookup draft is a fixed
     # proposal independent of the target model being verified against.
     draft_rows = [_row_dist(rng_setup, vocab) for _ in range(n_avail)]
     draft_tokens = [max(range(vocab), key=lambda i: row[i]) for row in draft_rows]
@@ -127,7 +127,7 @@ def test_block_verification_matches_sequential_distribution():
 def test_block_verify_never_beats_sequential_in_tau_but_matches_in_law():
     """Sanity check on the acceptance-length claim (Theorem 2): expected
     accepted length should be statistically indistinguishable (not worse)
-    between the two samplers for a deterministic draft -- fastmlx's draft
+    between the two samplers for a deterministic draft -- mlxturbo's draft
     proposal has no entropy for block verification to exploit, so unlike
     the paper's stochastic-drafter setting the expected gain here is ~0,
     not a regression. See docs/STATUS.md for the derivation.

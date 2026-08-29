@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastmlx.kernels._qmm_skinny_mma_source import (
+from mlxturbo.kernels._qmm_skinny_mma_source import (
     ACTIVE_INPUT_GROUPS,
     BITS,
     BLOCK_SIZE,
@@ -29,7 +29,7 @@ from fastmlx.kernels._qmm_skinny_mma_source import (
     eligible_layout,
     sums_stride,
 )
-from fastmlx.kernels import qmm_skinny_mma as qmv_module
+from mlxturbo.kernels import qmm_skinny_mma as qmv_module
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SWIFT_REFERENCE = REPO_ROOT / "tools/reference/e120/Qwen35.swift"
@@ -81,8 +81,8 @@ def test_python_constants_are_witnessed_in_vendored_swift():
     swift = SWIFT_REFERENCE.read_text()
     license_text = (SWIFT_REFERENCE.parent / "LICENSE").read_text()
     for relative in (
-        "fastmlx/kernels/_qmm_skinny_mma_source.py",
-        "fastmlx/kernels/qmm_skinny_mma.py",
+        "mlxturbo/kernels/_qmm_skinny_mma_source.py",
+        "mlxturbo/kernels/qmm_skinny_mma.py",
     ):
         port = (REPO_ROOT / relative).read_text()
         assert "Layr-Labs/qwen-3.8-mtp-challenge" in port

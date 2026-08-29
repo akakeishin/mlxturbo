@@ -197,11 +197,11 @@ def main():
 
     import mlx_lm.models.qwen4_exp as Q
 
-    from fastmlx import fused
+    from mlxturbo import fused
 
     model, tok = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, args.ngram)
     # hyper-connections は融合済みを前提に測る (これが現状の出発点)

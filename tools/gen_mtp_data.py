@@ -104,7 +104,7 @@ MIXED_PROMPTS = [
 
 def collect_snippets(rng, n):
     """ローカルの実コードから編集タスク用の切り出しを作る。"""
-    roots = [REPO / "fastmlx", REPO / "bench", REPO / "tools"]
+    roots = [REPO / "mlxturbo", REPO / "bench", REPO / "tools"]
     venv_mlx = list((REPO / ".venv").glob("lib/python*/site-packages/mlx_lm"))
     roots.extend(venv_mlx)
     files = []

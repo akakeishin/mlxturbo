@@ -47,7 +47,7 @@ def main():
 
     model, _ = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, args.ngram)
 

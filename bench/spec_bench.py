@@ -17,8 +17,8 @@ from mlx_lm import load, stream_generate
 from mlx_lm.models.qwen3_5 import TextModelArgs
 from mlx_lm.sample_utils import make_sampler
 
-from fastmlx.mtp import find_snapshot, load_mtp
-from fastmlx.spec import SpecEngine
+from mlxturbo.mtp import find_snapshot, load_mtp
+from mlxturbo.spec import SpecEngine
 
 _EDIT_SNIPPET = '''
 import json
@@ -136,7 +136,7 @@ def main():
 
     model, tokenizer = load(args.model)
     if args.fast_qmm:
-        from fastmlx.fast_qmm import enable as enable_fast_qmm
+        from mlxturbo.fast_qmm import enable as enable_fast_qmm
 
         enable_fast_qmm(model)
     text_args = TextModelArgs.from_dict(model.args.text_config)

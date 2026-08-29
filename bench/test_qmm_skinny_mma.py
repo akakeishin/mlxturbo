@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import mlx.core as mx
 
-from fastmlx.kernels._qmm_skinny_mma_source import SPLIT_K
-from fastmlx.kernels.qmm_skinny_mma import M_MAX, M_MIN, qmm_skinny_mma
+from mlxturbo.kernels._qmm_skinny_mma_source import SPLIT_K
+from mlxturbo.kernels.qmm_skinny_mma import M_MAX, M_MIN, qmm_skinny_mma
 
 BF16_CORRECTNESS_THRESHOLD = 8e-3
 M8_DEPENDENCY_CHAIN_SPEEDUP = 1.5

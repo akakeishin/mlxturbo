@@ -12,7 +12,7 @@
 load_mtp (原本チェックポイント用) で読むと二重シフトになる。
 
 使い方 (GPU 長時間。カーネル側セッションの計測と排他を確認してから):
-  uv run python -m fastmlx.train_mtp --data data/mtp_selfgen.jsonl \
+  uv run python -m mlxturbo.train_mtp --data data/mtp_selfgen.jsonl \
       --limit 1000 --tag ckpt1k
 """
 
@@ -179,7 +179,7 @@ def main():
         mx.save_safetensors(str(path), params)
         meta = {
             "norm_shift_applied": True,
-            "loader": "fastmlx.mtp.load_mtp_file",
+            "loader": "mlxturbo.mtp.load_mtp_file",
             "base_model": args.model,
             "original": args.original,
             "data": args.data,

@@ -1,6 +1,6 @@
 # KERNEL-HANDOFF-HC — hyper-connections の融合カーネル (2026-08-27)
 
-`docs/KERNEL-BRIEF-HC.md` のミッションの結果。実装は
+`docs/research/KERNEL-BRIEF-HC.md` のミッションの結果。実装は
 `fastmlx/kernels/hyper_connection.py`、入口は `fastmlx/fused.py` の
 `enable_hyper_connection_kernel()` / `disable_hyper_connection_kernel()`。既定は off。
 

@@ -28,7 +28,12 @@ m 可変一括検証、受理適応深度、厳密棄却サンプリング（tem
 - mlx-lm 素 decode 21〜23 tok/s。fastmlx は易しい内容 40〜51、難持続 28〜35 tok/s
 - 受理: 易しい文 ~3/3、難しい文平均 1.0〜1.5（連鎖 2 リンク目以降が弱い）
 
-## 3. 物理制約（確定事実。再測定不要）
+## 3. 物理制約（確定事実。再測定不要 — ただし M3 Max 世代限定）
+
+> **射程**: 以下は M3 Max（GEMM 13.1 TFLOPS / 帯域 345〜350GB/s）の演算・帯域比に乗った
+> 判定であって、恒久的な物理法則ではない。行列アクセラレータを積む M5 以降では
+> 「prefill の余地 1.22 倍」「m=16 を帯域天井へは不可能」「GDN scan は無実」の 3 件が
+> 失効しうる。根拠と失効の仕方は README の「ハード世代が変わると失効する判定」。
 
 - ストリーミング読み天井 345〜350GB/s。decode m=1 は 344.5GB/s ≒ 天井（磨く余地なし）
 - GEMM 天井 ~13.1 TFLOPS。prefill は 10.7TF = 82%（余地 1.22 倍、犯人は qmm_t タイル）
@@ -37,7 +42,9 @@ m 可変一括検証、受理適応深度、厳密棄却サンプリング（tem
 - 物理目標: m∈{2..10} は帯域 roof（mlp タイルで ~0.145ms）、m∈{11..16} は演算 roof。
   m=16 を帯域天井に置くことは不可能
 - scales/biases が量子化バイトの 11.1%（実効 4.50bit/weight）。group128 化で ~1.06 倍
-- GatedDeltaNet の scan は prefill でも decode でも無実（全視点一致）
+- GatedDeltaNet の scan は prefill でも decode でも無実（全視点一致）。
+  ただし prefill 側の無実は「時間の 2.6% しか占めない」という相対値による。matmul だけが
+  4 倍速い世代では占有が ~10% に上がるので、そこでは再測定対象に戻る
 
 ## 4. フェーズと作業項目
 
@@ -46,7 +53,7 @@ GPU を使う計測は同時に 1 プロセスだけ（結果が壊れる）。�
 
 ### Phase 0: レビュー指摘の修正（最初にやる。A より先）
 
-docs/REVIEW-2026-08-26.md（Codex Sol による ca9dc7f のレビュー）の指摘を処理する。
+docs/research/REVIEW-2026-08-26.md（Codex Sol による ca9dc7f のレビュー）の指摘を処理する。
 「壊れる」は全件修正、「怪しい」は修正または根拠つきで見送り判断を残す。特に:
 
 - convert.py の norm 二重シフト（最重篤）: MTP 入り成果物の再ロード時に本体
@@ -113,7 +120,7 @@ docs/REVIEW-2026-08-26.md（Codex Sol による ca9dc7f のレビュー）の指
 
 ### Phase D: アルゴリズム（受理率の分子側）
 
-設計根拠は docs/RESEARCH.md（必読）。二層構成:
+設計根拠は docs/research/RESEARCH.md（必読）。二層構成:
 **汎用パック (D1+D3+D4+bf16 MTP+KLD quant) = 訓練ゼロで全モデルに効く底上げ、
 目標 tokens/step 2.5-2.8**。D2 (訓練) は看板モデル専用のターボで別セッション。
 効き順:
@@ -184,8 +191,8 @@ MLX 量子化の有無を確認してから固定する）:
   8bit(392)/2bit g128(86)/3bit g128(43)/4bit(9) の混合で実効 ~3.4bpw。
   3bit expert の 2bit 化 + 8bit 島の 4-6bit 化で ~105GB (実効 ~3.0) が狙い目。
   2bit 主力域なので KLD ゲート必須
-- M6: GLM-5.2 — 調査の結果 NO-GO で確定 (docs/OFFLOAD-RESEARCH.md、
-  docs/OFFLOAD-DESIGN-SOL.md)。予測 0.6-1.1 tok/s、投機との相乗も先行研究と
+- M6: GLM-5.2 — 調査の結果 NO-GO で確定 (docs/research/OFFLOAD-RESEARCH.md、
+  docs/research/OFFLOAD-DESIGN-SOL.md)。予測 0.6-1.1 tok/s、投機との相乗も先行研究と
   実機記録で否定。再訪条件は sol 設計書の閾値リスト (SSD p10>=4.5GB/s、
   U_cold(4)<19 等) を満たすハード/モデルが現れたときのみ
 
@@ -228,7 +235,7 @@ MLX 量子化の有無を確認してから固定する）:
 - GPU 計測を伴う受け入れテストは直列キューで 1 つずつ実行する。
 - 各項目の完了条件は本計画書の「受け入れ」基準。数値が出ない場合は
   計測条件（バックグラウンド負荷）を先に疑う。
-- 迷ったら docs/RESEARCH.md と README.md の実測を正とする。仮説を追加測定なしで
+- 迷ったら docs/research/RESEARCH.md と README.md の実測を正とする。仮説を追加測定なしで
   実装判断に使わない。
 
 ## 7. リスクと反転条件

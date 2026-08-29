@@ -98,11 +98,11 @@ def main():
 
     model, tok = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install, install_ram
+        from mlxturbo.ngram_stream import install, install_ram
 
         (install_ram if args.ngram_mode == "ram" else install)(model, args.ngram)
     if args.rebit:
-        from fastmlx import rebit
+        from mlxturbo import rebit
 
         rebit.apply(model, args.rebit)
 

@@ -15,7 +15,7 @@ sys.path.insert(0, "/Users/ht/dev/fastmlx")
 
 import mlx.core as mx
 
-from fastmlx._mlx_compat import mlx_lm_load
+from mlxturbo._mlx_compat import mlx_lm_load
 
 PROSE = (
     "分散システムにおける結果整合性と強整合性の違いを、具体例を"

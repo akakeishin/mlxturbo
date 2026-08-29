@@ -47,7 +47,7 @@ def main():
                     help="読み込み後にビットを打ち直す (例 gdn=4)")
     ap.add_argument("--fused-hc", action="store_true",
                     help="hyper-connections を融合カーネルで動かしてから測る "
-                         "(fastmlx.fused.enable_hyper_connection_kernel)")
+                         "(mlxturbo.fused.enable_hyper_connection_kernel)")
     args = ap.parse_args()
 
     import os
@@ -62,11 +62,11 @@ def main():
 
     model, tok = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, args.ngram)
     if args.rebit:
-        from fastmlx import rebit
+        from mlxturbo import rebit
 
         rebit.apply(model, args.rebit)
     ids = tok.apply_chat_template(
@@ -74,7 +74,7 @@ def main():
         add_generation_prompt=True,
     )
     if args.fused_hc:
-        from fastmlx import fused
+        from mlxturbo import fused
 
         fused.enable_hyper_connection_kernel()
         print("hyper-connections を融合カーネルに差し替えた")

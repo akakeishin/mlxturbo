@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastmlx.kernels import dispatch
+from mlxturbo.kernels import dispatch
 
 
 class _Array:

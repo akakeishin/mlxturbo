@@ -56,13 +56,13 @@ def _variants(Q, mx):
     def _fixed(self, x):
         # idx と重みは 1 度作って使い回す (毎回作ると測りたくない op が乗る)
         key = x.shape[:-1]
-        cached = getattr(self, "_fastmlx_fixed", None)
+        cached = getattr(self, "_mlxturbo_fixed", None)
         if cached is None or cached[0] != key:
             idx = mx.broadcast_to(mx.arange(self.top_k), (*key, self.top_k))
             w = mx.full((*key, self.top_k), 1.0 / self.top_k, dtype=mx.float32)
             mx.eval(idx, w)
-            self._fastmlx_fixed = (key, idx, w)
-            cached = self._fastmlx_fixed
+            self._mlxturbo_fixed = (key, idx, w)
+            cached = self._mlxturbo_fixed
         return cached[1], cached[2]
 
     def no_route(self, x):
@@ -93,7 +93,7 @@ def main():
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--fused-route", action="store_true",
                     help="ルーティングを融合カーネルにしてから測る "
-                         "(fastmlx.fused.enable_moe_route)")
+                         "(mlxturbo.fused.enable_moe_route)")
     args = ap.parse_args()
 
     import os
@@ -108,7 +108,7 @@ def main():
 
     model, tok = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, args.ngram)
     ids = tok.apply_chat_template(
@@ -117,7 +117,7 @@ def main():
     )
 
     if args.fused_route:
-        from fastmlx import fused
+        from mlxturbo import fused
 
         fused.enable_moe_route()
         print("ルーティングを融合カーネルに差し替えた")

@@ -1,6 +1,6 @@
 # AGX ISA 解析基盤と第一次結果（2026-08-26）
 
-対象は `docs/GATE-RESULTS-A2.md` の m=8 bf16 = 1.04x を出したカーネル、
+対象は `docs/research/GATE-RESULTS-A2.md` の m=8 bf16 = 1.04x を出したカーネル、
 すなわち当時の `fastmlx/kernels/_qmm_skinny_mma_source.py` の `build_source(8)`。
 命令列まで下ろして H1 / H4 / H5 を判定する。
 
@@ -58,7 +58,7 @@ build_source(m)                       tools/isa/snapshots/ (固定)
    `<name>_shape` / `_strides` / `_ndim` も本体に名前が出たときだけ足す、
    関数名は `custom_kernel_<name>`、`template [[host_name(...)]]` で明示実体化）。
    これは復元であって公式仕様ではないので、GPU キューの `verbose=True` ダンプと
-   突き合わせて確認すること（`docs/ISA-QUEUE.md` Q1）。
+   突き合わせて確認すること（`docs/research/ISA-QUEUE.md` Q1）。
 2. `applegpu-nt -S` は「plugin interface not implemented: AIRNTEmitAssembly」で
    アセンブリを吐けない。ネイティブ image は出せるので、そちらを Mach-O から
    取り出す方式にした。
@@ -233,7 +233,7 @@ base_m8 は maxReg 42、スピル 0、threadgroup メモリは `partials` の 2K
 （256 threads × 8 simdgroup で、G13 の 32KB に対して余裕）。
 レジスタもスループット制約になっていない。
 ただし G13 のレジスタファイルは M3 と別物で、M3 は Dynamic Caching がある。
-M3 での確定は `maxTotalThreadsPerThreadgroup`（`docs/ISA-QUEUE.md` Q2）待ち。
+M3 での確定は `maxTotalThreadsPerThreadgroup`（`docs/research/ISA-QUEUE.md` Q2）待ち。
 
 **H3（split-K=8 の縮約経路）— 命令レベルでは小さい。**
 縮約は `threadgroup_barrier` 1 本 + `threadgroup_load` 8 本 + `fadd32` で、
@@ -253,7 +253,7 @@ M（2..9）ごとの特殊化を 8 本 `switch` で並べてインライン展�
 G13 のレジスタファイル上限に張り付いている**状態。
 M3 は Dynamic Caching があるので同じにはならない。
 `maxTotalThreadsPerThreadgroup` を M3 で見れば一発で分かる
-（`docs/ISA-QUEUE.md` Q2 にこのカーネルも入れてある）。
+（`docs/research/ISA-QUEUE.md` Q2 にこのカーネルも入れてある）。
 
 ## 7. この基盤の使い方
 
@@ -272,4 +272,4 @@ python3 tools/isa/analyze_agx.py --arch applegpu_g15s
 `fastmlx.kernels._qmm_skinny_mma_source.build_source()` も
 `current_qmm_skinny` として自動で拾う。
 
-GPU が要る 3 件は `docs/ISA-QUEUE.md` にまとめた。
+GPU が要る 3 件は `docs/research/ISA-QUEUE.md` にまとめた。

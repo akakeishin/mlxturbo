@@ -39,7 +39,7 @@ use_sig32 = "--sig32" in sys.argv
 import quant_eval  # noqa: E402
 
 if use_fused:
-    from fastmlx import fused
+    from mlxturbo import fused
 
     fused.enable_hyper_connection_kernel()
     print("hyper-connections を融合カーネルに差し替えた", flush=True)

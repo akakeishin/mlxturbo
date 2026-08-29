@@ -286,7 +286,7 @@ def install(model, sidecar: str | Path) -> None:
     else:
         how = "backend=mmap (既定は pread。FASTMLX_NGRAM_BACKEND を確認すること)"
     print(
-        f"[fastmlx] n-gram をサイドカー参照に差し替えた "
+        f"[mlxturbo] n-gram をサイドカー参照に差し替えた "
         f"({n} 層, {stream.bits}bit, RAM 0, {how}) <- {stream.dir}"
     )
 
@@ -319,7 +319,7 @@ def warn_if_not_installed(model) -> bool:
         return False
     if stale:
         print(
-            f"[fastmlx] 警告: n-gram 表がサイドカーに差し替わっていない "
+            f"[mlxturbo] 警告: n-gram 表がサイドカーに差し替わっていない "
             f"({stale}/{total} 層)。--ngram <サイドカー> を渡していないなら、"
             "出力は初期値の表で生成されたものになる"
         )

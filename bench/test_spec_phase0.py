@@ -1,4 +1,4 @@
-"""Phase 0 regression tests for :mod:`fastmlx.spec`.
+"""Phase 0 regression tests for :mod:`mlxturbo.spec`.
 
 The tests use a deterministic fake model and a small cache implementation.  This keeps the
 checks independent of a Qwen checkpoint while exercising the public generation/session contract
@@ -19,8 +19,8 @@ _IMPORT_ERROR = None
 try:
     import mlx.core as mx
 
-    import fastmlx.spec as spec_module
-    from fastmlx.spec import ChatSession, SpecEngine
+    import mlxturbo.spec as spec_module
+    from mlxturbo.spec import ChatSession, SpecEngine
 except ImportError as exc:  # pragma: no cover - exercised only on hosts without MLX
     if not any(
         marker in str(exc)
@@ -38,7 +38,7 @@ except ImportError as exc:  # pragma: no cover - exercised only on hosts without
 
 def _require_mlx() -> None:
     if _IMPORT_ERROR is not None:
-        raise unittest.SkipTest(f"MLX/fastmlx.spec unavailable: {_IMPORT_ERROR}")
+        raise unittest.SkipTest(f"MLX/mlxturbo.spec unavailable: {_IMPORT_ERROR}")
 
 
 def _expect_raise(fn, expected=(Exception,)):
@@ -184,7 +184,7 @@ def test_linear_capture_matches_masked_batched_native_forward() -> None:
     _require_mlx()
     from mlx_lm.models.cache import ArraysCache
 
-    from fastmlx._mlx_compat import DecoderLayer, TextModelArgs
+    from mlxturbo._mlx_compat import DecoderLayer, TextModelArgs
 
     args = TextModelArgs(
         hidden_size=64,

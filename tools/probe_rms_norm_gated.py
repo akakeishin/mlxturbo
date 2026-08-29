@@ -32,11 +32,11 @@ def main():
 
     import mlx_lm.models.qwen4_exp as Q
 
-    from fastmlx.kernels import rms_norm_gated as rng
+    from mlxturbo.kernels import rms_norm_gated as rng
 
     model, tok = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, args.ngram)
     ids = tok.apply_chat_template(
@@ -45,7 +45,7 @@ def main():
     )
 
     orig = Q.RMSNormGated.__call__
-    from fastmlx.kernels import rms_norm_gated as _rng
+    from mlxturbo.kernels import rms_norm_gated as _rng
 
     bad = []
     total = [0]

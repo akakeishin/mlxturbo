@@ -13,12 +13,12 @@ Phase Q (docs/STATUS.md)。bf16 アーカイブ (外付け SSD) から、128GB M
   build-ngram   n-gram 表を量子化してサイドカーへ出す (ディスク運用向け)
 
 使い方 (例):
-  uv run python -m fastmlx.convert_flash install-arch
-  uv run python -m fastmlx.convert_flash estimate --recipe v0-95
-  uv run python -m fastmlx.convert_flash extract-mtp \
+  uv run python -m mlxturbo.convert_flash install-arch
+  uv run python -m mlxturbo.convert_flash estimate --recipe v0-95
+  uv run python -m mlxturbo.convert_flash extract-mtp \
       --src "/Volumes/Mobile SSD/models/Qwen3.8-Flash-Next" \
       --out "/Volumes/Mobile SSD/models/qwen38fn-mtp.safetensors"
-  uv run python -m fastmlx.convert_flash convert --recipe v0-95 \
+  uv run python -m mlxturbo.convert_flash convert --recipe v0-95 \
       --src "/Volumes/Mobile SSD/models/Qwen3.8-Flash-Next" \
       --out ~/models/qwen38fn-mlx-v0-95
 """
@@ -92,7 +92,7 @@ RECIPES: dict[str, dict] = {
     # n-gram を RAM から追い出す構成 (~98GB)。表はサイドカーに置き、
     # 浮いた 19.2GB をすべて experts に回して 6bit の層を 10 -> 40 に増やす。
     # 使うには build-ngram でサイドカーを作り、読込後に
-    # fastmlx.ngram_stream.install(model, <サイドカー>) を呼ぶ
+    # mlxturbo.ngram_stream.install(model, <サイドカー>) を呼ぶ
     "v-stream": {
         "experts": {"bits": 4, "group_size": 64},
         "experts_hi": {"bits": 6, "group_size": 64},
@@ -274,7 +274,7 @@ def classify(path: str) -> str:
 def validate_recipe(recipe_name: str) -> None:
     """焼く前に、他のレーンと噛み合わない指定を弾く。
 
-    hyper-connections の融合カーネル (fastmlx/kernels/hyper_connection.py) は
+    hyper-connections の融合カーネル (mlxturbo/kernels/hyper_connection.py) は
     `eligible()` で bits を 4/8 に限っている。6bit を指定すると例外も警告も
     出さずに素の実装へ落ちるだけで、hyper-connections の 16ms がそのまま戻る。
     焼き上がってから速度が出ない理由を探す羽目になるので、ここで止める。

@@ -1,6 +1,6 @@
 """Qwen3.8-Flash-Next (qwen4_exp) の MTP ヘッド。
 
-`fastmlx/mtp.py` は qwen3_5 (27B) 用で、`mlx_lm.models.qwen3_5.DecoderLayer`
+`mlxturbo/mtp.py` は qwen3_5 (27B) 用で、`mlx_lm.models.qwen3_5.DecoderLayer`
 で組んでいる。Flash-Next は構造が違うので別に持つ。27B 側は触らない。
 
 ## サイドカーの重みから読み取った構造 (31 テンソル、bf16 5.21GB)
@@ -21,7 +21,7 @@
 
 norm の規約は本体と同じ `(1 + weight)`。根拠は `pre_fc_norm_embedding` の
 平均が -0.764、`pre_fc_norm_hidden` が -0.328 と負であること (27B の
-`fastmlx/mtp.py` が使ったのと同じ証拠の立て方)。
+`mlxturbo/mtp.py` が使ったのと同じ証拠の立て方)。
 
 ## 合成の仕方は実測で決めた -> ``lane``
 

@@ -1,4 +1,4 @@
-"""Metal-free unit tests for fastmlx/sam.py: SAM matching statistics must
+"""Metal-free unit tests for mlxturbo/sam.py: SAM matching statistics must
 agree with a naive O(n^3) brute-force longest-repeated-suffix search on
 known sequences (D3 acceptance criterion (a)).
 """
@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastmlx.sam import SuffixAutomaton
+from mlxturbo.sam import SuffixAutomaton
 
 
 def naive_longest_repeated_suffix(seq, n):

@@ -7,8 +7,8 @@
 250GB/s なら 2.54ms。**重み読みは融合では削れない**ので、見るべきは
 
 1. いま何 GB/s 出ているか (stock の実効帯域)
-2. fastmlx の自作経路 (nocap / mma) が M=1 で stock に勝てるか
-   -> 経路表 `fastmlx/kernels/dispatch.py` に (2560, 248320) は無い。
+2. mlxturbo の自作経路 (nocap / mma) が M=1 で stock に勝てるか
+   -> 経路表 `mlxturbo/kernels/dispatch.py` に (2560, 248320) は無い。
       既存の較正は M=5..16 (投機検証の幅) 向けで、M=1 は stock 固定
 3. 4bit に落としたらどれだけ縮むか (レシピ側の判断材料。品質は別途 KLD)
 
@@ -66,7 +66,7 @@ def main():
 
     model, _ = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, args.ngram)
     head = model.lm_head
@@ -88,7 +88,7 @@ def main():
         alts[nb] = (q2, s2, b2, 64, nb)
     del deq
 
-    from fastmlx.kernels.dispatch import quantized_matmul as dispatch_qmm
+    from mlxturbo.kernels.dispatch import quantized_matmul as dispatch_qmm
 
     for m in [int(v) for v in args.widths.split(",")]:
         x = mx.random.normal((m, k)).astype(mx.bfloat16)
@@ -103,7 +103,7 @@ def main():
         us = bench(stock)
         print(f"  stock ({bits}bit)      {us:8.2f} us  実効 {nbytes / us / 1000:6.1f} GB/s")
 
-        # fastmlx の経路表を (k, n_out) について強制的に有効化して比べる
+        # mlxturbo の経路表を (k, n_out) について強制的に有効化して比べる
         for route in ("nocap", "mma"):
             table = {(k, n_out): tuple([route] * 17)}
 

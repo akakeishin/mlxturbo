@@ -2,12 +2,12 @@
 
 mlx_lm.convert は読み込み時の sanitize (qwen3_5.py の TextModel.sanitize) で
 mtp.* を丸ごと捨てる。ここでは本体は mlx_lm と同じ経路（同じ sanitize、同じ
-量子化関数）で変換しつつ、mtp.* は fastmlx.mtp.load_mtp に通して同じ +1 norm
+量子化関数）で変換しつつ、mtp.* は mlxturbo.mtp.load_mtp に通して同じ +1 norm
 シフトを適用したうえで量子化し、"mtp." キーのまま同じ safetensors シャード集合
 に同梱保存する。group_size は本体・mtp 側とも CLI から可変。
 
 mlx_lm.convert からの差分（詳細は README/報告参照）:
-  - mtp.* を破棄せず、fastmlx.mtp の shift 規約で量子化して同梱保存する
+  - mtp.* を破棄せず、mlxturbo.mtp の shift 規約で量子化して同梱保存する
   - --group-size で本体・mtp 双方の量子化グループサイズを指定できる
   - config.json に "fastmlx_mtp": true と "mtp_quantization" を書く
   - --dry-run で本体の先頭 N 層 + mtp.* だけを変換し、ロード検証と逆量子化誤差
@@ -16,8 +16,8 @@ mlx_lm.convert からの差分（詳細は README/報告参照）:
     持たない（このプロジェクトの用途はローカル 1 回変換のみのため）
 
 使い方:
-    uv run python -m fastmlx.convert --group-size 128 --out /path/to/out
-    uv run python -m fastmlx.convert --group-size 128 --out /tmp/dry --dry-run
+    uv run python -m mlxturbo.convert --group-size 128 --out /path/to/out
+    uv run python -m mlxturbo.convert --group-size 128 --out /tmp/dry --dry-run
 """
 
 import argparse
@@ -57,7 +57,7 @@ def resolve_hf_path(hf_path: str) -> str:
 
     mlx_lm.utils.load はローカルに無いパスを渡すとネットワークからダウンロード
     しようとする。56GB のチェックポイントで意図せぬ取得が起きないよう、ここでは
-    fastmlx.mtp.find_snapshot (ローカルキャッシュ限定) で解決してから渡す。
+    mlxturbo.mtp.find_snapshot (ローカルキャッシュ限定) で解決してから渡す。
     """
     p = Path(hf_path)
     if p.exists():
@@ -134,7 +134,7 @@ def flatten_mtp_weights(mtp: nn.Module) -> dict:
 
     元チェックポイントの mtp.* キー命名 (mtp.fc.weight, mtp.layers.0...,
     mtp.norm.weight, mtp.pre_fc_norm_*.weight) と一致させることで、
-    fastmlx.mtp.load_mtp と同じキー規約のまま量子化済みとして保存できる。
+    mlxturbo.mtp.load_mtp と同じキー規約のまま量子化済みとして保存できる。
     """
     return {f"mtp.{k}": v for k, v in tree_flatten(mtp.parameters())}
 
@@ -166,7 +166,7 @@ def base_weights_for_mtp_artifact(model: nn.Module) -> dict:
 def load_quantized_mtp(out_dir, text_args: TextModelArgs) -> MTPModule:
     """変換済みディレクトリから mtp.* を量子化済みとして読み込む。
 
-    fastmlx.mtp.load_mtp は生の bf16 チェックポイントから読んで自前で量子化する
+    mlxturbo.mtp.load_mtp は生の bf16 チェックポイントから読んで自前で量子化する
     経路しか持たない。ここでは convert() が書いた config["mtp_quantization"] を
     見て同じ形の量子化スケルトンを組み、保存済みの mtp.weight/scales/biases を
     そのまま load_weights する — これが「mlx_lm.load(out) 相当」の mtp 版。
@@ -289,13 +289,13 @@ def convert(
         group_size, bits, mtp_bits
     )
 
-    print(f"[fastmlx.convert] loading base model from {snapshot}")
+    print(f"[mlxturbo.convert] loading base model from {snapshot}")
     model, tokenizer, config = mlx_lm_load(snapshot, return_config=True, lazy=True)
 
     if dry_run:
         validate_dry_run_layers(model, config, dry_run_layers)
         print(
-            f"[fastmlx.convert] dry-run: truncating base model to first "
+            f"[mlxturbo.convert] dry-run: truncating base model to first "
             f"{dry_run_layers} layer(s)"
         )
         truncate_layers(model, dry_run_layers)
@@ -311,7 +311,7 @@ def convert(
     text_args = TextModelArgs.from_dict(config["text_config"])
 
     print(
-        f"[fastmlx.convert] loading + quantizing mtp.* "
+        f"[mlxturbo.convert] loading + quantizing mtp.* "
         f"(group_size={group_size}, bits={mtp_bits})"
     )
     mtp = load_mtp(
@@ -319,7 +319,7 @@ def convert(
     )
 
     print(
-        f"[fastmlx.convert] quantizing base model "
+        f"[mlxturbo.convert] quantizing base model "
         f"(group_size={group_size}, bits={bits})"
     )
     model, config = quantize_model(model, config, group_size, bits, mode="affine")
@@ -332,7 +332,7 @@ def convert(
     }
     config["mtp_quantization_config"] = config["mtp_quantization"]
 
-    print(f"[fastmlx.convert] saving to {out_path}")
+    print(f"[mlxturbo.convert] saving to {out_path}")
     save_with_mtp(out_path, Path(snapshot), model, mtp, tokenizer, config)
 
     return {"out": str(out_path), "config": config, "model": model, "mtp": mtp}

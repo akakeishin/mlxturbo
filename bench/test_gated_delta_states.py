@@ -1,4 +1,4 @@
-"""fastmlx/kernels/gated_delta_states.py の正しさと性能を確認するスクリプト。
+"""mlxturbo/kernels/gated_delta_states.py の正しさと性能を確認するスクリプト。
 
 検証1 (正しさ): 実寸 (B=1, T in {1,4,8}, Hk=16, Hv=48, Dk=Dv=128) で
   (a) out が mlx_lm.gated_delta_update と一致 (fp16 丸め水準)
@@ -18,7 +18,7 @@ import time
 import mlx.core as mx
 from mlx_lm.models.gated_delta import gated_delta_update
 
-from fastmlx.kernels.gated_delta_states import gated_delta_update_with_states
+from mlxturbo.kernels.gated_delta_states import gated_delta_update_with_states
 
 B = 1
 HK = 16
@@ -39,7 +39,7 @@ def make_inputs(T: int):
     A_log = mx.log(mx.random.uniform(low=0.0, high=16.0, shape=(HV,)))
     dt_bias = mx.ones((HV,))
 
-    # 実運用 (qwen3_5.py / fastmlx/spec.py) と同じく q, k を rms_norm してから渡す。
+    # 実運用 (qwen3_5.py / mlxturbo/spec.py) と同じく q, k を rms_norm してから渡す。
     # これをしないと再帰的な状態更新が T が伸びるにつれ発散し (fp16 で inf/nan)、
     # 「両実装が同じ値を返すか」という検証の意味がなくなる。
     inv_scale = k.shape[-1] ** -0.5

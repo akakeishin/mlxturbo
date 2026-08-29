@@ -62,7 +62,7 @@ fast_qmm 側 (`ref_fastqmm_m8`) と A2 の MMA 版 (`base_m8_bf16`、
 `tools/isa/snapshots/qmm_skinny_mma_a2.py` に固定) は既存の枠でそのまま載る。
 コンパイル条件は mlx 0.32.2 の既定 (`-std=metal3.2 -O2
 -fmetal-math-mode=safe`)。逆アセンブルは G13 (`applegpu_g13g`)、
-M3 (G15) は `__text` サイズのみ (`docs/ISA-NOTES.md` §2-5 と同じ二段構え)。
+M3 (G15) は `__text` サイズのみ (`docs/research/ISA-NOTES.md` §2-5 と同じ二段構え)。
 
 ## 2. hot ループの命令ヒストグラム (G13、m=8)
 
@@ -103,7 +103,7 @@ hot 区間が複数ケースをまたぐため参考値。
   `bt[(kq*16+t)*8 + j]` がストライド 8 要素の書き込みなので、
   16 個のスカラー store とそのアドレス計算が全部残る。
 - `base_m8_bf16` (v2) は shuffle 80 + それに付く mov/icmpsel で 220 命令、
-  hot の 48%。`docs/ISA-NOTES.md` §4.1 の結論のまま。
+  hot の 48%。`docs/research/ISA-NOTES.md` §4.1 の結論のまま。
 - `v_direct_m8` は shuffle も threadgroup スラブも使わないので、
   上の 250 と 220 の**どちらも払っていない**。残るのは
   iadd 67 + mov 93 + and 34 + or 16 のアドレス計算と nibble マスクで、
@@ -159,8 +159,8 @@ README の「mlp タイル 50MB」と一致する。
 | v4 表 ON (1.18x) | 0.336 ms | 100.3 MB | **298 GB/s** | **86%** | 192 G/s |
 
 天井は README の実測ストリーミング上限 345 GB/s。
-1.57x / 1.04x は `docs/GATE-RESULTS-A2.md` (stock 0.380 ms)、
-1.1817x は `docs/STATUS.md` (stock 1.589666 ms / 4 = 0.397 ms) から。
+1.57x / 1.04x は `docs/research/GATE-RESULTS-A2.md` (stock 0.380 ms)、
+1.1817x は `docs/research/STATUS.md` (stock 1.589666 ms / 4 = 0.397 ms) から。
 別 run なので、それぞれ自分の stock で割って ms に戻してある。
 
 この表が全部を言っている。
@@ -310,7 +310,7 @@ MMA 系の 1 反復下限を数える (8 列 x 64 K、8 MMA):
 
 ### v5 の設計差分リスト
 
-fast_qmm から引く構造事実は `docs/KERNEL-INTEL.md` と ISA-NOTES に
+fast_qmm から引く構造事実は `docs/research/KERNEL-INTEL.md` と ISA-NOTES に
 記録済みのもののみ。コードは転写しない。
 
 1. **B 断片をレーン直読みで作る。** `simdgroup_matrix<T,8,8>` の 1 レーンは
@@ -355,7 +355,7 @@ v5 に移るまでの間、v4 に残っている分も数えておく。
 
 いずれも 1.31x の天井は動かさない。
 
-## 7. GPU が要る確認 (`docs/ISA-QUEUE.md` へ)
+## 7. GPU が要る確認 (`docs/research/ISA-QUEUE.md` へ)
 
 1. `v_direct` の M3 での `maxTotalThreadsPerThreadgroup`。
    maxReg 52 が occupancy をどれだけ落とすか。fast_qmm (30) と並べて取る。

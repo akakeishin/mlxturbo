@@ -1,7 +1,7 @@
 # fastmlx bridge — B1 probe の下部工事ノート（2026-08-26）
 
-対象は docs/ARCH-BETS.md の B1「検証ステップの直接エンコード」。買いたいのは
-ラッパ税 0.064ms/call × 呼び出し数（docs/HYPOTHESES-A2.md H2）を
+対象は docs/research/ARCH-BETS.md の B1「検証ステップの直接エンコード」。買いたいのは
+ラッパ税 0.064ms/call × 呼び出し数（docs/research/HYPOTHESES-A2.md H2）を
 N 呼び出し → 1 submit に潰すこと。その前段として
 
 - MLX の `mx.array` が抱える MTLBuffer を Python から取り出す
@@ -316,7 +316,7 @@ SDPA → gate → o_proj → MLP。以下は今回の spike で埋まってい�
 
 9. **失敗が見えなくなる。** MLX 経由なら `metal_kernel` の verbose と MLX の
    エラーが出るが、自前 encode では `MTLCommandBuffer.error` しか出ない。
-   docs/ISA-NOTES.md の基盤と `mx.metal.start_capture` の併用が前提になる。
+   docs/research/ISA-NOTES.md の基盤と `mx.metal.start_capture` の併用が前提になる。
 10. **`ensure_row_contiguous` の安全網が無い。** MLX 経由では黙ってコピーが
     入っていた。自前経路では呼び出し側が contiguous を保証しないと壊れる。
     `metal_buffer()` は例外を投げるが、これは実行時チェックであって

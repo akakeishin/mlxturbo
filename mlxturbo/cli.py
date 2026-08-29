@@ -1,7 +1,7 @@
-"""fastmlx 対話 CLI。
+"""mlxturbo 対話 CLI。
 
-uv run fastmlx                       # チャット REPL
-uv run fastmlx --prompt "..."        # ワンショット
+uv run mlxturbo                       # チャット REPL
+uv run mlxturbo --prompt "..."        # ワンショット
 """
 
 import argparse
@@ -15,7 +15,7 @@ from .runner import FallbackSession, build_runner
 from .spec import ChatSession
 
 # --mtp PATH (server.py) を build_runner 経由の load_cli_mtp まで運ぶための
-# 環境変数。build_runner (fastmlx/runner.py, 他レーンの担当領域につき編集不可)
+# 環境変数。build_runner (mlxturbo/runner.py, 他レーンの担当領域につき編集不可)
 # は load_cli_mtp を固定の位置引数だけで呼ぶので、呼び出し元を編集せずに
 # 追加のパスを通す口が無い。--ngram を FASTMLX_NGRAM_DISK で先に立てて
 # from_env で拾わせているのと同じ手筋 (cli.py 冒頭のコメント参照)。
@@ -42,7 +42,7 @@ def load_cli_mtp(
     """
 
     if no_mtp:
-        print("[fastmlx] --no-mtp: MTP を無効化し、lookup のみで投機します")
+        print("[mlxturbo] --no-mtp: MTP を無効化し、lookup のみで投機します")
         return None
     mtp_path = mtp_path or os.environ.get(MTP_PATH_ENV)
     if mtp_path:
@@ -51,7 +51,7 @@ def load_cli_mtp(
             return load_mtp_file(mtp_path, text_args, quantize=quant)
         except Exception as exc:  # サイドカー形式の不一致まで含め、無理に合わせない
             print(
-                f"[fastmlx] --mtp {mtp_path} を読み込めないため無効化します "
+                f"[mlxturbo] --mtp {mtp_path} を読み込めないため無効化します "
                 f"({type(exc).__name__}: {exc}); lookup のみで投機します"
             )
             return None
@@ -62,7 +62,7 @@ def load_cli_mtp(
         return load_mtp(find_snapshot(original), text_args, quantize=quant)
     except (FileNotFoundError, RuntimeError) as exc:
         print(
-            f"[fastmlx] MTP 重みが見つからないため無効化します "
+            f"[mlxturbo] MTP 重みが見つからないため無効化します "
             f"({type(exc).__name__}: {exc}); lookup のみで投機します"
         )
         return None
@@ -92,9 +92,9 @@ def main() -> None:
         "--ngram",
         default=None,
         help="n-gram (PLE) 表をチェックポイント本体に持たず外部サイドカーへ"
-        "分離してある変換 (fastmlx/ngram_stream.py) の場合、そのディレクトリ"
+        "分離してある変換 (mlxturbo/ngram_stream.py) の場合、そのディレクトリ"
         "を指定する。指定すると FASTMLX_NGRAM_DISK=1 を立ててから読み込み、"
-        "読み込み後に fastmlx.ngram_stream.install() で差し替える",
+        "読み込み後に mlxturbo.ngram_stream.install() で差し替える",
     )
     ap.add_argument(
         "--fly-theta",
@@ -124,7 +124,7 @@ def main() -> None:
         from .ngram_stream import install
 
         install(model, args.ngram)
-    print(f"[fastmlx] loaded in {time.perf_counter() - t0:.1f}s: {args.model}")
+    print(f"[mlxturbo] loaded in {time.perf_counter() - t0:.1f}s: {args.model}")
     runner = build_runner(
         model, tokenizer, config, args, n_draft=args.n_draft, max_draft=args.max_draft
     )
@@ -186,7 +186,7 @@ def main() -> None:
         return
 
     messages = []
-    print("[fastmlx] チャット開始。exit で終了。")
+    print("[mlxturbo] チャット開始。exit で終了。")
     while True:
         try:
             user = input("\n> ").strip()

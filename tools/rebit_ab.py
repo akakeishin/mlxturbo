@@ -55,7 +55,7 @@ def main():
 
     model, tok = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, args.ngram)
     ids = tok.apply_chat_template(
@@ -75,12 +75,12 @@ def main():
 
     what = []
     if args.rebit:
-        from fastmlx import rebit
+        from mlxturbo import rebit
 
         rebit.apply(model, args.rebit)
         what.append(args.rebit)
     if args.fused_hc:
-        from fastmlx import fused
+        from mlxturbo import fused
 
         fused.enable_hyper_connection_kernel()
         what.append("融合カーネル")
@@ -94,7 +94,7 @@ def main():
     # 他セッションが途中で 98GB を読み始めただけで差が化ける (実際に化けた)。
     # 交互なら遅くなった区間が両側に等しく乗る
     if args.fused_hc and not args.rebit:
-        from fastmlx import fused
+        from mlxturbo import fused
 
         off, on = [], []
         for _ in range(args.repeats):

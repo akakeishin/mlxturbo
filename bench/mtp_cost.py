@@ -47,9 +47,9 @@ def timed(fn, reps, warmup=5):
 def main():
     import mlx.core as mx
 
-    from fastmlx._mlx_compat import KVCache, TextModelArgs, mlx_lm_load
-    from fastmlx.mtp import find_snapshot, load_mtp
-    from fastmlx.spec import SpecEngine
+    from mlxturbo._mlx_compat import KVCache, TextModelArgs, mlx_lm_load
+    from mlxturbo.mtp import find_snapshot, load_mtp
+    from mlxturbo.spec import SpecEngine
 
     parser = argparse.ArgumentParser()
     parser.add_argument(

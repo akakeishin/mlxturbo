@@ -1,7 +1,7 @@
 # MTP-FLASH — Qwen3.8-Flash-Next の MTP と投機デコード (2026-08-29)
 
-`fastmlx/mtp.py` と `fastmlx/spec.py` は 27B (qwen3_5) 用。Flash-Next は構造が
-違うので `fastmlx/mtp_flash.py` と `fastmlx/spec_flash.py` に別で持つ。
+`mlxturbo/mtp.py` と `mlxturbo/spec.py` は 27B (qwen3_5) 用。Flash-Next は構造が
+違うので `mlxturbo/mtp_flash.py` と `mlxturbo/spec_flash.py` に別で持つ。
 **27B 側は触っていない。**
 
 ## 動いている
@@ -68,7 +68,7 @@ MTP は draft なので、**ビットを下げても出力の正しさは本体�
 
 Flash-Next の 36 層は GatedDeltaNet で、**再帰状態は KV のように末尾を切れない。**
 検証 forward の各位置の状態を捕獲して、受理した長さの分だけ採用する
-(`fastmlx/kernels/gated_delta_states.py` を流用。あれは q/k/v で動く汎用
+(`mlxturbo/kernels/gated_delta_states.py` を流用。あれは q/k/v で動く汎用
 カーネルなので Flash-Next にもそのまま効く)。
 
 巻き戻す対象は 4 つ:

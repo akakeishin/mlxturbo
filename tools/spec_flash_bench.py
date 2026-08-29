@@ -46,11 +46,11 @@ def main():
     import mlx.core as mx
     from mlx_lm import load
 
-    from fastmlx import fused, mtp_flash, spec_flash
+    from mlxturbo import fused, mtp_flash, spec_flash
 
     model, tok = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, args.ngram)
     fused.enable_hyper_connection_kernel()

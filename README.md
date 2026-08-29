@@ -1,72 +1,98 @@
-# fastmlx
+# mlxturbo
 
-Apple Silicon で LLM 推論を速くするエンジン。既存の Mac 向けスタック（mlx-lm / llama.cpp Metal）が届いていない速度を、カーネルと投機デコードの二段で取りにいく。
+Apple Silicon (MLX) 上のローカル推論エンジンと、OpenAI / Anthropic / Responses 互換の HTTP サーバー。
 
-## 目標
+**速いのは特定の2アーキテクチャだけ**で、それ以外のモデルは素の [mlx-lm](https://github.com/ml-explore/mlx-lm) と同速で動く汎用ランタイムです（後述の対応表を参照）。「汎用高速化ランタイム」ではありません。
 
-- 一次目標: 自分が毎日使える最速のローカル推論。全 M 系チップで動く設計にする（特定のメモリ容量を前提にしない）。
-- 当面のターゲット: Qwen3.8-27B（dense 系ハイブリッド）を M3 Max で快適に使う。decode の理論上限は帯域 400GB/s ÷ 重み ~15GB ≈ 26 tok/s なので、上限自体を投機で超える構成が必須。
-- 対 CUDA の比較は目標にしない。主張するなら「ルーフライン到達率」と「KV 作業集合が VRAM を超える領域での逆転」に限る。
+## これは何か
 
-## 層構造
+- モデルを 1 プロセスにロードして常駐させ、投機デコード（自己投機: 本体のモデル自身が出す MTP ヘッド + 文脈 suffix-lookup）で decode を高速化するエンジン
+- 上記エンジンを OpenAI 互換 (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`) と Anthropic 互換 (`/v1/messages`) の両方で叩ける HTTP サーバー (`mlxturbo-serve`)
+- 対応していないモデルでも動く（フォールバック）が、その場合は投機なしの素の mlx-lm と同速
 
-| 層 | 内容 | 状態 |
-|---|---|---|
-| L0 | 計測ハーネス（ルーフライン比、m カーブ） | `bench/baseline.py` `bench/verify_curve.py` |
-| L1 | デコード実行層（Metal カーネル、検証幅 m 可変） | 未着手（m カーブの段差是正が対象） |
-| L2 | 投機検証層（MTP 自己投機 + 文脈 lookup 混成） | `fastmlx/spec.py` 動作中 |
-| L3 | KV 永続層（prefix 再利用、メモリ予算はパラメータ） | 第一片のみ: チャットの append-only 増分 prefill |
+## 対応表（正直に）
 
-## L2 の現状（2026-08-26、Qwen3.8-27B-4bit、greedy、512 tok）
+| 経路 | 対象 | 投機 | 実測倍率（mlx-lm 比、後述の再現コマンド参照） |
+|---|---|---|---|
+| `flash_spec` | Qwen3.8-Flash-Next (`qwen4_exp` アーキテクチャ) + MTP サイドカー | あり（MTP 深さ1 + hyper-connections 融合カーネル） | 1.12x〜1.26x（プロンプト内容依存、後述） |
+| `spec` | `qwen3_5` 契約を満たすモデル（例: Qwen3.8-27B 系） | あり（MTP チェイン + suffix-lookup 混成） | 1.3x〜2.2x（プロンプト内容依存、後述） |
+| `fallback` | 上記以外の全モデル | なし | 1.0x（素の mlx-lm と同速） |
+
+どの経路が選ばれたかは起動ログと `GET /health` の `runner` / `fallback_reason` で確認できる。「投機が効くはずなのに黙って fallback に落ちている」を防ぎたい場合は `--require-runner flash_spec`（または `spec`）を付けて起動すると、条件を満たさないときに起動自体が失敗する（詳細は [`docs/SERVER.md`](docs/SERVER.md)）。
+
+## 投機が効く条件
+
+- `flash_spec` が動くには、モデルの `model_type` が `qwen4_exp` で、かつ MTP 重みが見つかっている必要がある（`--mtp` で明示指定するか、本体シャードに同梱されているか、サイドカーとして自動発見される）。MTP が見つからないときは投機無しの `flash_spec` にはならず、経路自体が成立しない。実測は [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) にある
+- `spec` が動くには、モデルが `qwen3_5` の contract（`SpecEngine` が要求する層構成や attention の形）に合っている必要がある。合っていなければ `fallback` に落ちる
+- 両経路とも、`temp=0`（greedy）は出力分布と厳密に一致する完全一致検証で動き、`temp>0` も棄却サンプリングで分布は厳密に同一のまま。ただし `top_p<1.0` や `repetition_penalty≠1.0` のように分布を変えるサンプリングパラメータを渡すと 400 になる。投機側のブロック検証が「対象分布からの厳密なサンプリング一致」を前提にしているため、サンプリングパラメータで分布そのものを歪められると検証が成り立たなくなる。この制限は `fallback` 経路には無い
+
+## インストール
+
+Apple Silicon Mac（macOS、MLX/Metal が使える環境）が前提。
+
+```
+git clone <このリポジトリ>
+cd mlxturbo
+uv sync
+```
+
+## モデルの入手
+
+- `fallback` / `spec` 経路: 通常の mlx-lm 互換チェックポイント（Hugging Face repo ID かローカルパス）をそのまま指定できる
+- `flash_spec` 経路（Qwen3.8-Flash-Next）: 元 checkpoint からの変換とMTP抽出が要る。手順は [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) と `mlxturbo/convert_flash.py --help`（`install-arch` / `estimate` / `extract-mtp` / `convert` の各サブコマンド）を参照
+
+## 起動
+
+対話 CLI（`spec` 経路、27B 系向け）:
+
+```
+uv run mlxturbo --model <path-or-repo-id> --prompt "こんにちは"
+```
+
+HTTP サーバー:
+
+```
+uv run mlxturbo-serve --model <path-or-repo-id> --served-model-name mymodel --port 8000
+```
+
+接続方法・オプション一覧・API キー認証・opencode / Codex CLI / Claude Code / Chatbox からの接続例は [`docs/SERVER.md`](docs/SERVER.md) に詳しくまとめてある。
+
+## 制約
+
+- **1 プロセス 1 モデル。** モデルは起動時に 1 回だけロードして常駐する設計で、複数モデルの切り替えは別プロセスを立てる必要がある
+- **リクエストは直列処理。** 継続バッチング（continuous batching）は未実装で、1 リクエスト = 1 生成に直列化される。複数クライアントを同時に繋ぐと、後着のリクエストは先着の生成が終わるまで待たされる（待ち行列上限 `--max-queue` を超えると 503）
+- **spec / flash_spec 経路は非恒等値のサンプリングパラメータを 400 にする。** 理由は上述のとおり、投機のブロック検証が厳密な分布一致を前提にしているため
+- **token logprobs は未対応。** レスポンスの `logprobs` は常に `null` または空配列
+- 詳しい制約一覧（決定性の範囲、文脈長ガードなど）は [`docs/SERVER.md`](docs/SERVER.md) の「制約」節を参照
+
+## 実測値と再現コマンド
+
+以下はすべて M3 Max 128GB / macOS 26.4 / mlx 0.32.2 での実測。ハードウェア世代が変わると数字は変わる（詳しくは [`docs/research/ROOFLINE-2026-08-26.md`](docs/research/ROOFLINE-2026-08-26.md) の「ハード世代が変わると失効する判定」を参照）。
+
+### `spec` 経路（Qwen3.8-27B-4bit、greedy、512 tok）
 
 | 条件 | decode tok/s | 対 mlx-lm |
 |---|---|---|
-| mlx-lm 素 | 21〜23 | 1.0x |
-| 自己投機・易しい内容（序盤 32tok） | 40〜51 | 1.7〜2.2x |
+| mlx-lm 素（フォールバック相当） | 21〜23 | 1.0x |
+| 自己投機・易しい内容（序盤32tok） | 40〜51 | 1.7〜2.2x |
 | 自己投機・難しい内容持続（code） | 31.9 | 1.49x |
 | 自己投機・難しい内容持続（prose） | 28.3 | 1.32x |
 
-- draft は 2 系統の混成。checkpoint 純正の MTP ヘッド（mlx-lm が捨てる mtp.* を +1 norm シフトで復元、4bit 量子化）と、文脈 suffix-lookup（末尾 ngram の再出現の続き。短く始めて当たれば倍増）。書き換え系（edit）は lookup で 1.60x / 35.4 tok/s
-- 検証は m 可変・受理適応の深度制御（全受理 +2 / 全棄却 1 / 部分受理 a）
-- temp=0 は完全一致検証で出力分布厳密同一（バッチ検証の縮約順の違いで準同点 argmax が稀に入れ替わる。実測 512 tok 中 1 箇所、双方流暢）。temp>0 は棄却サンプリング（受理確率 p_target(d)、棄却時は残差から再抽選）で、これも分布厳密同一
-- 線形 48 層の巻き戻しは、射影一括 + 再帰のみ逐次で全位置状態を保持する方式。再計算ゼロ
-- `uv run fastmlx` で対話 CLI。ChatSession が KV と線形状態をターン持ち越しし、履歴が追記のみなら差分 prefill（`--no-think` 推奨。3 ターン目で再利用 296 / 新規 19、TTFT 0.17s を実測）
+再現: `uv run mlxturbo --model <model> --prompt "<prompt>"`（生成の後に `decode tok/s` が自動で出力される）。mlx-lm 素との対照は `uv run python bench/baseline.py <model-id>`。
 
-次の伸び代（効き順の見立て）:
-1. L1 カーネル: m カーブの段差是正（m=4 の 1.32 倍、m=8 の 2.33 倍はカーネル税。ここが下がると受理分がそのまま速度になる。m=8 付近の段差は量子化 matmul のタイル境界と推定）
-2. 思考モード付き履歴の増分 prefill（テンプレートの think 剥がしで追記性が壊れる問題。定期チェックポイント等 L3 本体の領分）
-3. draft 木化（chain でなく分岐候補を同時検証）と lookup の suffix automaton 化
-4. prefill カーネル（27B で 219 tok/s、MFU ~42%。長プロンプトの律速）
+### `flash_spec` 経路（Qwen3.8-Flash-Next、v-l レシピ + MTP 4bit、greedy、48 tok）
 
-学習系は別プロジェクトに切り出す。L1 に入る前に固定する契約が 2 つある: paged-KV のページテーブル ABI と、検証幅 m∈{1..32} 可変のデコードインターフェース。L1 を m=1 決め打ちで書くと L2 で書き直しになる。
+| プロンプト | 受理率 | 貪欲 tok/s | 投機 tok/s | 倍率 |
+|---|---|---|---|---|
+| 日本語 | 0.741 | 26.94 | 33.92 | 1.26x |
+| 英語 | 0.516 | 26.78 | 30.02 | 1.12x |
 
-## 分かっていること（2026-08-26 実測・確認）
+受理率は課題の種類（コード/散文/手順など）によっても変わる。詳細と再現コマンドは [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) の「道具」節（`tools/spec_flash_bench.py` 等）を参照。
 
-- M3 Max 128GB / macOS 26.4 / mlx 0.32.2
-- 純粋ストリーミング読みの実到達天井は 345〜350GB/s（公称 400 の ~87%。sum/max reduce で実測）
-- GEMM の実到達ピークは ~13.1 TFLOPS（8192^3、fp16/bf16 同値。fp16 に倍レートは無い。以前の「28 TFLOPS」仮定は誤り）
-- prefill 219 tok/s = 11.8 TF = 実効ピークの ~90%。「MFU 42%」は分母の誤りで、prefill もほぼ飽和済み。残る余地は mlp_down の qmm 非効率 (fp16 GEMM 比 1.31 倍) などで全体 ~1.1〜1.2 倍
-- prefill の GatedDeltaNet scan は無実 (S=512 で 1.29ms、48 層でも全体の 2.6%)
-- decode m=1 の部品総和 (65ms) は実ステップ (47ms) より遅い = ディスパッチ隙間の証拠なし
-- Llama-3.2-1B-4bit: decode 374 tok/s、達成帯域 260GB/s
-- Qwen3.8-27B-4bit: decode 23.3 tok/s、達成帯域 352GB/s = 実到達天井の ~100%。m=1 に磨く余地はない
-- 検証 m=8 の実効帯域は ~140GB/s（天井の 4 割）。m カーブの税は帯域でなくカーネル非効率
-- B 案 (CPU+GPU 帯域ハーベスタ) は棄却確定: GPU 単独で天井到達済みで、拾える余りが無い
-- 判定確定: 比 0.88 ≥ 0.85 なので L1 は降格、L2（投機）先行。素のカーネル改善の伸び代は最大 1.13 倍しかない
-- 検証幅 m のコストカーブ（27B、512 tok 文脈）: m=2 で 1.04 倍、m=4 で 1.32 倍、m=8 で 2.33 倍、m=16〜32 は 3.6〜3.7 倍で平坦。ここを均すのが L1 の再出番（L2 の利得を直接広げる）
-- m カーブ税の真因は 2 種類（mlx v0.32.2 のソースと単体実測で確定）。M=6〜12: qmv_wide カーネルの「タイルは 5 ベクトルで頭打ち・タイルごとに重みを再読」仕様で ceil(M/5) 回の重み読み（m=5→6 と 10→11 の段差を実測で確認）。M=13〜32: qmm_t の 32x32x32 タイルは算術強度 12.8 MAC/B で、演算律速に必要な 38 MAC/B の 1/3 しかなく帯域の 2〜3 割で頭打ち
-- prefill の残り 2 割も同じ qmm_t タイル問題（強度 12.5 MAC/B → 予測 MFU ~33% ≈ 実測）。GatedDeltaNet の scan は時間 (S=512 で 1.29ms/層)・FLOPs (0.5%)・状態 I/O (step の 2%) すべてで無実
-- fastmlx/fast_qmm.py (vendored、ライセンス要確認): 8x8 MMA + グループ単位 dequant + split-K の公開カーネル。依存チェーン実測で m=8 が mlx の 1.57 倍、m=6 で 1.25 倍。m<6 と m>8 (wide 版は env で m<=16) はフォールバック
-- カーネル無改造の帯域レバー: scales/biases が量子化バイトの 11.1% (実効 4.50 bit/weight)。group128 か fp8 scale への再量子化で decode ~1.06 倍。MTP 保持の自前量子化と同時に検証する
-- 計測の規律: 独立呼び出しを積む計測は GPU が重ねて隠すため投機の依存チェーンを表さない (26% 劣化を 1.13 倍改善と誤読した先行事例あり)。単体 op はチェーン計測と単発計測を併記する。長時間ベンチ後はバックグラウンド (Spotlight 等) で帯域が半減しうるので、絶対値は静かなマシンで取り直す
-- カーネルの物理目標は m で分ける: m=8 は帯域律速に戻せる (mlp タイル 50MB → 0.145ms が床)。m=16 は演算床 (0.218ms) が帯域床を上回るため理想でも m=1 比 ~1.5 倍。「m=16 を帯域天井へ」は物理的に不可能で、目標は m∈{2..10} 帯域 roof / m∈{11..16} 演算 roof
-- 反証済みの仮説 (再訪しない): lm_head の 2D/3D ディスパッチ崖 (実測で差なし。op_curve の層単位絶対値が原因の誤検出)、GDN scan 犯人説、CPU+GPU 帯域ハーベスト、prefill 2 倍余地説
-- prefill は 219 tok/s（MFU ~42%）。長プロンプトの快適性は prefill 律速で、L3 と prefill カーネルの領分
-- Qwen3.8-27B は 64 層中 48 層が linear attention（full attention は 4 層に 1 層）。KV は full 側 16 層のみ
-- Qwen3.8 は MTP ヘッドを標準搭載するが、mlx-lm は読み込み時に捨てている（qwen3_5.py の sanitize）。lmstudio の 4bit 量子化にも入っていない。MTP を保持した自前量子化が L2 の前提作業
+## その他のドキュメント
 
-## 使い方
-
-```
-uv run python bench/baseline.py <model-id> [--gen-tokens 256] [--bandwidth-gbs 400]
-```
+- [`docs/README.md`](docs/README.md) — ドキュメント全体の索引
+- [`docs/SERVER.md`](docs/SERVER.md) — サーバーの起動・オプション・接続方法・制約
+- [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) — Flash-Next の MTP 投機デコード設計
+- [`docs/BACKLOG.md`](docs/BACKLOG.md) — やりたいが未着手のもの
+- [`docs/RELEASE.md`](docs/RELEASE.md) — 公開時にやること

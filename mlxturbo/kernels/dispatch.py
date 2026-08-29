@@ -165,7 +165,7 @@ def _get_dispatched_class():
         nn = _load_nn()
 
         class DispatchedQuantizedLinear(nn.QuantizedLinear):
-            """QuantizedLinear with fastmlx's shape-by-M matmul routing."""
+            """QuantizedLinear with mlxturbo's shape-by-M matmul routing."""
 
             def __call__(self, x):
                 active = self._fastmlx_dispatch_always or _DISPATCH_ACTIVE.get()

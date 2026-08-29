@@ -1,6 +1,6 @@
 """Flash-Next の MTP ヘッドが本当に t+2 を当てるかを確かめ、合成の仕方を決める。
 
-`fastmlx/mtp_flash.py` の docstring 参照: `pre_fc_norm_hidden` は 10240 なのに
+`mlxturbo/mtp_flash.py` の docstring 参照: `pre_fc_norm_hidden` は 10240 なのに
 `fc_hidden` の入力は 2560 で、重みの形だけでは合成が決まらない。**当てられる
 方が正解**なので、変種を並べて実データで判定する。
 
@@ -56,11 +56,11 @@ def main():
 
     import mlx_lm.models.qwen4_exp as Q
 
-    from fastmlx import mtp_flash
+    from mlxturbo import mtp_flash
 
     model, tok = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, args.ngram)
     targs = model.args.text

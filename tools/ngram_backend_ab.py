@@ -68,11 +68,11 @@ def main():
     import mlx.core as mx
     from mlx_lm import load
 
-    from fastmlx.ngram_stream import StreamNGram
+    from mlxturbo.ngram_stream import StreamNGram
 
     model, tok = load(args.model)
     if args.fused:
-        from fastmlx import fused
+        from mlxturbo import fused
 
         fused.enable_hyper_connection_kernel()
         print("hyper-connections 融合カーネル有効")

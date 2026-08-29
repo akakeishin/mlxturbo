@@ -1,10 +1,10 @@
 """SpecEngine (投機デコード) と、それが使えないモデル向けの通常生成の共通口。
 
-fastmlx/spec.py の SpecEngine は fastmlx/_mlx_compat.py の
+mlxturbo/spec.py の SpecEngine は mlxturbo/_mlx_compat.py の
 validate_spec_model_contract が要求する GDN ハイブリッド固有の形
 (model.language_model.model の fa_idx/ssm_idx、各層の is_linear、linear
 cache の advance/trim 等) を前提にしている。Llama/Gemma/dense Qwen は
-もちろん、GDN ハイブリッドでも fastmlx/spec.py が書かれた当時の mlx-lm 形
+もちろん、GDN ハイブリッドでも mlxturbo/spec.py が書かれた当時の mlx-lm 形
 (qwen3_5 の language_model ラッパー) と違うレイアウトのモデル (手元で確認
 できた範囲では hyper-connections を使う qwen4_exp アーキテクチャがこれに
 該当し、model.language_model が無い・層に is_linear/input_layernorm が無い・
@@ -16,7 +16,7 @@ mlx_lm.generate.stream_generate による普通の (非投機) 生成に落と�
 どちらの経路でも呼び出し側 (cli.py / server.py) から見た形
 (``Runner.generate(...)`` が返す dict) は同一にする。
 
-``build_runner`` はここで fastmlx.fused.enable_hyper_connection_kernel() も
+``build_runner`` はここで mlxturbo.fused.enable_hyper_connection_kernel() も
 有効化する (既定 on、``no_fused=True`` で無効化)。qwen4_exp (hyper-connections)
 アーキテクチャの `GatedResidual.__call__` をクラス単位で Metal カーネルへ
 差し替えるだけなので、SpecEngine 経路 (spec.py が独自に forward を再実装し、
@@ -70,7 +70,7 @@ class Runner(Protocol):
 
 
 class SpecRunner:
-    """投機デコード経路。fastmlx.spec.SpecEngine をそのまま使う。
+    """投機デコード経路。mlxturbo.spec.SpecEngine をそのまま使う。
 
     fly_theta/fly_window は cli.py の --fly-theta/--fly-window 用の任意
     キーワードとして **extra 経由でそのまま SpecEngine.generate へ流す
@@ -124,20 +124,30 @@ class SpecRunner:
 class FlashSpecRunner:
     """Qwen3.8-Flash-Next (``qwen4_exp``) 向け投機デコード経路。
 
-    ``fastmlx.spec_flash.FlashSpecEngine`` (MTP を draft にした深さ1の投機、
+    ``mlxturbo.spec_flash.FlashSpecEngine`` (MTP を draft にした深さ1の投機、
     GatedDeltaNet の状態捕獲/巻き戻し) をそのまま使う。27B (``qwen3_5``) 用の
-    ``SpecRunner``/``fastmlx.spec.SpecEngine`` とは別物 — モデルの層構成
+    ``SpecRunner``/``mlxturbo.spec.SpecEngine`` とは別物 — モデルの層構成
     (hyper-connections、GDN、512 expert MoE) が全く違うため、共通化はせず
     別クラスに分けてある (docs/MTP-FLASH.md 参照)。
 
     session は ``FallbackSession`` (``.cache`` 単数形 / ``.processed``) を
-    そのまま流用する: Flash-Next も GDN ハイブリッドで線形状態を途中位置へ
-    巻き戻せないため、``FallbackRunner`` と同じく「新プロンプトが処理済み列
-    の純粋な追記のときだけ再利用、それ以外は新規に作り直す」の2択に倒す
-    (``fastmlx.spec.ChatSession`` が持つ checkpoint 経由の部分再利用は実装
-    しない — ``FallbackSession`` に ``.checkpoints`` が無いので
-    ``server.py`` の ``_select_session`` 側でも自然に不発になり、常に安全側
-    の「新規スロットへ倒す」に帰着する)。``KIND`` が ``"spec"`` ではない
+    そのまま流用する。Flash-Next も GDN ハイブリッドで線形状態を途中位置へ
+    巻き戻せないため、この関数自身が持つ再利用判定は ``FallbackRunner`` と
+    同じ「新プロンプトが処理済み列の純粋な追記のときだけ再利用、それ以外は
+    新規に作り直す」の2択のまま —だが実際に再利用できる範囲はそれより広い:
+    ``FallbackSession`` に ``mlxturbo.spec.ChatSession`` と同じ形の
+    ``.checkpoints`` を持たせたことで (2026-08-29 追加、thinking 対応)、
+    ``server.py`` の ``_select_session``/``_try_checkpoint_restore_session_
+    cache`` が処理済み列の途中で分岐したプロンプトでも直近チェックポイント
+    まで復元してから ``session`` を渡してくる。この関数はその復元の有無を
+    一切知らない —``_select_session`` が復元済みの ``session.processed`` を
+    渡してくる限り、ここの LCP 判定は常に「全体一致」として素通しする
+    (復元後の ``processed`` は新プロンプトの真の接頭辞になっていることが
+    ``_select_session`` 側で保証されている)。``checkpoints`` の記録自体は
+    ``FlashSpecEngine.generate_stream`` のプレフィルチャンク境界ごとに行う
+    (``mlxturbo.spec.CHECKPOINT_RETENTION``/``snapshot_untrimmable_caches`` を
+    そのまま流用、KV/indexer は trim 可能なので記録不要 — spec_flash.py の
+    ``generate_stream`` docstring 参照)。``KIND`` が ``"spec"`` ではない
     ため、``server.py``/``cli.py`` の ``session_factory`` 選択
     (``ChatSession if KIND == "spec" else FallbackSession``) はここを変えず
     そのまま ``FallbackSession`` を選ぶ。
@@ -167,13 +177,24 @@ class FlashSpecRunner:
         if seed is not None:
             mx.random.seed(seed)
 
-        # FallbackRunner.generate と同じ LCP (最長共通接頭辞) 契約: 既存
-        # session の処理済み列全体が新プロンプトの接頭辞になっているときだけ
-        # cache を再利用する。GDN ハイブリッドの部分巻き戻しは行わない
-        # (FallbackSession/このクラスの docstring 参照)。
+        # FallbackRunner.generate と同じ LCP (最長共通接頭辞) 契約: この関数
+        # 自身は「processed 全体が新プロンプトの接頭辞」だけを見る。実際には
+        # server.py の _select_session がチェックポイント経由で processed を
+        # 途中位置まで復元済みのことがあるが (このクラスの docstring 参照)、
+        # 復元後の processed は新プロンプトの真の接頭辞になっていることが
+        # 呼び出し側で保証されているので、ここでの判定は常にこの分岐で拾える。
+        #
+        # ``checkpoints`` は ``mlxturbo.spec.ChatSession`` と同じ流儀 (直接
+        # 参照を引き継ぎ、コピーしない) — ``FallbackSession.invalidate()`` は
+        # ``self.checkpoints`` を新しい空リストへ **再代入**するだけで、既に
+        # 拾ったこのローカル変数が指す旧リストは書き換えない。cache を作り
+        # 直す場合 (session が無い/新規/追記でない) は古い記録を引き継ぐ意味が
+        # 無いので空にする。
         prompt_cache = None
         reused = 0
+        checkpoints: list | None = None
         if session is not None:
+            checkpoints = session.checkpoints
             if session.cache is not None:
                 pl = session.processed
                 n = min(len(pl), len(prompt_ids))
@@ -189,6 +210,7 @@ class FlashSpecRunner:
                     session.invalidate()
             if prompt_cache is None:
                 prompt_cache = self.engine.model.make_cache()
+                checkpoints = []
 
         remaining_prompt = prompt_ids[reused:]
         ids = mx.array(remaining_prompt)[None]
@@ -198,7 +220,14 @@ class FlashSpecRunner:
         ttft = None
         accepted = rounds = 0
         gen = self.engine.generate_stream(
-            ids, max_tokens, caches=prompt_cache, temp=temp, eos_ids=eos_ids, **extra
+            ids,
+            max_tokens,
+            caches=prompt_cache,
+            temp=temp,
+            eos_ids=eos_ids,
+            checkpoints=checkpoints,
+            base_pos=reused,
+            **extra,
         )
         try:
             while True:
@@ -218,14 +247,20 @@ class FlashSpecRunner:
             # produced/yielded but has not yet been fed into ``prompt_cache``.
             # Publish only the prefix the cache actually contains; the next
             # turn will prefill the trailing cur together with its new suffix.
-            session.publish(prompt_cache, list(prompt_ids) + tokens[:-1])
+            # ``checkpoints`` was extended in-place by ``generate_stream``
+            # (or reset to ``[]`` above when this call built a fresh cache) —
+            # publish it alongside so the next turn's _select_session can
+            # restore to it (mlxturbo/spec.py の ChatSession.publish と同じ形)。
+            session.publish(
+                prompt_cache, list(prompt_ids) + tokens[:-1], checkpoints=checkpoints
+            )
         return {
             "tokens": tokens,
             "ttft_s": ttft or 0.0,
             "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
             "prefill_reused": reused,
             "prefill_new": len(prompt_ids) - reused,
-            # fastmlx.spec.SpecEngine.generate と同じ定義 (n_decode/steps):
+            # mlxturbo.spec.SpecEngine.generate と同じ定義 (n_decode/steps):
             # プレフィルが生んだ最初の1トークンを除いた、反復あたりの実効
             # トークン数。rounds==0 (max_tokens<=1でループが一度も回らない)
             # なら SpecEngine と同じく 0.0 とする。
@@ -240,7 +275,7 @@ class FallbackSession:
     差分だけ prefill、そうでなければ全再構築) を、mlx_lm.models.cache の
     汎用 KV キャッシュに対して行う。FallbackRunner が実際に通る唯一のモデル
     (qwen4_exp/Flash-Next 系) は GDN ハイブリッドで、線形状態は途中位置へ
-    巻き戻せない (fastmlx/spec.py の ChatSession docstring と同じ制約) ため、
+    巻き戻せない (mlxturbo/spec.py の ChatSession docstring と同じ制約) ため、
     ここでも部分巻き戻し (trim) は行わず、追記か全再構築かの二択に倒す。
 
     ``processed``: これまでにこのキャッシュへ実際に feed 済みのトークン列
@@ -249,21 +284,37 @@ class FallbackSession:
     出す (see FallbackRunner.generate 呼び出し側の解析)ので、生成が EOS で
     早期終了しても max_tokens で打ち切られても、``tokens`` に集まった列は
     そのままキャッシュへ feed 済みの列と一致する。
+
+    ``checkpoints``: ``mlxturbo.spec.ChatSession.checkpoints`` と同じ形
+    (``[(position, snapshot), ...]``、position 昇順) — thinking マーカーの
+    再オープン等で処理済み列の途中から分岐した新プロンプトでも、直近の
+    プレフィルチャンク境界まで復元してから差分だけ prefill し直せる
+    (mlxturbo/server.py の ``_try_checkpoint_restore_session_cache`` が消費、
+    mlxturbo/runner.py の ``FlashSpecRunner`` docstring 参照)。
+    ``FallbackRunner`` (このクラスのもう一方の利用者) は ``mlx_lm.generate.
+    stream_generate`` を直接使い、チャンク境界ごとのスナップショットを
+    自分では作らないため、常に空のまま — ``_try_checkpoint_restore_session_
+    cache`` は空リストを falsy として即座に諦めるので、その経路にとっては
+    このフィールドが増えたこと自体、以前の「全体一致 or 新規スロット」の
+    二択から何も変わらない。
     """
 
     def __init__(self):
         self.cache = None
         self.processed: list[int] = []
+        self.checkpoints: list = []
 
     def invalidate(self):
         """Drop the published cache before it is aliased and mutated in place."""
 
         self.cache = None
         self.processed = []
+        self.checkpoints = []
 
-    def publish(self, cache, processed):
+    def publish(self, cache, processed, checkpoints=None):
         self.cache = cache
         self.processed = processed
+        self.checkpoints = checkpoints if checkpoints is not None else []
 
 
 class FallbackRunner:
@@ -389,7 +440,7 @@ class FallbackRunner:
             max_tokens=max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
-            # fastmlx.spec.PREFILL_STEP_SIZE と明示的に共有する。この値を
+            # mlxturbo.spec.PREFILL_STEP_SIZE と明示的に共有する。この値を
             # 渡さなければ mlx_lm.generate 側の既定 (2048、たまたま同じ) に
             # 黙って乗るだけで、どちらかを変えたときに経路ごとに prefill の
             # 刻み幅がずれる — 同じプロンプトが経路によって別のチャンク幅
@@ -530,7 +581,7 @@ def build_runner(
     args,
     n_draft: int = 3,
     max_draft: int = 8,
-    log_prefix: str = "[fastmlx]",
+    log_prefix: str = "[mlxturbo]",
 ) -> Runner:
     """SpecEngine の構築を試み、モデルの形が合わなければ通常生成へ落とす。
 

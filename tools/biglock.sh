@@ -13,7 +13,7 @@
 
 set -e
 
-LOCK="${TMPDIR:-/tmp}/fastmlx-bigmodel.lock"
+LOCK="${TMPDIR:-/tmp}/mlxturbo-bigmodel.lock"
 WAITED=0
 
 # ロックを取るまで回る。取得は noclobber で不可分にする。`[ -f ]` で見てから

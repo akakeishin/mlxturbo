@@ -7,14 +7,14 @@
 元 checkpoint は VLM (`Qwen4ExpForConditionalGeneration`)。1,658 キー中 **333 が vision 系** (`model.visual.blocks.*`) だが、変換で意図的に捨てている。変換後の v 系成果物に vision 系は **0 キー**。元 checkpoint (360GB / 131 シャード) は外付け `/Volumes/Mobile SSD/models/Qwen3.8-Flash-Next` に再取得済みなので、素材はいつでも読める。
 
 落としている箇所:
-- `fastmlx/convert_flash.py:331` — `mtp.` / `vision_tower.` / `model.visual.` を skip
+- `mlxturbo/convert_flash.py:331` — `mtp.` / `vision_tower.` / `model.visual.` を skip
 - `tools/vendor/qwen4_exp.py:849` — mlx-lm 側の `sanitize` でも同じものを skip (`# text-only pour l'instant`)
 
 必要な作業は 3 段。
 
 1. 変換で `model.visual.*` を残す (`convert_flash.py:331`)
 2. **mlx-lm 側に vision タワーのクラスを書く。** 現状 `qwen4_exp.py` に vision/visual の言及は skip の 2 行だけで、クラス自体が存在しない。**ここが一番重い**
-3. エンジンが埋め込み入力を受け取れるようにする。`fastmlx/spec.py:164` が `self.inner.embed_tokens(tokens[None])` と自前で埋め込んでいるのを、外から渡せるようにする。モデルの `__call__` は既に `input_embeddings` を受ける口を持っている (`qwen4_exp.py:746`)。`spec_flash.py` 側も同様の口が要る
+3. エンジンが埋め込み入力を受け取れるようにする。`mlxturbo/spec.py:164` が `self.inner.embed_tokens(tokens[None])` と自前で埋め込んでいるのを、外から渡せるようにする。モデルの `__call__` は既に `input_embeddings` を受ける口を持っている (`qwen4_exp.py:746`)。`spec_flash.py` 側も同様の口が要る
 
 投機デコード固有の注意点として、**n-gram lookup はトークン ID 上で動くので、画像プレースホルダ (同じ ID が数百個並ぶ) の区間で誤マッチを量産する。** lookup の対象から画像区間を外す処理が要る。MTP 側はドラフトが常にテキストなので影響しない。
 
@@ -26,7 +26,7 @@
 
 - 取り分の実測: gemma4-26B で B=4 実測 2.10x。Flash-Next はエキスパート和集合からの予測で 2.05〜2.19x (`bench/results/batch-flashnext-expert-union.json`)。「512 エキスパートなら飽和しにくい」は誤りで、飽和は (B × top_k) / num_experts で決まる
 - prefill には一切効かない (B に線形)。cold 32k は TTFT 112 秒で壁時計の 84% を prefill が占める (`bench/results/batch-flashnext-prefill-decode.json`)。**体感を狙うなら prefill 側が先**
-- 実装: `fastmlx/batch.py` に `enable_batch_cache()` (既定 off、未配線)。合成モデルの CPU 検証で QSA off と長さ揃いは B=1/2/4 完全一致。**残る制限**: QSA 有効 (2048 超) かつ長さ不揃いでバッチ出力が単体と一致しない (破損ではなく QSA のブロックグリッドが絶対列で切られるため。パディングを揃えれば 3.7e-8)。実モデル検証 `tools/verify_batch_real.py` は未実行
+- 実装: `mlxturbo/batch.py` に `enable_batch_cache()` (既定 off、未配線)。合成モデルの CPU 検証で QSA off と長さ揃いは B=1/2/4 完全一致。**残る制限**: QSA 有効 (2048 超) かつ長さ不揃いでバッチ出力が単体と一致しない (破損ではなく QSA のブロックグリッドが絶対列で切られるため。パディングを揃えれば 3.7e-8)。実モデル検証 `tools/verify_batch_real.py` は未実行
 - やる根拠は速度でなく**可用性**: 直列サーバーだとサブエージェントを流しっぱなしにしたまま別の作業ができない。B=4 でレイテンシは 0.53x に悪化するので、対話 1 本の用途では逆効果
 
 継続バッチングを投機デコードと GDN の再帰状態の上に載せるのは片手間の規模ではない。着手するなら `verify_batch_real.py` の実行が最初の一歩。
@@ -35,7 +35,7 @@
 
 サーバーは「spec/flash_spec の契約に合わなければ通常生成にフォールバック」なので、**載せれば喋る**。fallback の理由は `/health` の `fallback_reason` に出る。ただし投機デコードは効かない。
 
-- 27B 系の `SpecEngine` は `fastmlx/_mlx_compat.py:111` の契約 (GDN ハイブリッド固有の形) を要求する
+- 27B 系の `SpecEngine` は `mlxturbo/_mlx_compat.py:111` の契約 (GDN ハイブリッド固有の形) を要求する
 - Flash-Next 系は `spec_flash.py` の `FlashSpecEngine` (qwen4_exp 固有)
 - 他アーキテクチャで投機を効かせるには契約の一般化が要る。lookup (SAM) 側はモデル非依存なので、そちらだけ先に切り出す手はある
 

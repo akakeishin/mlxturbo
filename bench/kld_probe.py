@@ -57,8 +57,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# bench/spec_bench.py は import 時点で mlx.core / mlx_lm / fastmlx.mtp /
-# fastmlx.spec を import する（クラス定義のみ。GPU 計算は発生しない）。
+# bench/spec_bench.py は import 時点で mlx.core / mlx_lm / mlxturbo.mtp /
+# mlxturbo.spec を import する（クラス定義のみ。GPU 計算は発生しない）。
 from bench.spec_bench import PROMPTS  # noqa: E402
 
 DEFAULT_REF_MODEL = "Qwen/Qwen3.8-27B"

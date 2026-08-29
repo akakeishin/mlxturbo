@@ -4,11 +4,11 @@
 汎用パックの設計材料として引き続き有効。**
 
 新セッションはこのファイルから読み始めること。背景の正本は
-docs/PLAN.md (Phase D)、docs/RESEARCH.md、docs/KERNEL-INTEL.md、README.md。
+docs/research/PLAN.md (Phase D)、docs/research/RESEARCH.md、docs/research/KERNEL-INTEL.md、README.md。
 
 **2026-08-26 追記: D0 実測で本ファイルの前提が複数崩れた。vanilla 崩壊カーブに
 乗っていない・再スケールは無効果・3.5 tok/step は K=3 で構造的に不可。
-docs/D2-RESULTS.md の D0 節を先に読み、目標値はそちらを正とすること。**
+docs/research/D2-RESULTS.md の D0 節を先に読み、目標値はそちらを正とすること。**
 
 ## 目的
 
@@ -50,7 +50,7 @@ MTP ヘッド（~0.4B、backbone 凍結）を FastMTP レシピで微調整し�
 - GPU はカーネル側セッションの計測と排他。長時間学習の開始前に
   相手セッションの計測が走っていないか確認する
 - 学習スクリプトと成果物は fastmlx/train_mtp.py と models/mtp-tuned/ に。
-  レポートは docs/D2-RESULTS.md へ
+  レポートは docs/research/D2-RESULTS.md へ
 
 ## 期待値（実証済み参照値）
 

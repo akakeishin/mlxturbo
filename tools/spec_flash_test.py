@@ -39,11 +39,11 @@ def main():
     import numpy as np
     from mlx_lm import load
 
-    from fastmlx import spec_flash
+    from mlxturbo import spec_flash
 
     model, tok = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, args.ngram)
 

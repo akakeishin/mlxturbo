@@ -1,7 +1,7 @@
 """n-gram をディスクに置いたモデルを読み込んで動かす。
 
 `FASTMLX_NGRAM_DISK=1` で焼いたチェックポイントは n-gram 表を持たないので、
-読み込んだあと `fastmlx.ngram_stream.install` でサイドカーを結びつける必要が
+読み込んだあと `mlxturbo.ngram_stream.install` でサイドカーを結びつける必要が
 ある。mlx_lm.generate はその手順を知らないので、ここを入口にする。
 
 使い方:
@@ -34,7 +34,7 @@ def load_streamed(model_path: str, ngram_dir: str | None, mode: str = "disk"):
 
     model, tok = load(model_path)
     if ngram_dir:
-        from fastmlx.ngram_stream import install, install_ram
+        from mlxturbo.ngram_stream import install, install_ram
 
         (install_ram if mode == "ram" else install)(model, ngram_dir)
     return model, tok

@@ -56,11 +56,11 @@ def main():
     import numpy as np
     from mlx_lm import load
 
-    from fastmlx import fused
+    from mlxturbo import fused
 
     model, tok = load(args.model)
     if args.ngram:
-        from fastmlx.ngram_stream import install
+        from mlxturbo.ngram_stream import install
 
         install(model, args.ngram)
     ids = tok.apply_chat_template(
@@ -82,7 +82,7 @@ def main():
     # 構成は積み上げではなく**明示**する。積み上げだと「どのカーネルが効いたか」と
     # 「組み合わせたときにどうなるか」が分離できない。
     # RMSNormGated は空振り (-0.01〜-0.11ms) だったので外している
-    # (fastmlx/kernels/rms_norm_gated.py の docstring を参照)
+    # (mlxturbo/kernels/rms_norm_gated.py の docstring を参照)
     HC = fused.enable_hyper_connection_kernel
     MOE = fused.enable_moe_route
     CONFIGS = [
@@ -134,7 +134,7 @@ def main():
 
     # ビットを打ち直して同じ構成をもう一度測る。ロードし直さないので
     # マシンの状態が揃ったまま前後を比べられる
-    from fastmlx import rebit
+    from mlxturbo import rebit
 
     before = statistics.median(samples[CONFIGS[-1][0]])
     off()

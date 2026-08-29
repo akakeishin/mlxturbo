@@ -2,7 +2,7 @@
 
 Metal デバイスが要る手順だけをここに置く。実行は親が直列で行う。
 CPU で済む部分は全て済ませてあるので、以下は残り 3 件だけ。
-背景と CPU 側の結果は `docs/ISA-NOTES.md`。
+背景と CPU 側の結果は `docs/research/ISA-NOTES.md`。
 
 前提: リポジトリルートで、`.venv` が有効なこと。
 どれも 1 分以内に終わる。GPU を占有する重い dispatch は無い。
@@ -67,7 +67,7 @@ tools/isa/gpu_probe.sh
 ## Q3. M3 ネイティブコードの逆アセンブル（優先度: 低。やれたら）
 
 `dougallj/applegpu` は G13（M1）用で G15（M3）を復号できない
-（`docs/ISA-NOTES.md` §2-5）。Q2 が吐く `*.archive.bin` は M3 ドライバが作った
+（`docs/research/ISA-NOTES.md` §2-5）。Q2 が吐く `*.archive.bin` は M3 ドライバが作った
 本物のバイナリアーカイブなので、将来 G15 対応の逆アセンブラが出たとき、
 あるいは Xcode の GPU debugger に食わせるときの入力になる。
 いまは保存しておくだけでよい。

@@ -1,6 +1,6 @@
 """GatedDeltaNet カーネルの派生版: 全位置の再帰状態も一括で出力する。
 
-投機デコードの検証パス（`fastmlx/spec.py` の `_linear_capture`）は、巻き戻しの
+投機デコードの検証パス（`mlxturbo/spec.py` の `_linear_capture`）は、巻き戻しの
 ために「各位置を処理し終えた直後の状態」を必要としている。現状は
 `mlx_lm.models.gated_delta.gated_delta_update` を位置ごとに T 回呼んでおり、
 T 回のカーネル起動と、呼び出しごとの state (fp32, [B, Hv, Dv, Dk]) の

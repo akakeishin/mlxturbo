@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end checks for an OpenCode client talking to a fastmlx server."""
+"""End-to-end checks for an OpenCode client talking to a mlxturbo server."""
 
 from __future__ import annotations
 
@@ -110,7 +110,7 @@ class PreflightResult:
 
 def _sentinel(case: str, ordinal: int = 0) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "_", case).strip("_").upper()
-    digest = hashlib.sha256(f"fastmlx-opencode-e2e:{case}:{ordinal}".encode()).hexdigest()[:12].upper()
+    digest = hashlib.sha256(f"mlxturbo-opencode-e2e:{case}:{ordinal}".encode()).hexdigest()[:12].upper()
     return f"FASTMLX_E2E_{slug}_{digest}"
 
 
@@ -454,7 +454,7 @@ def _variant_config(config: dict[str, Any], model: str) -> dict[str, Any]:
     provider_id, separator, model_id = model.partition("/")
     if not separator:
         model_id = provider_id
-        provider_id = next(iter(providers), "fastmlx")
+        provider_id = next(iter(providers), "mlxturbo")
         for candidate_id, candidate in providers.items():
             if isinstance(candidate, dict) and isinstance(candidate.get("models"), dict) and model_id in candidate["models"]:
                 provider_id = candidate_id
@@ -495,7 +495,7 @@ class Harness:
         self.config_path = config_path
 
     def run(self, selected: list[str]) -> Iterable[CaseResult]:
-        with tempfile.TemporaryDirectory(prefix="fastmlx-opencode-e2e-") as temp_name:
+        with tempfile.TemporaryDirectory(prefix="mlxturbo-opencode-e2e-") as temp_name:
             root = Path(temp_name)
             for name in selected:
                 try:

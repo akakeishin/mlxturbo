@@ -6,7 +6,7 @@
 
 経路を外すと数字が出荷経路を表さなくなる:
 
-- ``fastmlx.runner.build_runner`` を通す。Flash-Next (qwen4_exp) は SpecEngine
+- ``mlxturbo.runner.build_runner`` を通す。Flash-Next (qwen4_exp) は SpecEngine
   の契約を満たさず ``FallbackRunner`` (非投機) に落ちるが、**融合 HC カーネルを
   有効化しているのは build_runner** で、SpecEngine 経路には効かない。つまり
   Flash-Next が実際に通る唯一の道が build_runner なので、モデルを直接叩く
@@ -143,13 +143,13 @@ def main() -> None:
 
     import mlx.core as mx
 
-    from fastmlx._mlx_compat import mlx_lm_load
-    from fastmlx.ngram_stream import StreamNGram, warn_if_not_installed
-    from fastmlx.runner import FallbackRunner, build_runner
+    from mlxturbo._mlx_compat import mlx_lm_load
+    from mlxturbo.ngram_stream import StreamNGram, warn_if_not_installed
+    from mlxturbo.runner import FallbackRunner, build_runner
 
     t0 = time.perf_counter()
     model, tokenizer, config = mlx_lm_load(args.model, return_config=True)
-    from fastmlx.ngram_stream import install
+    from mlxturbo.ngram_stream import install
 
     install(model, args.ngram)
     load_s = time.perf_counter() - t0
@@ -286,7 +286,7 @@ def main() -> None:
         "speculative_note": "投機は一切入っていない。README の「自己投機 1.5-2.2 倍」は "
                             "Qwen3.8-27B レーンの数字で、この値には適用できない",
         "conditions": {
-            "route": f"fastmlx.runner.build_runner -> {route} (非投機、HTTP を挟まない)",
+            "route": f"mlxturbo.runner.build_runner -> {route} (非投機、HTTP を挟まない)",
             "model_path": str(Path(args.model).expanduser()),
             "ngram_sidecar": str(Path(args.ngram).expanduser()),
             "fused_hyper_connection": True,

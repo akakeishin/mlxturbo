@@ -1,10 +1,10 @@
 # KERNEL-BRIEF-HC — hyper-connections の融合カーネル (2026-08-27)
 
-カーネル専門セッション向けの 2 本目のミッション。1 本目 (docs/KERNEL-BRIEF.md、
+カーネル専門セッション向けの 2 本目のミッション。1 本目 (docs/research/KERNEL-BRIEF.md、
 Qwen3.8-27B の検証ステップ短縮) とは対象モデルが違う。こちらは
 **Qwen3.8-Flash-Next (qwen4_exp)**。
 
-背景は docs/STATUS.md の「速度: 完全にディスパッチ律速だと確定」以降。
+背景は docs/research/STATUS.md の「速度: 完全にディスパッチ律速だと確定」以降。
 
 ## ミッション
 
@@ -23,7 +23,7 @@ hyper-connections は**読み出しがほとんど無いのに時間だけ食う
 > トークンは 5.77ms。**このミッションの判断自体は変わらない** — 上の
 > 「読み出し 1.8ms に対し実測 19.9ms」という独立した根拠で成立しており、
 > 実際に融合カーネルが 20.9 -> 4.51ms にしたことで裏付けられた。
-> 詳細は docs/STATUS.md の同日の訂正節。
+> 詳細は docs/research/STATUS.md の同日の訂正節。
 
 部品別の内訳 (`tools/ablate.py`、v-ng2、積み上げ式の無効化):
 
@@ -96,7 +96,7 @@ return mixed, hyper, inject
    **2026-08-27 に取り下げ。**この基準はどんな実装でも届かないことが対照実験で
    判明した (素と op 単位で同じで sigmoid だけ fp32 にした、素より*正確*な版が
    7.3% ずれる)。`mx.compile` 版の 5% も実装の誤りではなく bf16 の丸めが 96 段で
-   増幅した量だった。品質は 2 の KLD に一本化する。docs/KERNEL-HANDOFF-HC.md 参照
+   増幅した量だった。品質は 2 の KLD に一本化する。docs/research/KERNEL-HANDOFF-HC.md 参照
 2. **品質**: `bench/quant_eval.py compare` を融合ありで回し、bf16 基準の
    KLD が融合なしと **1e-5 以内**で一致すること
    (v-stream の現在値は KLD 0.00260 / top1 0.9881)
@@ -249,5 +249,5 @@ MoE の後の標的として GDN 2.2ms より優先度が高い (伸びしろ 3m
 ## 一般化
 
 GLM-5.3-Flash も **mHC (multi-head hyper-connections)** を持つ。ここで書く
-カーネルは構造がほぼそのまま移る見込み (docs/STATUS.md の GLM 節)。
+カーネルは構造がほぼそのまま移る見込み (docs/research/STATUS.md の GLM 節)。
 形状を引数で受ける作りにしておくと後が楽。

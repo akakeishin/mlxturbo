@@ -21,7 +21,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from fastmlx.convert_flash import _DTYPE_BYTES, iter_tensor_headers  # noqa: E402
+from mlxturbo.convert_flash import _DTYPE_BYTES, iter_tensor_headers  # noqa: E402
 
 # M3 Max の実測ピーク。micro_moe_gdn.py のビット掃引で見た限界コストが
 # MoE 385 GB/s / GDN 投影 243 GB/s だったので、上下を両方出す

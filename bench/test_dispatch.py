@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import mlx.core as mx
 import mlx.nn as nn
 
-from fastmlx.kernels.dispatch import (
+from mlxturbo.kernels.dispatch import (
     DEFAULT_ROUTE_TABLE,
     MMA,
     NOCAP,
@@ -26,8 +26,8 @@ from fastmlx.kernels.dispatch import (
     quantized_matmul,
     select_route,
 )
-from fastmlx.fast_qmm import fast_qmm
-from fastmlx.kernels.qmv_wide_nocap import qmv_wide_nocap
+from mlxturbo.fast_qmm import fast_qmm
+from mlxturbo.kernels.qmv_wide_nocap import qmv_wide_nocap
 
 
 def _weights(k, n):

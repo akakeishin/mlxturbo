@@ -16,22 +16,22 @@ hyper-connections が最大の残り。中身は行列積 3 本と elementwise �
 `mx.compile` に通せば elementwise がまとまる。全 96 個が同じ形なので、
 重みを引数で渡せばコンパイルは 1 回で済む。
 
-    from fastmlx import fused
+    from mlxturbo import fused
     fused.enable_hyper_connection()
 
 `mx.compile` は 1.8ms しか減らなかった (51.09 -> 49.29 ms/token)。行列積が
 間に挟まって elementwise の連なりが 1-3 op ずつに分断されるためで、こちらは
 参考実装として残してある。本命は Metal カーネルへの融合:
 
-    from fastmlx import fused
+    from mlxturbo import fused
     fused.enable_hyper_connection_kernel()
 
 GDN の `RMSNormGated` も同じ形で畳める:
 
-    from fastmlx import fused
+    from mlxturbo import fused
     fused.enable_rms_norm_gated()
 
-いずれも既定は off。中身は fastmlx/kernels/ 配下、測り方と数値の扱いは
+いずれも既定は off。中身は mlxturbo/kernels/ 配下、測り方と数値の扱いは
 docs/KERNEL-HANDOFF-HC.md と docs/KERNEL-BRIEF-MOE-GDN.md。
 """
 
@@ -139,7 +139,7 @@ def enable_hyper_connection_kernel() -> None:
     """`GatedResidual.__call__` を Metal 融合カーネルに差し替える。
 
     形は :func:`enable_hyper_connection` と同じで、既定は off。カーネルが
-    扱えない形・量子化 (:func:`fastmlx.kernels.hyper_connection.eligible`
+    扱えない形・量子化 (:func:`mlxturbo.kernels.hyper_connection.eligible`
     参照) に当たった呼び出しだけ、その場で素の実装へ落ちる。
     """
 

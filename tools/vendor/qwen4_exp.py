@@ -1,6 +1,6 @@
 # vendored from https://github.com/eauchs/mlx-lm branch add-qwen4-exp
 # (ml-explore/mlx-lm PR #1788, MIT ライセンス)。取り込み 2026-08-27。
-# fastmlx 側の変更点:
+# mlxturbo 側の変更点:
 #   1. mtp.* を落とす (サイドカーへ別抽出する)
 #   2. model.language_model.* -> model.* に畳む (公開 ckpt は VLM 形状)
 #   3. mlp.experts.{gate_up,down}_proj -> switch_mlp.* へ分解・改名
@@ -8,8 +8,8 @@
 #   5. RMSNorm を (1 + weight) 規約に直す (参照実装と同じ Gemma 系)
 #   6. FASTMLX_NGRAM_DISK=1 で n-gram 表を持たない (ディスクから行を引く)
 # (mlx-lm 本体は MTP モジュールを持たないため strict load が失敗する。
-#  MTP は fastmlx/convert_flash.py extract-mtp でサイドカーへ抽出して使う)。
-# インストール: fastmlx/convert_flash.py install-arch が
+#  MTP は mlxturbo/convert_flash.py extract-mtp でサイドカーへ抽出して使う)。
+# インストール: mlxturbo/convert_flash.py install-arch が
 # site-packages/mlx_lm/models/qwen4_exp.py へコピーする。
 # MLX port of Qwen3.8-Flash-Next (HF model_type: qwen4_exp)
 # New compared to qwen3_next: QSA sparse attention, gated residual
@@ -31,7 +31,7 @@ from .cache import ArraysCache, KVCache, _BaseCache
 from .gated_delta import gated_delta_update
 from .switch_layers import SwitchGLU
 
-# fastmlx: n-gram 表 (51.2B params) を RAM に持たず、行だけディスクから引く
+# mlxturbo: n-gram 表 (51.2B params) を RAM に持たず、行だけディスクから引く
 # 運用に切り替える。変換時と読込時の両方でこの旗を立てる必要がある。
 NGRAM_ON_DISK = os.environ.get("FASTMLX_NGRAM_DISK") == "1"
 
@@ -129,7 +129,7 @@ class RMSNorm(nn.Module):
             raise ValueError(f"dim {dim} non divisible par group_size {group_size}")
 
     def __call__(self, x: mx.array) -> mx.array:
-        # fastmlx: 元の port は x * weight で、+1 が抜けていた。学習済みの
+        # mlxturbo: 元の port は x * weight で、+1 が抜けていた。学習済みの
         # weight は 0 近傍の差分なので、掛けると信号が縮んで向きだけ残り、
         # 活性の大きさはそれらしいまま情報だけ壊れる (生成が無意味な反復になる)
         if self.group_size is None:
@@ -551,7 +551,7 @@ class NGramEmbedding(nn.Module):
                 2 * (_splitmix64((base_seed + _GAMMA * (i + 1)) & _MASK64) % half) + 1
             )
         # ここで組むのは checkpoint が無い場合の初期値でしかない。load_weights が
-        # 同名テンソルで上書きするので、実際に使うのは常にこちら (fastmlx 変更点)。
+        # 同名テンソルで上書きするので、実際に使うのは常にこちら (mlxturbo 変更点)。
         # 元の port は `_`-prefix の再計算コピーを __call__ で使っていたが、
         # layer_multipliers の再計算値は公開 checkpoint の実値と一致しない
         # (vocab_sizes/offsets は一致する)。乗数が違うとハッシュ先が全部ずれて
@@ -611,7 +611,7 @@ class _ShardedEmbedding(nn.Module):
         self.rows = rows
         self.dim = dim
         if NGRAM_ON_DISK:
-            # fastmlx: 表を持たない。実体は fastmlx.ngram_stream.install が
+            # mlxturbo: 表を持たない。実体は mlxturbo.ngram_stream.install が
             # サイドカー参照に差し替える。ここで確保すると 102GB 取られる
             return
         for i in range(n_shards):
@@ -621,7 +621,7 @@ class _ShardedEmbedding(nn.Module):
         if NGRAM_ON_DISK:
             raise RuntimeError(
                 "n-gram がディスク運用のまま差し替えられていない。"
-                "fastmlx.ngram_stream.install(model, <サイドカー>) を呼ぶこと"
+                "mlxturbo.ngram_stream.install(model, <サイドカー>) を呼ぶこと"
             )
         flat = gid.reshape(-1)
         shard_of = flat // self.rows
@@ -849,10 +849,10 @@ class Model(nn.Module):
             if k.startswith("vision_tower.") or k.startswith("model.visual."):
                 continue  # text-only pour l'instant
             if NGRAM_ON_DISK and "ngram_embedding.shard_" in k:
-                # fastmlx: ディスク運用ではモデル本体に持たせない
+                # mlxturbo: ディスク運用ではモデル本体に持たせない
                 continue
             if k.startswith("mtp."):
-                # fastmlx: MTP はサイドカーへ抽出して別ロードする (ヘッダ参照)
+                # mlxturbo: MTP はサイドカーへ抽出して別ロードする (ヘッダ参照)
                 continue
             if k.endswith("mlp.experts.gate_up_proj"):
                 # ckpt は融合 (E, 2*moe_inter, H)。transformers の Qwen3-Next 系と
