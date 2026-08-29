@@ -1,7 +1,7 @@
-"""fastmlx/server.py の追加分 (サンプリングパラメータ / /health / CORS /
+"""mlxturbo/server.py の追加分 (サンプリングパラメータ / /health / CORS /
 prompt cache 可視化 / /v1/completions) を、モデルをロードせずに検証する。
 
-STATE (fastmlx.server.STATE) はモジュールグローバルなので、各テストは
+STATE (mlxturbo.server.STATE) はモジュールグローバルなので、各テストは
 フェイクの Runner/Tokenizer で ModelState を組み立てて差し替える。生成の
 下回り (asyncio.Lock / ThreadPoolExecutor) は本物を使う (どちらも構築に
 イベントループやモデルを要らない) — テスト対象はあくまで server.py 側の
@@ -25,10 +25,10 @@ import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
 
-import fastmlx.cli as cli_module
-import fastmlx.server as server
-from fastmlx.runner import FallbackRunner, FallbackSession, FlashSpecRunner, SpecRunner
-from fastmlx.spec import ChatSession, SpecEngine
+import mlxturbo.cli as cli_module
+import mlxturbo.server as server
+from mlxturbo.runner import FallbackRunner, FallbackSession, FlashSpecRunner, SpecRunner
+from mlxturbo.spec import ChatSession, SpecEngine
 
 
 # ---------- フェイク tokenizer/detokenizer ----------
@@ -179,7 +179,7 @@ class FakeSpecRunner(FakeRunner):
     """SpecRunner を模す: seed しかサポートしない。
 
     実物の SpecRunner.generate は seed 以外を **extra 経由でそのまま
-    fastmlx.spec.SpecEngine.generate() に渡すが、SpecEngine.generate は
+    mlxturbo.spec.SpecEngine.generate() に渡すが、SpecEngine.generate は
     **kwargs を持たない固定シグネチャなので、未知のキーワード引数を渡すと
     TypeError で落ちる (実サーバーで実測: "SpecEngine.generate() got an
     unexpected keyword argument 'top_p'")。FakeRunner の generate は
@@ -605,7 +605,7 @@ def test_fake_reusing_runner_requires_a_published_cache():
         pytest.param(FakeRunner([]), FallbackSession, id="fallback"),
         pytest.param(FakeSpecRunner([]), ChatSession, id="spec"),
         # FlashSpecRunner (Qwen3.8-Flash-Next) は KIND="flash_spec" (!= "spec")
-        # なので FallbackSession を流用する側に落ちる (fastmlx/runner.py の
+        # なので FallbackSession を流用する側に落ちる (mlxturbo/runner.py の
         # FlashSpecRunner docstring 参照) — server.py 側は何も変えていない。
         pytest.param(FakeFlashSpecRunner([]), FallbackSession, id="flash_spec"),
     ],
@@ -624,7 +624,7 @@ def test_install_state_matches_production_session_type(runner, expected_factory)
 # 即 400 になっていた)。
 #
 # ただし 400 にしないだけでは足りない: SpecRunner.generate は seed 以外の
-# kwarg を fastmlx.spec.SpecEngine.generate() へそのまま **extra 経由で
+# kwarg を mlxturbo.spec.SpecEngine.generate() へそのまま **extra 経由で
 # 渡すが、SpecEngine.generate は **kwargs を持たない固定シグネチャなので、
 # 恒等値であっても runner がサポートしないキーをそのまま渡すと
 # "unexpected keyword argument" で 500 になる (実サーバーでの実測)。
@@ -960,7 +960,7 @@ def test_cors_disabled_by_default(client):
 def test_cors_enabled_via_helper():
     from fastapi import FastAPI
 
-    from fastmlx.server import _add_cors_middleware
+    from mlxturbo.server import _add_cors_middleware
 
     test_app = FastAPI()
     _add_cors_middleware(test_app, ["http://allowed.example"])
@@ -1995,7 +1995,7 @@ def test_flash_spec_generate_stream_zero_tokens_prefills_without_yield(monkeypat
 
     from contextlib import contextmanager
 
-    import fastmlx.spec_flash as spec_flash_module
+    import mlxturbo.spec_flash as spec_flash_module
 
     class FakeModel:
         model = SimpleNamespace()
@@ -2009,7 +2009,7 @@ def test_flash_spec_generate_stream_zero_tokens_prefills_without_yield(monkeypat
             return mx.zeros((1, ids.shape[1], 4))
 
     @contextmanager
-    def fake_capture(_model):
+    def fake_capture(_model, light: bool = False):
         yield SimpleNamespace(hyper=mx.zeros((1, 2, 1)))
 
     monkeypatch.setattr(spec_flash_module, "capture", fake_capture)
@@ -2637,7 +2637,7 @@ def test_anthropic_history_thinking_block_does_not_400(client):
     )
 
 
-def test_anthropic_rejects_modified_fastmlx_thinking_signature(client):
+def test_anthropic_rejects_modified_mlxturbo_thinking_signature(client):
     runner = FakeRunner(tokens_to_emit=[10])
     _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "ok"}))
 
@@ -3269,7 +3269,7 @@ def test_responses_stream_first_event_precedes_generation(client):
 # チャットテンプレートは system が先頭に無いと "System message must be at
 # the beginning" で落ちるので、トップレベルの system と messages 内の
 # system ロールを両方とも先頭へ寄せて 1 個の system メッセージへ連結する
-# (fastmlx/server.py の anthropic_messages 参照)。
+# (mlxturbo/server.py の anthropic_messages 参照)。
 
 
 def test_anthropic_system_role_in_messages_moved_to_front_with_top_level_system(client):
@@ -3367,11 +3367,11 @@ def test_anthropic_multiple_embedded_system_roles_keep_relative_order(client):
 #
 # 実際に捕獲した Codex CLI のリクエストボディでは、"tools" に
 # {"type": "function", ...} 以外の要素 (namespace で入れ子になった
-# サブエージェント用ツール群、web_search) が混ざって送られてくる。fastmlx
+# サブエージェント用ツール群、web_search) が混ざって送られてくる。mlxturbo
 # は "each item in 'tools' must be an object with \"type\": \"function\""
 # で 400 を返していた。namespace は中の function を展開して拾い、
 # web_search はこのサーバーに実行主体が無いので黙って落とさずログへ残して
-# から除く (fastmlx/server.py の _flatten_responses_tools 参照)。
+# から除く (mlxturbo/server.py の _flatten_responses_tools 参照)。
 
 
 def test_responses_tools_flattens_namespace_and_drops_web_search(client, capsys):
@@ -3420,7 +3420,7 @@ def test_responses_tools_flattens_namespace_and_drops_web_search(client, capsys)
     # web_search を黙って握りつぶさず、落としたことがログに残る。
     log = capsys.readouterr().out
     assert "web_search" in log
-    assert "[fastmlx-serve]" in log
+    assert "[mlxturbo-serve]" in log
 
 
 def test_responses_tools_all_unsupported_falls_back_to_no_tools(client):
@@ -3663,7 +3663,7 @@ def test_select_session_full_match_still_preferred_over_partial(client):
 #
 # 12 節の trim (exact-trim) は GDN ハイブリッド (ArraysCache が混ざる、この
 # サーバーの実運用構成そのもの) では常に不発に終わる。「巻き戻せないものは
-# スナップショットで持てばよい」という方針で、fastmlx/spec.py の
+# スナップショットで持てばよい」という方針で、mlxturbo/spec.py の
 # _prefill_hidden がプレフィルのチャンク境界ごとに ArraysCache 層の状態を
 # ChatSession.checkpoints へ退避しておき、trim が効かない場合の代替として
 # _try_checkpoint_restore_session_cache がそこから最も近い位置まで復元する。
@@ -3795,7 +3795,7 @@ def test_checkpoint_restore_end_to_end_matches_full_rebuild_with_mtp():
 
     from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
 
-    from fastmlx.mtp import MTPModule
+    from mlxturbo.mtp import MTPModule
 
     mx.random.seed(0)
     args = TextModelArgs(
@@ -3882,6 +3882,265 @@ def test_checkpoint_restore_end_to_end_matches_full_rebuild_with_mtp():
     )
 
     assert r2_reused["tokens"] == r2_fresh["tokens"]
+
+
+# ---------- 12c. flash_spec 経路 (FallbackSession) のチェックポイント復元 ----------
+#
+# 12b 節の _try_checkpoint_restore_session_cache/_select_session は
+# ChatSession (SpecEngine、27B/qwen3_5) だけを想定していたが、実装自体は
+# .checkpoints/.caches/.processed を duck typing で見るだけで runner の種類を
+# 知らない。FlashSpecRunner (Qwen3.8-Flash-Next, KIND="flash_spec") が使う
+# FallbackSession は .caches ではなく単数形 .cache を持つため、そのままでは
+# 12b 節の経路が「.caches が無い」で即座に諦めていた (mlxturbo/server.py の
+# _try_trim_session_cache と同じフォールバックが無かった) — これを直した。
+# もう1つ、Flash-Next の full attention 層 (_AttnCache) は KV とは別に
+# indexer の生 keys を持ち、.trim() は KV の offset しか戻さないので、
+# 何もしなければ indexer だけ古い長さのまま取り残される。これも直した
+# (mlxturbo/spec_flash.py の rollback() が検証 1 ラウンドぶんについて同じ
+# 後始末をしているのと同じ理由)。
+
+
+def test_checkpoint_restore_falls_back_to_singular_cache_and_truncates_indexer():
+    """FallbackSession (.cache 単数形) でも復元でき、Flash-Next の
+    _AttnCache.indexer.keys が KV の trim 後の offset に揃うところまで
+    確認する。"""
+
+    import mlx_lm.models.qwen4_exp as Q
+
+    attn = Q._AttnCache()
+    attn.offset = 10
+    attn.keys = mx.zeros((1, 1, 10, 1))
+    attn.values = mx.zeros((1, 1, 10, 1))
+    attn.indexer.keys = mx.arange(10)[None, :]  # (1, 10) -- 10 トークン分
+
+    arr = Q.ArraysCache(1)
+    arr.cache = [mx.array([9.0])]  # 「今」の (使われない) 状態
+
+    session = FallbackSession()
+    session.processed = list(range(10))
+    session.cache = [attn, arr]  # 複数形 .caches は無い
+    session.checkpoints = [(7, [(1, [mx.array([7.0])], None, None)])]
+
+    cp_pos = server._try_checkpoint_restore_session_cache(session, lcp=8)
+
+    assert cp_pos == 7
+    assert session.cache[0].offset == 7  # KV は trim
+    assert session.cache[0].indexer.keys.shape[1] == 7  # indexer も揃う
+    assert session.cache[0].indexer.keys.tolist() == [[0, 1, 2, 3, 4, 5, 6]]
+    assert float(session.cache[1].cache[0].item()) == 7.0  # ArraysCache は復元
+
+
+def test_select_session_reuses_via_checkpoint_for_flash_spec_fallback_session():
+    """FlashSpecRunner (KIND="flash_spec") が実際に使う FallbackSession には
+    ChatSession 専用の mtp_cache/h_last/mtp_valid が無い。_select_session の
+    hasattr ガードでそれらの後始末が自然に skip されるだけで、チェックポイント
+    経由の部分復元そのものは同じスロットを再利用できることを HTTP 越しでなく
+    直接確認する。"""
+
+    import mlx_lm.models.qwen4_exp as Q
+
+    _install_state(FakeFlashSpecRunner(tokens_to_emit=[]))
+
+    attn = Q._AttnCache()
+    attn.offset = 5
+    attn.keys = mx.zeros((1, 1, 5, 1))
+    attn.values = mx.zeros((1, 1, 5, 1))
+    attn.indexer.keys = mx.arange(5)[None, :]
+
+    arr = Q.ArraysCache(1)
+    arr.cache = [mx.array([99.0])]
+
+    sess = FallbackSession()
+    sess.processed = [1, 2, 3, 4, 5]
+    sess.cache = [attn, arr]
+    sess.checkpoints = [(3, [(1, [mx.array([3.0])], None, None)])]
+    server.STATE.session_pool[0] = sess
+
+    got = server._select_session([1, 2, 3, 9, 9])
+
+    assert got is sess
+    assert got.processed == [1, 2, 3]
+    assert got.cache[0].offset == 3
+    assert got.cache[0].indexer.keys.shape[1] == 3
+    assert float(got.cache[1].cache[0].item()) == 3.0
+    assert [pos for pos, _ in got.checkpoints] == [3]  # cp_pos より後ろは捨てる
+    # ChatSession 専用のフィールドは無い (FallbackSession に存在しない) --
+    # hasattr ガードで単に触られないことの確認。
+    assert not hasattr(got, "mtp_valid")
+    assert not hasattr(got, "mtp_cache")
+
+
+def _build_tiny_qwen4_exp():
+    """FlashSpecEngine が要求する形 (hyper-connections + GDN + full
+    attention/indexer + MoE + PLE + n-gram) を、実物の mlx_lm.models.
+    qwen4_exp / mlxturbo.mtp_flash.FlashMTPModule そのままで最小サイズで
+    組む (SpecEngine 側の test_checkpoint_restore_end_to_end_matches_full_
+    rebuild_with_mtp が qwen3_5 の TextModel を小さく組んだのと同じ発想)。
+    num_hidden_layers=4, full_attention_interval=4 -> 層0-2 が
+    linear_attention (GDN)、層3 が full_attention。ple_layer_ids=[2] ->
+    層1 (0-indexed) が PLE を持つ。"""
+
+    import mlx_lm.models.qwen4_exp as Q
+    from mlxturbo.mtp_flash import FlashMTPModule
+
+    text_args = Q.TextArgs(
+        hidden_size=16,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        vocab_size=32,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=8,
+        shared_expert_intermediate_size=8,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        hc_count=2,
+        hc_lowrank=4,
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=8,
+        indexer_budget=8,
+        indexer_compress_ratio=2,
+        ngram_size=3,
+        heads_per_ngram=2,
+        ngram_vocab_size_base=32,
+        ple_embed_dim=16,
+        ple_layer_ids=[2],
+        ple_conv_kernel_size=4,
+        full_attention_interval=4,
+        partial_rotary_factor=0.25,
+        rope_theta=10_000.0,
+        tie_word_embeddings=False,
+    )
+    model_args = Q.ModelArgs(text_config=text_args.__dict__.copy())
+    model = Q.Model(model_args)
+    mx.eval(model.parameters())
+    mtp = FlashMTPModule(model_args.text, variant="lane")
+    mx.eval(mtp.parameters())
+    return model, mtp
+
+
+def test_flash_spec_checkpoint_reuse_matches_full_rebuild_with_tail_mismatch(monkeypatch):
+    """この節の合否基準そのもの: thinking マーカー再オープンと同じ形の不一致
+    (処理済み列の末尾わずかだけが新プロンプトと食い違う、チェックポイント
+    境界そのものではない位置) のとき、チェックポイント経由で復元してから
+    続きを prefill した結果が、同じプロンプトを何も再利用せずまっさらに
+    処理した結果と完全一致すること。実物の FlashSpecEngine/FlashSpecRunner/
+    FallbackSession を小さいモデルで実際に動かして確認する (12b 節の
+    ChatSession 版 test_checkpoint_restore_end_to_end_matches_full_rebuild_
+    with_mtp の flash_spec 対)。"""
+
+    import mlxturbo.spec_flash as spec_flash_module
+
+    # 実運用と同じ PREFILL_STEP_SIZE=2048 では 12 トークンのプロンプトが
+    # 1 チャンクに収まってしまいチェックポイントが 1 個しかできない。
+    # SpecEngine 側のテストが prefill_step_size=3 を渡すのと同じ理由で、
+    # このモジュール定数だけ小さく差し替える (spec_flash.generate_stream は
+    # モジュールグローバルの PREFILL_STEP_SIZE をその場で参照するので、
+    # モンキーパッチだけで両経路 (フル/再利用) に同じ幅がかかる)。
+    monkeypatch.setattr(spec_flash_module, "PREFILL_STEP_SIZE", 3)
+
+    mx.random.seed(0)
+    model, mtp = _build_tiny_qwen4_exp()
+    engine = spec_flash_module.FlashSpecEngine(model, mtp)
+    runner = FlashSpecRunner(engine)
+
+    turn1_prompt = list(range(1, 13))  # 12 トークン、step=3 で境界 3,6,9,12
+
+    session = FallbackSession()
+    r1 = runner.generate(
+        turn1_prompt,
+        max_tokens=4,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=session,
+    )
+    assert [pos for pos, _ in session.checkpoints] == [3, 6, 9, 12]
+
+    # FlashSpecRunner の不変条件 (6a0cd27): 最後の cur はまだ cache に
+    # feed されていないので、publish されるのは tokens[:-1] まで。
+    fed_history = list(turn1_prompt) + r1["tokens"][:-1]
+    assert session.processed == fed_history
+
+    last_two = fed_history[-2:]
+    replacement = [(t + 1) % 32 for t in last_two]  # 必ず元の値と違う
+    turn2_prompt = fed_history[:-2] + replacement
+
+    lcp = 0
+    n = min(len(session.processed), len(turn2_prompt))
+    while lcp < n and session.processed[lcp] == turn2_prompt[lcp]:
+        lcp += 1
+    assert lcp == len(fed_history) - 2  # 末尾だけ食い違っている想定どおり
+    assert lcp not in (3, 6, 9, 12)  # チェックポイント境界そのものではない
+
+    cp_pos = server._try_checkpoint_restore_session_cache(session, lcp)
+    assert cp_pos == 12  # 生成部分にはチェックポイントが無いので prefill の
+    # 最後のチェックポイントまでしか戻れない -- それで十分機能する。
+
+    session.processed = session.processed[:cp_pos]
+    session.checkpoints = [c for c in session.checkpoints if c[0] <= cp_pos]
+
+    r2_reused = runner.generate(
+        turn2_prompt,
+        max_tokens=4,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=session,
+    )
+    assert r2_reused["prefill_reused"] == cp_pos  # 全量再構築ではない
+
+    r2_fresh = runner.generate(
+        turn2_prompt,
+        max_tokens=4,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=None,
+    )
+
+    assert r2_reused["tokens"] == r2_fresh["tokens"]
+
+
+def test_flash_spec_checkpoint_reuse_disabled_when_prompt_fits_one_chunk(monkeypatch):
+    """プロンプト全体が 1 チャンクに収まる (実運用の既定 PREFILL_STEP_SIZE=2048
+    ではほぼ常にそう) 場合、チェックポイントは末尾 (プロンプト全体) の 1 個
+    しかできない。末尾より前で食い違えば再利用できず新規スロットへ倒れる --
+    「再利用できないときは安全側の全再構築に倒す」が実際に効くことの確認。"""
+
+    import mlxturbo.spec_flash as spec_flash_module
+
+    mx.random.seed(1)
+    model, mtp = _build_tiny_qwen4_exp()
+    engine = spec_flash_module.FlashSpecEngine(model, mtp)
+    runner = FlashSpecRunner(engine)
+
+    turn1_prompt = list(range(1, 9))  # 8 トークン、既定 PREFILL_STEP_SIZE の
+    # 下では 1 チャンク (境界はプロンプト末尾の 1 個だけ)
+
+    session = FallbackSession()
+    runner.generate(
+        turn1_prompt,
+        max_tokens=2,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=session,
+    )
+    assert [pos for pos, _ in session.checkpoints] == [8]
+
+    turn2_prompt = [1, 2, 20, 21]  # 位置 2 で分岐 -- 唯一のチェックポイント
+    # (位置 8) より手前なので使えない
+
+    cp_pos = server._try_checkpoint_restore_session_cache(session, lcp=2)
+    assert cp_pos is None
+    assert session.cache[-1].offset == len(session.processed)  # 触られていない
 
 
 class FakeChatSessionRunner:
@@ -4033,7 +4292,7 @@ def test_http_partial_match_trim_produces_same_prompt_and_output_as_full_rebuild
 # ---------- 文脈長ガード (_resolve_model_max_context / _check_context_length) ----------
 #
 # 実サーバーで ~57,000 トークンのプロンプトが Metal の一括確保上限を超えて
-# [metal::malloc] のまま 500 になっていた事故 (fastmlx/spec.py のチャンク
+# [metal::malloc] のまま 500 になっていた事故 (mlxturbo/spec.py のチャンク
 # prefill とは別レイヤの、起動時にモデル config から決まる上限による事前
 # ガード)。ここではモデルをロードせず、STATE.max_context_tokens を直接
 # 差し込んで 4 経路 (chat/anthropic/completions/responses) と境界条件を
@@ -4078,7 +4337,7 @@ def test_resolve_model_max_context_returns_none_when_absent():
 # 小さい方を使う (_resolve_default_max_context_tokens)。
 #
 # ここでのテスト用の分母 (n_heads * PREFILL_STEP_SIZE * bytes_per_elem) は
-# 2 * 2048 * 2 = 8192 (PREFILL_STEP_SIZE は fastmlx.spec の実定数をそのまま
+# 2 * 2048 * 2 = 8192 (PREFILL_STEP_SIZE は mlxturbo.spec の実定数をそのまま
 # 使う -- テスト側で別の値を仮定すると経路間の共有を検証したことにならない)。
 
 
@@ -5041,10 +5300,10 @@ def test_health_before_load_still_reports_a_version():
     assert resp.json()["version"] == server._FASTMLX_VERSION
 
 
-def test_fastmlx_version_matches_pyproject():
+def test_mlxturbo_version_matches_pyproject():
     # importlib.metadata 経由で pyproject.toml の version をそのまま返す
     # (別ファイルに二重管理しない)。
-    assert server._FASTMLX_VERSION == server._fastmlx_version()
+    assert server._FASTMLX_VERSION == server._mlxturbo_version()
     assert server._FASTMLX_VERSION != ""
 
 
@@ -5155,7 +5414,7 @@ def test_server_module_shares_mtp_path_env_var_with_cli():
 
 # ---------- build_runner: Qwen3.8-Flash-Next (qwen4_exp) 配線 ----------
 #
-# fastmlx/runner.py の build_runner に足した分岐だけを、実モデルなしで検証
+# mlxturbo/runner.py の build_runner に足した分岐だけを、実モデルなしで検証
 # する。model_type/text/model.rope だけを持つ最小限のフェイクで route を
 # 確認する — 27B (qwen3_5) 側の既存分岐はここでは一切変えていない (下の
 # 「--mtp 無し」テストは、その既存分岐が最後まで正しく FallbackRunner に
@@ -5170,8 +5429,8 @@ def _fake_qwen4_exp_model():
 
 
 def test_build_runner_routes_qwen4_exp_with_mtp_to_flash_spec(monkeypatch):
-    import fastmlx.mtp_flash as mtp_flash_module
-    import fastmlx.runner as runner_module
+    import mlxturbo.mtp_flash as mtp_flash_module
+    import mlxturbo.runner as runner_module
 
     class DummyMTP:
         def parameters(self):
@@ -5215,8 +5474,8 @@ def test_build_runner_exits_when_flash_mtp_sidecar_unreadable_after_retry(monkey
     のにできないなら黙って無視せず大声で断る」という設計と矛盾するため、
     逃げ道のフラグ無しで exit 1 に統一した)。"""
 
-    import fastmlx.mtp_flash as mtp_flash_module
-    import fastmlx.runner as runner_module
+    import mlxturbo.mtp_flash as mtp_flash_module
+    import mlxturbo.runner as runner_module
 
     calls = []
 
@@ -5251,8 +5510,8 @@ def test_build_runner_retries_flash_mtp_load_once_then_succeeds(monkeypatch, cap
     """1 回目のロードが失敗し、2 回目 (リトライ) が成功すれば通常どおり
     FlashSpecRunner が返る — フォールバックにも exit 1 にもならない。"""
 
-    import fastmlx.mtp_flash as mtp_flash_module
-    import fastmlx.runner as runner_module
+    import mlxturbo.mtp_flash as mtp_flash_module
+    import mlxturbo.runner as runner_module
 
     class DummyMTP:
         def parameters(self):
@@ -5299,8 +5558,8 @@ def test_build_runner_falls_back_when_no_mtp_source_found(monkeypatch):
     呼ぶことすらなく FallbackRunner に落ちる — ``fallback_reason`` は
     「MTP が見つからない (...)」。"""
 
-    import fastmlx.mtp_flash as mtp_flash_module
-    import fastmlx.runner as runner_module
+    import mlxturbo.mtp_flash as mtp_flash_module
+    import mlxturbo.runner as runner_module
 
     called = []
     monkeypatch.setattr(
@@ -5328,8 +5587,8 @@ def test_build_runner_qwen4_exp_with_explicit_none_mtp_and_no_source_found(monke
     「属性自体が無い」場合と挙動が揃うことを確認する (自動発見も失敗する
     ディレクトリを渡した場合)。"""
 
-    import fastmlx.mtp_flash as mtp_flash_module
-    import fastmlx.runner as runner_module
+    import mlxturbo.mtp_flash as mtp_flash_module
+    import mlxturbo.runner as runner_module
 
     called = []
     monkeypatch.setattr(
@@ -5352,7 +5611,7 @@ def test_build_runner_resolves_loaded_hf_repo_before_flash_mtp_discovery(
 ):
     """A repo id must be searched in its local snapshot, not as ``org/repo``."""
 
-    import fastmlx.runner as runner_module
+    import mlxturbo.runner as runner_module
 
     seen = []
     monkeypatch.setattr(
@@ -5379,12 +5638,12 @@ def test_build_runner_resolves_loaded_hf_repo_before_flash_mtp_discovery(
 
 # ---------- build_runner: qwen4_exp の MTP 自動発見 (モデル内蔵/サイドカー) ----------
 #
-# --mtp が未指定のとき、fastmlx.runner._discover_flash_mtp_source が
+# --mtp が未指定のとき、mlxturbo.runner._discover_flash_mtp_source が
 # モデルディレクトリを見て MTP を自動で見つける。実モデルは要らない —
 # 合成の index.json + 小さな safetensors シャード (モデル内蔵側) と、
 # 単体の mtp.safetensors (サイドカー側) を tmp_path に置いて検証する。
 # load_flash_mtp 自体はモック (実際の重みロード/構築ロジックは
-# fastmlx/mtp_flash.py 側の責務で、ここでは呼び出され方だけを見る)。
+# mlxturbo/mtp_flash.py 側の責務で、ここでは呼び出され方だけを見る)。
 
 
 def test_discover_flash_mtp_source_finds_embedded_weights_in_index(tmp_path):
@@ -5392,7 +5651,7 @@ def test_discover_flash_mtp_source_finds_embedded_weights_in_index(tmp_path):
     それを含むシャードだけを読み、mtp.* テンソルだけを集めて返す
     (同じシャードに同居する非 mtp テンソルは混ざらない)。"""
 
-    import fastmlx.runner as runner_module
+    import mlxturbo.runner as runner_module
 
     shard_name = "model-00001-of-00001.safetensors"
     mx.save_safetensors(
@@ -5424,7 +5683,7 @@ def test_discover_flash_mtp_source_finds_embedded_weights_in_index(tmp_path):
 def test_discover_flash_mtp_source_finds_unsharded_embedded_weights(tmp_path):
     """An unsharded model has no index; inspect model.safetensors itself."""
 
-    import fastmlx.runner as runner_module
+    import mlxturbo.runner as runner_module
 
     mx.save_safetensors(
         str(tmp_path / "model.safetensors"),
@@ -5444,7 +5703,7 @@ def test_discover_flash_mtp_source_finds_unsharded_embedded_weights(tmp_path):
 def test_discover_flash_mtp_source_uses_sidecar_when_index_is_malformed(tmp_path):
     """A broken optional index must not hide a valid sidecar fallback."""
 
-    import fastmlx.runner as runner_module
+    import mlxturbo.runner as runner_module
 
     (tmp_path / "model.safetensors.index.json").write_text("[]")
     sidecar = tmp_path / "mtp.safetensors"
@@ -5460,7 +5719,7 @@ def test_discover_flash_mtp_source_finds_sidecar_file(tmp_path):
     """index.json が無くても、モデルディレクトリ直下の mtp.safetensors が
     あればそれをサイドカーとして返す (path 文字列、weights ではない)。"""
 
-    import fastmlx.runner as runner_module
+    import mlxturbo.runner as runner_module
 
     sidecar = tmp_path / "mtp.safetensors"
     mx.save_safetensors(str(sidecar), {"mtp.x": mx.zeros((1,))})
@@ -5470,7 +5729,7 @@ def test_discover_flash_mtp_source_finds_sidecar_file(tmp_path):
 
 
 def test_discover_flash_mtp_source_returns_none_when_nothing_found(tmp_path):
-    import fastmlx.runner as runner_module
+    import mlxturbo.runner as runner_module
 
     assert runner_module._discover_flash_mtp_source(tmp_path) is None
 
@@ -5480,8 +5739,8 @@ def test_build_runner_routes_qwen4_exp_via_embedded_mtp_weights(monkeypatch, tmp
     mtp.* テンソルがあれば自動発見して FlashSpecRunner まで到達する。
     load_flash_mtp には path=None, weights=<集めた dict> で渡ること。"""
 
-    import fastmlx.mtp_flash as mtp_flash_module
-    import fastmlx.runner as runner_module
+    import mlxturbo.mtp_flash as mtp_flash_module
+    import mlxturbo.runner as runner_module
 
     shard_name = "model-00001-of-00001.safetensors"
     mx.save_safetensors(
@@ -5523,8 +5782,8 @@ def test_build_runner_routes_qwen4_exp_via_sidecar_file(monkeypatch, tmp_path):
     """--mtp 未指定でも、モデルディレクトリ直下に mtp.safetensors があれば
     自動発見してそのパスで load_flash_mtp を呼ぶ (weights= は渡さない)。"""
 
-    import fastmlx.mtp_flash as mtp_flash_module
-    import fastmlx.runner as runner_module
+    import mlxturbo.mtp_flash as mtp_flash_module
+    import mlxturbo.runner as runner_module
 
     sidecar = tmp_path / "mtp.safetensors"
     mx.save_safetensors(str(sidecar), {"mtp.x": mx.zeros((1,))})
@@ -5557,8 +5816,8 @@ def test_build_runner_explicit_mtp_wins_over_auto_discovered_sidecar(monkeypatch
     """--mtp が明示指定されていれば、モデルディレクトリに自動発見できる
     サイドカーがあってもそちらは一切見ない (優先順位 1 が最優先)。"""
 
-    import fastmlx.mtp_flash as mtp_flash_module
-    import fastmlx.runner as runner_module
+    import mlxturbo.mtp_flash as mtp_flash_module
+    import mlxturbo.runner as runner_module
 
     # 自動発見されうるサイドカーを置いておく — 明示指定より優先されない
     # ことを確認するための撒き餌
@@ -5596,8 +5855,8 @@ def test_build_runner_falls_back_when_auto_discovered_mtp_unreadable(monkeypatch
     明示指定 (--mtp) とは違い exit せずフォールバックする。fallback_reason
     は「MTP 自動発見 (...) の読み込みに失敗: ...」。"""
 
-    import fastmlx.mtp_flash as mtp_flash_module
-    import fastmlx.runner as runner_module
+    import mlxturbo.mtp_flash as mtp_flash_module
+    import mlxturbo.runner as runner_module
 
     sidecar = tmp_path / "mtp.safetensors"
     mx.save_safetensors(str(sidecar), {"mtp.x": mx.zeros((1,))})
@@ -5642,8 +5901,8 @@ def test_build_runner_falls_back_with_reason_when_embedded_mtp_index_is_broken(
 ):
     """Broken auto-discovery is observable fallback, never a startup traceback."""
 
-    import fastmlx.mtp_flash as mtp_flash_module
-    import fastmlx.runner as runner_module
+    import mlxturbo.mtp_flash as mtp_flash_module
+    import mlxturbo.runner as runner_module
 
     called = []
     monkeypatch.setattr(

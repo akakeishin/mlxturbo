@@ -1,6 +1,6 @@
 """Qwen3.8-Flash-Next の投機デコードの土台: 状態の捕獲と巻き戻し。
 
-`fastmlx/spec.py` は 27B (qwen3_5) 構成に強く結びついているので別に持つ。
+`mlxturbo/spec.py` は 27B (qwen3_5) 構成に強く結びついているので別に持つ。
 
 ## なぜ捕獲が要るか
 
@@ -36,12 +36,19 @@ from contextlib import contextmanager
 import mlx.core as mx
 import mlx.nn as nn
 
-# fastmlx-serve 配線 (2026-08-29 追加): FallbackRunner/SpecEngine と同じ幅で
-# プレフィルをチャンク分割するための定数を共有する (fastmlx/spec.py の
+# mlxturbo-serve 配線 (2026-08-29 追加): FallbackRunner/SpecEngine と同じ幅で
+# プレフィルをチャンク分割するための定数を共有する (mlxturbo/spec.py の
 # PREFILL_STEP_SIZE docstring 参照 — 経路ごとに幅が違うと同じプロンプトでも
-# 出力が食い違う、という同じ理由でここも 1 箇所の値を使い回す)。spec.py は
-# 読むだけで変更しない。
-from .spec import PREFILL_STEP_SIZE
+# 出力が食い違う、という同じ理由でここも 1 箇所の値を使い回す)。
+#
+# thinking 対応 (2026-08-29 追加): セッション再利用のチェックポイント経由の
+# 部分復元も spec.py 側 (ChatSession.checkpoints / _prefill_hidden /
+# CHECKPOINT_RETENTION) と同じ仕組みを流用する。GDN/PLE/n-gram の巻き戻せない
+# レイヤーの状態はどちらの経路でも同じ ArraysCache.state (list) なので、
+# spec.py の snapshot_untrimmable_caches/restore_untrimmable_caches は
+# モデル非依存 (caches の is_trimmable()/state だけを見る) — そのまま使い回す。
+# spec.py は読むだけで変更しない。
+from .spec import CHECKPOINT_RETENTION, PREFILL_STEP_SIZE, snapshot_untrimmable_caches
 
 
 def _arch():
@@ -61,8 +68,32 @@ class Capture:
 
 
 @contextmanager
-def capture(model):
-    """検証 forward を、巻き戻しに必要な記録を残しながら回す文脈。"""
+def capture(model, light: bool = False):
+    """検証 forward を、巻き戻しに必要な記録を残しながら回す文脈。
+
+    ``light=True`` (追加、既定 False): ``GatedResidual`` (``cap.hyper``)
+    だけを記録し、``GatedDeltaNet``/``PLELayer`` は素の (状態を捕獲しない)
+    forward のまま通す。
+
+    理由: ``gated_delta_update_with_states`` が返す ``states_all`` は
+    ``(B, T, Hv, Dv, Dk)`` fp32 — 1 層 1 トークンあたり
+    ``Hv*Dv*Dk*4`` バイト (このモデルの構成で ~3MiB)。デコードループの
+    検証 forward は ``T<=2`` なので無視できる値だが、
+    ``generate_stream`` のプレフィル最終チャンクは ``T`` がチャンク幅
+    (最大 ``PREFILL_STEP_SIZE``) そのものになり得る。そこは
+    ``cap.hyper[:, -1:]`` (末尾位置の hyper 状態) しか使わないのに、
+    36 層 (linear_attention 層数) 分の ``states_all`` を無条件に確保・
+    保持していたため、T=2000 程度で数百 GB 級のメモリを要求し、macOS の
+    memorystatus killer にプロセスごと殺されていた (実測、トレースバック
+    無しでプロセスが消える症状の原因)。``GatedDeltaNet.__call__``/
+    ``PLELayer._short_conv`` を素の実装のまま通しても、cache の更新
+    (``cache[0]``/``cache[1]``/``cache[2]``/``cache.advance``) は本体側が
+    同じロジックで行うので、キャッシュの整合性は変わらない。変わるのは
+    ``cap.gdn``/``cap.ple`` (この呼び出し元では使われない) が空のままに
+    なることだけ。既存呼び出し (``light`` 省略 = False: ``generate()``、
+    ``generate_stream`` のデコードループ内検証 forward) は挙動を一切
+    変えない — 追加のみ。
+    """
 
     Q = _arch()
     from .kernels.gated_delta_states import gated_delta_update_with_states
@@ -132,14 +163,16 @@ def capture(model):
             cap.hyper = hyper
         return orig_hc(self, hyper)
 
-    Q.GatedDeltaNet.__call__ = gdn
-    Q.PLELayer._short_conv = ple_conv
+    if not light:
+        Q.GatedDeltaNet.__call__ = gdn
+        Q.PLELayer._short_conv = ple_conv
     Q.GatedResidual.__call__ = hc
     try:
         yield cap
     finally:
-        Q.GatedDeltaNet.__call__ = orig_gdn
-        Q.PLELayer._short_conv = orig_ple
+        if not light:
+            Q.GatedDeltaNet.__call__ = orig_gdn
+            Q.PLELayer._short_conv = orig_ple
         Q.GatedResidual.__call__ = orig_hc
 
 
@@ -257,7 +290,7 @@ class FlashSpecEngine:
                 cur, hyper_prev = nxt, cap.hyper[:, 0:1]
         return out[:max_tokens], accepted, rounds
 
-    # ---------- fastmlx-serve 配線 (2026-08-29 追加、すべて追加のみ) ----------
+    # ---------- mlxturbo-serve 配線 (2026-08-29 追加、すべて追加のみ) ----------
     #
     # 以下は ``generate()`` を一切変更せずに追加した新しい経路。理由は
     # docs/MTP-FLASH.md の実測に紐づく既存の ``generate()``/``capture``/
@@ -285,8 +318,10 @@ class FlashSpecEngine:
         caches=None,
         temp: float = 0.0,
         eos_ids=(),
+        checkpoints: list | None = None,
+        base_pos: int = 0,
     ):
-        """``generate()`` のトークン逐次版 (fastmlx-serve のストリーミング用)。
+        """``generate()`` のトークン逐次版 (mlxturbo-serve のストリーミング用)。
 
         1 ラウンドで確定した新規トークンのリスト (1 個または 2 個) を都度
         yield し、生成の終わりに ``(accepted, rounds)`` を return する
@@ -316,7 +351,7 @@ class FlashSpecEngine:
            流すトークン、キャッシュはその手前まで処理済み」を、ラウンド
            内で打ち切っても壊さない)。
 
-        プレフィルは ``fastmlx.spec.PREFILL_STEP_SIZE`` と同じ幅でチャンク
+        プレフィルは ``mlxturbo.spec.PREFILL_STEP_SIZE`` と同じ幅でチャンク
         分割する (Metal の 1 バッファ上限を超えないため、spec.py の
         ``_prefill_hidden`` と同じ理由・同じ幅 — 経路によって幅が違うと
         同じプロンプトでも出力が食い違う)。最後のチャンクだけ ``capture``
@@ -328,6 +363,20 @@ class FlashSpecEngine:
         ターンではほぼ常にそう) 場合、この分割は ``model(ids, cache=caches)``
         を 1 回 capture 付きで呼ぶのと数値的に同一 (チャンク境界そのものが
         発生しないため) —既存の ``generate()`` と同じ経路をそのまま通る。
+
+        ``checkpoints`` (省略時 None、mlxturbo/server.py の FlashSpecRunner
+        だけが渡す): 指定されていれば、チャンク境界ごとに巻き戻せない
+        レイヤー (GDN 再帰状態・conv 窓・PLE conv 窓・n-gram 文脈 — どれも
+        ``ArraysCache.state`` が返す同じ list に載る) のスナップショットを
+        このリストへ in-place で追記する。位置は ``base_pos`` (呼び出し元に
+        とってこの呼び出し開始位置 = セッションの再利用済みトークン数) を
+        足した絶対位置。``mlxturbo.spec.CHECKPOINT_RETENTION`` 件を超えたら
+        古いものから追い出す — ``mlxturbo.spec.ChatSession``/
+        ``_prefill_hidden`` と同じ仕組み・同じ刻み (プレフィルのチャンク
+        境界そのもの、新しい刻みは作らない)。KV/indexer (full attention)
+        は trim 可能なので snapshot 不要 — 復元側 (mlxturbo/server.py の
+        ``_try_checkpoint_restore_session_cache``) が ``.trim()`` と
+        indexer keys の追従で扱う。
         """
         if max_tokens < 0:
             raise ValueError("max_tokens must be non-negative")
@@ -344,7 +393,13 @@ class FlashSpecEngine:
             j = min(i + step, n)
             chunk = ids[:, i:j]
             if j == n:
-                with capture(model) as cap:
+                # light=True: このチャンクは cap.hyper[:, -1:] しか使わない
+                # (直後参照)。全捕獲 (cap.gdn/cap.ple) は T (このチャンク
+                # 長、最大 PREFILL_STEP_SIZE) に比例したメモリを 36 層分
+                # 無条件に確保し、数千トークンで実機を OOM させていた
+                # (capture() の light 引数 docstring 参照)。デコードループの
+                # 検証 forward (下、T<=2) は既存どおり全捕獲のまま
+                with capture(model, light=True) as cap:
                     logits = model(chunk, cache=caches)
                     mx.eval(logits)
             else:
@@ -356,6 +411,9 @@ class FlashSpecEngine:
                         mx.eval(state)
                 mx.clear_cache()
             i = j
+            if checkpoints is not None:
+                checkpoints.append((base_pos + i, snapshot_untrimmable_caches(caches)))
+                del checkpoints[:-CHECKPOINT_RETENTION]
         hyper_prev = cap.hyper[:, -1:]
         if max_tokens == 0:
             # Keep the successfully prefetched cache, but do not expose the
