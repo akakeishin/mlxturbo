@@ -71,6 +71,8 @@ uv run mlxturbo-serve --model <path-or-repo-id> --served-model-name mymodel --po
 
 ## 実測値と再現コマンド
 
+以下でリンクしている結果 JSON や `docs/` の文書は GitHub リポジトリ側にあり、PyPI パッケージ（wheel/sdist）には含まれない（配布物に入るのは `mlxturbo` ライブラリ本体のみ）。`pip` で入れた場合は [github.com/akakeishin/mlxturbo](https://github.com/akakeishin/mlxturbo) 側からリンクを辿ること。
+
 以下はすべて M3 Max 128GB / macOS 26.4 / mlx 0.32.2 での実測。ハードウェア世代が変わると数字は変わる（詳しくは [`docs/research/ROOFLINE-2026-08-26.md`](docs/research/ROOFLINE-2026-08-26.md) の「ハード世代が変わると失効する判定」を参照）。
 
 ### `spec` 経路（Qwen3.8-27B-4bit、greedy、512 tok）

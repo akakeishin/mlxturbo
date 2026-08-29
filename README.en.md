@@ -71,6 +71,8 @@ Connection methods, the full option list, API key auth, and connection examples 
 
 ## Measured numbers and how to reproduce them
 
+Raw result JSON files and the `docs/` write-ups linked below live in the GitHub repository, not in the PyPI package (the wheel/sdist ship only the `mlxturbo` library) — follow the links from [github.com/akakeishin/mlxturbo](https://github.com/akakeishin/mlxturbo) if you installed via `pip`.
+
 All of the following were measured on an M3 Max 128GB / macOS 26.4 / mlx 0.32.2. Numbers shift across hardware generations (see "judgments that expire when the hardware generation changes" in [`docs/research/ROOFLINE-2026-08-26.md`](docs/research/ROOFLINE-2026-08-26.md)).
 
 ### `spec` route (Qwen3.8-27B-4bit, greedy, 512 tok)

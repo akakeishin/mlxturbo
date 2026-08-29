@@ -431,7 +431,7 @@ def cmd_convert(args):
         mx.set_default_device(mx.cpu)
 
     # Class resolution for qwen4_exp always goes through mlxturbo._arch_registry
-    # via sys.meta_path, reading the vendored file (tools/vendor/qwen4_exp.py)
+    # via sys.meta_path, reading the vendored file (mlxturbo/_vendor/qwen4_exp.py)
     # directly. Since there is no copy in site-packages, mixing up copies cannot
     # happen in the first place (the accident from the old install-arch days,
     # where a stale copy stuck around, FASTMLX_NGRAM_DISK never took effect, and

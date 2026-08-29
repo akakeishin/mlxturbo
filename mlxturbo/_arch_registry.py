@@ -3,8 +3,9 @@
 ## Background
 
 The Flash-Next model class is not part of mlx-lm proper (mlx-lm PR #1788 is
-still unmerged). This repository carries a vendored copy as
-`tools/vendor/qwen4_exp.py`.
+still unmerged). This package carries a vendored copy as
+`mlxturbo/_vendor/qwen4_exp.py`, so that it ships inside the wheel and
+resolves from an installed environment, not just a repo checkout.
 
 mlx-lm has exactly one path for resolving a model class,
 
@@ -60,7 +61,10 @@ import sys
 from pathlib import Path
 
 MODULE_NAME = "mlx_lm.models.qwen4_exp"
-VENDOR_PATH = Path(__file__).resolve().parent.parent / "tools" / "vendor" / "qwen4_exp.py"
+# Resolved relative to this module's own installed location (not the repo
+# root), so this works the same from a `pip install`-ed wheel as it does from
+# a repo checkout — nothing here depends on `tools/` existing on disk.
+VENDOR_PATH = Path(__file__).resolve().parent / "_vendor" / "qwen4_exp.py"
 
 
 class _FlashNextArchFinder(importlib.abc.MetaPathFinder):
@@ -70,9 +74,10 @@ class _FlashNextArchFinder(importlib.abc.MetaPathFinder):
         if fullname != MODULE_NAME:
             return None
         if not VENDOR_PATH.exists():
-            # In environments without the vendor file (e.g. a distribution that
-            # dropped tools/), silently defer to the default finders. Raising
-            # here would also break imports of models that never use qwen4_exp.
+            # Should not happen for a normal install (the vendor file ships
+            # inside the mlxturbo package itself), but silently defer to the
+            # default finders rather than raise — that would also break
+            # imports of models that never use qwen4_exp.
             return None
         return importlib.util.spec_from_file_location(fullname, VENDOR_PATH)
 

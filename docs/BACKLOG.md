@@ -8,7 +8,7 @@
 
 落としている箇所:
 - `mlxturbo/convert_flash.py:331` — `mtp.` / `vision_tower.` / `model.visual.` を skip
-- `tools/vendor/qwen4_exp.py:849` — mlx-lm 側の `sanitize` でも同じものを skip (`# text-only pour l'instant`)
+- `mlxturbo/_vendor/qwen4_exp.py:849` — mlx-lm 側の `sanitize` でも同じものを skip (`# text-only pour l'instant`)
 
 必要な作業は 3 段。
 

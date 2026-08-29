@@ -1,10 +1,24 @@
 [project]
 name = "mlxturbo"
 version = "0.1.0"
-description = "Apple Silicon で MLX 推論を速くするエンジン"
-readme = "README.md"
+description = "A fast MLX inference engine and OpenAI/Anthropic-compatible server for Apple Silicon"
+readme = "README.en.md"
 license = "MIT"
+authors = [
+    { name = "akakeishin", email = "mizururi_22@gmail.com" },
+]
 requires-python = ">=3.13"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Environment :: GPU",
+    "Environment :: Console",
+]
 dependencies = [
     "fastapi>=0.141.1",
     "huggingface-hub>=1.28.0",
@@ -12,6 +26,10 @@ dependencies = [
     "mlx-lm>=0.31.3,<0.32",
     "uvicorn>=0.52.4",
 ]
+
+[project.urls]
+Homepage = "https://github.com/akakeishin/mlxturbo"
+Repository = "https://github.com/akakeishin/mlxturbo"
 
 [project.scripts]
 mlxturbo = "mlxturbo.cli:main"
@@ -21,8 +39,31 @@ mlxturbo-serve = "mlxturbo.server:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+exclude = [
+    "**/__pycache__",
+    "**/*.pyc",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["mlxturbo"]
+
+[tool.hatch.build.targets.sdist]
+# Deliberately narrow: bench/results/ (measurement JSON), docs/research/,
+# tools/, data/, models/, and .venv/ are excluded from the distributed
+# archive. They stay in the git repository; see README for pointers to the
+# raw benchmark data.
+#
+# `only-include` (not `include`) is required here: `include` only adds to
+# hatchling's default "everything not gitignored" sdist selection, which is
+# exactly the behavior that pulled in bench/results/ (untracked but not
+# gitignored) and even a stray vendored venv under tools/ in the first place.
+only-include = [
+    "mlxturbo",
+    "LICENSE",
+    "README.md",
+    "README.en.md",
+]
 
 [dependency-groups]
 dev = [
