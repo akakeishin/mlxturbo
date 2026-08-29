@@ -68,8 +68,9 @@ def _install_sigmoid32(Q):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="/Users/ht/models/qwen38fn-mlx-v-stream")
-    ap.add_argument("--ngram", default="/Users/ht/models/qwen38fn-ngram-4bit")
+    # 既定値は動作環境に依存する。自分の環境に合わせて --model/--ngram で上書きすること。
+    ap.add_argument("--model", default=str(Path.home() / "models/qwen38fn-mlx-v-stream"))
+    ap.add_argument("--ngram", default=str(Path.home() / "models/qwen38fn-ngram-4bit"))
     ap.add_argument("--no-speed", action="store_true")
     args = ap.parse_args()
 

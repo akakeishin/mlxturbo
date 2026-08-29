@@ -20,6 +20,7 @@ import statistics
 import subprocess
 import time
 from collections import Counter
+from pathlib import Path
 
 import mlx.core as mx
 from mlx_lm import load
@@ -309,9 +310,11 @@ def predict_from_expert_union(
 def main():
     p = argparse.ArgumentParser()
     p.add_argument(
+        # 既定値は動作環境に依存する。自分の環境に合わせて --model で上書きすること。
         "--model",
-        default="/Users/ht/.lmstudio/models/lmstudio-community/"
-        "gemma-4-26B-A4B-it-QAT-MLX-4bit",
+        default=str(
+            Path.home() / ".lmstudio/models/lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit"
+        ),
     )
     p.add_argument("--batches", default="1,2,4,8")
     p.add_argument("--reps", type=int, default=5)

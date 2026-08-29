@@ -29,7 +29,7 @@ decode tok/s・TTFT（prefill 時間の代理指標）・生成トークン数�
 
 使い方（例。実行は GPU 作業。静音プロトコル後に本番実行すること）:
 
-    uv run --project /Users/ht/dev/fastmlx python bench/compare_engines.py \\
+    uv run --project <repo> python bench/compare_engines.py \\
         --modes same-quant recommended \\
         --engines mlx-lm mlxturbo mtplx \\
         --prompts all \\
@@ -40,7 +40,7 @@ decode tok/s・TTFT（prefill 時間の代理指標）・生成トークン数�
 
 まずは --dry-run でコマンド列だけ確認すること（GPU を使わない）:
 
-    uv run --project /Users/ht/dev/fastmlx python bench/compare_engines.py --dry-run
+    uv run --project <repo> python bench/compare_engines.py --dry-run
 """
 
 from __future__ import annotations

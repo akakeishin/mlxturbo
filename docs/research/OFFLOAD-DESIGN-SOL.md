@@ -36,7 +36,7 @@ S_e=3\cdot6144\cdot2048\cdot4.5/8
 
 2. **Expert store**
 
-   safetensors shard をそのまま demand load してはいけません。現在の mlx-lm はロード時に experts を `SwitchGLU` の巨大な stacked tensor にまとめるため、expert 単位の退避ができません。[deepseek_v32.py](/Users/ht/dev/fastmlx/.venv/lib/python3.13/site-packages/mlx_lm/models/deepseek_v32.py:534)
+   safetensors shard をそのまま demand load してはいけません。現在の mlx-lm はロード時に experts を `SwitchGLU` の巨大な stacked tensor にまとめるため、expert 単位の退避ができません。[deepseek_v32.py](.venv/lib/python3.13/site-packages/mlx_lm/models/deepseek_v32.py:534)
 
    `(layer, expert)` ごとに gate/up/down の packed weight、scales、biases を連続した1 slabにし、4 KiB以上で整列させます。75ファイル×固定 expert offset 程度にし、1 expert 1ファイルの14,400ファイル構成は避けます。
 
@@ -67,7 +67,7 @@ S_e=3\cdot6144\cdot2048\cdot4.5/8
    =M_{\rm usable}-W_{\rm core}-KV-A(m)-M_{\rm staging}-M_{\rm OS}
    \]
 
-   PLAN上、fastmlx の検証状態だけでも \(m=32\) では約4.8 GBです。[docs/research/PLAN.md](/Users/ht/dev/fastmlx/docs/research/PLAN.md:197)
+   PLAN上、fastmlx の検証状態だけでも \(m=32\) では約4.8 GBです。[docs/research/PLAN.md](docs/research/PLAN.md:197)
 
    政策は次を推奨します。
 
@@ -116,7 +116,7 @@ fallbackは次です。
 
 - **現層 exact route**：可能、精度100%。ただし attention 後でしか分からない
 - **次層 predictive route**：MTP hidden、直前層route、token IDなどからの推定になる
-- 現行fastmlxのdraftは MTP moduleとlm_headだけで、target modelの層別expert IDを生成していません。[spec.py](/Users/ht/dev/fastmlx/fastmlx/spec.py:407)
+- 現行fastmlxのdraftは MTP moduleとlm_headだけで、target modelの層別expert IDを生成していません。[spec.py](fastmlx/spec.py:407)
 
 予測集合 \(P\)、実 target cold集合 \(T\) とすると、
 
@@ -148,7 +148,7 @@ p_{\rm route}(e)\cdot
 \|y_e^{q}-y_e^{ref}\|
 \]
 
-で感度を測るべきです。既存PLANのKLD gateと統合できます。[docs/research/PLAN.md](/Users/ht/dev/fastmlx/docs/research/PLAN.md:98)
+で感度を測るべきです。既存PLANのKLD gateと統合できます。[docs/research/PLAN.md](docs/research/PLAN.md:98)
 
 ## 2. 投機との相乗の定量見積もり
 
@@ -160,7 +160,7 @@ fastmlxでは1回の検証で出力するtoken数は、通常
 c=1+\mathbb E[a]
 \]
 
-です。したがって償却分母はdraft受理数 \(a\) ではなく \(1+a\) です。現行実測は mean accepted 1.38、tokens/step 2.38です。[D2-RESULTS.md](/Users/ht/dev/fastmlx/docs/research/D2-RESULTS.md:23)
+です。したがって償却分母はdraft受理数 \(a\) ではなく \(1+a\) です。現行実測は mean accepted 1.38、tokens/step 2.38です。[D2-RESULTS.md](docs/research/D2-RESULTS.md:23)
 
 \[
 B_{\rm AR}
@@ -268,9 +268,9 @@ false negativeは現層router後の完全stallです。平均精度だけでな�
 
 ### MLX lazy load / wired limit
 
-小さいが重要な補正があります。pinnedされたMLX 0.32.2の実ソースでは、safetensors loaderはliteralなOS `mmap` ではなく、lazy `Load` と `ParallelFileReader` の `pread` 系実装です。[load.h](/Users/ht/dev/fastmlx/.venv/lib/python3.13/site-packages/mlx/include/mlx/io/load.h:59)
+小さいが重要な補正があります。pinnedされたMLX 0.32.2の実ソースでは、safetensors loaderはliteralなOS `mmap` ではなく、lazy `Load` と `ParallelFileReader` の `pread` 系実装です。[load.h](.venv/lib/python3.13/site-packages/mlx/include/mlx/io/load.h:59)
 
-さらにmlx-lmの既定 `lazy=False` はロード後に全parameterを `mx.eval()` します。[utils.py](/Users/ht/dev/fastmlx/.venv/lib/python3.13/site-packages/mlx_lm/utils.py:282)
+さらにmlx-lmの既定 `lazy=False` はロード後に全parameterを `mx.eval()` します。[utils.py](.venv/lib/python3.13/site-packages/mlx_lm/utils.py:282)
 
 したがって316 GBでは、
 
@@ -422,7 +422,7 @@ B_{\rm cold/out}
 - cache-aware quantized MoE kernel
 - 新しいcorrectness/KLD matrix
 
-を伴う別backendだからです。一方、進行中のA2 kernelとMTP改善は既存モデルすべてへ効き、現在の成功条件に直結しています。[README.md](/Users/ht/dev/fastmlx/README.md:35)
+を伴う別backendだからです。一方、進行中のA2 kernelとMTP改善は既存モデルすべてへ効き、現在の成功条件に直結しています。[README.md](README.md:35)
 
 したがって順序は以下です。
 
@@ -451,7 +451,7 @@ B_{\rm cold/out}
 - swap発生またはp95 stallが1秒を超える
 - cache状態依存のbit切替が必要になる
 
-なお現PLAN記載の内蔵SSD空き267 GBでは316 GB artifact自体が入りません。[docs/research/PLAN.md](/Users/ht/dev/fastmlx/docs/research/PLAN.md:174) 外部SSDを使うなら、内蔵SSDの5–7 GB/sではなく外部SSDの実測値が判断基準です。
+なお現PLAN記載の内蔵SSD空き267 GBでは316 GB artifact自体が入りません。[docs/research/PLAN.md](docs/research/PLAN.md:174) 外部SSDを使うなら、内蔵SSDの5–7 GB/sではなく外部SSDの実測値が判断基準です。
 
 独立した Sol xhigh レビューでも、「短期のpre-download測定のみconditional GO、production戦線は現時点NO-GO」という同じ判定でした。ファイル変更は行っていません。
 

@@ -183,7 +183,7 @@ BRIEF-HC の見積もりは「4 トークン一括で 3 受理なら約 3 倍」
 # 合成の仕方とビット数を判定
 tools/biglock.sh uv run python tools/mtp_flash_probe.py \
     --model ~/models/qwen38fn-mlx-v-l --ngram ~/models/qwen38fn-ngram-4bit \
-    --mtp "/Volumes/Mobile SSD/models/qwen38fn-mtp.safetensors" --bits 0,8,6,4,3,2
+    --mtp "~/models/qwen38fn-mtp.safetensors" --bits 0,8,6,4,3,2
 
 # 捕獲と巻き戻しの正しさ
 tools/biglock.sh uv run python tools/spec_flash_test.py \
@@ -192,7 +192,7 @@ tools/biglock.sh uv run python tools/spec_flash_test.py \
 # 出力の一致と速度
 tools/biglock.sh uv run python tools/spec_flash_bench.py \
     --model ~/models/qwen38fn-mlx-v-l --ngram ~/models/qwen38fn-ngram-4bit \
-    --mtp "/Volumes/Mobile SSD/models/qwen38fn-mtp.safetensors"
+    --mtp "~/models/qwen38fn-mtp.safetensors"
 ```
 
 MTP サイドカーは 4 段 (v-xl/v-l/v-m/v-s) で共用できる。レシピに依らない。

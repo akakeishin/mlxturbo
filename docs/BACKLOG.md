@@ -4,7 +4,7 @@
 
 ## 1. マルチモーダル対応 (画像 → 音声・動画)
 
-元 checkpoint は VLM (`Qwen4ExpForConditionalGeneration`)。1,658 キー中 **333 が vision 系** (`model.visual.blocks.*`) だが、変換で意図的に捨てている。変換後の v 系成果物に vision 系は **0 キー**。元 checkpoint (360GB / 131 シャード) は外付け `/Volumes/Mobile SSD/models/Qwen3.8-Flash-Next` に再取得済みなので、素材はいつでも読める。
+元 checkpoint は VLM (`Qwen4ExpForConditionalGeneration`)。1,658 キー中 **333 が vision 系** (`model.visual.blocks.*`) だが、変換で意図的に捨てている。変換後の v 系成果物に vision 系は **0 キー**。元 checkpoint (360GB / 131 シャード) は外付け SSD 配下の `models/Qwen3.8-Flash-Next` に再取得済みなので、素材はいつでも読める。
 
 落としている箇所:
 - `mlxturbo/convert_flash.py:331` — `mtp.` / `vision_tower.` / `model.visual.` を skip

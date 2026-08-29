@@ -7,7 +7,7 @@
 
     tools/biglock.sh uv run python tools/spec_flash_bench.py \\
         --model ~/models/qwen38fn-mlx-v-l --ngram ~/models/qwen38fn-ngram-4bit \\
-        --mtp "/Volumes/Mobile SSD/models/qwen38fn-mtp.safetensors"
+        --mtp "~/models/qwen38fn-mtp.safetensors"
 """
 
 from __future__ import annotations

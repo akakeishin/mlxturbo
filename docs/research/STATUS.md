@@ -490,7 +490,7 @@ qwen-community-1.0 の再配布条項を精読してから (不可ならレシ�
 ## Phase Q: v0-95 焼き込み完了、port の forward が壊れている (2026-08-27)
 
 bf16 アーカイブ (131/131 シャード、335GiB、外付け SSD) から v0-95 を焼き、
-`/Users/ht/models/qwen38fn-mlx-v0-95` に 92GiB (98.8GB、見積もり 98.9GB と一致)。
+`~/models/qwen38fn-mlx-v0-95` に 92GiB (98.8GB、見積もり 98.9GB と一致)。
 ロードも生成も通るが、**出力は無意味な反復**で使えない。
 
 ### 公開 checkpoint に合わせて直した port のバグ 4 件

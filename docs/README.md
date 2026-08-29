@@ -10,6 +10,8 @@
 | ファイル | 内容 |
 |---|---|
 | [`SERVER.md`](SERVER.md) | `mlxturbo-serve` の起動・オプション・API キー認証・クライアント接続例（opencode / Codex CLI / Claude Code / Chatbox）・既知の制約 |
+| [`OPERATIONS.md`](OPERATIONS.md) | 公開インスタンスとして運用する場合の手引き（リバースプロキシ設定・`/health` の監視・ログの読み方・launchd 常駐） |
+| [`BENCHMARKS.md`](BENCHMARKS.md) | README / docs の実測値がどのコマンド・どの結果 JSON から来ているかの対応表 |
 | [`MTP-FLASH.md`](MTP-FLASH.md) | Qwen3.8-Flash-Next の MTP 投機デコード設計（`flash_spec` 経路の中身） |
 | [`BACKLOG.md`](BACKLOG.md) | やりたいが未着手のもの、根拠つき。決着済みの項目は末尾にまとめてある |
 

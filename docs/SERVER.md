@@ -117,7 +117,7 @@ Flash-Next (`qwen4_exp`) では、次の優先順で MTP を解決する。
 場所に置く場合だけ `--mtp` を使う:
 
 ```
-uv run mlxturbo-serve --model ... --mtp "/Volumes/Mobile SSD/models/qwen38fn-mtp.safetensors"
+uv run mlxturbo-serve --model ... --mtp "~/models/qwen38fn-mtp.safetensors"
 ```
 
 - `--mtp` を明示したのに2回のロード試行とも失敗した場合は、通常生成へ落とさず理由を出して **exit 1** する。

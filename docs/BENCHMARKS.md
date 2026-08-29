@@ -26,7 +26,7 @@ README.md の「実測値と再現コマンド」節、`flash_spec` 経路の表
 
 | 主張 | 生成コマンド | 結果 JSON |
 |---|---|---|
-| 日本語: 受理率 0.741、貪欲 26.94 tok/s、投機 33.92 tok/s、1.26x | `tools/biglock.sh uv run python tools/spec_flash_bench.py --model ~/models/qwen38fn-mlx-v-l --ngram ~/models/qwen38fn-ngram-4bit --mtp "/Volumes/Mobile SSD/models/qwen38fn-mtp.safetensors"` | **JSON ファイルへの保存なし。** `tools/spec_flash_bench.py` は `print()` で標準出力に出すだけで（既定 `--tokens 48 --reps 3`）、`bench/results/` にはこの数値を保持するファイルが無い。記録は [`MTP-FLASH.md`](MTP-FLASH.md) の表のみ |
+| 日本語: 受理率 0.741、貪欲 26.94 tok/s、投機 33.92 tok/s、1.26x | `tools/biglock.sh uv run python tools/spec_flash_bench.py --model ~/models/qwen38fn-mlx-v-l --ngram ~/models/qwen38fn-ngram-4bit --mtp "~/models/qwen38fn-mtp.safetensors"` | **JSON ファイルへの保存なし。** `tools/spec_flash_bench.py` は `print()` で標準出力に出すだけで（既定 `--tokens 48 --reps 3`）、`bench/results/` にはこの数値を保持するファイルが無い。記録は [`MTP-FLASH.md`](MTP-FLASH.md) の表のみ |
 | 英語: 受理率 0.516、貪欲 26.78 tok/s、投機 30.02 tok/s、1.12x | 同上 | 同上 |
 
 **この表の数値には既知の疑義がある。** 詳しくは次節。

@@ -22,13 +22,13 @@ docs/research/PLAN.md Phase E2「mlx-lm 素 vs fastmlx vs MTPLX の同一マシ�
    ログ: `tools/compare/hf-download-optimized-speed.log`。
    進捗確認:
    ```bash
-   tail -20 /Users/ht/dev/fastmlx/tools/compare/hf-download-optimized-speed.log
+   tail -20 ~/dev/fastmlx/tools/compare/hf-download-optimized-speed.log
    ps aux | grep "hf download" | grep -v grep
    du -sh ~/.cache/huggingface/hub/models--Youssofal--Qwen3.8-27B-MTPLX-Optimized-Speed 2>/dev/null
    ```
    完了後の確認（ローカル完結、ネットワークに出ない）:
    ```bash
-   uv run --project /Users/ht/dev/fastmlx python -c "
+   uv run --project ~/dev/fastmlx python -c "
    from huggingface_hub import snapshot_download
    print(snapshot_download('Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed', local_files_only=True))
    "
@@ -76,7 +76,7 @@ GPU は同時 1 プロセストラフィックが前提（docs/research/PLAN.md 
 まず `--dry-run` でコマンド列だけを確認する（GPU 不使用）:
 
 ```bash
-cd /Users/ht/dev/fastmlx
+cd ~/dev/fastmlx
 uv run python bench/compare_engines.py --dry-run \
   --gpu-note "dry-run: GPU未使用" --prompts code
 ```
@@ -92,7 +92,7 @@ tools/compare/mtplx-venv/bin/mtplx inspect Youssofal/Qwen3.8-27B-MTPLX-Optimized
 1 プロンプトだけで各エンジンが動くか予備戦する（cooldown 込み、~10-20分想定):
 
 ```bash
-cd /Users/ht/dev/fastmlx
+cd ~/dev/fastmlx
 uv run python bench/compare_engines.py \
   --modes same-quant \
   --engines mlx-lm fastmlx mtplx \
@@ -125,7 +125,7 @@ ps aux | grep -i mtplx  # 前回の mtplx デーモンが残っていないか
 MTPLX Optimized-Speed 込みで長め。エンジン間 60 秒冷却込み）:
 
 ```bash
-cd /Users/ht/dev/fastmlx
+cd ~/dev/fastmlx
 uv run python bench/compare_engines.py \
   --modes same-quant recommended \
   --engines mlx-lm fastmlx mtplx \
@@ -147,7 +147,7 @@ uv run python bench/compare_engines.py \
 場合は `--dry-run`（GPU 不使用、トークナイザのみ）:
 
 ```bash
-cd /Users/ht/dev/fastmlx
+cd ~/dev/fastmlx
 uv run python bench/kld_probe.py \
   --quant-model lmstudio-community/Qwen3.8-27B-MLX-4bit --dry-run
 ```
@@ -155,7 +155,7 @@ uv run python bench/kld_probe.py \
 実行する場合（GPU 作業。上記の比較ベンチとは同時に走らせないこと）:
 
 ```bash
-cd /Users/ht/dev/fastmlx
+cd ~/dev/fastmlx
 uv run python bench/kld_probe.py \
   --ref-model Qwen/Qwen3.8-27B \
   --quant-model lmstudio-community/Qwen3.8-27B-MLX-4bit \

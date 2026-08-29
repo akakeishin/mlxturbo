@@ -9,9 +9,10 @@ argmax が違えば、prose の spec 不一致は縮約順の数値差で説明�
 エンジンの検証/巻き戻しは無罪。
 """
 
+import os
 import sys
 
-sys.path.insert(0, "/Users/ht/dev/fastmlx")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mlx.core as mx
 

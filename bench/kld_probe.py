@@ -31,7 +31,7 @@ docs/PLAN.md Phase C1（上記引用）。ここでは teacher forcing の一般
 
 使い方（例。実行は GPU 作業なので静音プロトコル後に）:
 
-    uv run --project /Users/ht/dev/fastmlx python bench/kld_probe.py \\
+    uv run --project <repo> python bench/kld_probe.py \\
         --ref-model Qwen/Qwen3.8-27B \\
         --quant-model lmstudio-community/Qwen3.8-27B-MLX-4bit \\
         --prompts all --gen-tokens 128 \\
@@ -39,7 +39,7 @@ docs/PLAN.md Phase C1（上記引用）。ここでは teacher forcing の一般
 
 まずはトークナイザだけ読んでプレビュー（GPU 不使用、モデル重みは読まない）:
 
-    uv run --project /Users/ht/dev/fastmlx python bench/kld_probe.py \\
+    uv run --project <repo> python bench/kld_probe.py \\
         --quant-model lmstudio-community/Qwen3.8-27B-MLX-4bit --dry-run
 """
 
