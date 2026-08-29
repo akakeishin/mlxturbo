@@ -84,6 +84,7 @@ import json
 import os
 import queue
 import secrets
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -573,6 +574,27 @@ def _release_queue_slot() -> None:
     STATE.queue_depth = max(0, STATE.queue_depth - 1)
 
 
+async def _queue_owned_stream(stream):
+    """Make one stream the sole owner of one already-reserved queue slot.
+
+    The wrapper enters its cleanup region before requesting the inner stream's
+    first item.  Consequently a disconnect immediately after a protocol
+    preamble still releases the reservation; inner generators never release
+    queue slots themselves.
+    """
+
+    try:
+        async for item in stream:
+            yield item
+    finally:
+        try:
+            close = getattr(stream, "aclose", None)
+            if close is not None:
+                await close()
+        finally:
+            _release_queue_slot()
+
+
 _SSE_KEEPALIVE_INTERVAL = 15.0
 _SSE_KEEPALIVE_LINE = ": keepalive\n\n"
 
@@ -607,6 +629,40 @@ async def _await_with_keepalive(coro, interval: float = _SSE_KEEPALIVE_INTERVAL)
             task.cancel()
         raise
     yield ("result", task.result())
+
+
+async def _acquire_lock_with_keepalive(
+    lock: asyncio.Lock,
+    owned: list[bool],
+    interval: float = _SSE_KEEPALIVE_INTERVAL,
+):
+    """Acquire ``lock`` while yielding keepalives, with explicit ownership.
+
+    ``asyncio.Lock.acquire()`` can finish while the caller is suspended at a
+    yielded keepalive.  If the stream is closed in that window, merely
+    cancelling a still-pending task is insufficient: the completed task has
+    already taken the lock.  This helper records ownership before handing
+    control back after a successful acquire, and releases a completed-but-not-
+    transferred acquire when the async generator is closed.
+    """
+
+    task = asyncio.ensure_future(lock.acquire())
+    try:
+        while True:
+            done, _pending = await asyncio.wait({task}, timeout=interval)
+            if task in done:
+                break
+            yield _SSE_KEEPALIVE_LINE
+        task.result()
+        # No await/yield occurs between this assignment and generator return,
+        # so the caller's outer finally can now be the sole release owner.
+        owned[0] = True
+    except BaseException:
+        if not task.done():
+            task.cancel()
+        elif not task.cancelled() and task.exception() is None and task.result():
+            lock.release()
+        raise
 
 
 def _requeue_front(q: "queue.Queue", item) -> None:
@@ -1933,6 +1989,10 @@ def _log_gen_stats(res: dict) -> None:
 # (実測で確認済み: server.py の docstring 参照)。
 
 
+class _GenerationCancelled(Exception):
+    """Private cooperative-stop signal raised from a runner callback."""
+
+
 async def _run_generate(
     prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **sampling_kwargs
 ):
@@ -2102,7 +2162,7 @@ def _start_generation(
     session=None,
     **sampling_kwargs,
 ):
-    """ワーカーを STATE.executor へ投げ、(キュー, Future) を返す。
+    """ワーカーを STATE.executor へ投げ、(キュー, Future, stop Event) を返す。
 
     ``session`` はこのリクエスト用に ``_select_session`` が引き当てた
     session (ChatSession/FallbackSession) — 呼び出し側が ``STATE.lock`` の
@@ -2120,6 +2180,7 @@ def _start_generation(
     """
 
     q: queue.Queue = queue.Queue()
+    cancel_event = threading.Event()
     eos_ids = STATE.eos_ids
     router = ThinkingRouter(
         STATE.tokenizer,
@@ -2132,6 +2193,12 @@ def _start_generation(
     signaled = [False]
 
     def on_tokens(toks, text=None):
+        if cancel_event.is_set():
+            # All runner families invalidate aliased session state before
+            # mutation and publish only after successful completion.  Raising
+            # here therefore stops the next decode round without exposing a
+            # half-mutated cache.  Prefill itself remains non-preemptible.
+            raise _GenerationCancelled()
         for channel, payload in router.feed(toks):
             for kind, val in assembler.push(channel, payload):
                 q.put((kind, val))
@@ -2155,6 +2222,11 @@ def _start_generation(
                     for kind, val in assembler.push(channel, payload):
                         q.put((kind, val))
             q.put(("done", res))
+        except _GenerationCancelled:
+            # Cancelling the asyncio Task around ``to_thread(q.get)`` cannot
+            # cancel the underlying blocking thread.  Wake that orphaned get
+            # even though the SSE consumer itself is already gone.
+            q.put(("cancelled", None))
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as an SSE error event
             q.put(("error", exc))
 
@@ -2162,19 +2234,35 @@ def _start_generation(
     # asyncio.to_thread(q.get) で拾う (queue.Queue の待ち合わせだけなので
     # MLX のスレッド固定とは無関係、こちらは汎用スレッドプールで構わない)。
     future = STATE.executor.submit(worker)
-    return q, future
+    return q, future, cancel_event
 
 
 async def _await_worker(future) -> None:
     """ワーカー Future を待つ。ワーカー内の例外は worker() 自身が
     q.put(("error", ...)) で拾って握り潰しているので、ここで raise される
     のは future 自体の生成/キャンセル絡みの想定外のみ。ジェネレータの
-    finally から呼ぶので、ここでの例外がクリーンアップを壊さないよう飲む。"""
+    finally から呼ぶので通常の例外は飲む。一方、呼び出し Task の cancellation
+    は何度届いても worker 終了まで延期し、終了後にだけ再送出する。"""
 
-    try:
-        await asyncio.wrap_future(future)
-    except Exception:
-        pass
+    wrapped = asyncio.wrap_future(future)
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(wrapped)
+        except asyncio.CancelledError as exc:
+            if wrapped.cancelled():
+                break
+            # A second cancellation must not let the generator's outer
+            # finally release STATE.lock while the synchronous worker still
+            # mutates its session.  Defer it until the worker is terminal.
+            cancelled = exc
+            continue
+        except Exception:
+            break
+        else:
+            break
+    if cancelled is not None:
+        raise cancelled
 
 
 def _collect_events(
@@ -2417,29 +2505,38 @@ async def chat_completions(request: Request):
     req_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
+    include_usage = False
+    if stream:
+        stream_options = body.get("stream_options")
+        if stream_options is None:
+            stream_options = {}
+        elif not isinstance(stream_options, dict):
+            return _openai_error("'stream_options' must be a JSON object")
+        include_usage = bool(stream_options.get("include_usage", False))
+
     if not _try_reserve_queue_slot():
         return _busy_response("openai", "server is busy: too many queued requests")
 
     if stream:
-        stream_options = body.get("stream_options") or {}
-        include_usage = bool(stream_options.get("include_usage", False))
         # _openai_stream 側 (finally) がこのリクエストぶんのキュー枠を解放
         # する — StreamingResponse は生成器を最後まで読み切る/aclose する
         # ことが保証されているため、ここでの解放は不要 (むしろ二重解放になる)。
         return StreamingResponse(
-            _openai_stream(
-                prompt_ids,
-                max_tokens,
-                temp,
-                req_id,
-                created,
-                model_id,
-                stops,
-                include_usage,
-                thinking_budget,
-                sampling_params,
-                tool_enabled,
-                resolved_tools,
+            _queue_owned_stream(
+                _openai_stream(
+                    prompt_ids,
+                    max_tokens,
+                    temp,
+                    req_id,
+                    created,
+                    model_id,
+                    stops,
+                    include_usage,
+                    thinking_budget,
+                    sampling_params,
+                    tool_enabled,
+                    resolved_tools,
+                )
             ),
             media_type="text/event-stream",
         )
@@ -2543,20 +2640,15 @@ async def _openai_stream(
     yield f"data: {json.dumps(first)}\n\n"
 
     # ロック待ちの間も keepalive を流す (queue が詰まっていると、ここが実質
-    # 「最初のトークンが出るまで」の大半を占めることがある)。まだロックを
-    # 獲得していない時点で切断/例外になった場合はここでキュー枠を解放して
-    # 抜ける — 以降のロック確保後の finally とは別に処理する必要がある。
+    # 「最初のトークンが出るまで」の大半を占めることがある)。queue の所有は
+    # _queue_owned_stream、lock の所有は以下の owned フラグに一本化する。
+    owned = [False]
     try:
-        async for _ka_kind, _ka_val in _await_with_keepalive(STATE.lock.acquire()):
-            if _ka_kind == "keepalive":
-                yield _ka_val
-    except BaseException:
-        _release_queue_slot()
-        raise
+        async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
+            yield keepalive
 
-    try:
         session = _select_session(prompt_ids)
-        q, future = _start_generation(
+        q, future, cancel_event = _start_generation(
             prompt_ids,
             max_tokens,
             temp,
@@ -2739,11 +2831,13 @@ async def _openai_stream(
             yield "data: [DONE]\n\n"
         finally:
             # クライアント切断 (GeneratorExit) でここに来た場合も含め、
-            # ワーカーが実際に終わるまでロックを離さない。
+            # 次の token callback で協調停止し、ワーカーが実際に終わるまで
+            # ロックを離さない (prefill/実行中 kernel は割り込めない)。
+            cancel_event.set()
             await _await_worker(future)
     finally:
-        STATE.lock.release()
-        _release_queue_slot()
+        if owned[0]:
+            STATE.lock.release()
 
 
 # ---------- Anthropic 互換 ----------
@@ -2863,17 +2957,19 @@ async def anthropic_messages(request: Request):
         # _anthropic_stream 側 (finally) がこのリクエストぶんのキュー枠を
         # 解放する (openai 経路の chat_completions と同じ理由)。
         return StreamingResponse(
-            _anthropic_stream(
-                prompt_ids,
-                max_tokens,
-                temp,
-                msg_id,
-                model_id,
-                stops,
-                thinking_budget,
-                sampling_params,
-                tool_enabled,
-                resolved_tools,
+            _queue_owned_stream(
+                _anthropic_stream(
+                    prompt_ids,
+                    max_tokens,
+                    temp,
+                    msg_id,
+                    model_id,
+                    stops,
+                    thinking_budget,
+                    sampling_params,
+                    tool_enabled,
+                    resolved_tools,
+                )
             ),
             media_type="text/event-stream",
         )
@@ -2984,17 +3080,13 @@ async def _anthropic_stream(
     )
     yield sse("ping", {"type": "ping"})
 
+    owned = [False]
     try:
-        async for _ka_kind, _ka_val in _await_with_keepalive(STATE.lock.acquire()):
-            if _ka_kind == "keepalive":
-                yield _ka_val
-    except BaseException:
-        _release_queue_slot()
-        raise
+        async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
+            yield keepalive
 
-    try:
         session = _select_session(prompt_ids)
-        q, future = _start_generation(
+        q, future, cancel_event = _start_generation(
             prompt_ids,
             max_tokens,
             temp,
@@ -3197,10 +3289,11 @@ async def _anthropic_stream(
             )
             yield sse("message_stop", {"type": "message_stop"})
         finally:
+            cancel_event.set()
             await _await_worker(future)
     finally:
-        STATE.lock.release()
-        _release_queue_slot()
+        if owned[0]:
+            STATE.lock.release()
 
 
 # ---------- OpenAI 互換 (legacy /v1/completions) ----------
@@ -3275,25 +3368,34 @@ async def completions(request: Request):
     req_id = f"cmpl-{uuid.uuid4().hex}"
     created = int(time.time())
 
+    include_usage = False
+    if stream:
+        stream_options = body.get("stream_options")
+        if stream_options is None:
+            stream_options = {}
+        elif not isinstance(stream_options, dict):
+            return _openai_error("'stream_options' must be a JSON object")
+        include_usage = bool(stream_options.get("include_usage", False))
+
     if not _try_reserve_queue_slot():
         return _busy_response("openai", "server is busy: too many queued requests")
 
     if stream:
-        stream_options = body.get("stream_options") or {}
-        include_usage = bool(stream_options.get("include_usage", False))
         # _completions_stream 側 (finally) がこのリクエストぶんのキュー枠を
         # 解放する (openai chat 経路と同じ理由)。
         return StreamingResponse(
-            _completions_stream(
-                prompt_ids,
-                max_tokens,
-                temp,
-                req_id,
-                created,
-                model_id,
-                stops,
-                include_usage,
-                sampling_params,
+            _queue_owned_stream(
+                _completions_stream(
+                    prompt_ids,
+                    max_tokens,
+                    temp,
+                    req_id,
+                    created,
+                    model_id,
+                    stops,
+                    include_usage,
+                    sampling_params,
+                )
             ),
             media_type="text/event-stream",
         )
@@ -3356,19 +3458,15 @@ async def _completions_stream(
     include_usage,
     sampling_params: dict | None = None,
 ):
+    owned = [False]
     try:
-        async for _ka_kind, _ka_val in _await_with_keepalive(STATE.lock.acquire()):
-            if _ka_kind == "keepalive":
-                yield _ka_val
-    except BaseException:
-        _release_queue_slot()
-        raise
+        async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
+            yield keepalive
 
-    try:
         session = _select_session(prompt_ids)
         # thinking_budget=0: ThinkingRouter を content-only に固定する
         # (has_thinking に関わらず) ので reasoning_delta は絶対に来ない。
-        q, future = _start_generation(
+        q, future, cancel_event = _start_generation(
             prompt_ids, max_tokens, temp, 0, session=session, **(sampling_params or {})
         )
         try:
@@ -3461,10 +3559,11 @@ async def _completions_stream(
 
             yield "data: [DONE]\n\n"
         finally:
+            cancel_event.set()
             await _await_worker(future)
     finally:
-        STATE.lock.release()
-        _release_queue_slot()
+        if owned[0]:
+            STATE.lock.release()
 
 
 # ---------- OpenAI 互換 (Responses API, /v1/responses) ----------
@@ -3945,17 +4044,19 @@ async def responses_endpoint(request: Request):
         # _responses_stream 側 (finally) がこのリクエストぶんのキュー枠を
         # 解放する (他の openai 経路と同じ理由)。
         return StreamingResponse(
-            _responses_stream(
-                prompt_ids,
-                max_tokens,
-                temp,
-                resp_id,
-                created,
-                model_id,
-                thinking_budget,
-                sampling_params,
-                tool_enabled,
-                resolved_tools,
+            _queue_owned_stream(
+                _responses_stream(
+                    prompt_ids,
+                    max_tokens,
+                    temp,
+                    resp_id,
+                    created,
+                    model_id,
+                    thinking_budget,
+                    sampling_params,
+                    tool_enabled,
+                    resolved_tools,
+                )
             ),
             media_type="text/event-stream",
         )
@@ -4055,17 +4156,13 @@ async def _responses_stream(
         },
     )
 
+    owned = [False]
     try:
-        async for _ka_kind, _ka_val in _await_with_keepalive(STATE.lock.acquire()):
-            if _ka_kind == "keepalive":
-                yield _ka_val
-    except BaseException:
-        _release_queue_slot()
-        raise
+        async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
+            yield keepalive
 
-    try:
         session = _select_session(prompt_ids)
-        q, future = _start_generation(
+        q, future, cancel_event = _start_generation(
             prompt_ids,
             max_tokens,
             temp,
@@ -4306,10 +4403,11 @@ async def _responses_stream(
                 {"type": terminal_event, "response": final_response},
             )
         finally:
+            cancel_event.set()
             await _await_worker(future)
     finally:
-        STATE.lock.release()
-        _release_queue_slot()
+        if owned[0]:
+            STATE.lock.release()
 
 
 # ---------- 起動 ----------
@@ -4496,6 +4594,18 @@ def _enforce_required_runner(
     raise SystemExit(1)
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for capacities that must never be zero."""
+
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -4546,7 +4656,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--max-sessions",
-        type=int,
+        type=_positive_int,
         default=8,
         help="会話ごとの session (KV/prompt cache) を同時に保持する上限 (LRU、"
         " 超えたら最も長く未使用のものを捨てる)。91GB 級モデルの上に会話ごとの"

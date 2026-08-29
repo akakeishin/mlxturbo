@@ -1921,6 +1921,135 @@ def test_fallback_runner_without_session_matches_pre_existing_behavior(monkeypat
     assert calls[0]["prompt"] == [1, 2, 3]
 
 
+class _ContractFlashModel:
+    """FlashSpecEngine の cache/cur 契約だけを再現する軽量モデル。"""
+
+    @staticmethod
+    def make_cache():
+        return {"fed": []}
+
+
+class _ContractFlashEngine:
+    """各 yield の末尾 token はまだ cache に feed されていない。"""
+
+    model = _ContractFlashModel()
+
+    def __init__(self, calls):
+        self._outputs = iter(calls)
+        self.inputs = []
+
+    def generate_stream(self, ids, max_tokens, caches=None, **_kwargs):
+        prompt = list(ids[0].tolist())
+        self.inputs.append(prompt)
+        caches["fed"].extend(prompt)
+        emitted = 0
+        previous_cur = None
+        for token in next(self._outputs):
+            if emitted >= max_tokens:
+                break
+            if previous_cur is not None:
+                # A rejected depth-1 round feeds the previous cur and emits the
+                # newly verified token.  The emitted token becomes the next cur
+                # and remains immediately after the cache at the yield boundary.
+                caches["fed"].append(previous_cur)
+            previous_cur = token
+            emitted += 1
+            yield [token]
+        return 0, max(emitted - 1, 0)
+
+
+def test_flash_spec_runner_publishes_only_tokens_already_fed_to_cache():
+    """The trailing cur must be re-prefilled on the next turn, not skipped."""
+
+    engine = _ContractFlashEngine([[50, 51], [60]])
+    runner = FlashSpecRunner(engine)
+    session = FallbackSession()
+
+    first = runner.generate(
+        [1, 2, 3],
+        max_tokens=2,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=session,
+    )
+    assert first["tokens"] == [50, 51]
+    assert session.processed == session.cache["fed"] == [1, 2, 3, 50]
+
+    second_prompt = [1, 2, 3, 50, 51, 4]
+    second = runner.generate(
+        second_prompt,
+        max_tokens=1,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=session,
+    )
+    assert second["prefill_reused"] == 4
+    assert engine.inputs[1] == [51, 4]
+    assert session.processed == session.cache["fed"] == second_prompt
+
+
+def test_flash_spec_generate_stream_zero_tokens_prefills_without_yield(monkeypatch):
+    """max_tokens=0 must not leak the prefill-produced cur to callers."""
+
+    from contextlib import contextmanager
+
+    import fastmlx.spec_flash as spec_flash_module
+
+    class FakeModel:
+        model = SimpleNamespace()
+
+        @staticmethod
+        def make_cache():
+            return []
+
+        @staticmethod
+        def __call__(ids, cache=None):
+            return mx.zeros((1, ids.shape[1], 4))
+
+    @contextmanager
+    def fake_capture(_model):
+        yield SimpleNamespace(hyper=mx.zeros((1, 2, 1)))
+
+    monkeypatch.setattr(spec_flash_module, "capture", fake_capture)
+    engine = object.__new__(spec_flash_module.FlashSpecEngine)
+    engine.model = FakeModel()
+    engine.mtp = object()
+
+    chunks = list(
+        engine.generate_stream(
+            mx.array([[1, 2]]), max_tokens=0, caches=[], temp=0.0, eos_ids=set()
+        )
+    )
+    assert chunks == []
+
+
+def test_flash_spec_callback_failure_does_not_publish_mutated_reused_cache():
+    """A disconnect sentinel raised by on_tokens must leave no reusable state."""
+
+    engine = _ContractFlashEngine([[50, 51]])
+    runner = FlashSpecRunner(engine)
+    session = FallbackSession()
+    session.publish({"fed": [1, 2]}, [1, 2])
+
+    def disconnect(_tokens):
+        raise RuntimeError("client disconnected")
+
+    with pytest.raises(RuntimeError, match="client disconnected"):
+        runner.generate(
+            [1, 2, 3],
+            max_tokens=2,
+            temp=0.0,
+            eos_ids=set(),
+            on_tokens=disconnect,
+            session=session,
+        )
+
+    assert session.cache is None
+    assert session.processed == []
+
+
 def test_nonstream_cancellation_keeps_lock_until_worker_finishes():
     """Cancelling the HTTP task must not expose a still-mutating session."""
 
@@ -1956,6 +2085,12 @@ def test_nonstream_cancellation_keeps_lock_until_worker_finishes():
         assert state.lock.locked()
         assert not finished.is_set()
 
+        # Repeated cancellation must remain deferred as well.
+        task.cancel()
+        await asyncio.sleep(0)
+        assert state.lock.locked()
+        assert not finished.is_set()
+
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -1963,6 +2098,30 @@ def test_nonstream_cancellation_keeps_lock_until_worker_finishes():
         assert not state.lock.locked()
 
     asyncio.run(run())
+
+
+def test_stream_cancel_wakes_blocking_queue_get_with_internal_sentinel():
+    started = threading.Event()
+    release = threading.Event()
+
+    class PrefillBlockingRunner(FakeRunner):
+        def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
+            started.set()
+            assert release.wait(2), "test did not release blocking fake runner"
+            on_tokens([10])
+            raise AssertionError("cancel callback must stop before this line")
+
+    state = _install_state(PrefillBlockingRunner([]))
+    q, future, cancel_event = server._start_generation([1, 2, 3], 8, 0.0, None)
+    assert started.wait(1)
+
+    cancel_event.set()
+    release.set()
+    future.result(timeout=1)
+
+    assert q.get(timeout=1) == ("cancelled", None)
+    assert future.done()
+    state.executor.shutdown(wait=True)
 
 
 @pytest.mark.parametrize("protocol", ["openai", "anthropic"])
@@ -4420,6 +4579,148 @@ def test_queue_slot_released_after_stream_request(client):
     assert state.queue_depth == 0
 
 
+@pytest.mark.parametrize("route", ["chat", "completions"])
+@pytest.mark.parametrize("bad_options", ["bad", ["bad"], 1])
+def test_stream_options_must_be_object_before_queue_reservation(
+    client, route, bad_options
+):
+    runner = FakeRunner(tokens_to_emit=[10])
+    state = _install_state(
+        runner, tokenizer=FakeTokenizer(vocab={10: "x"}), max_queue=1
+    )
+    if route == "chat":
+        path = "/v1/chat/completions"
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+    else:
+        path = "/v1/completions"
+        body = {"prompt": "hi"}
+    body.update({"stream": True, "stream_options": bad_options})
+
+    resp = client.post(path, json=body)
+
+    assert resp.status_code == 400, resp.text
+    assert "stream_options" in resp.json()["error"]["message"]
+    assert state.queue_depth == 0
+    assert not runner.calls
+
+
+@pytest.mark.parametrize("protocol", ["chat", "anthropic", "responses"])
+def test_close_after_stream_preamble_releases_queue_slot(protocol):
+    runner = FakeRunner(tokens_to_emit=[10])
+    state = _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}), max_queue=1)
+
+    async def run():
+        assert server._try_reserve_queue_slot()
+        if protocol == "chat":
+            inner = server._openai_stream(
+                [1, 2, 3], 8, 0.0, "chat-id", 0, "test-model", [], False, None
+            )
+        elif protocol == "anthropic":
+            inner = server._anthropic_stream(
+                [1, 2, 3], 8, 0.0, "msg-id", "test-model", [], None
+            )
+        else:
+            inner = server._responses_stream(
+                [1, 2, 3], 8, 0.0, "resp-id", 0, "test-model", None
+            )
+        stream = server._queue_owned_stream(inner)
+        await stream.__anext__()  # protocol preamble, before lock acquisition
+        await stream.aclose()
+
+    asyncio.run(run())
+    assert state.queue_depth == 0
+    assert not state.lock.locked()
+    assert not runner.calls
+
+
+def test_close_after_lock_handoff_keepalive_releases_acquired_lock_and_queue():
+    runner = FakeRunner(tokens_to_emit=[10])
+    state = _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}), max_queue=1)
+
+    async def run():
+        await state.lock.acquire()
+        assert server._try_reserve_queue_slot()
+        inner = server._openai_stream(
+            [1, 2, 3], 8, 0.0, "chat-id", 0, "test-model", [], False, None
+        )
+        stream = server._queue_owned_stream(inner)
+        await stream.__anext__()  # role preamble
+
+        defaults = server._acquire_lock_with_keepalive.__defaults__
+        server._acquire_lock_with_keepalive.__defaults__ = (0.01,)
+        try:
+            assert await stream.__anext__() == server._SSE_KEEPALIVE_LINE
+            state.lock.release()
+            await asyncio.sleep(0.03)  # let the pending acquire task win
+            await stream.aclose()
+        finally:
+            server._acquire_lock_with_keepalive.__defaults__ = defaults
+
+    asyncio.run(run())
+    assert state.queue_depth == 0
+    assert not state.lock.locked()
+    assert not runner.calls
+
+
+def test_stream_double_cancellation_stops_decode_before_releasing_lock():
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    second_callback_completed = threading.Event()
+
+    class BlockingRunner(FakeRunner):
+        def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
+            try:
+                on_tokens([10])
+                started.set()
+                assert release.wait(2), "test did not release blocking fake runner"
+                on_tokens([11])
+                second_callback_completed.set()
+                return super().generate(
+                    prompt_ids, max_tokens, temp, eos_ids, None, session, **extra
+                )
+            finally:
+                finished.set()
+
+    state = _install_state(
+        BlockingRunner([]), tokenizer=FakeTokenizer(vocab={10: "x", 11: "y"}), max_queue=1
+    )
+
+    async def run():
+        assert server._try_reserve_queue_slot()
+        stream = server._queue_owned_stream(
+            server._openai_stream(
+                [1, 2, 3], 8, 0.0, "chat-id", 0, "test-model", [], False, None
+            )
+        )
+
+        async def consume():
+            async for _chunk in stream:
+                pass
+
+        task = asyncio.create_task(consume())
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        await asyncio.sleep(0.02)
+        assert state.lock.locked()
+        assert state.queue_depth == 1
+
+        task.cancel()
+        await asyncio.sleep(0.02)
+        assert state.lock.locked()
+        assert state.queue_depth == 1
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run())
+    assert finished.is_set()
+    assert not second_callback_completed.is_set()
+    assert not state.lock.locked()
+    assert state.queue_depth == 0
+
+
 def test_reserve_and_release_queue_slot_unit():
     runner = FakeRunner(tokens_to_emit=[])
     state = _install_state(runner, max_queue=2)
@@ -5046,6 +5347,36 @@ def test_build_runner_qwen4_exp_with_explicit_none_mtp_and_no_source_found(monke
     assert runner.fallback_reason == _NOT_FOUND_REASON
 
 
+def test_build_runner_resolves_loaded_hf_repo_before_flash_mtp_discovery(
+    monkeypatch, tmp_path
+):
+    """A repo id must be searched in its local snapshot, not as ``org/repo``."""
+
+    import fastmlx.runner as runner_module
+
+    seen = []
+    monkeypatch.setattr(
+        runner_module,
+        "resolve_local_model_path",
+        lambda ref: seen.append(("resolve", ref)) or tmp_path,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_discover_flash_mtp_source",
+        lambda path: seen.append(("discover", path)) or None,
+    )
+
+    model = _fake_qwen4_exp_model()
+    args = SimpleNamespace(
+        model="org/flash-model", original="fake-original", mtp=None, mtp_bits=4,
+        no_mtp=True, no_fused=True,
+    )
+    actual = runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
+
+    assert isinstance(actual, FallbackRunner)
+    assert seen == [("resolve", "org/flash-model"), ("discover", tmp_path)]
+
+
 # ---------- build_runner: qwen4_exp の MTP 自動発見 (モデル内蔵/サイドカー) ----------
 #
 # --mtp が未指定のとき、fastmlx.runner._discover_flash_mtp_source が
@@ -5088,6 +5419,41 @@ def test_discover_flash_mtp_source_finds_embedded_weights_in_index(tmp_path):
     assert source_label == "モデル内蔵"
     assert isinstance(spec, dict)
     assert set(spec.keys()) == {"mtp.pre_fc_norm_embedding.weight"}
+
+
+def test_discover_flash_mtp_source_finds_unsharded_embedded_weights(tmp_path):
+    """An unsharded model has no index; inspect model.safetensors itself."""
+
+    import fastmlx.runner as runner_module
+
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"),
+        {
+            "mtp.pre_fc_norm_embedding.weight": mx.zeros((4,)),
+            "model.embed_tokens.weight": mx.zeros((4, 4)),
+        },
+    )
+
+    result = runner_module._discover_flash_mtp_source(tmp_path)
+    assert result is not None
+    source_label, spec = result
+    assert source_label == "モデル内蔵 (model.safetensors)"
+    assert set(spec) == {"mtp.pre_fc_norm_embedding.weight"}
+
+
+def test_discover_flash_mtp_source_uses_sidecar_when_index_is_malformed(tmp_path):
+    """A broken optional index must not hide a valid sidecar fallback."""
+
+    import fastmlx.runner as runner_module
+
+    (tmp_path / "model.safetensors.index.json").write_text("[]")
+    sidecar = tmp_path / "mtp.safetensors"
+    mx.save_safetensors(str(sidecar), {"mtp.x": mx.zeros((1,))})
+
+    assert runner_module._discover_flash_mtp_source(tmp_path) == (
+        "サイドカー (mtp.safetensors)",
+        str(sidecar),
+    )
 
 
 def test_discover_flash_mtp_source_finds_sidecar_file(tmp_path):
@@ -5261,6 +5627,43 @@ def test_build_runner_falls_back_when_auto_discovered_mtp_unreadable(monkeypatch
     assert "再試行します" in out
 
 
+@pytest.mark.parametrize(
+    ("index_body", "detail"),
+    [
+        ("[]", "JSON object"),
+        (
+            json.dumps({"weight_map": {"mtp.x": "missing.safetensors"}}),
+            "missing.safetensors",
+        ),
+    ],
+)
+def test_build_runner_falls_back_with_reason_when_embedded_mtp_index_is_broken(
+    monkeypatch, tmp_path, index_body, detail
+):
+    """Broken auto-discovery is observable fallback, never a startup traceback."""
+
+    import fastmlx.mtp_flash as mtp_flash_module
+    import fastmlx.runner as runner_module
+
+    called = []
+    monkeypatch.setattr(
+        mtp_flash_module, "load_flash_mtp", lambda *a, **k: called.append(1)
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(index_body)
+
+    model = _fake_qwen4_exp_model()
+    args = SimpleNamespace(
+        model=str(tmp_path), original="fake-original", mtp=None, mtp_bits=4,
+        no_mtp=True, no_fused=True,
+    )
+    actual = runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
+
+    assert isinstance(actual, FallbackRunner)
+    assert not called
+    assert actual.fallback_reason.startswith("MTP 自動発見に失敗:")
+    assert detail in actual.fallback_reason
+
+
 # ---------- --require-runner (server.py: _enforce_required_runner) ----------
 #
 # main() 自体は実モデルロードを伴うので直接は叩かず、main() が呼ぶ
@@ -5305,3 +5708,13 @@ def test_enforce_required_runner_exits_without_reason_detail_when_none(capsys):
     out = capsys.readouterr().out
     assert "--require-runner flash_spec" in out
     assert "解決された runner は spec。" in out  # 理由の括弧書きが付かない
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_positive_int_rejects_zero_session_capacity(value):
+    with pytest.raises(server.argparse.ArgumentTypeError, match="at least 1"):
+        server._positive_int(value)
+
+
+def test_positive_int_accepts_valid_session_capacity():
+    assert server._positive_int("8") == 8

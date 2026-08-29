@@ -329,6 +329,8 @@ class FlashSpecEngine:
         を 1 回 capture 付きで呼ぶのと数値的に同一 (チャンク境界そのものが
         発生しないため) —既存の ``generate()`` と同じ経路をそのまま通る。
         """
+        if max_tokens < 0:
+            raise ValueError("max_tokens must be non-negative")
         eos = set(eos_ids)
         model = self.model
         caches = caches if caches is not None else model.make_cache()
@@ -355,6 +357,11 @@ class FlashSpecEngine:
                 mx.clear_cache()
             i = j
         hyper_prev = cap.hyper[:, -1:]
+        if max_tokens == 0:
+            # Keep the successfully prefetched cache, but do not expose the
+            # first sampled ``cur``.  This mirrors SpecEngine.generate(0) and
+            # lets FlashSpecRunner publish exactly the prompt as processed.
+            return 0, 0
         cur = self._sample(logits[:, -1], temp)
 
         first = int(cur.item())

@@ -35,7 +35,7 @@ from typing import Protocol
 
 import mlx.core as mx
 
-from ._mlx_compat import TextModelArgs
+from ._mlx_compat import TextModelArgs, resolve_local_model_path
 from .spec import PREFILL_STEP_SIZE, ChatSession, SpecEngine
 
 
@@ -214,7 +214,11 @@ class FlashSpecRunner:
         decode_time = time.perf_counter() - t0 - (ttft or 0.0)
         n_decode = max(len(tokens) - 1, 0)
         if session is not None:
-            session.publish(prompt_cache, list(prompt_ids) + tokens)
+            # FlashSpecEngine's invariant is that the final ``cur`` has been
+            # produced/yielded but has not yet been fed into ``prompt_cache``.
+            # Publish only the prefix the cache actually contains; the next
+            # turn will prefill the trailing cur together with its new suffix.
+            session.publish(prompt_cache, list(prompt_ids) + tokens[:-1])
         return {
             "tokens": tokens,
             "ttft_s": ttft or 0.0,
@@ -424,6 +428,10 @@ class FallbackRunner:
         }
 
 
+class _FlashMTPDiscoveryError(RuntimeError):
+    """An auto-discovery candidate exists but cannot be inspected safely."""
+
+
 def _discover_flash_mtp_source(model_dir: Path) -> tuple[str, dict | str] | None:
     """qwen4_exp (Flash-Next) 用、``--mtp`` 未指定のときの MTP 自動発見。
 
@@ -435,32 +443,77 @@ def _discover_flash_mtp_source(model_dir: Path) -> tuple[str, dict | str] | None
        シャードだけを ``mx.load`` で読み、``mtp.*`` キーだけを集めて返す
        (全シャードは読まない — 該当シャードのみに絞る)。量子化配布では
        MTP 重みがモデル本体に同梱されているのが通例
-    2. モデルディレクトリ直下の ``mtp.safetensors`` サイドカー
+    2. index の無い単一ファイルモデルなら ``model.safetensors`` 自体
+    3. モデルディレクトリ直下の ``mtp.safetensors`` サイドカー
 
-    見つかった場合 ``(source_label, spec)`` を返す。``spec`` は 1 のとき
+    見つかった場合 ``(source_label, spec)`` を返す。``spec`` は 1・2 のとき
     ``dict`` (``mtp_flash.load_flash_mtp`` の ``weights=`` にそのまま渡す)、
-    2 のとき ``str`` (同 ``path``)。どちらも無ければ ``None``。
+    3 のとき ``str`` (同 ``path``)。どれも無ければ ``None``。
     """
 
+    discovery_errors: list[str] = []
     index_path = model_dir / "model.safetensors.index.json"
     if index_path.exists():
         try:
-            weight_map = json.loads(index_path.read_text()).get("weight_map", {})
-        except (OSError, ValueError):
-            weight_map = {}
-        shards = sorted({shard for key, shard in weight_map.items() if key.startswith("mtp.")})
-        if shards:
-            collected: dict = {}
-            for shard in shards:
-                for key, value in mx.load(str(model_dir / shard)).items():
-                    if key.startswith("mtp."):
-                        collected[key] = value
-            return ("モデル内蔵", collected)
+            index_data = json.loads(index_path.read_text())
+            if not isinstance(index_data, dict):
+                raise ValueError("top level must be a JSON object")
+            weight_map = index_data.get("weight_map", {})
+            if not isinstance(weight_map, dict):
+                raise ValueError("'weight_map' must be a JSON object")
+
+            shards: set[str] = set()
+            for key, shard in weight_map.items():
+                if not isinstance(key, str) or not key.startswith("mtp."):
+                    continue
+                if not isinstance(shard, str) or not shard:
+                    raise ValueError(f"weight_map[{key!r}] must name a shard")
+                shard_path = Path(shard)
+                if shard_path.is_absolute() or ".." in shard_path.parts:
+                    raise ValueError(f"unsafe shard path for {key!r}: {shard!r}")
+                shards.add(shard)
+
+            if shards:
+                collected: dict = {}
+                for shard in sorted(shards):
+                    shard_path = model_dir / shard
+                    if not shard_path.exists():
+                        raise FileNotFoundError(f"index references missing shard: {shard_path}")
+                    for key, value in mx.load(str(shard_path)).items():
+                        if key.startswith("mtp."):
+                            collected[key] = value
+                if not collected:
+                    raise ValueError("indexed MTP shards contain no mtp.* tensors")
+                return ("モデル内蔵", collected)
+        except Exception as exc:
+            discovery_errors.append(
+                f"{index_path.name}: {type(exc).__name__}: {exc}"
+            )
+
+    # Standard unsharded Hugging Face/MLX layout.  mx.load is lazy for
+    # safetensors, so filtering the mapping does not materialize the unrelated
+    # base-model tensors on the GPU.
+    unsharded = model_dir / "model.safetensors"
+    if unsharded.exists():
+        try:
+            collected = {
+                key: value
+                for key, value in mx.load(str(unsharded)).items()
+                if key.startswith("mtp.")
+            }
+            if collected:
+                return ("モデル内蔵 (model.safetensors)", collected)
+        except Exception as exc:
+            discovery_errors.append(
+                f"{unsharded.name}: {type(exc).__name__}: {exc}"
+            )
 
     sidecar = model_dir / "mtp.safetensors"
     if sidecar.exists():
         return ("サイドカー (mtp.safetensors)", str(sidecar))
 
+    if discovery_errors:
+        raise _FlashMTPDiscoveryError("; ".join(discovery_errors))
     return None
 
 
@@ -559,8 +612,25 @@ def build_runner(
             source_label = "明示指定 (--mtp)"
             load_path, load_weights = mtp_path, None
         else:
-            model_dir = Path(getattr(args, "model", "") or ".")
-            discovered = _discover_flash_mtp_source(model_dir)
+            # ``args.model`` may be a Hugging Face repo id.  The model has
+            # already been loaded by this point, so resolve the corresponding
+            # local snapshot instead of treating ``org/repo`` as a relative
+            # filesystem path and silently missing its embedded MTP tensors.
+            model_ref = getattr(args, "model", "") or "."
+            try:
+                model_dir = resolve_local_model_path(model_ref)
+            except Exception:
+                # ``build_runner`` is also a public/testable boundary and can
+                # be called with an already-constructed model plus a synthetic
+                # non-cached name.  Preserve the old "no candidate" behavior
+                # there; normal CLI/server flow has loaded the repo already.
+                model_dir = Path(model_ref)
+            try:
+                discovered = _discover_flash_mtp_source(model_dir)
+            except _FlashMTPDiscoveryError as exc:
+                reason = f"MTP 自動発見に失敗: {exc}"
+                print(f"{log_prefix} {reason} — 通常生成にフォールバックします")
+                return FallbackRunner(model, tokenizer, fallback_reason=reason)
             if discovered is None:
                 reason = (
                     "MTP が見つからない (--mtp で指定するか、モデルディレクトリに"

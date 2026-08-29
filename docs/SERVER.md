@@ -3,7 +3,8 @@
 `fastmlx-serve` は OpenAI 互換 (`/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/models`) と
 Anthropic 互換 (`/v1/messages`) の両方を話す HTTP サーバー。モデルは起動時に 1 回だけロードして常駐させ、
 リクエストは内部で直列化する (`fastmlx/server.py` 冒頭の docstring 参照)。このドキュメントは配布物として
-他人のネットワークで動かすときの起動方法・クライアント設定・制約をまとめる。
+接続方法・運用上の制約をまとめる。既定の `127.0.0.1` はローカル利用向け。LAN/WAN に公開する場合は、
+後述のとおり TLS を終端する reverse proxy または SSH tunnel を必ず併用する。
 
 ## 起動
 
@@ -14,9 +15,23 @@ uv run fastmlx-serve --model mlx-community/Qwen3.6-35B-A3B-4bit --served-model-n
 `--model` 以外は全て省略可。ロードには数秒〜十数秒かかる (モデルサイズ依存)。起動ログに
 バージョン・待ち行列上限・API キー認証の有無・thinking/tool calling 対応の検出結果が出る。
 
+Flash-Next の投機デコードが必須なら、黙って通常生成へ落ちないよう起動条件も固定する:
+
+```
+uv run fastmlx-serve --model /path/to/qwen38fn-mlx-v-l --ngram /path/to/qwen38fn-ngram-4bit \
+  --served-model-name qwen38fn --require-runner flash_spec --port 8765
+```
+
+別ターミナルから次を実行し、`runner` と `fallback_reason` を確認してからクライアントを繋ぐ:
+
+```
+curl -sS http://127.0.0.1:8765/health
+curl -sS http://127.0.0.1:8765/v1/models
+```
+
 ### オプション一覧
 
-`uv run fastmlx-serve --help` が正。以下は抜粋 (この作業で追加したものは ← で示す):
+`uv run fastmlx-serve --help` が正。以下は主要オプションの抜粋:
 
 | オプション | 既定 | 内容 |
 |---|---|---|
@@ -29,20 +44,21 @@ uv run fastmlx-serve --model mlx-community/Qwen3.6-35B-A3B-4bit --served-model-n
 | `--temp` | `0.7` | `temperature` 省略時の既定値 |
 | `--mtp-bits` | `4` | MTP ヘッドの量子化ビット数 |
 | `--no-mtp` | 無効 | MTP を読み込まず lookup (SAM) のみで投機する |
-| `--mtp PATH` | 無効 ← | MTP ヘッドを単一 safetensors サイドカーから読み込む (後述) |
+| `--mtp PATH` | 無効 | MTP ヘッドを単一 safetensors サイドカーから読み込む (後述) |
 | `--ngram DIR` | 無効 | n-gram (PLE) 表を外部サイドカーから読み込む |
 | `--no-fused` | 無効 | hyper-connections 融合カーネルを無効化する |
 | `--allowed-origins` | 無効 (CORS 無し) | ブラウザからのクロスオリジン fetch を許可する Origin (カンマ区切り、`*` で全許可) |
-| `--max-sessions` | `8` | 会話ごとの session (KV/prompt cache) を同時保持する上限 (LRU) |
+| `--max-sessions` | `8` | 会話ごとの session (KV/prompt cache) を同時保持する上限 (LRU、1以上) |
 | `--max-context-tokens` | 自動検出 | 1 リクエストのプロンプト長上限。超えたら 400 |
 | `--model-alias NAME` | なし | `--served-model-name` 以外にもこの名前を 404 にせず受け付ける (繰り返し指定可) |
-| `--api-key KEY` | 無効 (認証なし) ← | このサーバーを叩ける API キー (繰り返し指定可) |
-| `--max-queue N` | `8` ← | 直列化ロックの待ち行列上限。超えたら 503 |
-| `--version` | — ← | バージョンを表示して終了 |
+| `--api-key KEY` | 無効 (認証なし) | このサーバーを叩ける API キー (繰り返し指定可) |
+| `--max-queue N` | `8` | 直列化ロックの待ち行列上限。超えたら 503 |
+| `--require-runner KIND` | なし | 解決 runner が `flash_spec` / `spec` / `fallback` の指定値と違えば exit 1 |
+| `--version` | — | バージョンを表示して終了 |
 
 ## API キー認証 (`--api-key`)
 
-配布して他人のネットワークで動かす前提の機能。**未指定なら今までどおり認証なし** (ローカル専用の既定を変えない)。
+**未指定なら今までどおり認証なし** (ローカル専用の既定を変えない)。
 
 ```
 uv run fastmlx-serve --model ... --api-key sk-fastmlx-xxxxxxxx
@@ -55,6 +71,12 @@ uv run fastmlx-serve --model ... --api-key sk-fastmlx-xxxxxxxx
   `authentication_error`)。キーの比較は `secrets.compare_digest` (タイミング攻撃対策)。
 - `/health` と `/api/hello` は監視・疎通用なので鍵の有無に関わらず常に 200 を返す。
 - `--api-key` は複数回指定でき、どれか 1 つに一致すれば通る (ローテーション用)。
+
+`--api-key` は認証だけを行い、通信を暗号化しない。`http://` のまま別ホストへ公開すると、キーと会話本文を
+経路上から読まれる。`--host 0.0.0.0` を使う場合は nginx/Caddy 等で HTTPS を終端するか、サーバー自体は
+`127.0.0.1` のまま SSH tunnel 越しに接続すること。また、現在は key-file / 環境変数専用オプションがなく、
+コマンドライン引数は shell history や同一ホストの process listing に残り得る。共有ホストではこの制約を
+理解したうえで reverse proxy 側の認証を使う。
 
 ## 待ち行列上限 (`--max-queue`)
 
@@ -70,25 +92,35 @@ uv run fastmlx-serve --model ... --api-key sk-fastmlx-xxxxxxxx
 SSE コメント行 (`: keepalive`) を送る** (OpenAI / Anthropic / Responses の全経路)。SSE コメント行は
 仕様上クライアントに無視されるため、通常のイベント処理には影響しない。
 
+クライアント切断後は、次の token callback で decode を協調停止する。既に実行中の長い prefill や Metal
+kernel 自体は割り込めないため、その区間だけは終了を待ってからロックとキュー枠を解放する。
+
 ## graceful shutdown
 
 SIGTERM/SIGINT を受けると、新規リクエストは 503 で断りつつ、**処理中のリクエスト (ストリーミング中の
 ものを含む) は完了させてから**終了する。もう一度シグナルを送る (種類は問わない) と即時終了する。
 
-## `--mtp PATH`: MTP サイドカーの指定
+## Flash-Next の MTP 自動発見と `--mtp PATH`
 
-Flash-Next 系の MTP ヘッドが単一の safetensors ファイル (サイドカー) として別途存在する場合、そのパスを
-直接指定できる。
+Flash-Next (`qwen4_exp`) では、次の優先順で MTP を解決する。
+
+1. `--mtp PATH` の明示指定
+2. モデル本体の `model.safetensors.index.json` が指す `mtp.*` シャード、または index のない
+   `model.safetensors` 内の `mtp.*` テンソル
+3. モデルディレクトリ直下の `mtp.safetensors` サイドカー
+
+`--model` が Hugging Face repo ID の場合も、ロード済みローカル snapshot を探索する。サイドカーを別の
+場所に置く場合だけ `--mtp` を使う:
 
 ```
 uv run fastmlx-serve --model ... --mtp "/Volumes/Mobile SSD/models/qwen38fn-mtp.safetensors"
 ```
 
-- 指定すると、`--original` の生チェックポイントからの探索やバンドル済みアーティファクトより **優先**
-  する。
-- サイドカーの中身の形式 (テンソル名など) が既存のロード処理と合わない場合は、無理に合わせず
-  **読めなかった旨をログに出して MTP 無しで起動する** (通常の「重みが無ければ無効化」と同じ姿勢)。
-- サーバー側はパスを渡す配線だけに徹している。実際のロード・エンジン側の統合は別レーンの担当。
+- `--mtp` を明示したのに2回のロード試行とも失敗した場合は、通常生成へ落とさず理由を出して **exit 1** する。
+- 自動発見候補の壊れた index・欠損シャード・読み込み失敗は通常生成へフォールバックし、`/health` の
+  `fallback_reason` に理由を出す。有効なサイドカーが別にあれば、壊れた index よりそちらを使う。
+- runner を運用条件にしたい場合は `--require-runner flash_spec` を付ける。MTP が見つからない場合も exit 1
+  になるため、配布環境で性能低下を見逃さない。
 
 ## クライアント接続例
 
@@ -102,6 +134,7 @@ uv run fastmlx-serve --model ... --mtp "/Volumes/Mobile SSD/models/qwen38fn-mtp.
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
+  "model": "fastmlx/qwen36",
   "provider": {
     "fastmlx": {
       "npm": "@ai-sdk/openai-compatible",
@@ -122,6 +155,10 @@ uv run fastmlx-serve --model ... --mtp "/Volumes/Mobile SSD/models/qwen38fn-mtp.
 
 `--api-key` を立てていなければ `apiKey` は何を入れても無視される (サーバー側が見ない)。`/models` で
 選択できるようになる。
+
+```
+FASTMLX_API_KEY=dummy opencode run --pure "Return exactly: fastmlx-ok"
+```
 
 ### Codex CLI
 
@@ -152,6 +189,11 @@ wire_api = "responses"
 `--api-key` を立てていない場合も `env_key` に何かしらの環境変数を割り当てておく (Codex は
 `Authorization: Bearer <値>` を必ず送るが、fastmlx 側は鍵未設定なら見ないので値は何でもよい)。
 
+```
+CODEX_HOME=/tmp/codex-fastmlx FASTMLX_API_KEY=dummy \
+  codex exec --skip-git-repo-check "Return exactly: fastmlx-ok" < /dev/null
+```
+
 ### Claude Code
 
 `ANTHROPIC_BASE_URL` を `/v1/messages` の手前 (ベース URL) まで、`ANTHROPIC_AUTH_TOKEN` に鍵を設定する:
@@ -160,6 +202,10 @@ wire_api = "responses"
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8765
 export ANTHROPIC_AUTH_TOKEN=sk-fastmlx-xxxxxxxx   # --api-key 未設定なら任意の値でよい
 export ANTHROPIC_MODEL=qwen36
+```
+
+```
+claude -p "Return exactly: fastmlx-ok" --model qwen36
 ```
 
 Claude Code は会話タイトル生成などの裏方処理で、メインモデルと別の小さいモデル名
@@ -183,6 +229,9 @@ Claude Code 側が「まだ十分空きがある」と判断したのに fastmlx
 - **リクエストは直列処理。** `fastmlx-serve` は 91GB 級のモデルを 128GB 機に載せている前提で、1 リクエスト
   = 1 生成に直列化する設計 (継続バッチングは未実装)。複数クライアントを同時に繋ぐ場合、後着のリクエスト
   は先着の生成が終わるまで待たされる (`--max-queue` を超えると 503)。
+- **token logprobs は未対応。** Chat/Completions/Responses のレスポンス中の `logprobs` は `null` または空配列
+  で、リクエストの `logprobs` / `top_logprobs` を計算しない。候補のrerank・信頼度表示・評価用途で必要な
+  クライアントは、値が返る前提で使わないこと。
 - **spec runner (投機デコード) 経路は恒等値以外のサンプリングパラメータを 400 にする。** `top_p=1.0` や
   `repetition_penalty=1.0` のような「分布を変えない既定値」は通すが、それ以外 (`top_p=0.9` 等) を投機
   デコード経路 (`SpecRunner`) へ渡すと 400 になる。投機デコードのブロック検証は「対象分布からの厳密な
