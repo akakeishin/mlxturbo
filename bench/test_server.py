@@ -4289,6 +4289,49 @@ def test_http_partial_match_trim_produces_same_prompt_and_output_as_full_rebuild
     )
 
 
+def test_select_session_on_executor_runs_on_state_executor_thread():
+    """``_select_session_on_executor`` は ``STATE.executor`` (モデルをロード
+    したのと同じ専用ワーカースレッド) 上で ``_select_session`` を実行する
+    こと。
+
+    2026-08-29 のチェックポイント機能追加で、``_select_session`` の 2nd
+    pass (``_try_trim_session_cache``/``_try_checkpoint_restore_session_
+    cache``) は実際に MLX 配列を触るようになった (``cache.trim()``、
+    ``indexer.keys`` のスライス、``restore_untrimmable_caches`` の
+    ``c.state`` 代入)。ところが ``_select_session`` 自体は
+    ``STATE.runner.generate`` と違い、長らく各エンドポイントから直接
+    (= イベントループのスレッドで) 呼ばれていた。モデルをロードした
+    専用スレッド (``STATE.executor``) 以外で MLX 配列を触ると "There is
+    no Stream(gpu, N) in current thread" で落ちる (``_run_generate``
+    直前のコメント参照、実測確認済み) — thinking 有効の 2 ターン目で
+    checkpoint 復元が実際に発火すると実機で再現した (この節の他のテストは
+    どれも FakeRunner/フェイクの caches か、TestClient と同じスレッドで
+    完結する tiny な実モデル呼び出しなので、この "呼び出し元と違うスレッド"
+    という条件そのものを再現しておらず、この不具合を見逃していた)。
+    ``_select_session_on_executor`` (server.py の chat/anthropic/completions/
+    responses、非ストリーミング/ストリーミング全 8 経路が呼ぶ) がその
+    修正そのもの — 直接呼ばず必ず ``STATE.executor`` 経由にする。
+    """
+
+    runner = FakeRunner([1])
+    _install_state(runner)
+    executor = server.STATE.executor
+    caller_thread_id = threading.get_ident()
+
+    seen_thread_id: dict[str, int] = {}
+    orig = server._select_session
+
+    def spy(prompt_ids):
+        seen_thread_id["id"] = threading.get_ident()
+        return orig(prompt_ids)
+
+    with mock.patch.object(server, "_select_session", side_effect=spy):
+        asyncio.run(server._select_session_on_executor([1, 2, 3]))
+
+    assert seen_thread_id["id"] != caller_thread_id
+    assert seen_thread_id["id"] == executor.submit(threading.get_ident).result()
+
+
 # ---------- 文脈長ガード (_resolve_model_max_context / _check_context_length) ----------
 #
 # 実サーバーで ~57,000 トークンのプロンプトが Metal の一括確保上限を超えて

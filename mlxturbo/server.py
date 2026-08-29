@@ -579,6 +579,34 @@ def _select_session(prompt_ids: list[int]):
     return session
 
 
+async def _select_session_on_executor(prompt_ids: list[int]):
+    """``_select_session`` を ``STATE.executor`` (モデルをロードしたのと同じ
+    専用ワーカースレッド) 上で実行する。
+
+    ``_run_generate`` の docstring/直前コメントにある不変条件 (MLX の計算
+    グラフ・KV キャッシュはロード時のスレッドに紐づくため、別スレッドで
+    触ると "There is no Stream(gpu, N) in current thread" で落ちる、実測
+    確認済み) は ``STATE.runner.generate`` だけの話ではない — 全体一致
+    (純粋な追記) の 1st pass は ``sess.processed`` (Python の int リスト)
+    を読むだけなので無害だが、2026-08-29 に ``_try_trim_session_cache``/
+    ``_try_checkpoint_restore_session_cache`` が実際に触る 2nd pass
+    (``cache.trim()``、``indexer.keys`` のスライス、
+    ``restore_untrimmable_caches`` の ``c.state = state`` 代入) は同じ
+    意味で実際の MLX 配列操作であり、この関数を呼び出し側のイベント
+    ループのスレッドで直接実行すると同じエラーで落ちる (実測: thinking
+    有効の 2 ターン目、履歴が処理済み列の途中で分岐して 2nd pass の
+    checkpoint 復元が実際に発火したときに再現した)。1st pass しか通らない
+    経路 (このサーバーの既存テストの大半) は元々何も MLX 配列を触らない
+    ため症状が出ず、見逃されていた。
+
+    ``STATE.lock`` を held のまま呼ぶこと (``_select_session`` 自身の
+    docstring と同じ前提) — ここでは新たに獲得し直さない。
+    """
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(STATE.executor, _select_session, prompt_ids)
+
+
 def _try_reserve_queue_slot() -> bool:
     """``STATE.lock`` を使う (=生成を伴う) 4 経路が、実際に待ち行列へ並ぶ
     前に呼ぶ。``STATE.queue_depth`` は「ロック待ち + 現在処理中」の合計
@@ -2572,7 +2600,7 @@ async def chat_completions(request: Request):
 
     try:
         async with STATE.lock:
-            session = _select_session(prompt_ids)
+            session = await _select_session_on_executor(prompt_ids)
             res = await _run_generate(
                 prompt_ids,
                 max_tokens,
@@ -2676,7 +2704,7 @@ async def _openai_stream(
         async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
             yield keepalive
 
-        session = _select_session(prompt_ids)
+        session = await _select_session_on_executor(prompt_ids)
         q, future, cancel_event = _start_generation(
             prompt_ids,
             max_tokens,
@@ -3005,7 +3033,7 @@ async def anthropic_messages(request: Request):
 
     try:
         async with STATE.lock:
-            session = _select_session(prompt_ids)
+            session = await _select_session_on_executor(prompt_ids)
             res = await _run_generate(
                 prompt_ids,
                 max_tokens,
@@ -3114,7 +3142,7 @@ async def _anthropic_stream(
         async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
             yield keepalive
 
-        session = _select_session(prompt_ids)
+        session = await _select_session_on_executor(prompt_ids)
         q, future, cancel_event = _start_generation(
             prompt_ids,
             max_tokens,
@@ -3431,7 +3459,7 @@ async def completions(request: Request):
 
     try:
         async with STATE.lock:
-            session = _select_session(prompt_ids)
+            session = await _select_session_on_executor(prompt_ids)
             res = await _run_generate(
                 prompt_ids,
                 max_tokens,
@@ -3492,7 +3520,7 @@ async def _completions_stream(
         async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
             yield keepalive
 
-        session = _select_session(prompt_ids)
+        session = await _select_session_on_executor(prompt_ids)
         # thinking_budget=0: ThinkingRouter を content-only に固定する
         # (has_thinking に関わらず) ので reasoning_delta は絶対に来ない。
         q, future, cancel_event = _start_generation(
@@ -4092,7 +4120,7 @@ async def responses_endpoint(request: Request):
 
     try:
         async with STATE.lock:
-            session = _select_session(prompt_ids)
+            session = await _select_session_on_executor(prompt_ids)
             res = await _run_generate(
                 prompt_ids,
                 max_tokens,
@@ -4190,7 +4218,7 @@ async def _responses_stream(
         async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
             yield keepalive
 
-        session = _select_session(prompt_ids)
+        session = await _select_session_on_executor(prompt_ids)
         q, future, cancel_event = _start_generation(
             prompt_ids,
             max_tokens,
