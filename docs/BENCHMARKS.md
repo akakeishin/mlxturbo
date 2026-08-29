@@ -1,8 +1,12 @@
 # BENCHMARKS — 実測値の再現手順
 
-README.md と docs/ に載っている実測値が、どのコマンドで・どの結果 JSON から出たものかの対応表。
+README.md と docs/ に載っている実測値が、どのコマンドで出たものかの対応表。
 「その数字、自分の機械でも出るのか」を確認したい懐疑的な読者向け。ここに載せた再現コマンドは
 実在するスクリプトの実際の引数・出力を確認したうえで書いてある。
+
+**元の測定 JSON は配布していない。**他人の機械の測定値そのものには意味が薄く、下のコマンドを
+自分で回せば自分の環境の数字が得られる。ここに残してあるのは「どのキーを見れば主張と突き
+合わせられるか」で、当時の観測値も併記してある。
 
 計測環境（共通）: M3 Max 128GB / macOS 26.4 / mlx 0.32.2。ハードウェア世代が変わると数字は変わる
 （詳しくは [`research/ROOFLINE-2026-08-26.md`](research/ROOFLINE-2026-08-26.md) を参照）。
@@ -13,8 +17,8 @@ README.md の「実測値と再現コマンド」節、`spec` 経路の表に対
 
 | 主張 | 生成コマンド | 結果 JSON |
 |---|---|---|
-| mlx-lm 素（フォールバック相当）decode 21〜23 tok/s、1.0x | `uv run python bench/baseline.py lmstudio-community/Qwen3.8-27B-MLX-4bit` | [`bench/results/qwen38-27b-4bit-baseline.json`](../bench/results/qwen38-27b-4bit-baseline.json) — `runs[].decode_tps` が 23.19〜23.28、`best_decode_tps` 23.28（21〜23 のレンジは、このファイルに加えて `spec-adaptive.json`・`spec-adaptive-mtp4.json` 内の `stock_decode_tps`（21.4〜23.0）を合わせた幅） |
-| 自己投機・難しい内容持続（code）31.9 tok/s、1.49x | `uv run python bench/spec_bench.py --mtp-bits 4 --prompts code --json spec-adaptive-mtp4.json` | [`bench/results/spec-adaptive-mtp4.json`](../bench/results/spec-adaptive-mtp4.json) の `code.sweep."3".spec_decode_tps` = 31.923677726588753、`speedup` = 1.4912509524906445 — 完全一致 |
+| mlx-lm 素（フォールバック相当）decode 21〜23 tok/s、1.0x | `uv run python bench/baseline.py lmstudio-community/Qwen3.8-27B-MLX-4bit` | `qwen38-27b-4bit-baseline.json` — `runs[].decode_tps` が 23.19〜23.28、`best_decode_tps` 23.28（21〜23 のレンジは、このファイルに加えて `spec-adaptive.json`・`spec-adaptive-mtp4.json` 内の `stock_decode_tps`（21.4〜23.0）を合わせた幅） |
+| 自己投機・難しい内容持続（code）31.9 tok/s、1.49x | `uv run python bench/spec_bench.py --mtp-bits 4 --prompts code --json spec-adaptive-mtp4.json` | `spec-adaptive-mtp4.json` の `code.sweep."3".spec_decode_tps` = 31.923677726588753、`speedup` = 1.4912509524906445 — 完全一致 |
 | 自己投機・難しい内容持続（prose）28.3 tok/s、1.32x | `uv run python bench/spec_bench.py --mtp-bits 4 --prompts prose --json spec-adaptive-mtp4.json` | 同ファイルの `prose.sweep."3".spec_decode_tps` = 28.26517333697319、`speedup` = 1.319699220254132 — 完全一致 |
 | 自己投機・易しい内容（序盤32tok）40〜51 tok/s、1.7〜2.2x | `uv run mlxturbo --model <model> --prompt "<短い/易しいプロンプト>"`（README 記載どおり） | **再現できる保存済み JSON が見つからなかった。** `bench/results/*.json` を全件走査したが、この数値の組み合わせを含むファイルは無い。最初にこの数値を書き込んだコミット（`1c6d503`）のメッセージにはこの実測値が書かれているが、同コミットで追加された JSON 群のどれにも入っていない。対話 CLI (`mlxturbo`) の手元実行結果 (`cli.py:175` が出す `[X.X tok/s | ...]` 行) をそのまま書いた可能性が高いが、そのログ自体は repo に無い。**要フォローアップ（下記「見つかった問題」参照）** |
 

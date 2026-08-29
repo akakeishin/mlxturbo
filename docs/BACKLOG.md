@@ -24,8 +24,8 @@
 
 **測定は済んでいて、実装も opt-in の形で存在する。配線だけしていない。**
 
-- 取り分の実測: gemma4-26B で B=4 実測 2.10x。Flash-Next はエキスパート和集合からの予測で 2.05〜2.19x (`bench/results/batch-flashnext-expert-union.json`)。「512 エキスパートなら飽和しにくい」は誤りで、飽和は (B × top_k) / num_experts で決まる
-- prefill には一切効かない (B に線形)。cold 32k は TTFT 112 秒で壁時計の 84% を prefill が占める (`bench/results/batch-flashnext-prefill-decode.json`)。**体感を狙うなら prefill 側が先**
+- 取り分の実測: gemma4-26B で B=4 実測 2.10x。Flash-Next はエキスパート和集合からの予測で 2.05〜2.19x (`tools/observe_flashnext_batch.py` の和集合モードで再現できる)。「512 エキスパートなら飽和しにくい」は誤りで、飽和は (B × top_k) / num_experts で決まる
+- prefill には一切効かない (B に線形)。cold 32k は TTFT 112 秒で壁時計の 84% を prefill が占める (同スクリプトの prefill/decode モードで再現できる)。**体感を狙うなら prefill 側が先**
 - 実装: `mlxturbo/batch.py` に `enable_batch_cache()` (既定 off、未配線)。合成モデルの CPU 検証で QSA off と長さ揃いは B=1/2/4 完全一致。**残る制限**: QSA 有効 (2048 超) かつ長さ不揃いでバッチ出力が単体と一致しない (破損ではなく QSA のブロックグリッドが絶対列で切られるため。パディングを揃えれば 3.7e-8)。実モデル検証 `tools/verify_batch_real.py` は未実行
 - やる根拠は速度でなく**可用性**: 直列サーバーだとサブエージェントを流しっぱなしにしたまま別の作業ができない。B=4 でレイテンシは 0.53x に悪化するので、対話 1 本の用途では逆効果
 
