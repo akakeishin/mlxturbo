@@ -99,7 +99,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ._mlx_compat import mlx_lm_load
 from .cli import MTP_PATH_ENV
-from .runner import FallbackSession, Runner, build_runner
+from .runner import RUNNER_KINDS, FallbackSession, Runner, build_runner
 from .spec import PREFILL_STEP_SIZE, ChatSession, restore_untrimmable_caches
 
 app = FastAPI()
@@ -2315,6 +2315,11 @@ async def health():
     処理中かどうか・待ち行列の深さ・バージョン。処理中かどうかは
     ``STATE.lock.locked()`` を見るだけ (直列化の設計上、ロックが空いていれば
     idle、取られていれば busy と等価)。
+
+    runner が fallback (非投機) のときだけ ``fallback_reason`` を追加する
+    (fastmlx.runner.build_runner が理由文字列を runner に持たせる — 「黙って
+    fallback に落ちて気づけない」を防ぐためのもの)。fallback でなければ
+    このキー自体を出さない。
     """
 
     if STATE is None:
@@ -2322,7 +2327,7 @@ async def health():
             status_code=503,
             content={"status": "loading", "loaded": False, "version": _FASTMLX_VERSION},
         )
-    return {
+    body = {
         "status": "ok",
         "model": STATE.model_name,
         "loaded": True,
@@ -2331,6 +2336,10 @@ async def health():
         "queue_depth": STATE.queue_depth,
         "version": STATE.version,
     }
+    fallback_reason = getattr(STATE.runner, "fallback_reason", None)
+    if fallback_reason is not None:
+        body["fallback_reason"] = fallback_reason
+    return body
 
 
 @app.get("/api/hello")
@@ -4461,6 +4470,32 @@ async def _drain_and_exit(server_obj: "uvicorn.Server") -> None:
     server_obj.should_exit = True
 
 
+def _enforce_required_runner(
+    runner: Runner, required_kind: str | None, log_prefix: str = "[fastmlx-serve]"
+) -> None:
+    """``--require-runner`` が指定されているのに解決された runner の
+    ``KIND`` が一致しなければ、フォールバックせず理由を明示して
+    ``SystemExit(1)`` する。
+
+    未指定 (``required_kind is None``) なら何もしない — 従来どおり黙って
+    fallback を許すが、fallback なら ``/health`` の ``fallback_reason`` で
+    見える (fastmlx.runner.build_runner のクラス docstring 参照)。
+    """
+
+    if required_kind is None:
+        return
+    resolved_kind = getattr(runner, "KIND", type(runner).__name__)
+    if resolved_kind == required_kind:
+        return
+    reason = getattr(runner, "fallback_reason", None)
+    detail = f" ({reason})" if reason else ""
+    print(
+        f"{log_prefix} --require-runner {required_kind} が指定されたが、解決された"
+        f" runner は {resolved_kind}{detail}。--mtp のパスと重みを確認せよ"
+    )
+    raise SystemExit(1)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -4566,9 +4601,27 @@ def main() -> None:
         metavar="PATH",
         help="MTP (multi-token prediction) ヘッドを単一 safetensors サイドカー"
         " から読み込む場合のパス。指定すると --original の生チェックポイント"
-        " からの探索やバンドル済みアーティファクトより優先する。テンソル名"
-        " などの形式が既存のロード処理と合わなければ、無理に合わせず読めない"
-        " 旨をログに出して MTP 無しで起動する (重み欠損時と同じ姿勢)",
+        " からの探索やバンドル済みアーティファクトより優先する。qwen4_exp"
+        " (Flash-Next) 系では、明示指定したのに読み込めない場合 (1 回だけ"
+        " 自動リトライした後も失敗) はフォールバックせず、理由を表示して"
+        " 起動を中止する (exit 1) — 逃げ道のフラグは無い。未指定の場合は"
+        " モデル本体の safetensors (mtp.* テンソル) → モデルディレクトリの"
+        " mtp.safetensors サイドカーの順に自動発見する (見つかった場合は"
+        " その旨をログに出す。この自動発見の失敗は exit せずフォールバック"
+        " する)。どれも見つからなければフォールバックする (exit はしない —"
+        " /health の fallback_reason で理由が見える)。27B (--original) 側は"
+        " 従来どおり、重み欠損を吸収して MTP 無しで起動する",
+    )
+    ap.add_argument(
+        "--require-runner",
+        default=None,
+        choices=sorted(RUNNER_KINDS),
+        metavar="KIND",
+        help="起動時に解決された runner (fastmlx.runner の KIND: "
+        + "/".join(sorted(RUNNER_KINDS))
+        + ") がこれと一致しなければ、フォールバックせず理由を表示して起動を"
+        " 中止する (exit 1)。未指定 (既定) では従来どおり黙って fallback を"
+        " 許す — その場合も /health の fallback_reason で理由が見える",
     )
     args = ap.parse_args()
 
@@ -4604,6 +4657,7 @@ def main() -> None:
             install(model, args.ngram)
         print(f"[fastmlx-serve] loaded in {time.perf_counter() - t0:.1f}s: {args.model}")
         runner = build_runner(model, tokenizer, config, args, log_prefix="[fastmlx-serve]")
+        _enforce_required_runner(runner, args.require_runner)
         if args.max_context_tokens is not None:
             max_context_tokens, source = args.max_context_tokens, "--max-context-tokens"
         else:

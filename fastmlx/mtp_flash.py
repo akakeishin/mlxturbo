@@ -151,19 +151,25 @@ def _sanitize(weights: dict) -> dict:
     return out
 
 
-def load_flash_mtp(path: str, args, variant: str = "lane",
-                   quantize: dict | None = None) -> FlashMTPModule:
+def load_flash_mtp(path: str | None, args, variant: str = "lane",
+                   quantize: dict | None = None, weights: dict | None = None) -> FlashMTPModule:
     """抽出済みサイドカー (`convert_flash extract-mtp` の出力) から組む。
 
     `quantize` は `{"group_size": 64, "bits": 4}`。MTP は draft なので、
     ビットを下げても**出力の正しさは本体の検証が保証する**。落ちるのは
     受理率 (= 速度) だけで、品質ではない。
+
+    `weights` (dict | None): 指定すると `path` を一切読まず、この dict
+    (`mtp.` 接頭辞つきの未 sanitize な生テンソル) をそのまま使う——本体の
+    safetensors シャードから `mtp.*` キーだけ読み集めて渡す口 (追加のみ:
+    未指定時の `path` 経由の挙動は 1 ビットも変えていない)。
     """
-    weights = _sanitize(dict(mx.load(str(Path(path))).items()))
+    raw_weights = dict(weights) if weights is not None else dict(mx.load(str(Path(path))).items())
+    sanitized_weights = _sanitize(raw_weights)
     mtp = FlashMTPModule(args, variant=variant)
     # **読んでから量子化する。**先に量子化すると scales/biases を持つ形に
     # なってしまい、bf16 の重みが入らない (27B の load_mtp と同じ順序)
-    mtp.load_weights(list(weights.items()))
+    mtp.load_weights(list(sanitized_weights.items()))
     if quantize:
         gs = quantize.get("group_size", 64)
         bad = [

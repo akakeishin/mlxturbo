@@ -895,6 +895,41 @@ def test_health_endpoint_reports_flash_spec_runner(client):
     assert resp.json()["runner"] == "flash_spec"
 
 
+def test_health_endpoint_reports_fallback_reason_when_present(client):
+    """build_runner が fallback_reason を持たせた runner (実物の
+    FallbackRunner や、同じ属性を持つフェイク) では /health にそのまま
+    出る — 「黙って fallback に落ちて気づけない」を防ぐための配線。"""
+
+    runner = FakeRunner(tokens_to_emit=[])
+    runner.fallback_reason = "qwen4_exp だが MTP を自動発見できなかった (fake reason)"
+    _install_state(runner)
+    resp = client.get("/health")
+    assert resp.json()["fallback_reason"] == (
+        "qwen4_exp だが MTP を自動発見できなかった (fake reason)"
+    )
+
+
+def test_health_endpoint_omits_fallback_reason_when_none(client):
+    """fallback_reason が None (投機経路、または FallbackRunner でも理由
+    なし) なら、キー自体を出さない。"""
+
+    runner = FakeRunner(tokens_to_emit=[])
+    runner.fallback_reason = None
+    _install_state(runner)
+    resp = client.get("/health")
+    assert "fallback_reason" not in resp.json()
+
+
+def test_health_endpoint_omits_fallback_reason_for_spec_runner(client):
+    """SpecRunner/FlashSpecRunner のフェイクには fallback_reason 属性が
+    そもそも無い (getattr の既定 None) — それでも壊れず、キーが出ない。"""
+
+    runner = FakeSpecRunner(tokens_to_emit=[])
+    _install_state(runner)
+    resp = client.get("/health")
+    assert "fallback_reason" not in resp.json()
+
+
 # ---------- 3b. バグ修正: GET/HEAD /api/hello が 404 だった ----------
 #
 # Claude Code の疎通確認。実装が無いと 404 になる (会話自体は成立するので
@@ -4843,10 +4878,11 @@ def test_build_runner_routes_qwen4_exp_with_mtp_to_flash_spec(monkeypatch):
 
     captured = {}
 
-    def fake_load_flash_mtp(path, text_args, quantize=None):
+    def fake_load_flash_mtp(path, text_args, quantize=None, weights=None):
         captured["path"] = path
         captured["text_args"] = text_args
         captured["quantize"] = quantize
+        captured["weights"] = weights
         return DummyMTP()
 
     monkeypatch.setattr(mtp_flash_module, "load_flash_mtp", fake_load_flash_mtp)
@@ -4867,13 +4903,24 @@ def test_build_runner_routes_qwen4_exp_with_mtp_to_flash_spec(monkeypatch):
     assert captured["path"] == "fake-sidecar.safetensors"
     assert captured["text_args"] is model.args.text
     assert captured["quantize"] == {"group_size": 64, "bits": 4}
+    # 明示指定 (--mtp) のときは weights= は渡さない (path 経由のまま)
+    assert captured["weights"] is None
 
 
-def test_build_runner_falls_back_when_flash_mtp_sidecar_unreadable(monkeypatch, capsys):
+def test_build_runner_exits_when_flash_mtp_sidecar_unreadable_after_retry(monkeypatch, capsys):
+    """``--mtp`` は運用者の明示指定なので、1 回リトライしても読めなければ
+    フォールバックせず理由を明示して ``SystemExit(1)`` する (仕様変更:
+    以前はここで FallbackRunner に倒していたが、それは「明示的に頼まれた
+    のにできないなら黙って無視せず大声で断る」という設計と矛盾するため、
+    逃げ道のフラグ無しで exit 1 に統一した)。"""
+
     import fastmlx.mtp_flash as mtp_flash_module
     import fastmlx.runner as runner_module
 
+    calls = []
+
     def fake_load_flash_mtp(*a, **k):
+        calls.append(1)
         raise ValueError("bad sidecar")
 
     monkeypatch.setattr(mtp_flash_module, "load_flash_mtp", fake_load_flash_mtp)
@@ -4887,19 +4934,69 @@ def test_build_runner_falls_back_when_flash_mtp_sidecar_unreadable(monkeypatch, 
         no_mtp=False,
         no_fused=True,
     )
-    runner = runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
-    assert isinstance(runner, FallbackRunner)
-    assert not isinstance(runner, FlashSpecRunner)
+    with pytest.raises(SystemExit) as exc_info:
+        runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
+    assert exc_info.value.code == 1
+    # ロードは 1 回だけリトライする = 呼び出しはちょうど 2 回
+    assert len(calls) == 2
     out = capsys.readouterr().out
     assert "bad-sidecar.safetensors" in out
     assert "ValueError" in out
+    assert "再試行します" in out  # 1 回目の失敗でリトライ予告のログが出る
+    assert "--mtp を外せば" in out  # 回避策の一言
 
 
-def test_build_runner_ignores_flash_spec_route_without_mtp_path(monkeypatch):
+def test_build_runner_retries_flash_mtp_load_once_then_succeeds(monkeypatch, capsys):
+    """1 回目のロードが失敗し、2 回目 (リトライ) が成功すれば通常どおり
+    FlashSpecRunner が返る — フォールバックにも exit 1 にもならない。"""
+
+    import fastmlx.mtp_flash as mtp_flash_module
+    import fastmlx.runner as runner_module
+
+    class DummyMTP:
+        def parameters(self):
+            return {}
+
+    attempts = []
+
+    def fake_load_flash_mtp(*a, **k):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise TimeoutError("GPU Timeout Error (simulated)")
+        return DummyMTP()
+
+    monkeypatch.setattr(mtp_flash_module, "load_flash_mtp", fake_load_flash_mtp)
+
+    model = _fake_qwen4_exp_model()
+    args = SimpleNamespace(
+        model="fake-model",
+        original="fake-original",
+        mtp="fake-sidecar.safetensors",
+        mtp_bits=4,
+        no_mtp=False,
+        no_fused=True,
+    )
+    runner = runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
+    assert isinstance(runner, FlashSpecRunner)
+    assert runner.fallback_reason is None
+    assert len(attempts) == 2
+    out = capsys.readouterr().out
+    assert "再試行します" in out
+    assert "GPU Timeout Error" in out
+
+
+_NOT_FOUND_REASON = (
+    "MTP が見つからない (--mtp で指定するか、モデルディレクトリに"
+    " mtp.safetensors を置く)"
+)
+
+
+def test_build_runner_falls_back_when_no_mtp_source_found(monkeypatch):
     """--mtp が無い呼び出し (cli.py の Namespace は ``mtp`` 属性自体を持た
-    ない) では、qwen4_exp モデルでも FlashSpecEngine 経路に入らず、既存の
-    27B 向け分岐 (SpecEngine 契約不一致 -> FallbackRunner) をそのまま通る —
-    27B 側の経路を一切変えていないことの回帰確認。"""
+    ない) かつモデルディレクトリにも自動発見できる MTP が無い場合、
+    qwen4_exp モデルでも FlashSpecEngine 経路に入らず、load_flash_mtp を
+    呼ぶことすらなく FallbackRunner に落ちる — ``fallback_reason`` は
+    「MTP が見つからない (...)」。"""
 
     import fastmlx.mtp_flash as mtp_flash_module
     import fastmlx.runner as runner_module
@@ -4911,7 +5008,8 @@ def test_build_runner_ignores_flash_spec_route_without_mtp_path(monkeypatch):
 
     model = _fake_qwen4_exp_model()
     # cli.py の argparse.Namespace には --mtp が無いので、mtp 属性自体が無い
-    # (server.py の Namespace と違い getattr(args, "mtp", None) が None を返す)
+    # (server.py の Namespace と違い getattr(args, "mtp", None) が None を返す)。
+    # "fake-model" は存在しないディレクトリなので自動発見も失敗する。
     args = SimpleNamespace(
         model="fake-model", original="fake-original", mtp_bits=4, no_mtp=True,
         no_fused=True,
@@ -4920,3 +5018,290 @@ def test_build_runner_ignores_flash_spec_route_without_mtp_path(monkeypatch):
     assert not called
     assert isinstance(runner, FallbackRunner)
     assert not isinstance(runner, FlashSpecRunner)
+    assert runner.fallback_reason == _NOT_FOUND_REASON
+
+
+def test_build_runner_qwen4_exp_with_explicit_none_mtp_and_no_source_found(monkeypatch):
+    """server.py の Namespace は ``--mtp`` 未指定でも ``mtp`` 属性自体は
+    存在し値が None になる (argparse の ``default=None``)。cli.py 側の
+    「属性自体が無い」場合と挙動が揃うことを確認する (自動発見も失敗する
+    ディレクトリを渡した場合)。"""
+
+    import fastmlx.mtp_flash as mtp_flash_module
+    import fastmlx.runner as runner_module
+
+    called = []
+    monkeypatch.setattr(
+        mtp_flash_module, "load_flash_mtp", lambda *a, **k: called.append(1)
+    )
+
+    model = _fake_qwen4_exp_model()
+    args = SimpleNamespace(
+        model="fake-model", original="fake-original", mtp=None, mtp_bits=4,
+        no_mtp=True, no_fused=True,
+    )
+    runner = runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
+    assert not called
+    assert isinstance(runner, FallbackRunner)
+    assert runner.fallback_reason == _NOT_FOUND_REASON
+
+
+# ---------- build_runner: qwen4_exp の MTP 自動発見 (モデル内蔵/サイドカー) ----------
+#
+# --mtp が未指定のとき、fastmlx.runner._discover_flash_mtp_source が
+# モデルディレクトリを見て MTP を自動で見つける。実モデルは要らない —
+# 合成の index.json + 小さな safetensors シャード (モデル内蔵側) と、
+# 単体の mtp.safetensors (サイドカー側) を tmp_path に置いて検証する。
+# load_flash_mtp 自体はモック (実際の重みロード/構築ロジックは
+# fastmlx/mtp_flash.py 側の責務で、ここでは呼び出され方だけを見る)。
+
+
+def test_discover_flash_mtp_source_finds_embedded_weights_in_index(tmp_path):
+    """model.safetensors.index.json の weight_map に mtp.* キーがあれば、
+    それを含むシャードだけを読み、mtp.* テンソルだけを集めて返す
+    (同じシャードに同居する非 mtp テンソルは混ざらない)。"""
+
+    import fastmlx.runner as runner_module
+
+    shard_name = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(
+        str(tmp_path / shard_name),
+        {
+            "mtp.pre_fc_norm_embedding.weight": mx.zeros((4,)),
+            "model.embed_tokens.weight": mx.zeros((4, 4)),
+        },
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "mtp.pre_fc_norm_embedding.weight": shard_name,
+                    "model.embed_tokens.weight": shard_name,
+                }
+            }
+        )
+    )
+
+    result = runner_module._discover_flash_mtp_source(tmp_path)
+    assert result is not None
+    source_label, spec = result
+    assert source_label == "モデル内蔵"
+    assert isinstance(spec, dict)
+    assert set(spec.keys()) == {"mtp.pre_fc_norm_embedding.weight"}
+
+
+def test_discover_flash_mtp_source_finds_sidecar_file(tmp_path):
+    """index.json が無くても、モデルディレクトリ直下の mtp.safetensors が
+    あればそれをサイドカーとして返す (path 文字列、weights ではない)。"""
+
+    import fastmlx.runner as runner_module
+
+    sidecar = tmp_path / "mtp.safetensors"
+    mx.save_safetensors(str(sidecar), {"mtp.x": mx.zeros((1,))})
+
+    result = runner_module._discover_flash_mtp_source(tmp_path)
+    assert result == ("サイドカー (mtp.safetensors)", str(sidecar))
+
+
+def test_discover_flash_mtp_source_returns_none_when_nothing_found(tmp_path):
+    import fastmlx.runner as runner_module
+
+    assert runner_module._discover_flash_mtp_source(tmp_path) is None
+
+
+def test_build_runner_routes_qwen4_exp_via_embedded_mtp_weights(monkeypatch, tmp_path):
+    """--mtp 未指定でも、モデルディレクトリの safetensors シャードに
+    mtp.* テンソルがあれば自動発見して FlashSpecRunner まで到達する。
+    load_flash_mtp には path=None, weights=<集めた dict> で渡ること。"""
+
+    import fastmlx.mtp_flash as mtp_flash_module
+    import fastmlx.runner as runner_module
+
+    shard_name = "model-00001-of-00001.safetensors"
+    mx.save_safetensors(
+        str(tmp_path / shard_name),
+        {"mtp.pre_fc_norm_embedding.weight": mx.zeros((4,))},
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {"weight_map": {"mtp.pre_fc_norm_embedding.weight": shard_name}}
+        )
+    )
+
+    class DummyMTP:
+        def parameters(self):
+            return {}
+
+    captured = {}
+
+    def fake_load_flash_mtp(path, text_args, quantize=None, weights=None):
+        captured["path"] = path
+        captured["weights"] = weights
+        return DummyMTP()
+
+    monkeypatch.setattr(mtp_flash_module, "load_flash_mtp", fake_load_flash_mtp)
+
+    model = _fake_qwen4_exp_model()
+    args = SimpleNamespace(
+        model=str(tmp_path), original="fake-original", mtp=None, mtp_bits=4,
+        no_mtp=True, no_fused=True,
+    )
+    runner = runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
+    assert isinstance(runner, FlashSpecRunner)
+    assert runner.fallback_reason is None
+    assert captured["path"] is None
+    assert set(captured["weights"].keys()) == {"mtp.pre_fc_norm_embedding.weight"}
+
+
+def test_build_runner_routes_qwen4_exp_via_sidecar_file(monkeypatch, tmp_path):
+    """--mtp 未指定でも、モデルディレクトリ直下に mtp.safetensors があれば
+    自動発見してそのパスで load_flash_mtp を呼ぶ (weights= は渡さない)。"""
+
+    import fastmlx.mtp_flash as mtp_flash_module
+    import fastmlx.runner as runner_module
+
+    sidecar = tmp_path / "mtp.safetensors"
+    mx.save_safetensors(str(sidecar), {"mtp.x": mx.zeros((1,))})
+
+    class DummyMTP:
+        def parameters(self):
+            return {}
+
+    captured = {}
+
+    def fake_load_flash_mtp(path, text_args, quantize=None, weights=None):
+        captured["path"] = path
+        captured["weights"] = weights
+        return DummyMTP()
+
+    monkeypatch.setattr(mtp_flash_module, "load_flash_mtp", fake_load_flash_mtp)
+
+    model = _fake_qwen4_exp_model()
+    args = SimpleNamespace(
+        model=str(tmp_path), original="fake-original", mtp=None, mtp_bits=4,
+        no_mtp=True, no_fused=True,
+    )
+    runner = runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
+    assert isinstance(runner, FlashSpecRunner)
+    assert captured["path"] == str(sidecar)
+    assert captured["weights"] is None
+
+
+def test_build_runner_explicit_mtp_wins_over_auto_discovered_sidecar(monkeypatch, tmp_path):
+    """--mtp が明示指定されていれば、モデルディレクトリに自動発見できる
+    サイドカーがあってもそちらは一切見ない (優先順位 1 が最優先)。"""
+
+    import fastmlx.mtp_flash as mtp_flash_module
+    import fastmlx.runner as runner_module
+
+    # 自動発見されうるサイドカーを置いておく — 明示指定より優先されない
+    # ことを確認するための撒き餌
+    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), {"mtp.x": mx.zeros((1,))})
+
+    class DummyMTP:
+        def parameters(self):
+            return {}
+
+    captured = {}
+
+    def fake_load_flash_mtp(path, text_args, quantize=None, weights=None):
+        captured["path"] = path
+        captured["weights"] = weights
+        return DummyMTP()
+
+    monkeypatch.setattr(mtp_flash_module, "load_flash_mtp", fake_load_flash_mtp)
+
+    model = _fake_qwen4_exp_model()
+    args = SimpleNamespace(
+        model=str(tmp_path),
+        original="fake-original",
+        mtp="explicit-sidecar.safetensors",
+        mtp_bits=4,
+        no_mtp=False,
+        no_fused=True,
+    )
+    runner = runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
+    assert isinstance(runner, FlashSpecRunner)
+    assert captured["path"] == "explicit-sidecar.safetensors"
+
+
+def test_build_runner_falls_back_when_auto_discovered_mtp_unreadable(monkeypatch, capsys, tmp_path):
+    """自動発見 (サイドカー) の読み込みが 1 回リトライしても失敗する場合、
+    明示指定 (--mtp) とは違い exit せずフォールバックする。fallback_reason
+    は「MTP 自動発見 (...) の読み込みに失敗: ...」。"""
+
+    import fastmlx.mtp_flash as mtp_flash_module
+    import fastmlx.runner as runner_module
+
+    sidecar = tmp_path / "mtp.safetensors"
+    mx.save_safetensors(str(sidecar), {"mtp.x": mx.zeros((1,))})
+
+    calls = []
+
+    def fake_load_flash_mtp(*a, **k):
+        calls.append(1)
+        raise ValueError("corrupt sidecar")
+
+    monkeypatch.setattr(mtp_flash_module, "load_flash_mtp", fake_load_flash_mtp)
+
+    model = _fake_qwen4_exp_model()
+    args = SimpleNamespace(
+        model=str(tmp_path), original="fake-original", mtp=None, mtp_bits=4,
+        no_mtp=True, no_fused=True,
+    )
+    runner = runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
+    assert isinstance(runner, FallbackRunner)
+    assert not isinstance(runner, FlashSpecRunner)
+    assert len(calls) == 2  # 自動発見にもリトライは適用される
+    assert runner.fallback_reason.startswith(
+        "MTP 自動発見 (サイドカー (mtp.safetensors)) の読み込みに失敗:"
+    )
+    assert "corrupt sidecar" in runner.fallback_reason
+    out = capsys.readouterr().out
+    assert "再試行します" in out
+
+
+# ---------- --require-runner (server.py: _enforce_required_runner) ----------
+#
+# main() 自体は実モデルロードを伴うので直接は叩かず、main() が呼ぶ
+# _enforce_required_runner を単体でテストする。
+
+
+class _FakeRunnerForRequire:
+    def __init__(self, kind: str, fallback_reason: str | None = None):
+        self.KIND = kind
+        self.fallback_reason = fallback_reason
+
+
+def test_enforce_required_runner_noop_when_unspecified():
+    runner = _FakeRunnerForRequire("fallback", fallback_reason="whatever")
+    server._enforce_required_runner(runner, None)  # 例外なし
+
+
+def test_enforce_required_runner_noop_when_kind_matches():
+    runner = _FakeRunnerForRequire("flash_spec")
+    server._enforce_required_runner(runner, "flash_spec")  # 例外なし
+
+
+def test_enforce_required_runner_exits_on_mismatch(capsys):
+    runner = _FakeRunnerForRequire("fallback", fallback_reason="MTP が見つからない (fake)")
+    with pytest.raises(SystemExit) as exc_info:
+        server._enforce_required_runner(runner, "flash_spec")
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "--require-runner flash_spec" in out
+    assert "fallback" in out
+    assert "MTP が見つからない (fake)" in out
+
+
+def test_enforce_required_runner_exits_without_reason_detail_when_none(capsys):
+    """fallback_reason が None のミスマッチ (投機経路同士の取り違え等) でも
+    SystemExit(1) 自体は変わらず起きる — 理由の括弧書きが単に付かないだけ。"""
+
+    runner = _FakeRunnerForRequire("spec", fallback_reason=None)
+    with pytest.raises(SystemExit) as exc_info:
+        server._enforce_required_runner(runner, "flash_spec")
+    assert exc_info.value.code == 1
+    out = capsys.readouterr().out
+    assert "--require-runner flash_spec" in out
+    assert "解決された runner は spec。" in out  # 理由の括弧書きが付かない

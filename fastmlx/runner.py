@@ -28,7 +28,9 @@ __call__ をそのまま呼ぶ、つまり Flash-Next/qwen4_exp が実際に通�
 
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 from typing import Protocol
 
 import mlx.core as mx
@@ -43,9 +45,17 @@ class Runner(Protocol):
     frequency_penalty/logit_bias/seed のうちどれを ``**sampling_kwargs`` 経由
     でこの runner に渡してよいかを申告する。宣言に無いキーが指定された
     リクエストは server.py が生成呼び出し前に 400 で弾く (SpecRunner/
-    FallbackRunner のクラス docstring 参照)。"""
+    FallbackRunner のクラス docstring 参照)。
+
+    ``fallback_reason`` (str | None) は、この runner が build_runner に
+    よってフォールバック経路として選ばれた理由。フォールバック以外の経路
+    (SpecRunner/FlashSpecRunner) では常に None。server.py の /health が
+    これをそのまま出す — 「黙って fallback に落ちて気づけない」を防ぐため
+    のもの (build_runner のクラス docstring 参照)。
+    """
 
     SUPPORTED_SAMPLING_PARAMS: frozenset
+    fallback_reason: str | None
 
     def generate(
         self,
@@ -91,6 +101,7 @@ class SpecRunner:
         self.engine = engine
         self.n_draft = n_draft
         self.max_draft = max_draft
+        self.fallback_reason = None
 
     def generate(
         self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, seed=None, **extra
@@ -148,6 +159,7 @@ class FlashSpecRunner:
 
     def __init__(self, engine):
         self.engine = engine
+        self.fallback_reason = None
 
     def generate(
         self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, seed=None, **extra
@@ -266,6 +278,11 @@ class FallbackRunner:
 
     ``SUPPORTED_SAMPLING_PARAMS``: 投機の分布保証を気にする必要が無い経路
     なので、mlx_lm.sample_utils がサポートするものは全部そのまま素通しする。
+
+    ``fallback_reason``: build_runner がこの runner を選んだ理由 (str)。
+    build_runner が直接構築する場合のみ渡される — 単体テストが
+    ``FallbackRunner(model, tokenizer)`` を直接呼ぶ既存の使い方は省略時
+    None のままで壊れない。
     """
 
     KIND = "fallback"
@@ -282,9 +299,10 @@ class FallbackRunner:
         }
     )
 
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, fallback_reason: str | None = None):
         self.model = model
         self.tokenizer = tokenizer
+        self.fallback_reason = fallback_reason
 
     def generate(
         self,
@@ -406,6 +424,52 @@ class FallbackRunner:
         }
 
 
+def _discover_flash_mtp_source(model_dir: Path) -> tuple[str, dict | str] | None:
+    """qwen4_exp (Flash-Next) 用、``--mtp`` 未指定のときの MTP 自動発見。
+
+    「特化モデルが自分のアクセラレータを持ち歩く」形にして、「渡し忘れて
+    フォールバック」の穴を消すためのもの。優先順位:
+
+    1. モデル本体の safetensors シャードの中 — ``model.safetensors.index.json``
+       の ``weight_map`` に ``mtp.`` で始まるキーがあれば、それを含む
+       シャードだけを ``mx.load`` で読み、``mtp.*`` キーだけを集めて返す
+       (全シャードは読まない — 該当シャードのみに絞る)。量子化配布では
+       MTP 重みがモデル本体に同梱されているのが通例
+    2. モデルディレクトリ直下の ``mtp.safetensors`` サイドカー
+
+    見つかった場合 ``(source_label, spec)`` を返す。``spec`` は 1 のとき
+    ``dict`` (``mtp_flash.load_flash_mtp`` の ``weights=`` にそのまま渡す)、
+    2 のとき ``str`` (同 ``path``)。どちらも無ければ ``None``。
+    """
+
+    index_path = model_dir / "model.safetensors.index.json"
+    if index_path.exists():
+        try:
+            weight_map = json.loads(index_path.read_text()).get("weight_map", {})
+        except (OSError, ValueError):
+            weight_map = {}
+        shards = sorted({shard for key, shard in weight_map.items() if key.startswith("mtp.")})
+        if shards:
+            collected: dict = {}
+            for shard in shards:
+                for key, value in mx.load(str(model_dir / shard)).items():
+                    if key.startswith("mtp."):
+                        collected[key] = value
+            return ("モデル内蔵", collected)
+
+    sidecar = model_dir / "mtp.safetensors"
+    if sidecar.exists():
+        return ("サイドカー (mtp.safetensors)", str(sidecar))
+
+    return None
+
+
+#: build_runner が返しうる Runner.KIND の全値。server.py の --require-runner
+#: がこの集合を choices に使う (KIND 文字列がここと build_runner の実際の
+#: 分岐とで散らばらないようにするための唯一の定義元)。
+RUNNER_KINDS = frozenset({SpecRunner.KIND, FlashSpecRunner.KIND, FallbackRunner.KIND})
+
+
 def build_runner(
     model,
     tokenizer,
@@ -435,6 +499,30 @@ def build_runner(
     - ``SpecEngine(model, mtp)`` 構築時の ``validate_spec_model_contract``
       が投げる ``TypeError``/``ValueError``/``RuntimeError`` だけが
       「契約不一致 = 対象外」の正式なシグナル
+
+    qwen4_exp (Flash-Next) の MTP は 3 段階で探す (優先順、``_discover_flash_mtp_source``
+    参照):
+
+    1. ``--mtp PATH`` 明示指定 — 最優先。運用者の明示指定なので、読めない
+       まま黙って遅い (非投機の) 構成で起動することは「対象外」判定とは
+       別物として扱う。ロードは 1 回だけリトライし (外付け SSD 起因の一時的
+       な GPU Timeout を想定)、それでも読めなければフォールバックせず
+       ``SystemExit(1)`` で終了する — 逃げ道のフラグは無い
+    2. モデル本体の safetensors シャードの中 — ``model.safetensors.index.json``
+       の ``weight_map`` に ``mtp.`` で始まるキーがあれば、該当シャードだけ
+       読み ``mtp.*`` テンソルを集めて使う (量子化配布では MTP 重みが本体に
+       同梱されているのが通例)
+    3. モデルディレクトリ直下の ``mtp.safetensors`` サイドカー
+
+    2・3 (自動発見) の失敗は明示指定ではないので exit しない — リトライは
+    2・3 にも適用するが、それでも失敗すればフォールバックする。どれも
+    見つからなければ従来どおりフォールバック。
+
+    フォールバックした runner (``FallbackRunner``) は ``fallback_reason``
+    (str) に理由を持つ: ``"MTP が見つからない (...)"`` /
+    ``"MTP 自動発見 (<出典>) の読み込みに失敗: <理由>"`` /
+    ``"spec 契約検証に失敗: <理由>"`` のいずれか。フォールバック以外の
+    runner では ``fallback_reason`` は常に None (Runner Protocol 参照)。
     """
 
     from . import fused
@@ -452,54 +540,114 @@ def build_runner(
         print(f"{log_prefix} hyper-connections 融合カーネル有効 (moe_route/rms_norm_gated は実測で"
               " 空振りのため無効のまま)")
 
-    # Qwen3.8-Flash-Next (qwen4_exp) + --mtp サイドカー -> FlashSpecEngine 経路
-    # (docs/MTP-FLASH.md)。27B (qwen3_5) は model_type が違うので以下の分岐
-    # には一切入らず、この関数の残り (既存の SpecEngine/FallbackRunner 分岐)
-    # をそのまま通る — 27B 側の経路は変えていない。``args.mtp`` が無い
-    # cli.py 呼び出し (--mtp 引数を持たない) では getattr が None を返すので
-    # ここも自然に素通りする。
+    # Qwen3.8-Flash-Next (qwen4_exp) + MTP (明示指定 or 自動発見) ->
+    # FlashSpecEngine 経路 (docs/MTP-FLASH.md)。27B (qwen3_5) は model_type が
+    # 違うので以下の分岐には一切入らず、この関数の残り (既存の
+    # SpecEngine/FallbackRunner 分岐) をそのまま通る — 27B 側の経路は変えて
+    # いない。``args.mtp`` が無い cli.py 呼び出し (--mtp 引数を持たない) では
+    # getattr が None を返すので自動発見側に自然に落ちる。
     mtp_path = getattr(args, "mtp", None)
-    if getattr(model.args, "model_type", None) == "qwen4_exp" and mtp_path:
+    if getattr(model.args, "model_type", None) == "qwen4_exp":
         from . import mtp_flash, spec_flash
+        from mlx.utils import tree_flatten
 
-        try:
-            mtp_bits = getattr(args, "mtp_bits", None)
-            quant = {"group_size": 64, "bits": mtp_bits} if mtp_bits else None
-            mtp = mtp_flash.load_flash_mtp(mtp_path, model.args.text, quantize=quant)
-            # 壊れた重み/Metal 確保失敗はここで大声で落ちる (意図的)。ただし
-            # 一括 mx.eval にはしない: サイドカーは外付け SSD の 5.2GB を mmap
-            # で遅延読みしており、量子化カーネルを 1 つのコマンドバッファに
-            # 全部積むと USB のページフォルトで GPU が止まり Metal の watchdog
-            # (GPU Timeout Error) を毎回踏む。テンソルごとに eval を切れば
-            # 1 バッファが短くなり、読みの遅さは待ち時間になるだけで済む。
-            from mlx.utils import tree_flatten
+        mtp_bits = getattr(args, "mtp_bits", None)
+        quant = {"group_size": 64, "bits": mtp_bits} if mtp_bits else None
 
-            for _name, p in tree_flatten(mtp.parameters()):
-                mx.eval(p)
-        except Exception as exc:
-            # サイドカーの形式不一致まで含め、無理に合わせない — load_cli_mtp
-            # (27B 側) と同じ姿勢。qwen4_exp が SpecEngine (27B 用) の契約に
-            # 合わないことは既に分かっているので、以降の既存分岐へは委ねず
-            # ここで直接 FallbackRunner に倒す。
-            print(
-                f"{log_prefix} --mtp {mtp_path} (qwen4_exp) を読み込めないため無効化します "
-                f"({type(exc).__name__}: {exc}); 通常生成にフォールバックします"
+        explicit = bool(mtp_path)
+        if explicit:
+            source_label = "明示指定 (--mtp)"
+            load_path, load_weights = mtp_path, None
+        else:
+            model_dir = Path(getattr(args, "model", "") or ".")
+            discovered = _discover_flash_mtp_source(model_dir)
+            if discovered is None:
+                reason = (
+                    "MTP が見つからない (--mtp で指定するか、モデルディレクトリに"
+                    " mtp.safetensors を置く)"
+                )
+                print(f"{log_prefix} {reason} — 通常生成にフォールバックします")
+                return FallbackRunner(model, tokenizer, fallback_reason=reason)
+            source_label, spec = discovered
+            if isinstance(spec, dict):
+                load_path, load_weights = None, spec
+            else:
+                load_path, load_weights = spec, None
+            print(f"{log_prefix} MTP を自動発見: {source_label}")
+
+        mtp = None
+        last_exc: Exception | None = None
+        # ロードは最大 2 回試みる (1 回だけリトライ)。直前に GPU Timeout の
+        # 実例があり (外付け SSD の mmap 読み出し起因の一時的失敗)、テンソル
+        # ごとの eval で主因は潰したがそれでも起こり得る一時的失敗のための
+        # 保険。明示指定 (--mtp) だけでなく自動発見 (モデル内蔵/サイドカー)
+        # にも同じリトライを適用する。2 回目も失敗すれば一時的ではなく
+        # 恒久的な失敗 (パス誤り・形式不一致等) とみなす。
+        for attempt in range(2):
+            try:
+                mtp = mtp_flash.load_flash_mtp(
+                    load_path, model.args.text, quantize=quant, weights=load_weights
+                )
+                # 壊れた重み/Metal 確保失敗はここで大声で落ちる (意図的)。
+                # ただし一括 mx.eval にはしない: サイドカーは外付け SSD の
+                # 5.2GB を mmap で遅延読みしており、量子化カーネルを 1 つの
+                # コマンドバッファに全部積むと USB のページフォルトで GPU が
+                # 止まり Metal の watchdog (GPU Timeout Error) を毎回踏む。
+                # テンソルごとに eval を切れば 1 バッファが短くなり、読みの
+                # 遅さは待ち時間になるだけで済む。
+                for _name, p in tree_flatten(mtp.parameters()):
+                    mx.eval(p)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                mtp = None
+                if attempt == 0:
+                    print(
+                        f"{log_prefix} MTP ロードに失敗、再試行します: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+        if last_exc is not None:
+            if explicit:
+                # ``--mtp`` は運用者の明示指定なので、読めないまま黙って遅い
+                # (非投機の) 構成で起動することは「対象外アーキテクチャ」
+                # 判定とは別物として扱う — フォールバックせず、理由を明示
+                # して終了する。逃げ道のフラグは無い。
+                print(
+                    f"{log_prefix} --mtp {mtp_path} (qwen4_exp) を再試行しても"
+                    f"読み込めません ({type(last_exc).__name__}: {last_exc})。"
+                    " この --mtp を外せば、モデル内蔵/サイドカーの MTP を"
+                    " 自動で探す運用に切り替わります (見つからなければ MTP"
+                    " 無しで起動)。終了します。"
+                )
+                raise SystemExit(1)
+            # 自動発見 (モデル内蔵/サイドカー) の失敗は明示指定ではないので
+            # exit しない — フォールバックへ倒す。
+            reason = (
+                f"MTP 自動発見 ({source_label}) の読み込みに失敗: "
+                f"{type(last_exc).__name__}: {last_exc}"
             )
-            return FallbackRunner(model, tokenizer)
+            print(f"{log_prefix} {reason}; 通常生成にフォールバックします")
+            return FallbackRunner(model, tokenizer, fallback_reason=reason)
 
         engine = spec_flash.FlashSpecEngine(model, mtp)
         bits_note = f"{mtp_bits}bit" if mtp_bits else "bf16"
-        print(f"{log_prefix} Flash-Next 投機デコード有効 (FlashSpecEngine, MTP: あり, {bits_note})")
+        print(
+            f"{log_prefix} Flash-Next 投機デコード有効 (FlashSpecEngine, MTP: あり"
+            f" [{source_label}], {bits_note})"
+        )
         return FlashSpecRunner(engine)
 
     try:
         text_args = TextModelArgs.from_dict(model.args.text_config)
     except AttributeError as exc:
+        reason = f"spec 契約検証に失敗: text_config なし ({type(exc).__name__}: {exc})"
         print(
             f"{log_prefix} 非対応モデルにつき通常生成にフォールバック "
             f"(text_config なし: {type(exc).__name__}: {exc})"
         )
-        return FallbackRunner(model, tokenizer)
+        return FallbackRunner(model, tokenizer, fallback_reason=reason)
 
     mtp = load_cli_mtp(args.model, config, text_args, args.original, args.mtp_bits, args.no_mtp)
     if mtp is not None:
@@ -508,11 +656,12 @@ def build_runner(
     try:
         engine = SpecEngine(model, mtp)
     except (TypeError, ValueError, RuntimeError) as exc:
+        reason = f"spec 契約検証に失敗: {type(exc).__name__}: {exc}"
         print(
             f"{log_prefix} 非対応モデルにつき通常生成にフォールバック "
             f"(SpecEngine 契約検証エラー: {type(exc).__name__}: {exc})"
         )
-        return FallbackRunner(model, tokenizer)
+        return FallbackRunner(model, tokenizer, fallback_reason=reason)
 
     mtp_note = "MTP: なし" if mtp is None else "MTP: あり"
     print(f"{log_prefix} 投機デコード有効 ({mtp_note} / lookup: 有効)")
