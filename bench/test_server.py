@@ -27,7 +27,7 @@ from fastapi.testclient import TestClient
 
 import fastmlx.cli as cli_module
 import fastmlx.server as server
-from fastmlx.runner import FallbackRunner, FallbackSession, SpecRunner
+from fastmlx.runner import FallbackRunner, FallbackSession, FlashSpecRunner, SpecRunner
 from fastmlx.spec import ChatSession, SpecEngine
 
 
@@ -203,6 +203,32 @@ class FakeSpecRunner(FakeRunner):
             # SpecRunner.generate seeds MLX immediately before generation.
             # Keeping that side effect in the fake makes the HTTP forwarding
             # assertion cover the real boundary instead of only recording a kwarg.
+            mx.random.seed(extra["seed"])
+        return super().generate(
+            prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra
+        )
+
+
+class FakeFlashSpecRunner(FakeRunner):
+    """FlashSpecRunner (Qwen3.8-Flash-Next 用) を模す: seed しかサポート
+    しない。FakeSpecRunner と同じ理由 (docstring 参照) で、実物の
+    FlashSpecRunner.generate も未対応キーを ``**extra`` 経由でそのまま
+    ``FlashSpecEngine.generate_stream`` へ渡し、そちらが固定シグネチャ
+    (``**kwargs`` を持たない) なので未知のキーワード引数は TypeError で
+    落ちる。FakeRunner.generate はこれを再現しないので、ここで模す。
+    """
+
+    KIND = "flash_spec"
+    SUPPORTED_SAMPLING_PARAMS = FlashSpecRunner.SUPPORTED_SAMPLING_PARAMS
+
+    def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
+        unexpected = sorted(set(extra) - self.SUPPORTED_SAMPLING_PARAMS)
+        if unexpected:
+            raise TypeError(
+                "FlashSpecEngine.generate_stream() got an unexpected keyword "
+                f"argument '{unexpected[0]}'"
+            )
+        if "seed" in extra:
             mx.random.seed(extra["seed"])
         return super().generate(
             prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra
@@ -487,6 +513,46 @@ def test_spec_runner_allows_seed(client, monkeypatch):
     assert seeded == [7]
 
 
+# ---------- 2c. FlashSpecRunner (Qwen3.8-Flash-Next) 経路も seed 以外を 400 で弾く ----------
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"top_p": 0.9},
+        {"top_k": 10},
+        {"min_p": 0.1},
+        {"repetition_penalty": 1.1},
+        {"presence_penalty": 0.1},
+        {"frequency_penalty": 0.1},
+        {"logit_bias": {"1": 1.0}},
+    ],
+)
+def test_flash_spec_runner_rejects_unsupported_sampling_params(client, params):
+    runner = FakeFlashSpecRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    body = {"messages": [{"role": "user", "content": "hi"}], **params}
+    resp = client.post("/v1/chat/completions", json=body)
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+
+
+def test_flash_spec_runner_allows_seed(client, monkeypatch):
+    seeded = []
+    monkeypatch.setattr(mx.random, "seed", seeded.append)
+    runner = FakeFlashSpecRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "seed": 7},
+    )
+    assert resp.status_code == 200, resp.text
+    assert runner.calls[0]["seed"] == 7
+    assert seeded == [7]
+
+
 @pytest.mark.parametrize(
     ("tokens", "max_tokens", "eos_ids", "expected"),
     [
@@ -538,6 +604,10 @@ def test_fake_reusing_runner_requires_a_published_cache():
     [
         pytest.param(FakeRunner([]), FallbackSession, id="fallback"),
         pytest.param(FakeSpecRunner([]), ChatSession, id="spec"),
+        # FlashSpecRunner (Qwen3.8-Flash-Next) は KIND="flash_spec" (!= "spec")
+        # なので FallbackSession を流用する側に落ちる (fastmlx/runner.py の
+        # FlashSpecRunner docstring 参照) — server.py 側は何も変えていない。
+        pytest.param(FakeFlashSpecRunner([]), FallbackSession, id="flash_spec"),
     ],
 )
 def test_install_state_matches_production_session_type(runner, expected_factory):
@@ -816,6 +886,13 @@ def test_health_endpoint_reports_spec_runner(client):
     _install_state(runner)
     resp = client.get("/health")
     assert resp.json()["runner"] == "spec"
+
+
+def test_health_endpoint_reports_flash_spec_runner(client):
+    runner = FakeFlashSpecRunner(tokens_to_emit=[])
+    _install_state(runner)
+    resp = client.get("/health")
+    assert resp.json()["runner"] == "flash_spec"
 
 
 # ---------- 3b. バグ修正: GET/HEAD /api/hello が 404 だった ----------
@@ -4738,3 +4815,108 @@ def test_load_cli_mtp_nonexistent_path_does_not_touch_search_paths(capsys):
 
 def test_server_module_shares_mtp_path_env_var_with_cli():
     assert server.MTP_PATH_ENV == cli_module.MTP_PATH_ENV == "FASTMLX_MTP_PATH"
+
+
+# ---------- build_runner: Qwen3.8-Flash-Next (qwen4_exp) 配線 ----------
+#
+# fastmlx/runner.py の build_runner に足した分岐だけを、実モデルなしで検証
+# する。model_type/text/model.rope だけを持つ最小限のフェイクで route を
+# 確認する — 27B (qwen3_5) 側の既存分岐はここでは一切変えていない (下の
+# 「--mtp 無し」テストは、その既存分岐が最後まで正しく FallbackRunner に
+# 落ちることの回帰確認も兼ねる)。
+
+
+def _fake_qwen4_exp_model():
+    return SimpleNamespace(
+        args=SimpleNamespace(model_type="qwen4_exp", text=object(), text_config={}),
+        model=SimpleNamespace(rope=object()),
+    )
+
+
+def test_build_runner_routes_qwen4_exp_with_mtp_to_flash_spec(monkeypatch):
+    import fastmlx.mtp_flash as mtp_flash_module
+    import fastmlx.runner as runner_module
+
+    class DummyMTP:
+        def parameters(self):
+            return {}
+
+    captured = {}
+
+    def fake_load_flash_mtp(path, text_args, quantize=None):
+        captured["path"] = path
+        captured["text_args"] = text_args
+        captured["quantize"] = quantize
+        return DummyMTP()
+
+    monkeypatch.setattr(mtp_flash_module, "load_flash_mtp", fake_load_flash_mtp)
+
+    model = _fake_qwen4_exp_model()
+    args = SimpleNamespace(
+        model="fake-model",
+        original="fake-original",
+        mtp="fake-sidecar.safetensors",
+        mtp_bits=4,
+        no_mtp=False,
+        no_fused=True,
+    )
+    runner = runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
+    assert isinstance(runner, FlashSpecRunner)
+    assert runner.KIND == "flash_spec"
+    assert runner.engine.model is model
+    assert captured["path"] == "fake-sidecar.safetensors"
+    assert captured["text_args"] is model.args.text
+    assert captured["quantize"] == {"group_size": 64, "bits": 4}
+
+
+def test_build_runner_falls_back_when_flash_mtp_sidecar_unreadable(monkeypatch, capsys):
+    import fastmlx.mtp_flash as mtp_flash_module
+    import fastmlx.runner as runner_module
+
+    def fake_load_flash_mtp(*a, **k):
+        raise ValueError("bad sidecar")
+
+    monkeypatch.setattr(mtp_flash_module, "load_flash_mtp", fake_load_flash_mtp)
+
+    model = _fake_qwen4_exp_model()
+    args = SimpleNamespace(
+        model="fake-model",
+        original="fake-original",
+        mtp="bad-sidecar.safetensors",
+        mtp_bits=4,
+        no_mtp=False,
+        no_fused=True,
+    )
+    runner = runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
+    assert isinstance(runner, FallbackRunner)
+    assert not isinstance(runner, FlashSpecRunner)
+    out = capsys.readouterr().out
+    assert "bad-sidecar.safetensors" in out
+    assert "ValueError" in out
+
+
+def test_build_runner_ignores_flash_spec_route_without_mtp_path(monkeypatch):
+    """--mtp が無い呼び出し (cli.py の Namespace は ``mtp`` 属性自体を持た
+    ない) では、qwen4_exp モデルでも FlashSpecEngine 経路に入らず、既存の
+    27B 向け分岐 (SpecEngine 契約不一致 -> FallbackRunner) をそのまま通る —
+    27B 側の経路を一切変えていないことの回帰確認。"""
+
+    import fastmlx.mtp_flash as mtp_flash_module
+    import fastmlx.runner as runner_module
+
+    called = []
+    monkeypatch.setattr(
+        mtp_flash_module, "load_flash_mtp", lambda *a, **k: called.append(1)
+    )
+
+    model = _fake_qwen4_exp_model()
+    # cli.py の argparse.Namespace には --mtp が無いので、mtp 属性自体が無い
+    # (server.py の Namespace と違い getattr(args, "mtp", None) が None を返す)
+    args = SimpleNamespace(
+        model="fake-model", original="fake-original", mtp_bits=4, no_mtp=True,
+        no_fused=True,
+    )
+    runner = runner_module.build_runner(model, tokenizer=object(), config={}, args=args)
+    assert not called
+    assert isinstance(runner, FallbackRunner)
+    assert not isinstance(runner, FlashSpecRunner)

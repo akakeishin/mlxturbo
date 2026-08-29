@@ -110,6 +110,113 @@ class SpecRunner:
         )
 
 
+class FlashSpecRunner:
+    """Qwen3.8-Flash-Next (``qwen4_exp``) 向け投機デコード経路。
+
+    ``fastmlx.spec_flash.FlashSpecEngine`` (MTP を draft にした深さ1の投機、
+    GatedDeltaNet の状態捕獲/巻き戻し) をそのまま使う。27B (``qwen3_5``) 用の
+    ``SpecRunner``/``fastmlx.spec.SpecEngine`` とは別物 — モデルの層構成
+    (hyper-connections、GDN、512 expert MoE) が全く違うため、共通化はせず
+    別クラスに分けてある (docs/MTP-FLASH.md 参照)。
+
+    session は ``FallbackSession`` (``.cache`` 単数形 / ``.processed``) を
+    そのまま流用する: Flash-Next も GDN ハイブリッドで線形状態を途中位置へ
+    巻き戻せないため、``FallbackRunner`` と同じく「新プロンプトが処理済み列
+    の純粋な追記のときだけ再利用、それ以外は新規に作り直す」の2択に倒す
+    (``fastmlx.spec.ChatSession`` が持つ checkpoint 経由の部分再利用は実装
+    しない — ``FallbackSession`` に ``.checkpoints`` が無いので
+    ``server.py`` の ``_select_session`` 側でも自然に不発になり、常に安全側
+    の「新規スロットへ倒す」に帰着する)。``KIND`` が ``"spec"`` ではない
+    ため、``server.py``/``cli.py`` の ``session_factory`` 選択
+    (``ChatSession if KIND == "spec" else FallbackSession``) はここを変えず
+    そのまま ``FallbackSession`` を選ぶ。
+
+    ``SUPPORTED_SAMPLING_PARAMS``: ``SpecRunner`` と同じ理由で ``seed`` のみ
+    宣言する。temperature>0 は ``FlashSpecEngine.generate_stream`` が検証
+    forward の位置0/1の logits から直接サンプルする形で対応済みだが、
+    top_p/top_k/repetition_penalty 等でロジットを書き換えると target 分布
+    そのものが変わってしまい、この経路の温度サンプリングが前提にしている
+    「生の softmax(logits/temp) からサンプルする」ことと整合しなくなる。
+    ``SpecRunner`` と同様、対応するための再導出はこのタスクの範囲外と判断し、
+    (b) 案: server.py 側で 400 を返して弾く。``generate_stream`` 自身も
+    ``**extra`` を持たない固定シグネチャなので、万一ここへ未対応キーが
+    素通りしてきても TypeError で落ちる (二重の防御、``SpecRunner`` と同型)。
+    """
+
+    KIND = "flash_spec"
+    SUPPORTED_SAMPLING_PARAMS = frozenset({"seed"})
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def generate(
+        self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, seed=None, **extra
+    ):
+        if seed is not None:
+            mx.random.seed(seed)
+
+        # FallbackRunner.generate と同じ LCP (最長共通接頭辞) 契約: 既存
+        # session の処理済み列全体が新プロンプトの接頭辞になっているときだけ
+        # cache を再利用する。GDN ハイブリッドの部分巻き戻しは行わない
+        # (FallbackSession/このクラスの docstring 参照)。
+        prompt_cache = None
+        reused = 0
+        if session is not None:
+            if session.cache is not None:
+                pl = session.processed
+                n = min(len(pl), len(prompt_ids))
+                lcp = 0
+                while lcp < n and pl[lcp] == prompt_ids[lcp]:
+                    lcp += 1
+                if lcp == len(pl) and lcp < len(prompt_ids):
+                    prompt_cache = session.cache
+                    reused = lcp
+                    # session.cache を以後このローカル変数が所有する。生成中の
+                    # 例外はここから先、publish() されるまで公開 session を
+                    # invalid のままにする (FallbackRunner と同じ理由)。
+                    session.invalidate()
+            if prompt_cache is None:
+                prompt_cache = self.engine.model.make_cache()
+
+        remaining_prompt = prompt_ids[reused:]
+        ids = mx.array(remaining_prompt)[None]
+
+        tokens: list[int] = []
+        t0 = time.perf_counter()
+        ttft = None
+        accepted = rounds = 0
+        gen = self.engine.generate_stream(
+            ids, max_tokens, caches=prompt_cache, temp=temp, eos_ids=eos_ids, **extra
+        )
+        try:
+            while True:
+                step_tokens = next(gen)
+                if ttft is None:
+                    ttft = time.perf_counter() - t0
+                tokens.extend(step_tokens)
+                if on_tokens:
+                    on_tokens(step_tokens)
+        except StopIteration as stop:
+            if stop.value is not None:
+                accepted, rounds = stop.value
+        decode_time = time.perf_counter() - t0 - (ttft or 0.0)
+        n_decode = max(len(tokens) - 1, 0)
+        if session is not None:
+            session.publish(prompt_cache, list(prompt_ids) + tokens)
+        return {
+            "tokens": tokens,
+            "ttft_s": ttft or 0.0,
+            "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
+            "prefill_reused": reused,
+            "prefill_new": len(prompt_ids) - reused,
+            # fastmlx.spec.SpecEngine.generate と同じ定義 (n_decode/steps):
+            # プレフィルが生んだ最初の1トークンを除いた、反復あたりの実効
+            # トークン数。rounds==0 (max_tokens<=1でループが一度も回らない)
+            # なら SpecEngine と同じく 0.0 とする。
+            "tokens_per_step": (n_decode / rounds) if rounds else 0.0,
+        }
+
+
 class FallbackSession:
     """FallbackRunner 用の会話ごとの mlx_lm prompt_cache 入れ物。
 
@@ -344,6 +451,46 @@ def build_runner(
         fused.enable_hyper_connection_kernel()
         print(f"{log_prefix} hyper-connections 融合カーネル有効 (moe_route/rms_norm_gated は実測で"
               " 空振りのため無効のまま)")
+
+    # Qwen3.8-Flash-Next (qwen4_exp) + --mtp サイドカー -> FlashSpecEngine 経路
+    # (docs/MTP-FLASH.md)。27B (qwen3_5) は model_type が違うので以下の分岐
+    # には一切入らず、この関数の残り (既存の SpecEngine/FallbackRunner 分岐)
+    # をそのまま通る — 27B 側の経路は変えていない。``args.mtp`` が無い
+    # cli.py 呼び出し (--mtp 引数を持たない) では getattr が None を返すので
+    # ここも自然に素通りする。
+    mtp_path = getattr(args, "mtp", None)
+    if getattr(model.args, "model_type", None) == "qwen4_exp" and mtp_path:
+        from . import mtp_flash, spec_flash
+
+        try:
+            mtp_bits = getattr(args, "mtp_bits", None)
+            quant = {"group_size": 64, "bits": mtp_bits} if mtp_bits else None
+            mtp = mtp_flash.load_flash_mtp(mtp_path, model.args.text, quantize=quant)
+            # 壊れた重み/Metal 確保失敗はここで大声で落ちる (意図的)。ただし
+            # 一括 mx.eval にはしない: サイドカーは外付け SSD の 5.2GB を mmap
+            # で遅延読みしており、量子化カーネルを 1 つのコマンドバッファに
+            # 全部積むと USB のページフォルトで GPU が止まり Metal の watchdog
+            # (GPU Timeout Error) を毎回踏む。テンソルごとに eval を切れば
+            # 1 バッファが短くなり、読みの遅さは待ち時間になるだけで済む。
+            from mlx.utils import tree_flatten
+
+            for _name, p in tree_flatten(mtp.parameters()):
+                mx.eval(p)
+        except Exception as exc:
+            # サイドカーの形式不一致まで含め、無理に合わせない — load_cli_mtp
+            # (27B 側) と同じ姿勢。qwen4_exp が SpecEngine (27B 用) の契約に
+            # 合わないことは既に分かっているので、以降の既存分岐へは委ねず
+            # ここで直接 FallbackRunner に倒す。
+            print(
+                f"{log_prefix} --mtp {mtp_path} (qwen4_exp) を読み込めないため無効化します "
+                f"({type(exc).__name__}: {exc}); 通常生成にフォールバックします"
+            )
+            return FallbackRunner(model, tokenizer)
+
+        engine = spec_flash.FlashSpecEngine(model, mtp)
+        bits_note = f"{mtp_bits}bit" if mtp_bits else "bf16"
+        print(f"{log_prefix} Flash-Next 投機デコード有効 (FlashSpecEngine, MTP: あり, {bits_note})")
+        return FlashSpecRunner(engine)
 
     try:
         text_args = TextModelArgs.from_dict(model.args.text_config)
