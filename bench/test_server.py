@@ -348,6 +348,9 @@ def _install_state(runner, tokenizer=None, **overrides) -> server.ModelState:
         max_queue=overrides.get("max_queue", 8),
         queue_depth=overrides.get("queue_depth", 0),
         version=overrides.get("version", "0.0.0-test"),
+        downgrade_runner=overrides.get("downgrade_runner"),
+        response_store=overrides.get("response_store", OrderedDict()),
+        max_stored_responses=overrides.get("max_stored_responses", 50),
     )
     server.STATE = state
     return state
@@ -2112,7 +2115,7 @@ def test_stream_cancel_wakes_blocking_queue_get_with_internal_sentinel():
             raise AssertionError("cancel callback must stop before this line")
 
     state = _install_state(PrefillBlockingRunner([]))
-    q, future, cancel_event = server._start_generation([1, 2, 3], 8, 0.0, None)
+    q, future, cancel_event, _raw_token_count = server._start_generation([1, 2, 3], 8, 0.0, None)
     assert started.wait(1)
 
     cancel_event.set()
@@ -3027,7 +3030,11 @@ def test_protocol_error_envelopes_include_required_metadata(client):
     assert anthropic.headers["request-id"] == request_id
 
 
-def test_responses_previous_response_id_is_400(client):
+def test_responses_unknown_previous_response_id_is_404(client):
+    """項目 15: previous_response_id はもう黙って 400 にしない — 保存済み
+    LRU (STATE.response_store) に無い id だけ 404 になる (OpenAI 準拠、
+    _check_model_openai の model_not_found と同じ流儀)。"""
+
     tok = FakeTokenizer(vocab={10: "ok"})
     runner = FakeRunner(tokens_to_emit=[10])
     _install_state(runner, tokenizer=tok)
@@ -3036,22 +3043,87 @@ def test_responses_previous_response_id_is_400(client):
         "/v1/responses",
         json={"model": "test-model", "input": "hi", "previous_response_id": "resp_123"},
     )
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 404, resp.text
     assert not runner.calls
-    assert "previous_response_id" in resp.json()["error"]["message"]
+    assert "resp_123" in resp.json()["error"]["message"]
+    assert resp.json()["error"]["code"] == "response_not_found"
 
 
-def test_responses_store_true_is_400(client):
+def test_responses_store_true_round_trips_with_previous_response_id(client):
+    """項目 15: store:true で保存した応答の id を次ターンの
+    previous_response_id に渡すと、保存しておいた会話 (今回の input + この
+    応答の output) が次ターンの新しい input の前に連結されて
+    apply_chat_template へ渡る — クライアントは全文を送り直さなくてよい。"""
+
     tok = FakeTokenizer(vocab={10: "ok"})
     runner = FakeRunner(tokens_to_emit=[10])
     _install_state(runner, tokenizer=tok)
 
-    resp = client.post(
+    first = client.post(
         "/v1/responses",
         json={"model": "test-model", "input": "hi", "store": True},
     )
-    assert resp.status_code == 400, resp.text
-    assert not runner.calls
+    assert first.status_code == 200, first.text
+    resp_id = first.json()["id"]
+    assert resp_id
+    assert "downgrade_reason" not in first.json()
+
+    second = client.post(
+        "/v1/responses",
+        json={
+            "model": "test-model",
+            "input": "again",
+            "previous_response_id": resp_id,
+        },
+    )
+    assert second.status_code == 200, second.text
+    assert len(runner.calls) == 2
+    messages = tok.last_apply_chat_template_kwargs["messages"]
+    assert messages == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": "again"},
+    ]
+
+
+def test_responses_store_defaults_to_no_previous_response_id_available(client):
+    """store を指定しない (既定 False) 応答の id は previous_response_id
+    として使えない — LRU に積まれていないので 404 になる。"""
+
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    first = client.post("/v1/responses", json={"model": "test-model", "input": "hi"})
+    assert first.status_code == 200, first.text
+    resp_id = first.json()["id"]
+
+    second = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "again", "previous_response_id": resp_id},
+    )
+    assert second.status_code == 404, second.text
+
+
+def test_responses_stored_lru_evicts_oldest(client):
+    """保持数の上限 (--max-stored-responses) を超えたら最も古いものを
+    追い出す。"""
+
+    tok = FakeTokenizer(vocab={10: "ok"})
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok, max_stored_responses=1)
+
+    first = client.post(
+        "/v1/responses", json={"model": "test-model", "input": "hi", "store": True}
+    )
+    first_id = first.json()["id"]
+    client.post("/v1/responses", json={"model": "test-model", "input": "bye", "store": True})
+
+    resp = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "again", "previous_response_id": first_id},
+    )
+    assert resp.status_code == 404, resp.text
 
 
 def test_responses_reasoning_effort_produces_reasoning_output_item(client):
@@ -6020,3 +6092,468 @@ def test_positive_int_rejects_zero_session_capacity(value):
 
 def test_positive_int_accepts_valid_session_capacity():
     assert server._positive_int("8") == 8
+
+
+# ---------- Kimi K3 レビュー 項目 14: /v1/embeddings は 501 で明示 ----------
+
+
+def test_embeddings_endpoint_returns_501(client):
+    runner = FakeRunner(tokens_to_emit=[])
+    _install_state(runner)
+
+    resp = client.post("/v1/embeddings", json={"model": "test-model", "input": "hi"})
+    assert resp.status_code == 501, resp.text
+    assert resp.json()["error"]["code"] == "not_implemented"
+
+
+# ---------- Kimi K3 レビュー 項目 7: 非恒等サンプリングパラメータのリクエスト単位降格 ----------
+
+
+def test_spec_runner_downgrades_non_identity_sampling_params_instead_of_400(client):
+    """STATE.downgrade_runner が使えるとき、SpecRunner 経路への非恒等値
+    (top_p=0.9) はもう 400 にならず、そのリクエストだけ downgrade_runner
+    (FallbackRunner 相当) へ処理が回る。主 runner (spec) は一切呼ばれない。"""
+
+    primary = FakeSpecRunner(tokens_to_emit=[10])
+    downgrade = FakeRunner(tokens_to_emit=[11])
+    tok = FakeTokenizer(vocab={10: "spec-out", 11: "fallback-out"})
+    _install_state(primary, tokenizer=tok, downgrade_runner=downgrade)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "top_p": 0.9},
+    )
+    assert resp.status_code == 200, resp.text
+    assert not primary.calls
+    assert len(downgrade.calls) == 1
+    assert downgrade.calls[0]["top_p"] == 0.9
+    body = resp.json()
+    assert body["choices"][0]["message"]["content"] == "fallback-out"
+    assert "downgrade_reason" in body
+    assert "top_p" in body["downgrade_reason"]
+
+
+def test_spec_runner_identity_values_still_use_primary_runner_when_downgrade_available(client):
+    """downgrade_runner が構成されていても、恒等値 (top_p=1.0) は従来どおり
+    主 runner (投機経路) のまま — 降格は非恒等値のときだけ。"""
+
+    primary = FakeSpecRunner(tokens_to_emit=[10])
+    downgrade = FakeRunner(tokens_to_emit=[11])
+    tok = FakeTokenizer(vocab={10: "spec-out", 11: "fallback-out"})
+    _install_state(primary, tokenizer=tok, downgrade_runner=downgrade)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "top_p": 1.0},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(primary.calls) == 1
+    assert not downgrade.calls
+    assert "downgrade_reason" not in resp.json()
+
+
+def test_flash_spec_runner_downgrades_on_anthropic_route_too(client):
+    """項目 7 の降格は OpenAI 経路専用ではない — Anthropic 経路でも同じ
+    resolver (_resolve_runner_for_request) を通る。"""
+
+    primary = FakeFlashSpecRunner(tokens_to_emit=[10])
+    downgrade = FakeRunner(tokens_to_emit=[11])
+    tok = FakeTokenizer(vocab={10: "spec-out", 11: "fallback-out"})
+    _install_state(primary, tokenizer=tok, downgrade_runner=downgrade)
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_k": 5,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert not primary.calls
+    assert len(downgrade.calls) == 1
+    assert downgrade.calls[0]["top_k"] == 5
+
+
+def test_spec_runner_still_400s_without_a_downgrade_runner(client):
+    """downgrade_runner が無い (main() がそもそも用意しない = STATE.runner が
+    既に fallback のとき) 構成では、既存どおり 400 のまま — 降格の安全網
+    が無い場合まで黙って何かへ回したりしない。"""
+
+    runner = FakeSpecRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))  # downgrade_runner=None (既定)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "top_p": 0.9},
+    )
+    assert resp.status_code == 400, resp.text
+
+
+def test_spec_runner_downgrade_streaming_sets_response_header(client):
+    """ストリーミング経路では per-chunk の JSON スキーマを変えず、HTTP
+    ヘッダで降格を示す。"""
+
+    primary = FakeSpecRunner(tokens_to_emit=[10])
+    downgrade = FakeRunner(tokens_to_emit=[10, 999])
+    tok = FakeTokenizer(vocab={10: "hi"}, eos_token_ids=(999,))
+    _install_state(primary, tokenizer=tok, downgrade_runner=downgrade)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": 0.9,
+            "stream": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert "X-Mlxturbo-Downgrade-Reason" in resp.headers
+    assert not primary.calls
+    assert downgrade.calls
+
+
+def test_spec_runner_downgrade_does_not_touch_session_pool(client):
+    """降格したリクエストは session=None で渡る (ChatSession/FallbackSession
+    の型不一致を避けるため) — session_pool は一切増えない。"""
+
+    primary = FakeSpecRunner(tokens_to_emit=[10])
+    downgrade = FakeRunner(tokens_to_emit=[11])
+    tok = FakeTokenizer(vocab={10: "spec-out", 11: "fallback-out"})
+    pool = OrderedDict()
+    _install_state(primary, tokenizer=tok, downgrade_runner=downgrade, session_pool=pool)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "top_p": 0.9},
+    )
+    assert resp.status_code == 200, resp.text
+    assert downgrade.calls[0]["session"] is None if "session" in downgrade.calls[0] else True
+    assert len(pool) == 0
+
+
+# ---------- Kimi K3 レビュー 項目 8: response_format を黙殺しない ----------
+
+
+@pytest.mark.parametrize("rf", [{"type": "json_object"}, {"type": "json_schema"}])
+def test_response_format_non_text_is_400(client, rf):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "response_format": rf},
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+    assert "response_format" in resp.json()["error"]["message"]
+
+
+def test_response_format_text_is_allowed(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "text"},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert runner.calls
+
+
+def test_response_format_omitted_is_allowed(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+# ---------- Kimi K3 レビュー 項目 18: stop 文字列のトークン単位 early-stop ----------
+
+
+class _StopWatchingRunner(FakeRunner):
+    """``tokens_to_emit`` を「1 要素 = 1 回の on_tokens 呼び出し (1 デコード
+    ラウンド)」の token id リストのリストとして解釈する (通常の FakeRunner は
+    1 トークン = 1 呼び出し固定)。投機デコードの 1 ラウンドが複数トークンを
+    まとめて確定させるのと同じ形にしないと、stop 文字列がラウンドの境目を
+    跨いだときの既存の _find_stop 切り詰めロジック (今回変更していない部分)
+    を正しく再現できない — 1 文字ずつ別々の on_tokens 呼び出しで届けると、
+    マーカーの前半が「まだ一致と分かっていない」時点で別チャンクとして
+    クライアントへ流れてしまい、この既存ロジック自体の仕様と噛み合わない
+    (項目 18 が変えたのは打ち切りの早さだけで、この切り詰めロジック自体は
+    対象外)。
+
+    stop 一致後の cancel_event.set() が実際に generate() を打ち切ることは、
+    「用意したラウンド全部を処理せずに終わる」(= 呼び出し側が検証する
+    res["tokens"]/実際に呼ばれた回数) で確認する。
+    """
+
+    rounds_processed = 0
+
+    def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
+        self.calls.append({"prompt_ids": list(prompt_ids), **extra})
+        emitted: list[int] = []
+        for batch in self.tokens_to_emit:
+            if len(emitted) >= max_tokens:
+                break
+            emitted.extend(batch)
+            self.rounds_processed += 1
+            on_tokens(list(batch))  # cancel_event が立っていればここで例外が飛ぶ
+            if any(t in eos_ids for t in batch):
+                break
+            # 実機の 1 デコードラウンドは実時間がかかる (GPU forward) ので、
+            # その間に非同期側の consumer が queue を追いついて処理し、stop
+            # 一致を検出して cancel_event.set() する猶予がある。この fake は
+            # メモリ操作だけで即座に全ラウンドを queue へ積んでしまうと
+            # consumer が追いつく前に生成が終わってしまい、早期打ち切りその
+            # ものを検証できない — ラウンド間に短い sleep を挟んで、実機と
+            # 同じ「producer と consumer が競走する」状況を作る。
+            time.sleep(0.005)
+        return {
+            "tokens": emitted,
+            "ttft_s": 0.001,
+            "decode_tps": 100.0,
+            "prefill_reused": self.prefill_reused,
+            "prefill_new": len(prompt_ids) - self.prefill_reused,
+            "tokens_per_step": 1.0,
+        }
+
+
+def _stop_marker_token_batches(
+    marker: str, tail_rounds: int = 40
+) -> tuple[list[list[int]], dict[int, str], int]:
+    """"a" / "b" / <marker、1トークンで> / "c" (1ラウンド1文字) x
+    tail_rounds、という「ラウンドごとの token id リスト」を作る。marker の
+    後ろに大量のラウンドを積んでおき、early-stop が効かなければ全部処理
+    されてしまう形にする。戻り値は (batches, vocab, total_token_count)。
+
+    marker は 1 トークンで表す (1 文字にする) — ThinkingRouter.feed は
+    on_tokens に何個まとめて渡されても content_delta を 1 トークン=1
+    セグメント単位でキューに積む (tool_enabled=False でも content_detok.
+    add_token を 1 トークンずつ呼ぶ実装) ため、複数トークンにまたがる stop
+    文字列は「マーカー全体が既知になった時点で、既に一部が別の (直前の)
+    content_delta として転送済み」になり得る。これは _find_stop の切り詰め
+    ロジック自体の話で項目 18 (打ち切りの早さ) の対象外 — このテストは
+    早期打ち切りだけを見るので、その既存の切り詰めロジックが素直に扱える
+    「1 トークンに収まる marker」で構成する。
+    """
+
+    vocab: dict[int, str] = {}
+    next_id = 0
+
+    def new_id(ch: str) -> int:
+        nonlocal next_id
+        i = next_id
+        next_id += 1
+        vocab[i] = ch
+        return i
+
+    assert len(marker) == 1, "marker は 1 トークン (1 文字) で表せる長さにすること"
+    batches = [[new_id("a")], [new_id("b")], [new_id(marker)]]
+    batches.extend([new_id("c")] for _ in range(tail_rounds))
+    total = sum(len(b) for b in batches)
+    return batches, vocab, total
+
+
+def test_chat_completions_stream_stop_cancels_generation_early(client):
+    marker = "!"
+    batches, vocab, total = _stop_marker_token_batches(marker)
+    runner = _StopWatchingRunner(tokens_to_emit=batches)
+    tok = FakeTokenizer(vocab=vocab)
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "stop": [marker],
+            "max_tokens": total,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    events = _sse_events(resp.text)
+    content = "".join(
+        e["choices"][0]["delta"].get("content", "")
+        for e in events
+        if e.get("choices") and "delta" in e["choices"][0]
+    )
+    assert content == "ab"
+    finish_reasons = [
+        e["choices"][0]["finish_reason"]
+        for e in events
+        if e.get("choices") and e["choices"][0].get("finish_reason")
+    ]
+    assert finish_reasons[-1] == "stop"
+    # 早期打ち切りの核心: マーカーの後ろに 40 ラウンドぶんの 'c' を用意した
+    # (= 用意した全ラウンドを消化していれば rounds_processed は 43 になる)
+    # が、cancel_event.set() で打ち切られるので明らかにそれより少ない —
+    # マーカーを検出したラウンドの次のラウンドで即座に止まる。
+    assert runner.rounds_processed < len(batches)
+    assert runner.rounds_processed <= 4  # a, b, marker, 最初の 'c' の直前で停止
+
+
+def test_anthropic_stream_stop_sequence_cancels_generation_early(client):
+    marker = "!"
+    batches, vocab, total = _stop_marker_token_batches(marker)
+    runner = _StopWatchingRunner(tokens_to_emit=batches)
+    tok = FakeTokenizer(vocab=vocab)
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": total,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "stop_sequences": [marker],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    events = _sse_events(resp.text)
+    text = "".join(
+        e["delta"]["text"]
+        for e in events
+        if e.get("type") == "content_block_delta" and e["delta"].get("type") == "text_delta"
+    )
+    assert text == "ab"
+    stop_reasons = [e["delta"]["stop_reason"] for e in events if e.get("type") == "message_delta"]
+    assert stop_reasons[-1] == "stop_sequence"
+    assert runner.rounds_processed < len(batches)
+
+
+def test_completions_legacy_stream_stop_cancels_generation_early(client):
+    marker = "!"
+    batches, vocab, total = _stop_marker_token_batches(marker)
+    runner = _StopWatchingRunner(tokens_to_emit=batches)
+    tok = FakeTokenizer(vocab=vocab)
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/completions",
+        json={
+            "model": "test-model",
+            "prompt": "hi",
+            "stream": True,
+            "stop": [marker],
+            "max_tokens": total,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    events = _sse_events(resp.text)
+    text = "".join(e["choices"][0]["text"] for e in events if e.get("choices"))
+    assert text == "ab"
+    finish_reasons = [
+        e["choices"][0]["finish_reason"]
+        for e in events
+        if e.get("choices") and e["choices"][0].get("finish_reason")
+    ]
+    assert finish_reasons[-1] == "stop"
+    assert runner.rounds_processed < len(batches)
+
+
+def test_stream_stop_without_match_runs_to_completion(client):
+    """一致しなければ従来どおり最後まで回る (early-stop の副作用で結果が
+    変わっていないことの対照実験)。"""
+
+    runner = FakeRunner(tokens_to_emit=[10, 11, 999])
+    tok = FakeTokenizer(vocab={10: "a", 11: "b"}, eos_token_ids=(999,))
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+            "stop": ["never-appears"],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    events = _sse_events(resp.text)
+    content = "".join(
+        e["choices"][0]["delta"].get("content", "")
+        for e in events
+        if e.get("choices") and "delta" in e["choices"][0]
+    )
+    assert content == "ab"
+
+
+# ---------- Kimi K3 レビュー 項目 16: Anthropic usage のキャッシュフィールド ----------
+
+
+def test_anthropic_usage_maps_prefill_reused_to_cache_read_input_tokens(client):
+    runner = FakeReusingRunner(reply_tokens=[10, 999])
+    tok = FakeTokenizer(vocab={10: "hi"}, eos_token_ids=(999,))
+    _install_state(runner, tokenizer=tok)
+
+    session_key = next(server.STATE.session_key_seq)
+    session = FallbackSession()
+    session.cache = object()
+    session.processed = [1, 2, 3]
+    server.STATE.session_pool[session_key] = session
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    usage = resp.json()["usage"]
+    assert usage["cache_read_input_tokens"] >= 0
+    assert "cache_creation_input_tokens" in usage
+    assert usage["input_tokens"] + usage["cache_read_input_tokens"] >= 0
+
+
+def test_anthropic_usage_always_includes_cache_fields_even_when_zero(client):
+    """再利用が無い (cold) ターンでも、フィールド自体は常に出す —
+    「対応しているが今回は 0 件」と「対応していない」を区別しない
+    (_usage_dict/_anthropic_usage 共通の方針)。"""
+
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "hi"}))
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    usage = resp.json()["usage"]
+    assert usage["cache_read_input_tokens"] == 0
+    assert usage["cache_creation_input_tokens"] == usage["input_tokens"]
+
+
+def test_anthropic_cache_control_on_system_block_is_accepted_and_ignored(client):
+    """項目 16: cache_control 自体は読まない (無視する) — 少なくとも 400 に
+    はならず、system テキストはそのまま反映される。"""
+
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "hi"}))
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "system": [
+                {"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}}
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status_code == 200, resp.text

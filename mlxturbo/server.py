@@ -100,7 +100,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ._mlx_compat import mlx_lm_load
 from .cli import MTP_PATH_ENV
-from .runner import RUNNER_KINDS, FallbackSession, Runner, build_runner
+from .runner import RUNNER_KINDS, FallbackRunner, FallbackSession, Runner, build_runner
 from .spec import PREFILL_STEP_SIZE, ChatSession, restore_untrimmable_caches
 
 app = FastAPI()
@@ -266,6 +266,20 @@ class ModelState:
     max_queue: int = 8
     queue_depth: int = 0
     version: str = ""
+    # STATE.runner が投機系 (SpecRunner/FlashSpecRunner) のとき、非恒等な
+    # サンプリングパラメータや logprobs を要求されたリクエストだけをこの
+    # runner (非投機の FallbackRunner) へその場で降格させる。400 で拒否する
+    # 代わりに、投機デコードの分布保証を「投機を使わない」ことで守ったまま
+    # 処理する (_resolve_runner_for_request 参照)。STATE.runner が既に
+    # fallback のとき (build_runner が起動時に自動フォールバックした場合)
+    # は降格が要らないので None のまま。
+    downgrade_runner: "Runner | None" = None
+    # /v1/responses の store:true で保存する応答の LRU (項目 15)。キーは
+    # response id、値は _ResponseRecord。永続化はしない — プロセス再起動で
+    # 全て失われる (このサーバーは元々レスポンスを永続化しない設計、
+    # server.py 冒頭の docstring 参照)。上限は --max-stored-responses。
+    response_store: "OrderedDict[str, object]" = field(default_factory=OrderedDict)
+    max_stored_responses: int = 50
 
 
 STATE: ModelState | None = None
@@ -1776,7 +1790,8 @@ def _parse_sampling_params(body: dict) -> tuple[dict, str | None]:
 # 例えば top_p=1.0 は確率質量を 100% 残すので分布を変えない。SpecRunner が
 # SUPPORTED_SAMPLING_PARAMS に挙げていないキーでも、実際に渡ってきた値が
 # ここに列挙された恒等値なら投機デコードの分布保証を何も脅かさないので、
-# _check_and_strip_sampling_params は 400 で弾かない。マジックナンバーを条件式へ散らさず
+# _resolve_runner_for_request は 400 で弾かない (恒等値でない場合はリクエスト
+# 単位降格、項目 7 参照)。マジックナンバーを条件式へ散らさず
 # ここへ集約する。logit_bias は「None または空 dict」が恒等値なので、
 # 値そのものではなく _is_identity_sampling_value 側で特別扱いする。
 #
@@ -1805,51 +1820,80 @@ def _is_identity_sampling_value(name: str, value) -> bool:
     return value in _IDENTITY_SAMPLING_VALUES.get(name, ())
 
 
-def _check_and_strip_sampling_params(params: dict) -> str | None:
-    """現在の Runner (SpecRunner/FallbackRunner) が受け付けないサンプリング
-    パラメータが、かつ分布を変える値で指定されていれば、理由付きのエラー
-    文字列を返す。値が恒等値 (例: top_p=1.0, frequency_penalty=0.0) なら
-    キーが SUPPORTED_SAMPLING_PARAMS に無くても分布を変えないため 400 には
-    しない — opencode や OpenAI SDK など、既定値をキー付きで送ってくる実
-    クライアントが spec runner のモデルを使えなくなることを避けるため。
-    SpecRunner が非恒等値を弾く理由は mlxturbo/runner.py の SpecRunner
-    docstring (Block Verification の分布保証との関係) を参照。
+def _resolve_runner_for_request(
+    params: dict, *, logprobs_requested: bool = False
+) -> tuple[object, str | None, str | None]:
+    """このリクエストで実際に使う runner を決める。戻り値は
+    ``(runner, downgrade_reason, error)``。
 
-    副作用: エラーを返さずに通す場合、``params`` を破壊的に書き換えて、
-    「runner がサポートしないが恒等値なので通したキー」を削除する。
-    SpecEngine.generate() のように **kwargs を持たない generate() へ
-    そのまま渡すと未知のキーワード引数で TypeError (-> 500) になるため —
-    「無変換」という意味を、そのキーを一切渡さないことで正確に表現する。
-    呼び出し側は 4 箇所あるが、ここで dict を直接変更することで各所に
-    ストリップ処理を書かずに済ませる。
+    現在の ``STATE.runner`` (SpecRunner/FlashSpecRunner) が受け付けない
+    非恒等サンプリングパラメータ (例: top_p=0.9) や logprobs が指定された
+    場合、以前は 400 で拒否していた (Kimi K3 レビュー項目 7)。実クライアント
+    (opencode/OpenAI SDK 等) は top_p 等を既定値以外でも普通に送ってくるため、
+    投機デコード対応モデルというだけでいきなり弾かれる体験になっていた。
+
+    ここでは 400 にする代わりに、``STATE.downgrade_runner`` (main() が
+    起動時に用意した非投機の FallbackRunner、runner.py 参照) が使えるなら
+    このリクエストだけそちらへ降格する。投機デコードの分布保証
+    (SpecRunner/FlashSpecRunner docstring 参照) は「投機を使わない」ことで
+    自明に守られるので、値そのものを正しく反映したまま処理できる —
+    黙って降格するのではなく、理由をサーバーログへ出す (呼び出し側は
+    これをレスポンスにも乗せること。「黙って fallback に落ちて気づけない」
+    を防ぐ、このリポジトリ全体の方針 — build_runner の fallback_reason と
+    同じ考え方)。
+
+    降格しなかった場合の副作用は元の _check_and_strip_sampling_params と
+    同じ: ``params`` を破壊的に書き換え、現 runner がサポートしないが恒等値
+    なので通すキーを削除する (SpecEngine.generate() 等、**kwargs を持たない
+    generate() への型不一致な引数漏れを防ぐ)。
+
+    降格もできない (= STATE.downgrade_runner が無い。起動時に既に fallback
+    だったモデルでは常にこの経路) のに非恒等値が来た場合だけ、旧来どおり
+    400 相当のエラー文字列を返す — 通常は起こらない (fallback runner は
+    全キーをサポート宣言しているため) が、将来別の runner 種別が増えたとき
+    の安全網として残す。
     """
 
-    if not params:
-        return None
     supported = getattr(STATE.runner, "SUPPORTED_SAMPLING_PARAMS", frozenset())
     unrecognized = set(params) - supported
-    if not unrecognized:
-        return None
     non_identity = sorted(
         name for name in unrecognized if not _is_identity_sampling_value(name, params[name])
     )
+    needs_downgrade = bool(non_identity) or logprobs_requested
+    if needs_downgrade and STATE.downgrade_runner is not None:
+        triggers = list(non_identity)
+        if logprobs_requested:
+            triggers.append("logprobs")
+        kind = getattr(STATE.runner, "KIND", type(STATE.runner).__name__)
+        reason = (
+            f"non-default sampling parameter(s)/logprobs ({', '.join(triggers)}) are "
+            f"incompatible with the '{kind}' speculative-decoding runner's exact-"
+            "distribution guarantee; this request was transparently downgraded to "
+            "non-speculative ('fallback') generation instead of being rejected"
+        )
+        print(f"[mlxturbo-serve] request downgraded to non-speculative generation: {reason}")
+        return STATE.downgrade_runner, reason, None
+    if not unrecognized:
+        return STATE.runner, None, None
     if non_identity:
         kind = getattr(STATE.runner, "KIND", type(STATE.runner).__name__)
         return (
+            STATE.runner,
+            None,
             f"this model is served via the '{kind}' runner, which does not support "
             f"non-default values for: {', '.join(non_identity)}. The speculative-decoding "
             "runner only supports 'seed' (plus identity values that leave the sampling "
             "distribution unchanged, e.g. top_p=1.0 or frequency_penalty=0.0) among the "
             "extended sampling parameters, because its correctness guarantee (rejection "
             "sampling against the exact target distribution) assumes temperature-only "
-            "sampling; changing the base distribution would silently break that guarantee."
+            "sampling; changing the base distribution would silently break that guarantee.",
         )
     # ここに残っているのは全て「runner がサポートしないが恒等値」のキー。
     # 分布を変えないので拒否はしないが、runner.generate() が知らない
     # キーワード引数として受け取らないよう、渡す前に落としておく。
     for name in unrecognized:
         del params[name]
-    return None
+    return STATE.runner, None, None
 
 
 def _stop_sequences(body: dict) -> list[str]:
@@ -1878,6 +1922,54 @@ def _find_stop(text: str, stops: list[str]) -> tuple[int, str] | None:
         if idx != -1 and (best is None or idx < best[0]):
             best = (idx, s)
     return best
+
+
+def _check_response_format(body: dict) -> str | None:
+    """``response_format`` (OpenAI の JSON mode) は制約付きデコードの実装が
+    無いので黙って無視しない (Kimi K3 レビュー項目 8)。JSON を期待する
+    agentic なクライアントが素のテキストを受け取ってパースに失敗する事故を、
+    previous_response_id (このファイル内の既存の 400) と同じ「対応しない
+    ものは明示的に断る」方針で防ぐ。``{"type": "text"}`` (未指定と等価) は
+    無変換なのでそのまま通す。"""
+
+    rf = body.get("response_format")
+    if rf is None:
+        return None
+    if not isinstance(rf, dict) or "type" not in rf:
+        return "'response_format' must be an object with a 'type' field"
+    rf_type = rf["type"]
+    if rf_type == "text":
+        return None
+    return (
+        f"'response_format' of type {rf_type!r} is not supported: this server has no "
+        "constrained-decoding implementation, so it cannot guarantee the output actually "
+        "conforms to the requested format. Omit 'response_format' (or pass "
+        "{\"type\": \"text\"}) and parse/validate the model's plain-text output yourself."
+    )
+
+
+def _downgrade_headers(downgrade_reason: str | None) -> dict[str, str] | None:
+    """リクエスト単位降格 (項目 7) が起きたことをストリーミング応答でも
+    観測できるようにする HTTP ヘッダ。SSE の各チャンクは OpenAI/Anthropic の
+    標準スキーマなので、そこへ独自フィールドを混ぜると agentic クライアント
+    のスキーマ検証を壊しかねない — ヘッダなら per-chunk の JSON 形状を一切
+    変えずに同じ情報を出せる。降格していなければ None (StreamingResponse は
+    headers=None を「デフォルトのまま」として扱う)。"""
+
+    if downgrade_reason is None:
+        return None
+    return {"X-Mlxturbo-Downgrade-Reason": downgrade_reason}
+
+
+def _attach_downgrade_reason(body: dict, downgrade_reason: str | None) -> None:
+    """非ストリーミング応答の JSON ボディへ、リクエスト単位降格 (項目 7) の
+    理由をそのまま追加する。降格していなければ何もしない (キー自体を
+    出さない — /health の fallback_reason と同じ流儀)。標準スキーマに無い
+    追加フィールドだが、`/health` の fallback_reason 同様、このリポジトリは
+    「黙って降格しない」ことをレスポンス形状より優先する。"""
+
+    if downgrade_reason is not None:
+        body["downgrade_reason"] = downgrade_reason
 
 
 def _openai_error(
@@ -2017,6 +2109,38 @@ def _usage_dict(prompt_tokens: int, completion_tokens: int, cached_tokens: int) 
     return usage
 
 
+def _anthropic_usage(prompt_tokens: int, completion_tokens: int, res: dict) -> dict:
+    """Anthropic 形式の usage。prefill 再利用の実測 (``res["prefill_reused"]``/
+    ``res["prefill_new"]``、cli.py の表示行や ``_log_gen_stats`` と同じ数値)
+    を Anthropic のキャッシュ関連フィールドへマッピングする (Kimi K3 レビュー
+    項目 16)。Claude Code 等が送ってくる ``cache_control`` 自体は読まない —
+    「どこまでキャッシュするか」の指示だが、このサーバーはリクエスト単位で
+    session の LCP から再利用量を機械的に決めるだけで、ブロック単位の
+    キャッシュ境界という概念を持たないため、受け取って無視する (無視して
+    いることをそのまま報告に明記する、というタスク側の指示どおり)。
+
+    Anthropic 実 API の意味に合わせる: ``input_tokens`` はキャッシュから
+    読んだ分を除いた「実際に処理した」トークン数 (= prefill_new)、
+    ``cache_read_input_tokens`` が再利用された分 (= prefill_reused)。
+    ``cache_creation_input_tokens`` は新規に処理して session へ書き込んだ分
+    (= prefill_new) をそのまま採る — このサーバーの session はターンごとに
+    KV を積み増すので、新規処理分は原則すべて次ターン以降の再利用候補になる
+    (エフェメラル 5m/1h の内訳までは持たない、フラットな合計のみ)。
+    ``res`` に prefill 情報が無い runner (通常は無いが、防御的に既定 0) でも
+    フィールド自体は常に出す — 0 と「対応していない」をレスポンス形状から
+    区別しない、``_usage_dict`` と同じ方針。
+    """
+
+    prefill_reused = res.get("prefill_reused", 0)
+    prefill_new = res.get("prefill_new", max(prompt_tokens - prefill_reused, 0))
+    return {
+        "input_tokens": prefill_new,
+        "output_tokens": completion_tokens,
+        "cache_creation_input_tokens": prefill_new,
+        "cache_read_input_tokens": prefill_reused,
+    }
+
+
 def _log_gen_stats(res: dict) -> None:
     """prefill 再利用が効いているかは OpenAI/Anthropic のレスポンス形式には
     無い数値なので、cli.py の表示行と同じ内容を運用者向けに一行ログへ出す。"""
@@ -2051,11 +2175,15 @@ class _GenerationCancelled(Exception):
 
 
 async def _run_generate(
-    prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **sampling_kwargs
+    prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, runner=None, **sampling_kwargs
 ):
+    """``runner`` を省略すると ``STATE.runner`` (通常経路)。リクエスト単位
+    降格 (項目 7、``_resolve_runner_for_request`` 参照) されたリクエストは
+    呼び出し側が ``STATE.downgrade_runner`` を明示的に渡す。"""
+
     loop = asyncio.get_running_loop()
     fn = functools.partial(
-        STATE.runner.generate,
+        (runner or STATE.runner).generate,
         prompt_ids,
         max_tokens=max_tokens,
         temp=temp,
@@ -2217,18 +2345,31 @@ def _start_generation(
     tool_calling_enabled: bool = False,
     tools_for_parsing=None,
     session=None,
+    runner=None,
     **sampling_kwargs,
 ):
-    """ワーカーを STATE.executor へ投げ、(キュー, Future, stop Event) を返す。
+    """ワーカーを STATE.executor へ投げ、(キュー, Future, stop Event,
+    raw_token_count) を返す。
 
     ``session`` はこのリクエスト用に ``_select_session`` が引き当てた
     session (ChatSession/FallbackSession) — 呼び出し側が ``STATE.lock`` の
     中で選んで渡す (グローバル状態の STATE.session は無い)。
 
+    ``runner`` を省略すると ``STATE.runner``。リクエスト単位降格 (項目 7、
+    ``_resolve_runner_for_request`` 参照) されたリクエストは呼び出し側が
+    ``STATE.downgrade_runner`` を明示的に渡す。
+
+    ``raw_token_count`` は ``[int]`` の 1 要素リスト (呼び出し側から見える
+    可変箱) — ``on_tokens`` が実際に処理した生トークン数を都度加算する。
+    stop 文字列一致で cancel_event.set() して早期打ち切る場合 (項目 18)、
+    runner.generate() は正常な res dict を返さず ``("cancelled", None)`` に
+    なるため usage の completion_tokens をこれで代替する。
+
     キューに積まれる要素: ``("reasoning_delta", text)`` / ``("content_delta",
     text)`` / ``("tool_call", {"id","name","arguments"})`` (成功裏に解析
     できた tool call 1 個ぶん) / ``("budget_exceeded", None)`` (予算超過を
-    検知した回だけ 1 回) / ``("done", res)`` / ``("error", exc)``。
+    検知した回だけ 1 回) / ``("done", res)`` / ``("cancelled", None)`` /
+    ``("error", exc)``。
 
     呼び出し側は必ずこの Future を最後まで待つこと (正常終了・エラー・
     クライアント切断のどの経路でも)。そうしないと、まだ実行中のワーカーが
@@ -2248,6 +2389,7 @@ def _start_generation(
     )
     assembler = SegmentAssembler(tools_for_parsing)
     signaled = [False]
+    raw_token_count = [0]
 
     def on_tokens(toks, text=None):
         if cancel_event.is_set():
@@ -2256,6 +2398,7 @@ def _start_generation(
             # here therefore stops the next decode round without exposing a
             # half-mutated cache.  Prefill itself remains non-preemptible.
             raise _GenerationCancelled()
+        raw_token_count[0] += len(toks)
         for channel, payload in router.feed(toks):
             for kind, val in assembler.push(channel, payload):
                 q.put((kind, val))
@@ -2265,7 +2408,7 @@ def _start_generation(
 
     def worker():
         try:
-            res = STATE.runner.generate(
+            res = (runner or STATE.runner).generate(
                 prompt_ids,
                 max_tokens=max_tokens,
                 temp=temp,
@@ -2291,7 +2434,7 @@ def _start_generation(
     # asyncio.to_thread(q.get) で拾う (queue.Queue の待ち合わせだけなので
     # MLX のスレッド固定とは無関係、こちらは汎用スレッドプールで構わない)。
     future = STATE.executor.submit(worker)
-    return q, future, cancel_event
+    return q, future, cancel_event, raw_token_count
 
 
 async def _await_worker(future) -> None:
@@ -2497,6 +2640,46 @@ async def api_hello():
     return {"status": "ok"}
 
 
+@app.post("/v1/embeddings")
+async def embeddings(request: Request):
+    """Kimi K3 レビュー項目 14: 未対応であることを 501 で明示する。
+
+    調べた結論: 「不可能」ではなく「このサーバーの現在の構成では正しく実装
+    できる保証が無いので、無理に実装しない」という判断。理由は 2 つ:
+
+    1. このサーバーがロードするのは生成用モデル (Qwen3.6-35B-A3B / Flash-
+       Next 系) で、埋め込み専用モデルではない。生成モデルの最終隠れ状態
+       (lm_head 直前) をプーリングして埋め込み代わりに使う手法自体は存在
+       する (LLM2Vec/GritLM 等) が、それは対象モデルに合わせた pooling
+       方式の選定・検証を伴う専用の実装であって、「とりあえず forward して
+       プーリングする」だけでは品質を保証できない。
+
+    2. 隠れ状態を取り出すための forward 呼び出しはモデルのラッパー構造
+       (VLM 形式なら ``model.language_model.model``、GDN ハイブリッドの
+       cache 構築など) に依存する — この構造を正しく踏まえた実装は
+       mlxturbo/spec.py の SpecEngine が既に持っている領域であり、今回
+       server.py だけを触ってよい制約の中でそれを別実装として持ち込むと、
+       spec.py 側の実装と食い違うリスクを抱えたまま検証もできない状態で
+       レビューに晒すことになる。
+
+    したがって、黙って何か (誤った) 埋め込みを返すよりは 501 で明示する
+    ことを選んだ。real な埋め込みが必要なら、専用の埋め込みモデル
+    (mlx-embeddings 等) を別途ロードして両立させる構成が筋が良いはずだが、
+    それはこのサーバーのモデル管理 (1 モデル常駐・専用スレッド固定) の
+    設計そのものに関わる変更で、今回の変更範囲を超える。
+    """
+
+    return _openai_error(
+        "'/v1/embeddings' is not implemented: this server only loads a generation "
+        "model (not a dedicated embedding model), and deriving embeddings from its "
+        "hidden states would require architecture-specific pooling logic this pass "
+        "did not implement or validate. Run a dedicated embedding server for this.",
+        status=501,
+        err_type="server_error",
+        code="not_implemented",
+    )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     try:
@@ -2552,7 +2735,10 @@ async def chat_completions(request: Request):
     sampling_params, err = _parse_sampling_params(body)
     if err is not None:
         return _openai_error(err)
-    unsupported_err = _check_and_strip_sampling_params(sampling_params)
+    response_format_err = _check_response_format(body)
+    if response_format_err is not None:
+        return _openai_error(response_format_err)
+    gen_runner, downgrade_reason, unsupported_err = _resolve_runner_for_request(sampling_params)
     if unsupported_err is not None:
         return _openai_error(unsupported_err)
     stops = _stop_sequences(body)
@@ -2593,14 +2779,24 @@ async def chat_completions(request: Request):
                     sampling_params,
                     tool_enabled,
                     resolved_tools,
+                    runner=gen_runner,
                 )
             ),
             media_type="text/event-stream",
+            headers=_downgrade_headers(downgrade_reason),
         )
 
     try:
         async with STATE.lock:
-            session = await _select_session_on_executor(prompt_ids)
+            # 降格したリクエストは session プールに触らない: FallbackRunner
+            # は FallbackSession (.cache 単数形) を期待するが、STATE.runner
+            # が spec なら session プールの中身は ChatSession (.caches 複数形)
+            # で型が合わない。session=None で渡せば FallbackRunner.generate
+            # は毎回新規 prompt_cache を作るだけの経路に自然に倒れる
+            # (_resolve_runner_for_request の docstring 参照)。
+            session = None if downgrade_reason is not None else await _select_session_on_executor(
+                prompt_ids
+            )
             res = await _run_generate(
                 prompt_ids,
                 max_tokens,
@@ -2608,6 +2804,7 @@ async def chat_completions(request: Request):
                 STATE.eos_ids,
                 None,
                 session,
+                runner=gen_runner,
                 **sampling_params,
             )
     except Exception as exc:
@@ -2648,7 +2845,7 @@ async def chat_completions(request: Request):
         if not content_text:
             message["content"] = None
 
-    return {
+    out = {
         "id": req_id,
         "object": "chat.completion",
         "created": created,
@@ -2664,6 +2861,8 @@ async def chat_completions(request: Request):
             len(prompt_ids), len(res["tokens"]), res.get("prefill_reused", 0)
         ),
     }
+    _attach_downgrade_reason(out, downgrade_reason)
+    return out
 
 
 async def _openai_stream(
@@ -2679,6 +2878,7 @@ async def _openai_stream(
     sampling_params: dict | None = None,
     tool_enabled: bool = False,
     tools_for_parsing=None,
+    runner=None,
 ):
     # 受付 (検証) は呼び出し側で StreamingResponse を組み立てる前に完了して
     # いる。生成の開始 (ロック獲得・ワーカー投入) を待たずに最初のイベントを
@@ -2704,8 +2904,20 @@ async def _openai_stream(
         async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
             yield keepalive
 
-        session = await _select_session_on_executor(prompt_ids)
-        q, future, cancel_event = _start_generation(
+        # 降格したリクエスト (runner が STATE.runner と別物 = STATE.downgrade_
+        # runner) は session プールに触らない — 型が合わない
+        # (_resolve_runner_for_request の docstring 参照)。
+        downgraded = runner is not None and runner is not STATE.runner
+        session = None if downgraded else await _select_session_on_executor(prompt_ids)
+        # ``_select_session`` はスロットを選んだ時点で processed 列を「実際に
+        # 再利用される長さ」ちょうどへ切り詰め済み (全体一致ならそのまま、
+        # 部分一致なら trim/checkpoint 復元後の長さ) なので、ここで読んだ
+        # 値は runner.generate() が内部で計算する prefill_reused と一致する。
+        # stop 文字列一致で早期打ち切り (cancel_event.set(), 項目 18) した
+        # ときは runner が res dict を返さない ("cancelled") ため、usage の
+        # cached_tokens をこの事前計算値で代替する。
+        reused_at_select = len(session.processed) if session is not None else 0
+        q, future, cancel_event, raw_token_count = _start_generation(
             prompt_ids,
             max_tokens,
             temp,
@@ -2713,6 +2925,7 @@ async def _openai_stream(
             tool_enabled,
             tools_for_parsing,
             session=session,
+            runner=runner,
             **(sampling_params or {}),
         )
         try:
@@ -2823,6 +3036,15 @@ async def _openai_stream(
                             keep_len = idx - len(acc_text)
                             visible = payload[:keep_len] if keep_len > 0 else ""
                             stopped = True
+                            # 項目 18: 一致した瞬間に生成そのものを打ち切る。
+                            # 従来はここで転送だけ止め、実際の生成は max_tokens
+                            # まで裏で回り続けていた (無駄な decode)。visible
+                            # の計算 (=クライアントへ見せる文字列) はここより
+                            # 前で確定済みなので、打ち切っても出力内容は変わ
+                            # らない — 変わるのは以降の decode を省く分の速さ
+                            # だけ。session はこの後 publish されない (次ターン
+                            # は fresh prefill、cancel_event の既存の契約どおり)。
+                            cancel_event.set()
                         acc_text = new_acc
                     if visible:
                         chunk = {
@@ -2849,6 +3071,21 @@ async def _openai_stream(
                     n_completion = len(payload["tokens"])
                     cached_tokens = payload.get("prefill_reused", 0)
                     _log_gen_stats(payload)
+                    break
+                elif kind == "cancelled":
+                    # stop 文字列一致による早期打ち切り (上の content_delta
+                    # 分岐で cancel_event.set() した結果) だけがここへ来る —
+                    # クライアント切断はこのループ自体を async generator の
+                    # GeneratorExit で中断させるので、ここには来ない。runner
+                    # は res dict を返さないので、usage は on_tokens が数えた
+                    # raw_token_count と session 選択時点の reused で代替する。
+                    finish_reason = "stop"
+                    n_completion = raw_token_count[0]
+                    cached_tokens = reused_at_select
+                    print(
+                        f"[mlxturbo-serve] stop string matched — cancelled early after "
+                        f"{n_completion} decoded tokens (prefill reused={cached_tokens})"
+                    )
                     break
                 else:  # error
                     err = {
@@ -2982,7 +3219,7 @@ async def anthropic_messages(request: Request):
     sampling_params, err = _parse_sampling_params(body)
     if err is not None:
         return _anthropic_error(err)
-    unsupported_err = _check_and_strip_sampling_params(sampling_params)
+    gen_runner, downgrade_reason, unsupported_err = _resolve_runner_for_request(sampling_params)
     if unsupported_err is not None:
         return _anthropic_error(unsupported_err)
     stops = _stop_sequences(body)
@@ -3026,14 +3263,20 @@ async def anthropic_messages(request: Request):
                     sampling_params,
                     tool_enabled,
                     resolved_tools,
+                    runner=gen_runner,
                 )
             ),
             media_type="text/event-stream",
+            headers=_downgrade_headers(downgrade_reason),
         )
 
     try:
         async with STATE.lock:
-            session = await _select_session_on_executor(prompt_ids)
+            # 降格したリクエストは session プールに触らない (chat_completions
+            # と同じ理由、_resolve_runner_for_request の docstring 参照)。
+            session = None if downgrade_reason is not None else await _select_session_on_executor(
+                prompt_ids
+            )
             res = await _run_generate(
                 prompt_ids,
                 max_tokens,
@@ -3041,6 +3284,7 @@ async def anthropic_messages(request: Request):
                 STATE.eos_ids,
                 None,
                 session,
+                runner=gen_runner,
                 **sampling_params,
             )
     except Exception as exc:
@@ -3084,7 +3328,7 @@ async def anthropic_messages(request: Request):
     if not content_blocks:
         content_blocks.append({"type": "text", "text": ""})
 
-    return {
+    out = {
         "id": msg_id,
         "type": "message",
         "role": "assistant",
@@ -3092,11 +3336,10 @@ async def anthropic_messages(request: Request):
         "content": content_blocks,
         "stop_reason": stop_reason,
         "stop_sequence": matched_stop,
-        "usage": {
-            "input_tokens": len(prompt_ids),
-            "output_tokens": len(res["tokens"]),
-        },
+        "usage": _anthropic_usage(len(prompt_ids), len(res["tokens"]), res),
     }
+    _attach_downgrade_reason(out, downgrade_reason)
+    return out
 
 
 async def _anthropic_stream(
@@ -3110,6 +3353,7 @@ async def _anthropic_stream(
     sampling_params: dict | None = None,
     tool_enabled: bool = False,
     tools_for_parsing=None,
+    runner=None,
 ):
     def sse(event, data):
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -3142,8 +3386,10 @@ async def _anthropic_stream(
         async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
             yield keepalive
 
-        session = await _select_session_on_executor(prompt_ids)
-        q, future, cancel_event = _start_generation(
+        downgraded = runner is not None and runner is not STATE.runner
+        session = None if downgraded else await _select_session_on_executor(prompt_ids)
+        reused_at_select = len(session.processed) if session is not None else 0
+        q, future, cancel_event, raw_token_count = _start_generation(
             prompt_ids,
             max_tokens,
             temp,
@@ -3151,6 +3397,7 @@ async def _anthropic_stream(
             tool_enabled,
             tools_for_parsing,
             session=session,
+            runner=runner,
             **(sampling_params or {}),
         )
         try:
@@ -3168,6 +3415,8 @@ async def _anthropic_stream(
             # を出す形なので、順序としては同じ)。
 
             n_out = 0
+            prefill_reused = 0
+            prefill_new = 0
             stop_reason = "end_turn"
             matched_stop = None
             acc_text = ""
@@ -3275,6 +3524,9 @@ async def _anthropic_stream(
                             visible = payload[:keep_len] if keep_len > 0 else ""
                             stopped = True
                             matched_stop = matched
+                            # 項目 18: 一致した瞬間に生成そのものを打ち切る
+                            # (_openai_stream の同じ変更と同一の理由)。
+                            cancel_event.set()
                         acc_text = new_acc
                     if not visible:
                         continue
@@ -3306,6 +3558,8 @@ async def _anthropic_stream(
                     budget_exceeded = True
                 elif kind == "done":
                     n_out = len(payload["tokens"])
+                    prefill_reused = payload.get("prefill_reused", 0)
+                    prefill_new = payload.get("prefill_new", 0)
                     if budget_exceeded:
                         stop_reason = "max_tokens"
                     elif made_tool_call:
@@ -3315,6 +3569,18 @@ async def _anthropic_stream(
                             "stop_sequence" if stopped else _stop_reason_anthropic(payload["tokens"])
                         )
                     _log_gen_stats(payload)
+                    break
+                elif kind == "cancelled":
+                    # stop 文字列一致による早期打ち切り (_openai_stream の
+                    # 同じ分岐と同じ理由・同じ契約)。
+                    n_out = raw_token_count[0]
+                    prefill_reused = reused_at_select
+                    prefill_new = max(len(prompt_ids) - reused_at_select, 0)
+                    stop_reason = "stop_sequence"
+                    print(
+                        f"[mlxturbo-serve] stop string matched — cancelled early after "
+                        f"{n_out} decoded tokens (prefill reused={prefill_reused})"
+                    )
                     break
                 else:  # error
                     yield sse(
@@ -3341,7 +3607,15 @@ async def _anthropic_stream(
                 {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": matched_stop},
-                    "usage": {"output_tokens": n_out},
+                    # input_tokens は message_start で即座に流した (生成開始
+                    # 前の) 素朴な len(prompt_ids) のままなので上書きしない —
+                    # ここではキャッシュ実測 (項目 16) が生成後にしか分から
+                    # ない cache_read/cache_creation_input_tokens だけ足す。
+                    "usage": {
+                        "output_tokens": n_out,
+                        "cache_creation_input_tokens": prefill_new,
+                        "cache_read_input_tokens": prefill_reused,
+                    },
                 },
             )
             yield sse("message_stop", {"type": "message_stop"})
@@ -3415,7 +3689,7 @@ async def completions(request: Request):
     sampling_params, err = _parse_sampling_params(body)
     if err is not None:
         return _openai_error(err)
-    unsupported_err = _check_and_strip_sampling_params(sampling_params)
+    gen_runner, downgrade_reason, unsupported_err = _resolve_runner_for_request(sampling_params)
     if unsupported_err is not None:
         return _openai_error(unsupported_err)
     stops = _stop_sequences(body)
@@ -3452,14 +3726,18 @@ async def completions(request: Request):
                     stops,
                     include_usage,
                     sampling_params,
+                    runner=gen_runner,
                 )
             ),
             media_type="text/event-stream",
+            headers=_downgrade_headers(downgrade_reason),
         )
 
     try:
         async with STATE.lock:
-            session = await _select_session_on_executor(prompt_ids)
+            session = None if downgrade_reason is not None else await _select_session_on_executor(
+                prompt_ids
+            )
             res = await _run_generate(
                 prompt_ids,
                 max_tokens,
@@ -3467,6 +3745,7 @@ async def completions(request: Request):
                 STATE.eos_ids,
                 None,
                 session,
+                runner=gen_runner,
                 **sampling_params,
             )
     except Exception as exc:
@@ -3485,7 +3764,7 @@ async def completions(request: Request):
             text = text[: hit[0]]
             finish_reason = "stop"
 
-    return {
+    out = {
         "id": req_id,
         "object": "text_completion",
         "created": created,
@@ -3502,6 +3781,8 @@ async def completions(request: Request):
             len(prompt_ids), len(res["tokens"]), res.get("prefill_reused", 0)
         ),
     }
+    _attach_downgrade_reason(out, downgrade_reason)
+    return out
 
 
 async def _completions_stream(
@@ -3514,17 +3795,20 @@ async def _completions_stream(
     stops,
     include_usage,
     sampling_params: dict | None = None,
+    runner=None,
 ):
     owned = [False]
     try:
         async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
             yield keepalive
 
-        session = await _select_session_on_executor(prompt_ids)
+        downgraded = runner is not None and runner is not STATE.runner
+        session = None if downgraded else await _select_session_on_executor(prompt_ids)
+        reused_at_select = len(session.processed) if session is not None else 0
         # thinking_budget=0: ThinkingRouter を content-only に固定する
         # (has_thinking に関わらず) ので reasoning_delta は絶対に来ない。
-        q, future, cancel_event = _start_generation(
-            prompt_ids, max_tokens, temp, 0, session=session, **(sampling_params or {})
+        q, future, cancel_event, raw_token_count = _start_generation(
+            prompt_ids, max_tokens, temp, 0, session=session, runner=runner, **(sampling_params or {})
         )
         try:
             first_item = None
@@ -3554,6 +3838,7 @@ async def _completions_stream(
                             keep_len = idx - len(acc_text)
                             visible = payload[:keep_len] if keep_len > 0 else ""
                             stopped = True
+                            cancel_event.set()  # 項目 18: 早期打ち切り
                         acc_text = new_acc
                     if visible:
                         chunk = {
@@ -3583,6 +3868,17 @@ async def _completions_stream(
                     n_completion = len(payload["tokens"])
                     cached_tokens = payload.get("prefill_reused", 0)
                     _log_gen_stats(payload)
+                    break
+                elif kind == "cancelled":
+                    # stop 文字列一致による早期打ち切り (_openai_stream と
+                    # 同じ理由・同じ契約)。
+                    finish_reason = "stop"
+                    n_completion = raw_token_count[0]
+                    cached_tokens = reused_at_select
+                    print(
+                        f"[mlxturbo-serve] stop string matched — cancelled early after "
+                        f"{n_completion} decoded tokens (prefill reused={cached_tokens})"
+                    )
                     break
                 else:  # error
                     err = {"error": {"message": str(payload), "type": "server_error"}}
@@ -3636,10 +3932,13 @@ async def _completions_stream(
 # イベントへ組み立てる」の 2 つだけで、生成ロジックを 3 つ目のプロトコル
 # として複製しない。
 #
-# store / previous_response_id によるサーバー側での会話継続は実装しない
-# (このサーバーは元々レスポンスを一切永続化しない設計 — 会話履歴は毎ターン
-# クライアントが全文を送り直す前提、モジュール冒頭の docstring 参照)。
-# previous_response_id が来たら黙って無視せず 400 で明示する。
+# store / previous_response_id によるサーバー側での会話継続は、メモリ上の
+# LRU (STATE.response_store) だけで実装している — 永続化はしない (プロセス
+# 再起動で全て失われる、モジュール冒頭の docstring の「会話履歴はクライアント
+# が毎ターン全文を送り直す」設計自体は変えていない。previous_response_id は
+# その全文送り直しの手間を省く「サーバー側にも同じ履歴を持たせておく」薄い
+# 最適化に過ぎない)。詳細は _resolve_previous_response/_store_response_if_
+# requested を参照。
 
 
 def _responses_content_to_text(content) -> str:
@@ -4024,6 +4323,105 @@ def _responses_output_items_from_events(events: list[tuple[str, object]]) -> lis
     return items
 
 
+# ---------- previous_response_id / store (項目 15) ----------
+#
+# メモリ上の LRU (STATE.response_store) だけで会話を継続する。永続化は
+# しない — プロセスが再起動すれば全て失われる (このサーバーは元々レスポン
+# スを永続化しない設計、モジュール冒頭の docstring 参照)。保存する内容は
+# 「その応答を生成するために実際に使った raw input アイテム列 + その応答
+# 自身の output アイテム列」— どちらも _normalize_responses_input がその
+# まま受け付ける形 (Responses API の生アイテム形状) なので、次ターンは
+# それを ``input`` の前に連結してもう一度 _normalize_responses_input へ
+# 通すだけで会話全体を再構成できる。新しい変換ロジックを別に持たない。
+
+
+def _resolve_previous_response(
+    body: dict,
+) -> tuple[list, str | None, "JSONResponse | None"]:
+    """``previous_response_id`` を解決する。戻り値は
+    ``(prior_items, effective_instructions, error_response)``。
+
+    見つからなければ 404 (OpenAI 準拠、_check_model_openai と同じ流儀)。
+    このサーバーは再起動すると全て失う LRU でしかないので、"見つからない"
+    は「そもそも store:true で保存されていない」「LRU から追い出された」
+    「プロセスが再起動した」のどれとも区別しない — 404 のメッセージで
+    その旨を説明する。
+    """
+
+    previous_response_id = body.get("previous_response_id")
+    if previous_response_id is None:
+        return [], body.get("instructions"), None
+    if not isinstance(previous_response_id, str):
+        return [], None, _openai_error("'previous_response_id' must be a string")
+    record = STATE.response_store.get(previous_response_id)
+    if record is None:
+        return (
+            [],
+            None,
+            _openai_error(
+                f"'previous_response_id' {previous_response_id!r} was not found. This "
+                "server keeps only an in-memory LRU of responses created with "
+                "'store: true' (see --max-stored-responses); it is never persisted to "
+                "disk, so a process restart, an evicted entry, or a response that was "
+                "never stored will all surface as this same error.",
+                status=404,
+                code="response_not_found",
+            ),
+        )
+    STATE.response_store.move_to_end(previous_response_id)
+    effective_instructions = body.get("instructions")
+    if effective_instructions is None:
+        effective_instructions = record["instructions"]
+    return record["items"], effective_instructions, None
+
+
+def _combine_responses_input(raw_input, prior_items: list) -> tuple[list | None, str | None]:
+    """今回の ``input`` を ``prior_items`` (previous_response_id から復元した
+    raw アイテム列、無ければ空) の後ろへ連結する。今回分が文字列なら
+    ``_normalize_responses_input`` の「input が文字列のときの単一 user
+    メッセージ」変換と同じ形へ先に開いてから連結する — prior_items (リスト)
+    と混在させるため。previous_response_id が無い (prior_items が空の)
+    通常経路では、文字列をここで開いても最終的に _normalize_responses_input
+    へ渡す中身は以前と完全に同じメッセージ列になる (list 分岐を通るだけ)。
+    """
+
+    if raw_input is None:
+        return None, "'input' is required"
+    if isinstance(raw_input, str):
+        new_items = [{"type": "message", "role": "user", "content": raw_input}]
+    elif isinstance(raw_input, list):
+        new_items = raw_input
+    else:
+        return None, f"'input' must be a string or an array of items, got {type(raw_input).__name__}"
+    return prior_items + new_items, None
+
+
+def _store_response_if_requested(
+    store: bool,
+    resp_id: str,
+    effective_instructions: str | None,
+    combined_input: list | None,
+    output_items: list[dict],
+) -> None:
+    """``store: true`` のときだけ、この応答を STATE.response_store へ積む
+    (LRU、上限 STATE.max_stored_responses、超えたら最も長く未使用のものを
+    捨てる)。``combined_input`` (今回実際に使った raw アイテム列。前ターン
+    から復元した分含む) + ``output_items`` (この応答自身の output、reasoning
+    アイテムも含めて丸ごと持つ — 読み出し側の _normalize_responses_input が
+    reasoning/item_reference を読み飛ばすので害はない) を次ターンがそのまま
+    連結できる形で保存する。"""
+
+    if not store:
+        return
+    STATE.response_store[resp_id] = {
+        "items": list(combined_input or []) + output_items,
+        "instructions": effective_instructions,
+    }
+    STATE.response_store.move_to_end(resp_id)
+    while len(STATE.response_store) > STATE.max_stored_responses:
+        STATE.response_store.popitem(last=False)
+
+
 @app.post("/v1/responses")
 async def responses_endpoint(request: Request):
     try:
@@ -4033,25 +4431,27 @@ async def responses_endpoint(request: Request):
     if not isinstance(body, dict):
         return _openai_error("request body must be a JSON object")
 
-    if body.get("previous_response_id") is not None:
-        return _openai_error(
-            "'previous_response_id' is not supported: this server does not persist "
-            "responses server-side (see server.py docstring — sessions are keyed by "
-            "prefix match on the conversation you resend, not by a stored response "
-            "id). Send the full conversation in 'input' each turn instead."
-        )
-    if body.get("store") is True:
-        return _openai_error(
-            "'store: true' is not supported: this server never persists responses "
-            "server-side, so a stored response would not be retrievable afterwards."
-        )
+    # previous_response_id/store (項目 15): サーバー側にメモリ上の LRU
+    # (STATE.response_store, main() --max-stored-responses、永続化はしない)
+    # を持ち、store:true で保存した応答を後続ターンの previous_response_id
+    # から辿れるようにする。以前はどちらも黙って無視せず 400 で断っていた
+    # (このコメントの旧版と _resolve_previous_response の docstring 参照) が、
+    # OpenAI 公式の agentic な例 (前ターンの id だけを送り、全文を送り直さ
+    # ない) がそのままでは動かない指摘を受けて実装した。
+    prior_items, effective_instructions, prev_err = _resolve_previous_response(body)
+    if prev_err is not None:
+        return prev_err
+    store = bool(body.get("store", False))
 
     model_err = _check_model_openai(body)
     if model_err is not None:
         return model_err
 
+    combined_input, input_err = _combine_responses_input(body.get("input"), prior_items)
+    if input_err is not None:
+        return _openai_error(input_err)
     try:
-        norm_messages = _normalize_responses_input(body.get("input"), body.get("instructions"))
+        norm_messages = _normalize_responses_input(combined_input, effective_instructions)
     except ContentNormalizationError as exc:
         return _openai_error(str(exc))
 
@@ -4085,7 +4485,7 @@ async def responses_endpoint(request: Request):
     sampling_params, err = _parse_sampling_params(body)
     if err is not None:
         return _openai_error(err)
-    unsupported_err = _check_and_strip_sampling_params(sampling_params)
+    gen_runner, downgrade_reason, unsupported_err = _resolve_runner_for_request(sampling_params)
     if unsupported_err is not None:
         return _openai_error(unsupported_err)
 
@@ -4113,14 +4513,21 @@ async def responses_endpoint(request: Request):
                     sampling_params,
                     tool_enabled,
                     resolved_tools,
+                    runner=gen_runner,
+                    store=store,
+                    combined_input=combined_input,
+                    effective_instructions=effective_instructions,
                 )
             ),
             media_type="text/event-stream",
+            headers=_downgrade_headers(downgrade_reason),
         )
 
     try:
         async with STATE.lock:
-            session = await _select_session_on_executor(prompt_ids)
+            session = None if downgrade_reason is not None else await _select_session_on_executor(
+                prompt_ids
+            )
             res = await _run_generate(
                 prompt_ids,
                 max_tokens,
@@ -4128,6 +4535,7 @@ async def responses_endpoint(request: Request):
                 STATE.eos_ids,
                 None,
                 session,
+                runner=gen_runner,
                 **sampling_params,
             )
     except Exception as exc:
@@ -4161,6 +4569,8 @@ async def responses_endpoint(request: Request):
     }
     if incomplete_reason is not None:
         out["incomplete_details"] = {"reason": incomplete_reason}
+    _attach_downgrade_reason(out, downgrade_reason)
+    _store_response_if_requested(store, resp_id, effective_instructions, combined_input, output_items)
     return out
 
 
@@ -4175,6 +4585,10 @@ async def _responses_stream(
     sampling_params: dict | None = None,
     tool_enabled: bool = False,
     tools_for_parsing=None,
+    runner=None,
+    store: bool = False,
+    combined_input: list | None = None,
+    effective_instructions: str | None = None,
 ):
     """Responses の主要な lifecycle イベント列を出す: response.created ->
     response.output_item.added -> response.output_text.delta /
@@ -4218,8 +4632,9 @@ async def _responses_stream(
         async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
             yield keepalive
 
-        session = await _select_session_on_executor(prompt_ids)
-        q, future, cancel_event = _start_generation(
+        downgraded = runner is not None and runner is not STATE.runner
+        session = None if downgraded else await _select_session_on_executor(prompt_ids)
+        q, future, cancel_event, _raw_token_count = _start_generation(
             prompt_ids,
             max_tokens,
             temp,
@@ -4227,6 +4642,7 @@ async def _responses_stream(
             tool_enabled,
             tools_for_parsing,
             session=session,
+            runner=runner,
             **(sampling_params or {}),
         )
         try:
@@ -4452,6 +4868,14 @@ async def _responses_stream(
             }
             if incomplete_reason is not None:
                 final_response["incomplete_details"] = {"reason": incomplete_reason}
+            # 項目 15: store:true ならここで保存する。status が "incomplete"
+            # (max_tokens 打ち切り等) でも、非ストリームと同じ扱いで output
+            # をそのまま保存する — 部分的な応答でも previous_response_id で
+            # 続けられた方が有用なため。"failed" は上の return で既に抜けて
+            # いるので保存しない (壊れた応答を次ターンへ持ち越さない)。
+            _store_response_if_requested(
+                store, resp_id, effective_instructions, combined_input, output_items
+            )
             terminal_event = (
                 "response.completed" if status == "completed" else "response.incomplete"
             )
@@ -4720,6 +5144,14 @@ def main() -> None:
         " KV を無制限に積まないための上限",
     )
     ap.add_argument(
+        "--max-stored-responses",
+        type=_positive_int,
+        default=50,
+        help="/v1/responses に store: true が指定されたときサーバー側で保持する"
+        " 応答の上限 (LRU、超えたら最も長く未使用のものを捨てる)。永続化はしない"
+        " (プロセス再起動で全て失われる)。previous_response_id の解決に使う",
+    )
+    ap.add_argument(
         "--max-context-tokens",
         type=int,
         default=None,
@@ -4836,9 +5268,19 @@ def main() -> None:
                 max_context_tokens, source = from_config, "config"
             else:
                 max_context_tokens, source = from_metal, "Metal 一括確保上限から逆算"
-        return runner, tokenizer, max_context_tokens, source
+        # runner が既に非投機 (fallback) なら降格の余地が無いので構築しない。
+        # 投機系 (spec/flash_spec) のときだけ、このリクエスト単位の降格用に
+        # 同じ model/tokenizer を指す FallbackRunner をもう1つ持つ (項目 7)。
+        # 構築自体は参照を持つだけで GPU 計算を伴わないので、専用スレッド外
+        # (この _load() の戻り値を受け取った後) で作っても安全。
+        downgrade_runner = None if runner.KIND == FallbackRunner.KIND else FallbackRunner(
+            model, tokenizer
+        )
+        return runner, tokenizer, max_context_tokens, source, downgrade_runner
 
-    runner, tokenizer, max_context_tokens, source = executor.submit(_load).result()
+    runner, tokenizer, max_context_tokens, source, downgrade_runner = executor.submit(
+        _load
+    ).result()
     if max_context_tokens is not None:
         print(
             f"[mlxturbo-serve] プロンプト長の上限: {max_context_tokens} トークン ({source})"
@@ -4874,8 +5316,19 @@ def main() -> None:
         api_keys=frozenset(args.api_key),
         max_queue=args.max_queue,
         version=_FASTMLX_VERSION,
+        downgrade_runner=downgrade_runner,
+        max_stored_responses=args.max_stored_responses,
     )
     print(f"[mlxturbo-serve] version {_FASTMLX_VERSION}")
+    if downgrade_runner is not None:
+        print(
+            "[mlxturbo-serve] 非恒等サンプリングパラメータ/logprobs 要求時のリクエスト単位"
+            " 降格: 有効 (fallback runner へ、400 で拒否する代わりに処理する)"
+        )
+    else:
+        print(
+            "[mlxturbo-serve] リクエスト単位降格: 対象外 (runner が既に非投機のため)"
+        )
     print(
         f"[mlxturbo-serve] served model name: {served_name} "
         f"(session pool: {session_factory.__name__}, max {args.max_sessions} 会話)"
