@@ -376,6 +376,8 @@ def _install_state(runner, tokenizer=None, **overrides) -> server.ModelState:
         downgrade_runner=overrides.get("downgrade_runner"),
         response_store=overrides.get("response_store", OrderedDict()),
         max_stored_responses=overrides.get("max_stored_responses", 50),
+        batch_coordinator=overrides.get("batch_coordinator"),
+        max_batch=overrides.get("max_batch", 1),
     )
     server.STATE = state
     return state
@@ -7322,3 +7324,305 @@ def test_completions_legacy_logprobs_validation_error_over_20(client):
     resp = client.post("/v1/completions", json={"prompt": "hi", "logprobs": 25})
     assert resp.status_code == 400, resp.text
     assert not runner.calls
+
+
+# ---------- Continuous batching (item 11 / BACKLOG.md §2) ----------
+#
+# mlxturbo.batch.BatchCoordinator drives mlx_lm.generate.BatchGenerator
+# directly against the served model's own __call__ — a FakeRunner cannot
+# stand in for that (there is no forward pass to drive), so these tests use
+# a tiny but structurally real qwen4_exp model, the same reduced shape
+# tools/verify_batch_cache.py's own CPU-only verification uses. Every other
+# test in this file uses FakeRunner because it does not need real MLX
+# compute; this is the one corner that does, by construction.
+#
+# What is and is not covered here: the gating logic (_resolve_batch_tier /
+# maybe_build_batch_coordinator) is tested directly (fast, deterministic).
+# The coordinator's actual concurrency/tier-isolation behavior is tested by
+# calling server._run_generate_batched / server._start_batched_generation
+# concurrently — the same "call the internal function directly" style
+# test_nonstream_cancellation_keeps_lock_until_worker_finishes and
+# test_stream_cancel_wakes_blocking_queue_get_with_internal_sentinel already
+# use above, rather than a full HTTP round trip (which would additionally
+# need a tokenizer whose chat template / detokenization actually agrees with
+# a randomly-initialized tiny model's vocabulary — orthogonal to what this
+# section is verifying).
+
+_TINY_BATCH_CFG = dict(
+    model_type="qwen4_exp_text",
+    hidden_size=64,
+    num_hidden_layers=4,
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    head_dim=16,
+    vocab_size=256,
+    rms_norm_eps=1e-6,
+    full_attention_interval=2,
+    num_experts=4,
+    num_experts_per_tok=2,
+    moe_intermediate_size=32,
+    shared_expert_intermediate_size=32,
+    linear_num_key_heads=2,
+    linear_num_value_heads=4,
+    linear_key_head_dim=32,
+    linear_value_head_dim=32,
+    linear_conv_kernel_dim=4,
+    output_gate_type="sigmoid",
+    hc_count=2,
+    hc_lowrank=16,
+    indexer_n_heads=2,
+    indexer_kv_heads=1,
+    indexer_head_dim=16,
+    indexer_budget=8,
+    indexer_compress_ratio=2,
+    ngram_size=3,
+    heads_per_ngram=2,
+    ngram_vocab_size_base=256,
+    make_ngram_vocab_size_divisible_by=8,
+    split_ngram_parts=2,
+    ple_embed_dim=32,
+    ple_layer_ids=[1],
+    ple_conv_kernel_size=4,
+    seed=0,
+    eos_token_id=99,
+    partial_rotary_factor=0.25,
+    rope_theta=10000.0,
+    tie_word_embeddings=False,
+)
+
+
+def _build_tiny_batch_model(budget: int = 8):
+    from mlx.utils import tree_map
+    from mlx_lm.models import qwen4_exp as Q
+
+    cfg = dict(_TINY_BATCH_CFG, indexer_budget=budget)
+    mx.random.seed(0)
+    model = Q.Model(Q.ModelArgs(model_type="qwen4_exp", text_config=cfg))
+    model.update(
+        tree_map(
+            lambda a: mx.random.normal(a.shape) * 0.05 if a.dtype == mx.float32 else a,
+            model.parameters(),
+        )
+    )
+    mx.eval(model.parameters())
+    model.eval()
+    return model
+
+
+@pytest.fixture
+def batch_env():
+    """A tiny real qwen4_exp model + FallbackRunner + BatchCoordinator
+    (max_batch=4, indexer_budget=8), built on a single dedicated executor
+    thread — mirroring server.py's own thread-pinning rule (the model and
+    BatchGenerator's wired-limit call are both MLX operations, so both must
+    happen on the thread the coordinator will later drive them from; see
+    server.py's module docstring for the "There is no Stream(gpu, N) in
+    current thread" failure mode this avoids). CPU-only and restores the
+    previous default device / mx.metal.is_available on teardown so this does
+    not leak into other tests in the file.
+    """
+
+    import mlxturbo.batch as batch_module
+
+    prev_device = mx.default_device()
+    prev_metal_available = mx.metal.is_available
+    mx.set_default_device(mx.cpu)
+    # BatchGenerator pokes mx.device_info()["max_recommended_working_set_size"]
+    # when it thinks Metal is available, which does not exist once the
+    # default device has been forced to CPU.
+    mx.metal.is_available = lambda: False
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        model = executor.submit(_build_tiny_batch_model, 8).result()
+        batch_module.enable_batch_cache()
+        runner = FallbackRunner(model, FakeTokenizer())
+        coordinator = batch_module.BatchCoordinator(
+            model, executor, max_batch=4, prefill_step_size=8, eos_ids=[99]
+        )
+        yield SimpleNamespace(executor=executor, model=model, runner=runner, coordinator=coordinator)
+    finally:
+        executor.shutdown(wait=True)
+        mx.set_default_device(prev_device)
+        mx.metal.is_available = prev_metal_available
+
+
+def test_resolve_batch_tier_default_off():
+    """--max-batch unset (the default) -> STATE.batch_coordinator is None
+    -> every request routes through the pre-existing STATE.lock path,
+    unconditionally. This is what makes the default behavior provably
+    unchanged by this feature."""
+
+    _install_state(FakeRunner([10]))
+    assert server.STATE.batch_coordinator is None
+    assert server._resolve_batch_tier(server.STATE.runner, [1, 2, 3], 8) is None
+
+
+def test_resolve_batch_tier_excludes_non_fallback_runner(batch_env):
+    """Even with a coordinator built, only a plain FallbackRunner is
+    eligible — SpecRunner/FlashSpecRunner/DraftSpecRunner/LookupSpecRunner
+    keep going through the unchanged STATE.lock path (see
+    mlxturbo.runner.can_batch / the module note above FallbackRunner in
+    runner.py)."""
+
+    _install_state(FakeRunner([10]), batch_coordinator=batch_env.coordinator, max_batch=4)
+    assert server._resolve_batch_tier(FakeRunner([10]), [1, 2, 3], 8) is None
+    assert server._resolve_batch_tier(FakeSpecRunner([10]), [1, 2, 3], 8) is None
+    assert server._resolve_batch_tier(batch_env.runner, [1, 2, 3], 8) is not None
+
+
+def test_resolve_batch_tier_excludes_logprobs(batch_env):
+    _install_state(batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4)
+    assert (
+        server._resolve_batch_tier(batch_env.runner, [1, 2, 3], 8, logprobs_requested=True)
+        is None
+    )
+    assert (
+        server._resolve_batch_tier(batch_env.runner, [1, 2, 3], 8, logprobs_requested=False)
+        is not None
+    )
+
+
+def test_resolve_batch_tier_pool_vs_solo(batch_env):
+    """indexer_budget=8 for this fixture's model. A request whose prompt +
+    max_tokens stays at or under budget can never trigger QSA ("pool");
+    one that could cross it is always "solo", regardless of how the current
+    live batch happens to look (see mlxturbo/batch.py's classify docstring)."""
+
+    _install_state(batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4)
+    assert server._resolve_batch_tier(batch_env.runner, [1, 2, 3], 4) == "pool"  # 3+4=7 <= 8
+    assert server._resolve_batch_tier(batch_env.runner, [1] * 6, 4) == "solo"  # 6+4=10 > 8
+
+
+def test_maybe_build_batch_coordinator_gating(batch_env):
+    from mlxturbo.runner import maybe_build_batch_coordinator
+
+    assert (
+        maybe_build_batch_coordinator(
+            batch_env.runner, batch_env.model, batch_env.executor, 1, [99]
+        )
+        is None
+    )  # --max-batch omitted/1: off, regardless of runner kind
+    assert (
+        maybe_build_batch_coordinator(
+            FakeSpecRunner([10]), batch_env.model, batch_env.executor, 4, [99]
+        )
+        is None
+    )  # spec-kind runner: off, regardless of --max-batch
+    built = maybe_build_batch_coordinator(
+        batch_env.runner, batch_env.model, batch_env.executor, 4, [99]
+    )
+    assert built is not None
+    assert built.max_batch == 4
+
+
+def test_two_concurrent_batched_requests_complete(batch_env):
+    """The actual point of item 11: two requests admitted before either has
+    finished both complete correctly, via the exact function server.py's
+    endpoints call (server._run_generate_batched)."""
+
+    _install_state(batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4)
+
+    async def run():
+        return await asyncio.gather(
+            server._run_generate_batched([1, 2, 3, 4], 5, 0.0),
+            server._run_generate_batched([5, 6, 7, 8], 5, 0.0),
+        )
+
+    res1, res2 = asyncio.run(run())
+    assert len(res1["tokens"]) == 5
+    assert len(res2["tokens"]) == 5
+    assert res1["prefill_reused"] == 0 and res1["prefill_new"] == 4
+    assert res2["prefill_reused"] == 0 and res2["prefill_new"] == 4
+
+
+def test_batched_streaming_end_to_end(batch_env):
+    """server._start_batched_generation must speak the exact same q/future
+    protocol as server._start_generation (see test_stream_cancel_wakes_
+    blocking_queue_get_with_internal_sentinel above for the non-batched
+    counterpart of this shape)."""
+
+    _install_state(batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4)
+    q, future, cancel_event, raw_token_count = server._start_batched_generation(
+        [1, 2, 3], 4, 0.0, None
+    )
+    events = []
+    while True:
+        kind, val = q.get(timeout=5)
+        events.append(kind)
+        if kind in ("done", "cancelled", "error"):
+            break
+    assert events[-1] == "done"
+    assert raw_token_count[0] == 4
+    future.result(timeout=5)  # never raises — see mlxturbo.batch.Admission's docstring
+
+
+def test_batched_solo_tier_never_overlaps_pool_tier(batch_env):
+    """The safety property item 11 exists for: a request that could ever
+    cross indexer_budget ("solo") never shares a live batch with anything
+    else, even when submitted concurrently with pool-tier requests (see
+    mlxturbo/batch.py's classify docstring for why unequal-length QSA-active
+    batches are the one configuration this whole feature must never
+    produce)."""
+
+    _install_state(batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4)
+    solo_ts: list[float] = []
+    pool1_ts: list[float] = []
+    pool2_ts: list[float] = []
+
+    def make_on_tokens(sink):
+        def on_tokens(toks, text=None):
+            sink.append(time.perf_counter())
+
+        return on_tokens
+
+    async def run():
+        await asyncio.gather(
+            server._run_generate_batched(
+                [1] * 6, 6, 0.0, on_tokens=make_on_tokens(solo_ts)  # 6+6=12 > 8 budget -> solo
+            ),
+            server._run_generate_batched(
+                [1, 2, 3], 4, 0.0, on_tokens=make_on_tokens(pool1_ts)  # 3+4=7 <= 8 -> pool
+            ),
+            server._run_generate_batched(
+                [1, 2], 4, 0.0, on_tokens=make_on_tokens(pool2_ts)  # 2+4=6 <= 8 -> pool
+            ),
+        )
+
+    asyncio.run(run())
+    assert solo_ts and pool2_ts
+
+    def overlaps(a, b):
+        return max(a[0], b[0]) <= min(a[-1], b[-1])
+
+    solo_window = (solo_ts[0], solo_ts[-1])
+    pool_ts = pool1_ts + pool2_ts
+    pool_window = (min(pool_ts), max(pool_ts))
+    assert not overlaps(solo_window, pool_window)
+
+
+def test_batched_admission_cancelled_before_start_resolves_cleanly(batch_env):
+    """A request cancelled before the coordinator ever admits it (e.g. the
+    client disconnected while still queued behind --max-batch capacity)
+    resolves as "cancelled" without disturbing anything else — see
+    mlxturbo.batch.BatchCoordinator._drive's admit() cancel_event check."""
+
+    import concurrent.futures as cf
+
+    from mlxturbo import batch as batch_module
+
+    ev = threading.Event()
+    ev.set()
+    fut: "cf.Future" = cf.Future()
+    admission = batch_module.Admission(
+        prompt_ids=[1, 2, 3],
+        max_tokens=4,
+        sampler=None,
+        logits_processors=[],
+        tier="pool",
+        on_tokens=None,
+        on_done=None,
+        cancel_event=ev,
+        future=fut,
+    )
+    batch_env.coordinator.submit(admission)
+    assert fut.result(timeout=5) is None

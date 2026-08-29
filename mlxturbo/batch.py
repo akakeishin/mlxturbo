@@ -690,4 +690,304 @@ def disable_batch_cache() -> None:
     _ENABLED = False
 
 
-__all__ = ["disable_batch_cache", "enable_batch_cache"]
+# ------------------------------------------------------------- coordinator
+#
+# Wires the above patches into server.py as opt-in continuous batching
+# (BACKLOG.md §2, Kimi K3 review item 11). Restricted to the FallbackRunner
+# path only: SpecRunner/FlashSpecRunner keep their own draft-token state
+# machine, which this module has never touched and which server.py forbids
+# editing for this change (spec.py / spec_flash.py / mtp*.py are the
+# measured, verified speculative engines). Whether continuous batching can
+# coexist with speculative drafting is unmeasured, so it simply isn't
+# attempted here — a request only ever reaches this coordinator when the
+# runner resolved for it is a FallbackRunner (see runner.should_batch).
+#
+# Bit-exact agreement between batched and solo generation is not the bar.
+# `mx.quantized_matmul` rounds differently depending on the total batch
+# length passed to one call — measured independently in this repo for
+# prefill chunking (commit 963c868) and confirmed here for request batching
+# (tools/verify_batch_real.py --mode kld): even equal-length, padding-free
+# batches (`short-eq`) diverge from the solo reference after a few dozen
+# greedy-decoded tokens. This is an MLX property, not a bug in this module,
+# and neither vLLM nor llama.cpp promise cross-configuration bit-exactness
+# either. What this module guarantees instead:
+#
+#   1. Determinism within one fixed batch composition (same inputs, same
+#      co-resident sequences -> same output, every time).
+#   2. Fluent output (no word-level corruption, no language switching, no
+#      repeat loops) on every configuration, including the QSA/uneven-length
+#      one below.
+#   3. next-token KLD against solo generation, while both paths still agree
+#      (i.e. still conditioned on an identical history), at the same order
+#      of magnitude as this project's own quantization noise floor (v-fast6:
+#      0.00378) for every configuration this module will ever actually
+#      admit into a shared batch.
+#
+# `classify()` below is what keeps guarantee 3 honest: a request whose
+# kv length could ever cross `indexer_budget` (QSA could activate for it) is
+# always run alone ("solo" tier), never sharing a batch with anything else.
+# QSA's block grid is cut by absolute column position, so an unequal-length,
+# left-padded batch can select a different set of blocks than solo
+# generation would (mlxturbo/batch.py's own "Remaining limitation" section,
+# above) — not corruption, but a real selection difference, and the one
+# case in tools/verify_batch_real.py --mode kld where the aligned-window KLD
+# ran measurably above the noise floor (long-uneq, B=4: up to ~4.4x
+# 0.00378 for one sequence). Everything that provably can never reach QSA
+# (`pool` tier) may share a batch freely up to --max-batch; the "solo" tier
+# is deliberately more conservative than the strict correctness condition
+# (which only forbids *unequal*-length QSA-risk combinations, not equal-length
+# ones) because tracking "would this still be equal-length by the time X
+# joins" across a continuously-refilling batch is a correctness-sensitive
+# bookkeeping problem this pass chose not to take on; the cost is one
+# forgone speed opportunity (equal-length long prompts always run one at a
+# time here), not a correctness gap.
+
+import queue as _queue
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+
+def _indexer_budget(model) -> int | None:
+    """None means "this architecture has no QSA / no such notion" (anything
+    other than qwen4_exp) — every request is then always poolable."""
+
+    try:
+        return model.args.text.indexer_budget
+    except AttributeError:
+        return None
+
+
+def classify(model, prompt_len: int, max_tokens: int) -> str:
+    """"solo": this request's kv length could exceed indexer_budget before it
+    is done, so QSA could activate for it — it must never share a batch with
+    anything else (see the module docstring above). "pool": QSA provably
+    cannot activate for this request regardless of what else is batched with
+    it, so it may share freely."""
+
+    budget = _indexer_budget(model)
+    if budget is None:
+        return "pool"
+    return "solo" if (prompt_len + max_tokens) > budget else "pool"
+
+
+@dataclass
+class Admission:
+    """One request waiting on (or being served by) the coordinator.
+
+    ``on_tokens``: called once per generated token, on the coordinator's
+    worker thread, exactly like a synchronous ``Runner.generate``'s own
+    on_tokens callback (``None`` for a non-streaming caller). It is expected
+    to be cheap, thread-safe, and never touch MLX arrays (the existing
+    server.py closure only appends to plain lists/queues and reads a
+    ``threading.Event`` — see ``_start_generation``).
+
+    ``on_done``: called exactly once, on the coordinator's worker thread,
+    with ``("done", res)`` / ``("cancelled", None)`` / ``("error", exc)`` —
+    the same three-outcome protocol server.py's own worker() already speaks
+    over its queue. ``None`` for a non-streaming caller, which reads the
+    outcome off ``future`` directly instead.
+
+    ``future``: a plain ``concurrent.futures.Future`` (thread-safe to
+    complete from the coordinator's worker thread and observe via
+    ``asyncio.wrap_future`` on the caller's own event loop). Always resolved
+    with the ``res`` dict (or ``None`` on cancel/error) — never with an
+    exception, matching ``_start_generation``'s existing worker(), whose own
+    Future never raises either (every outcome, including errors, is
+    reported through the queue instead so a caller waiting on the Future
+    only ever needs to know "the request is done").
+    """
+
+    prompt_ids: list[int]
+    max_tokens: int
+    sampler: Callable
+    logits_processors: list
+    tier: str
+    on_tokens: Callable[[list[int]], None] | None
+    on_done: Callable[[str, Any], None] | None
+    cancel_event: "threading.Event | None"
+    future: "Any"  # concurrent.futures.Future
+    uid: int | None = None
+    tokens: list = field(default_factory=list)
+    t0: float | None = None
+    ttft: float | None = None
+
+
+class BatchCoordinator:
+    """Continuous-batching worker. Owns nothing until the first admission;
+    from then on it runs its drive loop on ``executor`` (the single MLX
+    worker thread — see the docstring at the top of server.py) only while it
+    has live or pending work, so it never starves the other things already
+    submitted to that same executor (session-pool lookups, non-batched
+    generate calls for solo-tier or spec-path requests).
+    """
+
+    def __init__(self, model, executor, max_batch: int, prefill_step_size: int, eos_ids):
+        self.model = model
+        self.executor = executor
+        self.max_batch = max(1, max_batch)
+        self.prefill_step_size = prefill_step_size
+        self.eos_ids = list(eos_ids)
+        self._inbox: "_queue.SimpleQueue[Admission]" = _queue.SimpleQueue()
+        self._guard = threading.Lock()
+        self._active = False
+
+    def submit(self, admission: Admission) -> None:
+        """Thread-safe; callable from any asyncio task. Enqueues the
+        admission and, if no drive loop is currently running, starts one."""
+
+        self._inbox.put(admission)
+        with self._guard:
+            if not self._active:
+                self._active = True
+                self.executor.submit(self._drive)
+
+    # ---- runs on the single MLX worker thread ---------------------------
+
+    def _complete(self, adm: "Admission", res=None, cancelled=False, error=None) -> None:
+        if adm.on_done is not None:
+            # Streaming: errors/cancellation are reported through the queue
+            # (mirroring _start_generation's worker() exactly), so the
+            # Future itself never raises — it exists only so the caller
+            # knows the worker has finished.
+            if error is not None:
+                adm.on_done("error", error)
+            elif cancelled:
+                adm.on_done("cancelled", None)
+            else:
+                adm.on_done("done", res)
+            adm.future.set_result(res)
+        else:
+            # Non-streaming: there is no queue, so the Future is the only
+            # channel — an error must actually raise for the caller (e.g.
+            # _run_generate_batched) to see it, exactly as a real exception
+            # from runner.generate() would propagate through
+            # loop.run_in_executor on the non-batched path.
+            if error is not None:
+                adm.future.set_exception(error)
+            else:
+                adm.future.set_result(res)
+
+    def _build_res(self, adm: "Admission") -> dict:
+        decode_time = 0.0
+        if adm.t0 is not None and adm.ttft is not None:
+            decode_time = max(0.0, time.perf_counter() - adm.t0 - adm.ttft)
+        n_decode = max(len(adm.tokens) - 1, 0)
+        return {
+            "tokens": adm.tokens,
+            "ttft_s": adm.ttft or 0.0,
+            "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
+            "prefill_reused": 0,
+            "prefill_new": len(adm.prompt_ids),
+            "tokens_per_step": 1.0,
+        }
+
+    def _deliver_token(self, adm: "Admission", token: int) -> None:
+        if adm.ttft is None:
+            adm.ttft = time.perf_counter() - (adm.t0 or time.perf_counter())
+        adm.tokens.append(token)
+        if adm.on_tokens is not None:
+            adm.on_tokens([token])
+
+    def _drive(self) -> None:
+        from mlx_lm.generate import BatchGenerator
+
+        gen = None
+        live: dict[int, Admission] = {}
+        mode: str | None = None  # None | "solo" | "pool"
+        pending_solo: list[Admission] = []
+        pending_pool: list[Admission] = []
+
+        def new_gen():
+            return BatchGenerator(
+                self.model,
+                stop_tokens=[[t] for t in self.eos_ids],
+                prefill_step_size=self.prefill_step_size,
+            )
+
+        def admit(adm: Admission, tier: str) -> None:
+            nonlocal gen, mode
+            if adm.cancel_event is not None and adm.cancel_event.is_set():
+                self._complete(adm, cancelled=True)
+                return
+            if gen is None:
+                gen = new_gen()
+            uid = gen.insert(
+                [adm.prompt_ids],
+                [adm.max_tokens],
+                samplers=[adm.sampler],
+                logits_processors=[adm.logits_processors],
+            )[0]
+            adm.uid = uid
+            adm.t0 = time.perf_counter()
+            live[uid] = adm
+            mode = tier
+
+        try:
+            while True:
+                while True:
+                    try:
+                        adm = self._inbox.get_nowait()
+                    except _queue.Empty:
+                        break
+                    (pending_solo if adm.tier == "solo" else pending_pool).append(adm)
+
+                if mode in (None, "pool"):
+                    while pending_pool and len(live) < self.max_batch:
+                        admit(pending_pool.pop(0), "pool")
+                if mode is None and not live and pending_solo:
+                    admit(pending_solo.pop(0), "solo")
+
+                if not live:
+                    if pending_solo or pending_pool:
+                        # Something is waiting for the other tier to fully
+                        # drain (or for cancellation to clear it above) —
+                        # spin once more rather than exiting.
+                        continue
+                    break
+
+                for r in gen.next_generated():
+                    adm = live.get(r.uid)
+                    if adm is None:
+                        continue
+                    try:
+                        if r.finish_reason != "stop":
+                            self._deliver_token(adm, r.token)
+                    except BaseException as exc:  # noqa: BLE001 - isolate one uid's callback failure from the rest of the batch
+                        del live[r.uid]
+                        gen.remove([r.uid])
+                        cancelled = adm.cancel_event is not None and adm.cancel_event.is_set()
+                        self._complete(adm, cancelled=cancelled, error=None if cancelled else exc)
+                        continue
+                    if r.finish_reason is not None:
+                        del live[r.uid]
+                        self._complete(adm, res=self._build_res(adm))
+
+                if not live:
+                    mode = None
+        except BaseException as exc:  # noqa: BLE001 - never leave a caller's Future unresolved on an internal bug
+            for adm in list(live.values()) + pending_solo + pending_pool:
+                self._complete(adm, error=exc)
+        finally:
+            if gen is not None:
+                gen.close()
+            with self._guard:
+                self._active = False
+            # A late arrival could have landed between the last empty-check
+            # above and clearing _active; re-check under the lock so it is
+            # never stranded in the inbox with nothing to ever pick it up.
+            if not self._inbox.empty():
+                with self._guard:
+                    if not self._active:
+                        self._active = True
+                        self.executor.submit(self._drive)
+
+
+__all__ = [
+    "Admission",
+    "BatchCoordinator",
+    "classify",
+    "disable_batch_cache",
+    "enable_batch_cache",
+]

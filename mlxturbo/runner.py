@@ -593,6 +593,119 @@ class FallbackRunner:
         return result
 
 
+# ---------------------------------------------------------- continuous batching
+#
+# BACKLOG.md §2 / Kimi K3 review item 11. Restricted to FallbackRunner: the
+# batch coordinator (mlxturbo.batch.BatchCoordinator) drives
+# mlx_lm.generate.BatchGenerator directly against the model's own __call__ —
+# exactly the path FallbackRunner.generate already takes (via
+# stream_generate), and exactly what mlxturbo.batch's monkey patches exist
+# for. SpecRunner/FlashSpecRunner/DraftSpecRunner/LookupSpecRunner keep their
+# own draft-token state machines untouched; whether continuous batching can
+# coexist with any of them is unmeasured, so server.py only ever routes a
+# request here when the runner resolved for it (after any per-request
+# downgrade) is a plain FallbackRunner.
+
+BATCH_SUPPORTED_SAMPLING_PARAMS = FallbackRunner.SUPPORTED_SAMPLING_PARAMS
+
+
+def can_batch(resolved_runner) -> bool:
+    """True only for a plain ``FallbackRunner`` — see the module note above."""
+
+    return type(resolved_runner) is FallbackRunner
+
+
+def batch_tier(coordinator, prompt_ids: list[int], max_tokens: int) -> str:
+    """"solo" or "pool" — see mlxturbo.batch.classify's docstring for what
+    the two mean and why "solo" is deliberately more conservative than the
+    strict correctness condition."""
+
+    from . import batch as _batch
+
+    return _batch.classify(coordinator.model, len(prompt_ids), max_tokens)
+
+
+def start_batched_generation(
+    coordinator,
+    prompt_ids: list[int],
+    max_tokens: int,
+    temp: float,
+    on_tokens,
+    on_done,
+    cancel_event,
+    top_p: float = 0.0,
+    top_k: int = 0,
+    min_p: float = 0.0,
+    repetition_penalty: float | None = None,
+    presence_penalty: float | None = None,
+    frequency_penalty: float | None = None,
+    logit_bias: dict | None = None,
+    seed: int | None = None,
+    **extra,
+):
+    """Build one ``mlxturbo.batch.Admission`` and submit it to ``coordinator``.
+
+    Mirrors ``FallbackRunner.generate``'s own sampler/logits_processors
+    construction exactly (same ``make_sampler``/``make_logits_processors``
+    calls, same ``seed`` handling via ``mx.random.seed``), so the two paths
+    sample identically for the same parameters — only *how* the forward pass
+    is driven differs (a private ``BatchGenerator`` per request there, one
+    shared continuously-refilled ``BatchGenerator`` here).
+
+    ``on_tokens``/``on_done``/``cancel_event`` follow the same three-argument
+    contract server.py's own ``_build_streaming_pipeline`` produces
+    (``on_tokens(toks)`` per generated token, ``on_done(kind, val)`` exactly
+    once with ``"done"``/``"cancelled"``/``"error"``); a non-streaming caller
+    passes ``on_tokens=None, on_done=None, cancel_event=None``.
+
+    ``logprobs``/``top_logprobs``/``n_draft``/``max_draft``/``fly_*`` are
+    accepted via ``**extra`` and ignored — a logprobs request is excluded
+    from batch eligibility upstream (server.py's ``_resolve_runner_for_request``
+    already demotes it to non-speculative for the same reason SpecRunner
+    does; batching does not yet collect logprobs, so such a request simply
+    never reaches this function), and the rest are speculative-only knobs
+    that do not apply to FallbackRunner in the first place.
+
+    Returns the ``Admission``'s ``concurrent.futures.Future`` (always
+    resolved with a ``res`` dict — see mlxturbo.batch.Admission's docstring
+    for the streaming/non-streaming difference in how errors surface).
+    """
+
+    import concurrent.futures
+
+    import mlx.core as mx
+    from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+    from . import batch as _batch
+
+    if seed is not None:
+        mx.random.seed(seed)
+
+    sampler = make_sampler(temp=temp, top_p=top_p, min_p=min_p, top_k=top_k)
+    logits_processors = make_logits_processors(
+        logit_bias=logit_bias,
+        repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+    )
+    tier = _batch.classify(coordinator.model, len(prompt_ids), max_tokens)
+
+    future: "concurrent.futures.Future" = concurrent.futures.Future()
+    admission = _batch.Admission(
+        prompt_ids=list(prompt_ids),
+        max_tokens=max_tokens,
+        sampler=sampler,
+        logits_processors=logits_processors,
+        tier=tier,
+        on_tokens=on_tokens,
+        on_done=on_done,
+        cancel_event=cancel_event,
+        future=future,
+    )
+    coordinator.submit(admission)
+    return future
+
+
 class DraftSpecRunner:
     """Architecture-independent speculative path that uses mlx_lm's own
     draft-model speculative decoding (``mlx_lm.generate.
@@ -961,6 +1074,61 @@ def build_runner(
         return wrapped
 
     return resolved
+
+
+def maybe_build_batch_coordinator(
+    resolved_runner,
+    model,
+    executor,
+    max_batch: int,
+    eos_ids,
+    prefill_step_size: int | None = None,
+    log_prefix: str = "[mlxturbo]",
+):
+    """``None`` unless both hold: ``--max-batch`` asked for more than 1, and
+    ``resolved_runner`` is a plain ``FallbackRunner`` (see ``can_batch``). The
+    default (``--max-batch`` omitted or 1) must produce ``None`` here so that
+    server.py's existing fully-serial behavior is exactly unchanged when the
+    flag is not used — this function is the single place that decides "does
+    continuous batching exist on this server at all".
+
+    ``resolved_runner`` is not necessarily server.py's primary ``STATE.runner``
+    — when the primary is speculative (spec/flash_spec/draft_spec/
+    lookup_spec), server.py passes ``STATE.downgrade_runner`` instead (the
+    same plain ``FallbackRunner``, wrapping the identical model, that
+    per-request downgrades for non-identity sampling/logprobs already route
+    to today — see ``_resolve_runner_for_request`` in server.py). Either way
+    this never touches the speculative runner itself: an ordinary request
+    served by spec/flash_spec keeps going through STATE.lock exactly as
+    before, unaffected by --max-batch.
+
+    Also calls ``mlxturbo.batch.enable_batch_cache()`` when building one —
+    harmless to call even when the served model is not qwen4_exp (the patches
+    only touch qwen4_exp's own classes; see that module's docstring), and
+    necessary when it is.
+    """
+
+    if max_batch <= 1 or not can_batch(resolved_runner):
+        return None
+
+    from . import batch as _batch
+    from .spec import PREFILL_STEP_SIZE
+
+    _batch.enable_batch_cache()
+    coordinator = _batch.BatchCoordinator(
+        model,
+        executor,
+        max_batch=max_batch,
+        prefill_step_size=prefill_step_size or PREFILL_STEP_SIZE,
+        eos_ids=eos_ids,
+    )
+    print(
+        f"{log_prefix} 継続バッチング有効 (--max-batch {max_batch}, FallbackRunner 限定)。"
+        " QSA が有効になりうるリクエスト (プロンプト長 + max_tokens が"
+        " indexer_budget を超えうるもの) は自動で単独実行に倒します"
+        " (mlxturbo/batch.py の classify() 参照)"
+    )
+    return coordinator
 
 
 def _build_base_runner(

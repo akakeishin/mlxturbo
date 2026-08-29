@@ -103,7 +103,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from importlib import metadata as _importlib_metadata
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 
 import mlx.core as mx
 from fastapi import FastAPI, Request
@@ -112,7 +112,17 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ._mlx_compat import mlx_lm_load
 from .cli import MTP_PATH_ENV
-from .runner import RUNNER_KINDS, FallbackRunner, FallbackSession, Runner, build_runner
+from .runner import (
+    RUNNER_KINDS,
+    FallbackRunner,
+    FallbackSession,
+    Runner,
+    build_runner,
+    can_batch,
+    maybe_build_batch_coordinator,
+    start_batched_generation,
+)
+from .runner import batch_tier as _runner_batch_tier
 from .spec import PREFILL_STEP_SIZE, ChatSession, restore_untrimmable_caches
 
 app = FastAPI()
@@ -307,6 +317,17 @@ class ModelState:
     # limit is --max-stored-responses.
     response_store: "OrderedDict[str, object]" = field(default_factory=OrderedDict)
     max_stored_responses: int = 50
+    # --max-batch (item 11 / BACKLOG.md §2). None unless continuous batching
+    # was actually built for this server (max_batch>1 AND the resolved
+    # runner is a plain FallbackRunner — see
+    # mlxturbo.runner.maybe_build_batch_coordinator). Every one of the 8
+    # generation call sites checks this (via _resolve_batch_tier) before
+    # deciding whether to route around STATE.lock into the coordinator;
+    # None here always means "route through STATE.lock exactly as before",
+    # so the default (--max-batch omitted, or spec/flash_spec active) is
+    # provably unchanged.
+    batch_coordinator: "Any" = None
+    max_batch: int = 1
 
 
 STATE: ModelState | None = None
@@ -2399,6 +2420,111 @@ class _GenerationCancelled(Exception):
     """Private cooperative-stop signal raised from a runner callback."""
 
 
+def _resolve_batch_tier(
+    gen_runner, prompt_ids: list[int], max_tokens: int, logprobs_requested: bool = False
+) -> str | None:
+    """``None`` means "not batch-eligible — route through STATE.lock exactly
+    as before" (this is also what makes --max-batch's default of 1, and any
+    server not passing it at all, provably identical to before this change:
+    STATE.batch_coordinator is None, so every call short-circuits here).
+
+    Otherwise ``"pool"``/``"solo"`` (mlxturbo.batch.classify, via
+    runner.batch_tier) — see the ModelState.batch_coordinator field
+    docstring and mlxturbo/batch.py's module docstring for what the two mean.
+
+    Excludes logprobs requests: batching does not collect logprobs yet (see
+    runner.start_batched_generation's docstring), so such a request simply
+    keeps going through the existing STATE.lock + FallbackRunner.generate
+    path, identical to how it is served today.
+    """
+
+    coordinator = STATE.batch_coordinator
+    if coordinator is None or logprobs_requested:
+        return None
+    if not can_batch(gen_runner):
+        return None
+    return _runner_batch_tier(coordinator, prompt_ids, max_tokens)
+
+
+async def _run_generate_batched(
+    prompt_ids, max_tokens, temp, on_tokens=None, **sampling_kwargs
+) -> dict:
+    """The batched-path analogue of ``_run_generate`` — used instead of it
+    (never both) whenever ``_resolve_batch_tier`` returned non-``None``.
+
+    No session is passed (batched requests always do a fresh prefill; see
+    mlxturbo/batch.py's module docstring — the same simplification already
+    used for a per-request-downgraded request, see the callers'
+    ``session=None`` comment). No ``STATE.lock`` either: concurrency between
+    admissions is the entire point, and mutual exclusion around the model
+    forward pass now lives inside ``BatchCoordinator`` itself.
+
+    Cancellation: mirrors ``_run_generate``'s own shield/defer pattern. A
+    non-streaming caller has no ``cancel_event`` to signal early, so — same
+    as the pre-existing non-batched non-streaming path — a client
+    disconnect does not stop generation early, only defers when the
+    ``CancelledError`` is allowed to propagate until the Future is done.
+    """
+
+    future = start_batched_generation(
+        STATE.batch_coordinator, prompt_ids, max_tokens, temp, on_tokens, None, None,
+        **sampling_kwargs,
+    )
+    wrapped = asyncio.wrap_future(future)
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            result = await asyncio.shield(wrapped)
+        except asyncio.CancelledError as exc:
+            if wrapped.cancelled():
+                raise
+            cancelled = exc
+            continue
+        except Exception:
+            if cancelled is not None:
+                raise cancelled
+            raise
+        if cancelled is not None:
+            raise cancelled
+        return result
+
+
+def _start_batched_generation(
+    prompt_ids,
+    max_tokens,
+    temp,
+    thinking_budget,
+    tool_calling_enabled: bool = False,
+    tools_for_parsing=None,
+    **sampling_kwargs,
+):
+    """The batched-path analogue of ``_start_generation`` — same external
+    contract (``q, future, cancel_event, raw_token_count``), so every
+    streaming call site can swap one for the other without any other change:
+    the SSE-side consumption code (``_await_with_keepalive``,
+    ``asyncio.to_thread(q.get)``, ``_await_worker``) neither knows nor cares
+    which one produced its queue.
+    """
+
+    q, cancel_event, raw_token_count, on_tokens, on_done = _build_streaming_pipeline(
+        prompt_ids, thinking_budget, tool_calling_enabled, tools_for_parsing
+    )
+    future = start_batched_generation(
+        STATE.batch_coordinator,
+        prompt_ids,
+        max_tokens,
+        temp,
+        on_tokens,
+        on_done,
+        cancel_event,
+        **sampling_kwargs,
+    )
+    # A plain concurrent.futures.Future, exactly like _start_generation's own
+    # STATE.executor.submit(worker) return value — _await_worker wraps it
+    # with asyncio.wrap_future itself.
+    return q, future, cancel_event, raw_token_count
+
+
 async def _run_generate(
     prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, runner=None, **sampling_kwargs
 ):
@@ -2610,6 +2736,62 @@ def _start_generation(
     session at once.
     """
 
+    q, cancel_event, raw_token_count, on_tokens, on_done = _build_streaming_pipeline(
+        prompt_ids, thinking_budget, tool_calling_enabled, tools_for_parsing
+    )
+
+    def worker():
+        try:
+            res = (runner or STATE.runner).generate(
+                prompt_ids,
+                max_tokens=max_tokens,
+                temp=temp,
+                eos_ids=STATE.eos_ids,
+                on_tokens=on_tokens,
+                session=session,
+                **sampling_kwargs,
+            )
+            on_done("done", res)
+        except _GenerationCancelled:
+            # Cancelling the asyncio Task around ``to_thread(q.get)`` cannot
+            # cancel the underlying blocking thread.  Wake that orphaned get
+            # even though the SSE consumer itself is already gone.
+            on_done("cancelled", None)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the client as an SSE error event
+            on_done("error", exc)
+
+    # Submit to the generation-only thread (executor). The async side picks up
+    # results through the queue with asyncio.to_thread(q.get) (that is only a
+    # queue.Queue wait, unrelated to MLX's thread pinning, so a general-purpose
+    # thread pool is fine there).
+    future = STATE.executor.submit(worker)
+    return q, future, cancel_event, raw_token_count
+
+
+def _build_streaming_pipeline(
+    prompt_ids, thinking_budget, tool_calling_enabled, tools_for_parsing
+):
+    """The part of ``_start_generation`` that has nothing to do with *how*
+    generation actually runs: the queue, the cancellation flag, the raw token
+    counter, and the ThinkingRouter/SegmentAssembler pipeline that turns a raw
+    token stream into the ``(kind, val)`` events the SSE layer consumes.
+
+    Shared verbatim by ``_start_generation`` (submits a single blocking
+    ``runner.generate`` call to ``STATE.executor``) and
+    ``_start_batched_generation`` (submits an ``Admission`` to
+    ``STATE.batch_coordinator`` instead — see mlxturbo/batch.py) so the two
+    only differ in how the token stream is actually produced, never in how it
+    is turned into SSE events.
+
+    Returns ``(q, cancel_event, raw_token_count, on_tokens, on_done)``.
+    ``on_done(kind, val)`` is the three-outcome completion callback
+    (``"done"``/``"cancelled"``/``"error"``) both callers invoke exactly
+    once; for ``"done"`` it runs the router's finalize pass (flushing any
+    still-buffered reasoning/content/tool-call text) before pushing the
+    terminal event, exactly as the original inline ``worker()`` did — for
+    ``"cancelled"``/``"error"`` it does not, also unchanged from before.
+    """
+
     q: queue.Queue = queue.Queue()
     cancel_event = threading.Event()
     eos_ids = STATE.eos_ids
@@ -2639,36 +2821,17 @@ def _start_generation(
             q.put(("budget_exceeded", None))
             signaled[0] = True
 
-    def worker():
-        try:
-            res = (runner or STATE.runner).generate(
-                prompt_ids,
-                max_tokens=max_tokens,
-                temp=temp,
-                eos_ids=eos_ids,
-                on_tokens=on_tokens,
-                session=session,
-                **sampling_kwargs,
-            )
+    def on_done(kind, val):
+        if kind == "done":
             if not router.budget_exceeded:
                 for channel, payload in router.finalize():
-                    for kind, val in assembler.push(channel, payload):
-                        q.put((kind, val))
-            q.put(("done", res))
-        except _GenerationCancelled:
-            # Cancelling the asyncio Task around ``to_thread(q.get)`` cannot
-            # cancel the underlying blocking thread.  Wake that orphaned get
-            # even though the SSE consumer itself is already gone.
-            q.put(("cancelled", None))
-        except Exception as exc:  # noqa: BLE001 - surfaced to the client as an SSE error event
-            q.put(("error", exc))
+                    for k2, v2 in assembler.push(channel, payload):
+                        q.put((k2, v2))
+            q.put(("done", val))
+        else:
+            q.put((kind, val))
 
-    # Submit to the generation-only thread (executor). The async side picks up
-    # results through the queue with asyncio.to_thread(q.get) (that is only a
-    # queue.Queue wait, unrelated to MLX's thread pinning, so a general-purpose
-    # thread pool is fine there).
-    future = STATE.executor.submit(worker)
-    return q, future, cancel_event, raw_token_count
+    return q, cancel_event, raw_token_count, on_tokens, on_done
 
 
 async def _await_worker(future) -> None:
@@ -3067,28 +3230,39 @@ async def chat_completions(request: Request):
             headers=_downgrade_headers(downgrade_reason),
         )
 
+    batch_tier = _resolve_batch_tier(
+        gen_runner, prompt_ids, max_tokens, logprobs_requested=logprobs_requested
+    )
     try:
-        async with STATE.lock:
-            # A downgraded request does not touch the session pool:
-            # FallbackRunner expects a FallbackSession (singular .cache), but
-            # if STATE.runner is a spec runner the pool holds ChatSessions
-            # (plural .caches) and the types do not match. Passing session=None
-            # makes FallbackRunner.generate fall naturally onto the path where
-            # it simply builds a fresh prompt_cache every time (see the
-            # _resolve_runner_for_request docstring).
-            session = None if downgrade_reason is not None else await _select_session_on_executor(
-                prompt_ids
+        if batch_tier is not None:
+            # Continuous batching (--max-batch): no STATE.lock, no session
+            # (see mlxturbo/batch.py's module docstring) — concurrency with
+            # other in-flight requests is the entire point.
+            res = await _run_generate_batched(
+                prompt_ids, max_tokens, temp, None, **sampling_params
             )
-            res = await _run_generate(
-                prompt_ids,
-                max_tokens,
-                temp,
-                STATE.eos_ids,
-                None,
-                session,
-                runner=gen_runner,
-                **sampling_params,
-            )
+        else:
+            async with STATE.lock:
+                # A downgraded request does not touch the session pool:
+                # FallbackRunner expects a FallbackSession (singular .cache), but
+                # if STATE.runner is a spec runner the pool holds ChatSessions
+                # (plural .caches) and the types do not match. Passing session=None
+                # makes FallbackRunner.generate fall naturally onto the path where
+                # it simply builds a fresh prompt_cache every time (see the
+                # _resolve_runner_for_request docstring).
+                session = None if downgrade_reason is not None else await _select_session_on_executor(
+                    prompt_ids
+                )
+                res = await _run_generate(
+                    prompt_ids,
+                    max_tokens,
+                    temp,
+                    STATE.eos_ids,
+                    None,
+                    session,
+                    runner=gen_runner,
+                    **sampling_params,
+                )
     except Exception as exc:
         return _openai_error(str(exc), status=500, err_type="server_error")
     finally:
@@ -3202,36 +3376,54 @@ async def _openai_stream(
     # first token"). Ownership of the queue slot is centralized in
     # _queue_owned_stream, and ownership of the lock in the owned flag below.
     owned = [False]
+    batch_tier = _resolve_batch_tier(runner or STATE.runner, prompt_ids, max_tokens)
     try:
-        async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
-            yield keepalive
+        if batch_tier is not None:
+            # Continuous batching (--max-batch): no STATE.lock (owned stays
+            # False, so the function's own final `if owned[0]:` is already a
+            # correct no-op), no session (see mlxturbo/batch.py's module
+            # docstring — batched requests always do a fresh prefill).
+            session = None
+            reused_at_select = 0
+            q, future, cancel_event, raw_token_count = _start_batched_generation(
+                prompt_ids,
+                max_tokens,
+                temp,
+                thinking_budget,
+                tool_enabled,
+                tools_for_parsing,
+                **(sampling_params or {}),
+            )
+        else:
+            async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
+                yield keepalive
 
-        # A downgraded request (whose runner differs from STATE.runner =
-        # STATE.downgrade_runner) does not touch the session pool — the types
-        # do not match (see the _resolve_runner_for_request docstring).
-        downgraded = runner is not None and runner is not STATE.runner
-        session = None if downgraded else await _select_session_on_executor(prompt_ids)
-        # By the time ``_select_session`` has chosen a slot it has already
-        # truncated the processed sequence to exactly "the length that will
-        # actually be reused" (unchanged for a whole-sequence match, the
-        # post-trim/post-checkpoint-restore length for a partial match), so the
-        # value read here matches the prefill_reused that runner.generate()
-        # computes internally. When a stop string matches and generation is cut
-        # off early (cancel_event.set(), item 18), the runner does not return a
-        # res dict ("cancelled"), so usage's cached_tokens falls back to this
-        # precomputed value.
-        reused_at_select = len(session.processed) if session is not None else 0
-        q, future, cancel_event, raw_token_count = _start_generation(
-            prompt_ids,
-            max_tokens,
-            temp,
-            thinking_budget,
-            tool_enabled,
-            tools_for_parsing,
-            session=session,
-            runner=runner,
-            **(sampling_params or {}),
-        )
+            # A downgraded request (whose runner differs from STATE.runner =
+            # STATE.downgrade_runner) does not touch the session pool — the types
+            # do not match (see the _resolve_runner_for_request docstring).
+            downgraded = runner is not None and runner is not STATE.runner
+            session = None if downgraded else await _select_session_on_executor(prompt_ids)
+            # By the time ``_select_session`` has chosen a slot it has already
+            # truncated the processed sequence to exactly "the length that will
+            # actually be reused" (unchanged for a whole-sequence match, the
+            # post-trim/post-checkpoint-restore length for a partial match), so the
+            # value read here matches the prefill_reused that runner.generate()
+            # computes internally. When a stop string matches and generation is cut
+            # off early (cancel_event.set(), item 18), the runner does not return a
+            # res dict ("cancelled"), so usage's cached_tokens falls back to this
+            # precomputed value.
+            reused_at_select = len(session.processed) if session is not None else 0
+            q, future, cancel_event, raw_token_count = _start_generation(
+                prompt_ids,
+                max_tokens,
+                temp,
+                thinking_budget,
+                tool_enabled,
+                tools_for_parsing,
+                session=session,
+                runner=runner,
+                **(sampling_params or {}),
+            )
         try:
             # Starting generation (submitting the worker) finishes immediately,
             # but keepalives are likewise sent until the first queue element
@@ -3587,24 +3779,30 @@ async def anthropic_messages(request: Request):
             headers=_downgrade_headers(downgrade_reason),
         )
 
+    batch_tier = _resolve_batch_tier(gen_runner, prompt_ids, max_tokens)
     try:
-        async with STATE.lock:
-            # A downgraded request does not touch the session pool (the same
-            # reason as chat_completions; see the _resolve_runner_for_request
-            # docstring).
-            session = None if downgrade_reason is not None else await _select_session_on_executor(
-                prompt_ids
+        if batch_tier is not None:
+            res = await _run_generate_batched(
+                prompt_ids, max_tokens, temp, None, **sampling_params
             )
-            res = await _run_generate(
-                prompt_ids,
-                max_tokens,
-                temp,
-                STATE.eos_ids,
-                None,
-                session,
-                runner=gen_runner,
-                **sampling_params,
-            )
+        else:
+            async with STATE.lock:
+                # A downgraded request does not touch the session pool (the same
+                # reason as chat_completions; see the _resolve_runner_for_request
+                # docstring).
+                session = None if downgrade_reason is not None else await _select_session_on_executor(
+                    prompt_ids
+                )
+                res = await _run_generate(
+                    prompt_ids,
+                    max_tokens,
+                    temp,
+                    STATE.eos_ids,
+                    None,
+                    session,
+                    runner=gen_runner,
+                    **sampling_params,
+                )
     except Exception as exc:
         return _anthropic_error(str(exc), status=500, err_type="server_error")
     finally:
@@ -3701,24 +3899,38 @@ async def _anthropic_stream(
     yield sse("ping", {"type": "ping"})
 
     owned = [False]
+    batch_tier = _resolve_batch_tier(runner or STATE.runner, prompt_ids, max_tokens)
     try:
-        async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
-            yield keepalive
+        if batch_tier is not None:
+            session = None
+            reused_at_select = 0
+            q, future, cancel_event, raw_token_count = _start_batched_generation(
+                prompt_ids,
+                max_tokens,
+                temp,
+                thinking_budget,
+                tool_enabled,
+                tools_for_parsing,
+                **(sampling_params or {}),
+            )
+        else:
+            async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
+                yield keepalive
 
-        downgraded = runner is not None and runner is not STATE.runner
-        session = None if downgraded else await _select_session_on_executor(prompt_ids)
-        reused_at_select = len(session.processed) if session is not None else 0
-        q, future, cancel_event, raw_token_count = _start_generation(
-            prompt_ids,
-            max_tokens,
-            temp,
-            thinking_budget,
-            tool_enabled,
-            tools_for_parsing,
-            session=session,
-            runner=runner,
-            **(sampling_params or {}),
-        )
+            downgraded = runner is not None and runner is not STATE.runner
+            session = None if downgraded else await _select_session_on_executor(prompt_ids)
+            reused_at_select = len(session.processed) if session is not None else 0
+            q, future, cancel_event, raw_token_count = _start_generation(
+                prompt_ids,
+                max_tokens,
+                temp,
+                thinking_budget,
+                tool_enabled,
+                tools_for_parsing,
+                session=session,
+                runner=runner,
+                **(sampling_params or {}),
+            )
         try:
             first_item = None
             async for _ka_kind, _ka_val in _await_with_keepalive(asyncio.to_thread(q.get)):
@@ -4076,21 +4288,29 @@ async def completions(request: Request):
             headers=_downgrade_headers(downgrade_reason),
         )
 
+    batch_tier = _resolve_batch_tier(
+        gen_runner, prompt_ids, max_tokens, logprobs_requested=logprobs_requested
+    )
     try:
-        async with STATE.lock:
-            session = None if downgrade_reason is not None else await _select_session_on_executor(
-                prompt_ids
+        if batch_tier is not None:
+            res = await _run_generate_batched(
+                prompt_ids, max_tokens, temp, None, **sampling_params
             )
-            res = await _run_generate(
-                prompt_ids,
-                max_tokens,
-                temp,
-                STATE.eos_ids,
-                None,
-                session,
-                runner=gen_runner,
-                **sampling_params,
-            )
+        else:
+            async with STATE.lock:
+                session = None if downgrade_reason is not None else await _select_session_on_executor(
+                    prompt_ids
+                )
+                res = await _run_generate(
+                    prompt_ids,
+                    max_tokens,
+                    temp,
+                    STATE.eos_ids,
+                    None,
+                    session,
+                    runner=gen_runner,
+                    **sampling_params,
+                )
     except Exception as exc:
         return _openai_error(str(exc), status=500, err_type="server_error")
     finally:
@@ -4151,18 +4371,28 @@ async def _completions_stream(
     runner=None,
 ):
     owned = [False]
+    batch_tier = _resolve_batch_tier(runner or STATE.runner, prompt_ids, max_tokens)
     try:
-        async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
-            yield keepalive
+        if batch_tier is not None:
+            session = None
+            reused_at_select = 0
+            # thinking_budget=0 pins ThinkingRouter to content-only (regardless of
+            # has_thinking), so reasoning_delta can never arrive.
+            q, future, cancel_event, raw_token_count = _start_batched_generation(
+                prompt_ids, max_tokens, temp, 0, **(sampling_params or {})
+            )
+        else:
+            async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
+                yield keepalive
 
-        downgraded = runner is not None and runner is not STATE.runner
-        session = None if downgraded else await _select_session_on_executor(prompt_ids)
-        reused_at_select = len(session.processed) if session is not None else 0
-        # thinking_budget=0 pins ThinkingRouter to content-only (regardless of
-        # has_thinking), so reasoning_delta can never arrive.
-        q, future, cancel_event, raw_token_count = _start_generation(
-            prompt_ids, max_tokens, temp, 0, session=session, runner=runner, **(sampling_params or {})
-        )
+            downgraded = runner is not None and runner is not STATE.runner
+            session = None if downgraded else await _select_session_on_executor(prompt_ids)
+            reused_at_select = len(session.processed) if session is not None else 0
+            # thinking_budget=0 pins ThinkingRouter to content-only (regardless of
+            # has_thinking), so reasoning_delta can never arrive.
+            q, future, cancel_event, raw_token_count = _start_generation(
+                prompt_ids, max_tokens, temp, 0, session=session, runner=runner, **(sampling_params or {})
+            )
         try:
             first_item = None
             async for _ka_kind, _ka_val in _await_with_keepalive(asyncio.to_thread(q.get)):
@@ -4893,21 +5123,27 @@ async def responses_endpoint(request: Request):
             headers=_downgrade_headers(downgrade_reason),
         )
 
+    batch_tier = _resolve_batch_tier(gen_runner, prompt_ids, max_tokens)
     try:
-        async with STATE.lock:
-            session = None if downgrade_reason is not None else await _select_session_on_executor(
-                prompt_ids
+        if batch_tier is not None:
+            res = await _run_generate_batched(
+                prompt_ids, max_tokens, temp, None, **sampling_params
             )
-            res = await _run_generate(
-                prompt_ids,
-                max_tokens,
-                temp,
-                STATE.eos_ids,
-                None,
-                session,
-                runner=gen_runner,
-                **sampling_params,
-            )
+        else:
+            async with STATE.lock:
+                session = None if downgrade_reason is not None else await _select_session_on_executor(
+                    prompt_ids
+                )
+                res = await _run_generate(
+                    prompt_ids,
+                    max_tokens,
+                    temp,
+                    STATE.eos_ids,
+                    None,
+                    session,
+                    runner=gen_runner,
+                    **sampling_params,
+                )
     except Exception as exc:
         return _openai_error(str(exc), status=500, err_type="server_error")
     finally:
@@ -4999,23 +5235,36 @@ async def _responses_stream(
     )
 
     owned = [False]
+    batch_tier = _resolve_batch_tier(runner or STATE.runner, prompt_ids, max_tokens)
     try:
-        async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
-            yield keepalive
+        if batch_tier is not None:
+            session = None
+            q, future, cancel_event, _raw_token_count = _start_batched_generation(
+                prompt_ids,
+                max_tokens,
+                temp,
+                thinking_budget,
+                tool_enabled,
+                tools_for_parsing,
+                **(sampling_params or {}),
+            )
+        else:
+            async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
+                yield keepalive
 
-        downgraded = runner is not None and runner is not STATE.runner
-        session = None if downgraded else await _select_session_on_executor(prompt_ids)
-        q, future, cancel_event, _raw_token_count = _start_generation(
-            prompt_ids,
-            max_tokens,
-            temp,
-            thinking_budget,
-            tool_enabled,
-            tools_for_parsing,
-            session=session,
-            runner=runner,
-            **(sampling_params or {}),
-        )
+            downgraded = runner is not None and runner is not STATE.runner
+            session = None if downgraded else await _select_session_on_executor(prompt_ids)
+            q, future, cancel_event, _raw_token_count = _start_generation(
+                prompt_ids,
+                max_tokens,
+                temp,
+                thinking_budget,
+                tool_enabled,
+                tools_for_parsing,
+                session=session,
+                runner=runner,
+                **(sampling_params or {}),
+            )
         try:
             first_item = None
             async for _ka_kind, _ka_val in _await_with_keepalive(asyncio.to_thread(q.get)):
@@ -5630,6 +5879,27 @@ def main() -> None:
         " 503 (Retry-After 付き) で断る。/health の queue_depth で現在値を見れる",
     )
     ap.add_argument(
+        "--max-batch",
+        type=int,
+        default=1,
+        metavar="N",
+        help="継続バッチング (BACKLOG.md §2) を有効にし、同時に処理する"
+        " リクエスト数の上限を N にする。既定 (未指定、または 1) では"
+        " 従来どおり全リクエストを直列実行する — この既定の挙動は変えない。"
+        " 効くのは FallbackRunner を実際に使うリクエストだけ: runner が"
+        " 元から非投機ならすべてのリクエストに、投機系 (spec/flash_spec/"
+        "draft_spec/lookup_spec) が主経路なら非恒等サンプリング/logprobs で"
+        " fallback へ降格されたリクエストだけに効く (投機経路自体とバッチ化"
+        " の相性は未検証なので、通常の投機リクエストは従来どおり直列)。"
+        " /health の queue_depth はどちらの経路でも共通の待ち行列を報告する。"
+        " QSA が有効になりうるリクエスト (プロンプト長 + max_tokens が"
+        " indexer_budget を超えうるもの) は正しさのため常に単独実行に自動で"
+        " 倒す (mlxturbo/batch.py 参照)。ビット一致は保証しない"
+        " (mx.quantized_matmul のバッチ長依存の丸めのため。"
+        " tools/verify_batch_real.py --mode kld 参照) — 保証するのは"
+        " 同一バッチ構成内の決定性",
+    )
+    ap.add_argument(
         "--mtp",
         default=None,
         metavar="PATH",
@@ -5714,11 +5984,37 @@ def main() -> None:
         downgrade_runner = None if runner.KIND == FallbackRunner.KIND else FallbackRunner(
             model, tokenizer
         )
-        return runner, tokenizer, max_context_tokens, source, downgrade_runner
+        # --max-batch (default 1 = off) builds mlxturbo.batch.BatchCoordinator
+        # only when there is a plain FallbackRunner in play somewhere — see
+        # maybe_build_batch_coordinator's docstring for why it must be that
+        # exact class. That FallbackRunner is either the primary `runner`
+        # (this model does not fit the spec/flash_spec contract at all) or,
+        # when the primary is speculative, `downgrade_runner` — the same
+        # object per-request downgrades (item 7) already route non-identity-
+        # sampling/logprobs requests to today, wrapping the identical
+        # `model`. Either way this never touches the speculative runner
+        # itself: a spec/flash_spec-served request that is not downgraded
+        # keeps going through STATE.lock exactly as before, unaffected by
+        # --max-batch. Built inside _load() (this same executor thread)
+        # because BatchGenerator's own construction touches MLX (the
+        # wired-limit call), which is subject to the same thread-pinning
+        # rule as everything else here.
+        fallback_candidate = runner if runner.KIND == FallbackRunner.KIND else downgrade_runner
+        eos_ids = set(tokenizer.eos_token_ids)
+        batch_coordinator = maybe_build_batch_coordinator(
+            fallback_candidate, model, executor, args.max_batch, eos_ids,
+            log_prefix="[mlxturbo-serve]",
+        )
+        return runner, tokenizer, max_context_tokens, source, downgrade_runner, batch_coordinator
 
-    runner, tokenizer, max_context_tokens, source, downgrade_runner = executor.submit(
-        _load
-    ).result()
+    (
+        runner,
+        tokenizer,
+        max_context_tokens,
+        source,
+        downgrade_runner,
+        batch_coordinator,
+    ) = executor.submit(_load).result()
     if max_context_tokens is not None:
         print(
             f"[mlxturbo-serve] プロンプト長の上限: {max_context_tokens} トークン ({source})"
@@ -5757,8 +6053,25 @@ def main() -> None:
         version=_FASTMLX_VERSION,
         downgrade_runner=downgrade_runner,
         max_stored_responses=args.max_stored_responses,
+        batch_coordinator=batch_coordinator,
+        max_batch=args.max_batch,
     )
     print(f"[mlxturbo-serve] version {_FASTMLX_VERSION}")
+    if batch_coordinator is not None:
+        if runner.KIND == FallbackRunner.KIND:
+            print(f"[mlxturbo-serve] 継続バッチング: 有効 (--max-batch {args.max_batch})")
+        else:
+            print(
+                f"[mlxturbo-serve] 継続バッチング: 有効 (--max-batch {args.max_batch})、"
+                f" ただし runner={runner.KIND} なので効くのは非恒等サンプリング/logprobs で"
+                " fallback へ降格されたリクエストだけ (投機経路の通常リクエストは"
+                " 従来どおり直列)"
+            )
+    elif args.max_batch > 1:
+        print(
+            f"[mlxturbo-serve] --max-batch {args.max_batch} が指定されましたが無効"
+            " (継続バッチングが使える runner が見当たらない)"
+        )
     if downgrade_runner is not None:
         print(
             "[mlxturbo-serve] 非恒等サンプリングパラメータ/logprobs 要求時のリクエスト単位"
