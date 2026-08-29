@@ -1,9 +1,11 @@
 # vendored from https://github.com/avlp12/mlx-lm/blob/main/mlx_lm/fast_qmm.py
-# ライセンス確認済み (2026-08-26): fork の LICENSE は MIT (Copyright Apple Inc.)。
-# MIT 条件 (ライセンス文の保持) の下で利用・改変・再配布可。
-# M3 Max 実測: 依存チェーンで m=8 が mx.quantized_matmul の 1.57 倍、m=6 で 1.25 倍。
-# m カーブ税の真因 (qmv_wide の 5 本上限による ceil(M/5) 回の重み再読) を
-# 8x8 MMA タイル + 量子化グループ単位 dequant + split-K で回避する。
+# License checked (2026-08-26): the fork's LICENSE is MIT (Copyright Apple Inc.).
+# Use, modification and redistribution are permitted under the MIT terms
+# (retaining the license text).
+# Measured on M3 Max: on a dependent chain, m=8 is 1.57x mx.quantized_matmul and
+# m=6 is 1.25x. The real cause of the m-curve tax (the 5-row cap in qmv_wide,
+# which re-reads the weights ceil(M/5) times) is avoided here with an 8x8 MMA
+# tile + dequantization per quantization group + split-K.
 # Copyright © 2026 Apple Inc.
 
 """Small-M quantized matmul that amortizes the weight read.
@@ -42,12 +44,13 @@ KC = 128           # x staging chunk (4KB) — total threadgroup use 12KB
 NPT = 64           # output columns per threadgroup — amortizes the x staging
 TGT = 256          # 8 simdgroups
 M_MIN = 5          # measured crossover on a *dependent* chain (see below)
-# 2026-08-27 再測定 (B ステージングのベクトル化 + _zpad キャッシュ後):
-# M=5 は依存チェーン 2 ランの両方で全 4 形状勝ち (stock 比 0.91-0.96x)。
-# M=4 は 1.07-1.26x で依然 stock が勝つ (qmv が重み 1 回読みで帯域に近い)。
-# 旧クロスオーバー M=6 の根拠だった「M=4 は 0.98-1.10x でノイズ内、モデルでは
-# MTP k=3 を遅くした」という観測は M=4 には今も当てはまる。単発スループット
-# ではなく依存チェーンのレイテンシで判定している点は従来どおり。
+# Re-measured 2026-08-27 (after vectorizing the B staging and caching _zpad):
+# M=5 wins on all 4 shapes in both dependent-chain runs (0.91-0.96x vs stock).
+# At M=4 stock still wins, at 1.07-1.26x (qmv reads the weights once and is close
+# to bandwidth). The observation that justified the old crossover of M=6 — "M=4 is
+# 0.98-1.10x, inside the noise, and it slowed MTP k=3 down in the model" — still
+# holds for M=4. As before, the verdict is based on dependent-chain latency, not
+# on one-shot throughput.
 M_MAX = 8          # one MMA tile
 # Below this the grid is ceil(N/64) threadgroups and the GPU sits idle; the
 # model has 96 layers with N=48, which would each get a single threadgroup.
@@ -55,33 +58,36 @@ N_MIN = 4096
 
 _SRC = r"""
     const int K = KD, N = ND, M = MD;
-    const int KPS = KD / 8;                 // 심드그룹당 K 구간
+    const int KPS = KD / 8;                 // K span per simdgroup
 
     uint tid  = thread_position_in_threadgroup.x;
     uint tgid = threadgroup_position_in_grid.x;
     uint sg   = tid >> 5;
     uint lane = tid & 31;
 
-    int n0 = (int)tgid * 8;                 // threadgroup 하나가 출력열 8개
+    int n0 = (int)tgid * 8;                 // one threadgroup covers 8 output columns
 
-    // x 는 device 에서 직접 MMA 로 읽는다(bf16 입력 + float 누산). 스테이징이 없어져
-    // threadgroup 메모리가 10KB 로 내려가고, 무엇보다 임계경로가 짧아진다.
-    threadgroup bfloat16_t bs[8 * 512];     // 심드그룹별 64k x 8n, 8KB
-    threadgroup float red[8 * 64];          // 심드그룹 간 합산, 2KB
+    // x is read directly by MMA from device memory (bf16 input, float accumulation).
+    // With no staging, threadgroup memory drops to 10KB, and more importantly the
+    // critical path gets shorter.
+    threadgroup bfloat16_t bs[8 * 512];     // per simdgroup: 64k x 8n, 8KB
+    threadgroup float red[8 * 64];          // cross-simdgroup reduction, 2KB
 
     simdgroup_matrix<float, 8, 8> C = simdgroup_matrix<float, 8, 8>(0);
     threadgroup bfloat16_t* bt = bs + sg * 512;
 
-    // ── split-K: 8개 심드그룹이 K 를 8등분해 각자 짧은 직렬 루프를 돈다.
-    //    (종전 판본은 한 threadgroup 이 K 전체를 순회해 배리어 160쌍이 임계경로에 놓였다)
+    // ── split-K: 8 simdgroups split K into 8 parts, each running its own short
+    //    serial loop. (the earlier version had one threadgroup walk all of K,
+    //    which put 160 barrier pairs on the critical path)
     int kbeg = (int)sg * KPS;
     for (int kk = 0; kk < KPS; kk += 64) {
         int ka = kbeg + kk;
         int j  = (int)(lane & 7);
         int kq = (int)(lane >> 3);
         int n  = n0 + j;
-        // B スラブは列メジャー bt[j*64 + k]。1 レーンの 16 要素が連続になり
-        // vec4 store 4 本で書ける (ストライド 8 のスカラー store 16 本を廃止)。
+        // The B slab is column-major, bt[j*64 + k]. A lane's 16 elements then sit
+        // contiguously and can be written with 4 vec4 stores (this retired the
+        // 16 scalar stores at stride 8).
         threadgroup bfloat16_t* bc = bt + j * 64 + kq * 16;
         if (n < N) {
             int g = ka >> 6;
@@ -110,8 +116,8 @@ _SRC = r"""
 
         simdgroup_matrix<bfloat16_t, 8, 8> A, B;
         for (int kt = 0; kt < 8; ++kt) {
-            simdgroup_load(A, x + ka + kt * 8, K);   // x[0:8, ka+8kt ..] — 패딩된 8행
-            simdgroup_load(B, bt + kt * 8, 64, ulong2(0, 0), true);  // 列メジャーを transpose で読む
+            simdgroup_load(A, x + ka + kt * 8, K);   // x[0:8, ka+8kt ..] — padded to 8 rows
+            simdgroup_load(B, bt + kt * 8, 64, ulong2(0, 0), true);  // read the column-major slab transposed
             simdgroup_multiply_accumulate(C, A, B, C);
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -120,7 +126,7 @@ _SRC = r"""
     simdgroup_store(C, red + sg * 64, 8);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // 8개 부분합을 더해 쓴다.
+    // sum the 8 partial results and write them out.
     for (int i = (int)tid; i < 64; i += 256) {
         int m = i >> 3, j = i & 7;
         int n = n0 + j;
@@ -133,10 +139,11 @@ _SRC = r"""
 """
 
 
-M_WIDE_MAX = 16    # 두 번째 MMA 타일까지 — 가중치 읽기는 M=8 과 동일하다
-# 검증 폭 9-16 은 스톡에서 M=8 대비 3.8배를 문다([I128]). B 타일은 이미
-# threadgroup 에 올라와 있으므로, 행 8-15 를 위한 누산기 하나를 더 두면 그 폭이
-# M=8 의 가중치-읽기 비용을 그대로 나눠 쓴다. 창 안(M<=8) 경로는 손대지 않는다.
+M_WIDE_MAX = 16    # up to the second MMA tile — the weight read is identical to M=8
+# On stock, verification widths 9-16 cost 3.8x M=8 ([I128]). The B tile is
+# already resident in threadgroup memory, so adding one more accumulator for
+# rows 8-15 lets that width share M=8's weight-read cost outright. The
+# in-window (M<=8) path is left untouched.
 
 _SRC_WIDE = r"""
     const int K = KD, N = ND, M = MD;
@@ -149,8 +156,8 @@ _SRC_WIDE = r"""
 
     int n0 = (int)tgid * 8;
 
-    threadgroup bfloat16_t bs[8 * 512];     // B 타일 — 두 행-타일이 공유한다(요점)
-    threadgroup float red[8 * 128];         // 심드그룹 8 x 행타일 2 x 64, 4KB
+    threadgroup bfloat16_t bs[8 * 512];     // B tile — shared by both row-tiles (that's the whole point)
+    threadgroup float red[8 * 128];         // 8 simdgroups x 2 row-tiles x 64, 4KB
 
     simdgroup_matrix<float, 8, 8> C0 = simdgroup_matrix<float, 8, 8>(0);
     simdgroup_matrix<float, 8, 8> C1 = simdgroup_matrix<float, 8, 8>(0);
@@ -162,8 +169,9 @@ _SRC_WIDE = r"""
         int j  = (int)(lane & 7);
         int kq = (int)(lane >> 3);
         int n  = n0 + j;
-        // B スラブは列メジャー bt[j*64 + k]。1 レーンの 16 要素が連続になり
-        // vec4 store 4 本で書ける (ストライド 8 のスカラー store 16 本を廃止)。
+        // The B slab is column-major, bt[j*64 + k]. A lane's 16 elements then sit
+        // contiguously and can be written with 4 vec4 stores (this retired the
+        // 16 scalar stores at stride 8).
         threadgroup bfloat16_t* bc = bt + j * 64 + kq * 16;
         if (n < N) {
             int g = ka >> 6;
@@ -192,10 +200,10 @@ _SRC_WIDE = r"""
 
         simdgroup_matrix<bfloat16_t, 8, 8> A0, A1, B;
         for (int kt = 0; kt < 8; ++kt) {
-            simdgroup_load(B, bt + kt * 8, 64, ulong2(0, 0), true);  // 列メジャーを transpose で読む
-            simdgroup_load(A0, x + ka + kt * 8, K);              // 행 0-7
+            simdgroup_load(B, bt + kt * 8, 64, ulong2(0, 0), true);  // read the column-major slab transposed
+            simdgroup_load(A0, x + ka + kt * 8, K);              // rows 0-7
             simdgroup_multiply_accumulate(C0, A0, B, C0);
-            simdgroup_load(A1, x + (size_t)8 * K + ka + kt * 8, K);  // 행 8-15
+            simdgroup_load(A1, x + (size_t)8 * K + ka + kt * 8, K);  // rows 8-15
             simdgroup_multiply_accumulate(C1, A1, B, C1);
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -206,7 +214,7 @@ _SRC_WIDE = r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (int i = (int)tid; i < 128; i += 256) {
-        int m = i >> 3, j = i & 7;          // m 0-15 (0-7 은 C0, 8-15 는 C1 구간)
+        int m = i >> 3, j = i & 7;          // m 0-15 (0-7 is C0's range, 8-15 is C1's)
         int mm = (m < 8) ? m : (m - 8);
         int slot = (m < 8) ? (mm * 8 + j) : (64 + mm * 8 + j);
         int mrow = (m < 8) ? m : m;
@@ -223,11 +231,12 @@ _ZPAD: dict = {}
 
 
 def _zpad(rows: int, k: int):
-    """ゼロ埋め用の定数配列。毎回 mx.zeros を dispatch しないためのキャッシュ。
+    """Constant array used for zero padding, cached so we don't dispatch mx.zeros every time.
 
-    カーネル内で実在しない行をレーン側マスクで作る案は依存チェーン実測で
-    棄却済み (per-lane スカラー A 構築が発行コストを 20-45% 増やし、
-    nocap にも負ける)。ホスト側パディング維持が現状の勝ち筋。
+    The alternative of synthesizing the non-existent rows inside the kernel with a
+    lane-side mask was rejected on dependent-chain measurements (building A per
+    lane as scalars raised the dispatch cost by 20-45% and it even lost to nocap).
+    Keeping the padding on the host side is what currently wins.
     """
     key = (rows, k)
     z = _ZPAD.get(key)
@@ -287,9 +296,9 @@ def _eligible(
 
 
 def _wide_qmm(x, w, scales, biases, *, M: int, K: int, N: int):
-    """M in (8, 16] — 두 행-타일. 창 안 경로와 동일한 형상 규약을 쓴다."""
+    """M in (8, 16] — two row-tiles. Uses the same shape convention as the in-window path."""
     flat = x.reshape(-1, K)
-    if M < 16:                       # 커널은 16행 타일을 device 에서 직접 읽는다
+    if M < 16:                       # the kernel reads a 16-row tile directly from device memory
         flat = mx.concatenate([flat, _zpad(16 - M, K)], axis=0)
     (out,) = _KERNEL_WIDE(
         inputs=[flat, w, scales, biases],
@@ -302,13 +311,13 @@ def _wide_qmm(x, w, scales, biases, *, M: int, K: int, N: int):
     return out.reshape(*x.shape[:-1], N)
 
 
-# --- 폭 히스토그램 (진단 전용, MLXLM_QMM_HIST=1 로 켠다) ---
+# --- width histogram (diagnostics only, enable with MLXLM_QMM_HIST=1) ---
 _HIST_ON = os.environ.get("MLXLM_QMM_HIST") == "1"
 _WIDTH_HIST: dict = {}
 
 
 def width_histogram():
-    """M(=검증 폭) 별 호출 수와 어느 경로로 갔는지. 진단용."""
+    """Call count by M (verification width), and which path each one took. Diagnostics only."""
     return dict(sorted(_WIDTH_HIST.items()))
 
 
@@ -339,7 +348,7 @@ def fast_qmm(x, w, scales, biases, *, group_size: int, bits: int):
             x, w, scales, biases, transpose=True, group_size=group_size, bits=bits
         )
     flat = x.reshape(M, K)
-    if M < 8:  # 커널이 8행 MMA 타일을 device 에서 직접 읽는다 — 경계 밖을 막는다
+    if M < 8:  # the kernel reads an 8-row MMA tile directly from device memory — this keeps it from reading out of bounds
         flat = mx.concatenate([flat, _zpad(8 - M, K)], axis=0)
     (out,) = _KERNEL(
         inputs=[flat, w, scales, biases],
@@ -357,9 +366,9 @@ _ORIGINAL_SHARDED_CALLS: dict = {}
 
 
 def _qmm_or_fallback(self, x, original):
-    """affine 창이면 fast_qmm, 아니면 원본 GEMM 경로만 (통신 없이)."""
+    """fast_qmm for the affine window, otherwise just the original GEMM path (no communication)."""
     if "biases" not in self or getattr(self, "mode", "affine") != "affine":
-        return None  # 호출자가 원본 __call__ 전체로 폴백
+        return None  # caller falls back to the full original __call__
     return fast_qmm(
         x,
         self["weight"],
@@ -388,8 +397,9 @@ def enable(model: Any = None) -> None:
     _ORIGINAL_CALL = nn.QuantizedLinear.__call__
 
     def __call__(self, x):
-        # 커널은 affine(scales+biases) 전용 — nvfp4/mxfp4 등 다른 모드의 층은
-        # biases 가 없어 KeyError 로 죽는다(community 빌드 KL 측정에서 실증).
+        # the kernel is affine(scales+biases)-only — layers in other modes such as
+        # nvfp4/mxfp4 have no biases and would die with a KeyError (confirmed in
+        # practice during a community build's KL measurements).
         y = _qmm_or_fallback(self, x, _ORIGINAL_CALL)
         if y is None:
             return _ORIGINAL_CALL(self, x)

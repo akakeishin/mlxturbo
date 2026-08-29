@@ -1,29 +1,34 @@
-"""SpecEngine (投機デコード) と、それが使えないモデル向けの通常生成の共通口。
+"""Common entry point for SpecEngine (speculative decoding) and, for models it
+cannot handle, ordinary generation.
 
-mlxturbo/spec.py の SpecEngine は mlxturbo/_mlx_compat.py の
-validate_spec_model_contract が要求する GDN ハイブリッド固有の形
-(model.language_model.model の fa_idx/ssm_idx、各層の is_linear、linear
-cache の advance/trim 等) を前提にしている。Llama/Gemma/dense Qwen は
-もちろん、GDN ハイブリッドでも mlxturbo/spec.py が書かれた当時の mlx-lm 形
-(qwen3_5 の language_model ラッパー) と違うレイアウトのモデル (手元で確認
-できた範囲では hyper-connections を使う qwen4_exp アーキテクチャがこれに
-該当し、model.language_model が無い・層に is_linear/input_layernorm が無い・
-最終 norm が無いなど、単なる属性名ずれではなく _hidden_forward/_linear_capture
-の再実装そのものと噛み合わない) では TypeError 等で構築に失敗する。
+The SpecEngine in mlxturbo/spec.py assumes the GDN-hybrid-specific shape that
+validate_spec_model_contract in mlxturbo/_mlx_compat.py requires
+(fa_idx/ssm_idx on model.language_model.model, is_linear on each layer,
+advance/trim on the linear cache, and so on). Construction fails with a
+TypeError or the like not only for Llama/Gemma/dense Qwen, but also for GDN
+hybrids whose layout differs from the mlx-lm shape that existed when
+mlxturbo/spec.py was written (the qwen3_5 language_model wrapper). The case
+confirmed here is the qwen4_exp architecture, which uses hyper-connections: it
+has no model.language_model, its layers have no is_linear/input_layernorm, it
+has no final norm, and so on — this is not a mere attribute-name mismatch but
+a mismatch with the reimplementation of _hidden_forward/_linear_capture
+itself.
 
-``build_runner`` は起動時に SpecEngine の構築を一度だけ試み、失敗したら
-mlx_lm.generate.stream_generate による普通の (非投機) 生成に落とす。
-どちらの経路でも呼び出し側 (cli.py / server.py) から見た形
-(``Runner.generate(...)`` が返す dict) は同一にする。
+``build_runner`` tries to construct a SpecEngine exactly once at startup and,
+if that fails, drops to ordinary (non-speculative) generation via
+mlx_lm.generate.stream_generate. On either path the shape seen by callers
+(cli.py / server.py) — the dict returned by ``Runner.generate(...)`` — is
+identical.
 
-``build_runner`` はここで mlxturbo.fused.enable_hyper_connection_kernel() も
-有効化する (既定 on、``no_fused=True`` で無効化)。qwen4_exp (hyper-connections)
-アーキテクチャの `GatedResidual.__call__` をクラス単位で Metal カーネルへ
-差し替えるだけなので、SpecEngine 経路 (spec.py が独自に forward を再実装し、
-この差し替えを経由しない) には影響せず、FallbackRunner 経路 (モデル自身の
-__call__ をそのまま呼ぶ、つまり Flash-Next/qwen4_exp が実際に通る唯一の道)
-にだけ効く。moe_route と rms_norm_gated は実測で空振り (前者は +0.34ms 遅く
-なる、tools/ablate_moe.py 参照) なので有効化しない。
+``build_runner`` also enables mlxturbo.fused.enable_hyper_connection_kernel()
+here (on by default, disabled with ``no_fused=True``). It only swaps the
+qwen4_exp (hyper-connections) architecture's `GatedResidual.__call__` for a
+Metal kernel at the class level, so it has no effect on the SpecEngine path
+(spec.py reimplements forward on its own and never goes through this swap)
+and takes effect only on the FallbackRunner path (which calls the model's own
+__call__ — that is, the only road Flash-Next/qwen4_exp actually travels).
+moe_route and rms_norm_gated came out empty-handed in measurements (the
+former is +0.34ms slower; see tools/ablate_moe.py), so they are not enabled.
 """
 
 from __future__ import annotations
@@ -40,18 +45,18 @@ from .spec import PREFILL_STEP_SIZE, ChatSession, SpecEngine
 
 
 class Runner(Protocol):
-    """``SUPPORTED_SAMPLING_PARAMS`` (class attribute, set of str) は
-    server.py が top_p/top_k/min_p/repetition_penalty/presence_penalty/
-    frequency_penalty/logit_bias/seed のうちどれを ``**sampling_kwargs`` 経由
-    でこの runner に渡してよいかを申告する。宣言に無いキーが指定された
-    リクエストは server.py が生成呼び出し前に 400 で弾く (SpecRunner/
-    FallbackRunner のクラス docstring 参照)。
+    """``SUPPORTED_SAMPLING_PARAMS`` (class attribute, set of str) declares
+    which of top_p/top_k/min_p/repetition_penalty/presence_penalty/
+    frequency_penalty/logit_bias/seed server.py is allowed to pass to this
+    runner via ``**sampling_kwargs``. A request that specifies a key not in
+    the declaration is rejected by server.py with a 400 before the generate
+    call (see the class docstrings of SpecRunner/FallbackRunner).
 
-    ``fallback_reason`` (str | None) は、この runner が build_runner に
-    よってフォールバック経路として選ばれた理由。フォールバック以外の経路
-    (SpecRunner/FlashSpecRunner) では常に None。server.py の /health が
-    これをそのまま出す — 「黙って fallback に落ちて気づけない」を防ぐため
-    のもの (build_runner のクラス docstring 参照)。
+    ``fallback_reason`` (str | None) is the reason build_runner chose this
+    runner as the fallback path. On the non-fallback paths
+    (SpecRunner/FlashSpecRunner) it is always None. server.py's /health
+    reports it verbatim — it exists to prevent "silently dropping to the
+    fallback with no way to notice" (see build_runner's class docstring).
     """
 
     SUPPORTED_SAMPLING_PARAMS: frozenset
@@ -70,28 +75,34 @@ class Runner(Protocol):
 
 
 class SpecRunner:
-    """投機デコード経路。mlxturbo.spec.SpecEngine をそのまま使う。
+    """Speculative decoding path. Uses mlxturbo.spec.SpecEngine directly.
 
-    fly_theta/fly_window は cli.py の --fly-theta/--fly-window 用の任意
-    キーワードとして **extra 経由でそのまま SpecEngine.generate へ流す
-    (未指定なら SpecEngine 側の既定 0.0/6 が効く)。server.py は渡さない。
+    fly_theta/fly_window are optional keywords for cli.py's
+    --fly-theta/--fly-window; they are forwarded verbatim to
+    SpecEngine.generate via **extra (when unspecified, SpecEngine's own
+    defaults of 0.0/6 apply). server.py does not pass them.
 
-    ``SUPPORTED_SAMPLING_PARAMS``: server.py がリクエストのサンプリング
-    パラメータ (top_p/top_k/min_p/repetition_penalty/presence_penalty/
-    frequency_penalty/logit_bias/seed) のうちどれをこの経路へ渡してよいか
-    判定するための宣言。ここでは ``seed`` だけ。理由: SpecEngine.generate は
-    temp>0 のとき Block Verification (arXiv:2403.10444, spec.py
-    ``_block_verify_tau``) で棄却サンプリングと厳密同一分布を保証している。
-    この保証は「ドラフトの提案分布と検証側の target 分布がどちらも生の
-    ``softmax(logits/temp)`` である」ことに依存する閉形式の受理長導出
-    (docs/STATUS.md) の上に立っており、top_p/top_k/min_p でロジットを
-    足切りしたり repetition_penalty 等でロジットを書き換えたりすると
-    target 分布そのものが変わるので、受理長の閉形式が別の式になり、実装を
-    改めない限り分布保証が静かに壊れる。そこを正しく再導出して実装するのは
-    このタスクの範囲外と判断し、これらのパラメータは (b) 案: server.py 側で
-    400 を返して弾く。一方 ``seed`` は乱数の初期状態を変えるだけで分布その
-    ものは変えないので、影響なく素通しできる (engine.generate 自身は seed
-    引数を持たないため、ここで mx.random.seed() を呼んで消費する)。
+    ``SUPPORTED_SAMPLING_PARAMS``: the declaration server.py uses to decide
+    which of a request's sampling parameters (top_p/top_k/min_p/
+    repetition_penalty/presence_penalty/frequency_penalty/logit_bias/seed)
+    may be forwarded to this path. Here it is ``seed`` only. Why:
+    SpecEngine.generate guarantees, for temp>0, a distribution strictly
+    identical to rejection sampling, via Block Verification
+    (arXiv:2403.10444, spec.py ``_block_verify_tau``). That guarantee stands
+    on a closed-form derivation of the acceptance length (docs/STATUS.md)
+    which depends on "both the draft's proposal distribution and the
+    verifier's target distribution being the raw ``softmax(logits/temp)``";
+    truncating the logits with top_p/top_k/min_p, or rewriting them with
+    repetition_penalty and the like, changes the target distribution itself,
+    so the closed form for the acceptance length becomes a different
+    equation and the distribution guarantee silently breaks unless the
+    implementation is reworked. Correctly re-deriving and implementing that
+    was judged out of scope for this task, so these parameters take option
+    (b): server.py rejects them with a 400. ``seed``, on the other hand,
+    only changes the initial state of the RNG and not the distribution
+    itself, so it can be passed straight through with no effect
+    (engine.generate itself takes no seed argument, so it is consumed here by
+    calling mx.random.seed()).
     """
 
     KIND = "spec"
@@ -122,46 +133,56 @@ class SpecRunner:
 
 
 class FlashSpecRunner:
-    """Qwen3.8-Flash-Next (``qwen4_exp``) 向け投機デコード経路。
+    """Speculative decoding path for Qwen3.8-Flash-Next (``qwen4_exp``).
 
-    ``mlxturbo.spec_flash.FlashSpecEngine`` (MTP を draft にした深さ1の投機、
-    GatedDeltaNet の状態捕獲/巻き戻し) をそのまま使う。27B (``qwen3_5``) 用の
-    ``SpecRunner``/``mlxturbo.spec.SpecEngine`` とは別物 — モデルの層構成
-    (hyper-connections、GDN、512 expert MoE) が全く違うため、共通化はせず
-    別クラスに分けてある (docs/MTP-FLASH.md 参照)。
+    Uses ``mlxturbo.spec_flash.FlashSpecEngine`` (depth-1 speculation with
+    MTP as the draft, plus capture/rewind of the GatedDeltaNet state)
+    directly. It is a different thing from
+    ``SpecRunner``/``mlxturbo.spec.SpecEngine``, which serve the 27B
+    (``qwen3_5``) — the model's layer structure (hyper-connections, GDN,
+    512-expert MoE) is completely different, so instead of unifying them they
+    are split into separate classes (see docs/MTP-FLASH.md).
 
-    session は ``FallbackSession`` (``.cache`` 単数形 / ``.processed``) を
-    そのまま流用する。Flash-Next も GDN ハイブリッドで線形状態を途中位置へ
-    巻き戻せないため、この関数自身が持つ再利用判定は ``FallbackRunner`` と
-    同じ「新プロンプトが処理済み列の純粋な追記のときだけ再利用、それ以外は
-    新規に作り直す」の2択のまま —だが実際に再利用できる範囲はそれより広い:
-    ``FallbackSession`` に ``mlxturbo.spec.ChatSession`` と同じ形の
-    ``.checkpoints`` を持たせたことで (2026-08-29 追加、thinking 対応)、
-    ``server.py`` の ``_select_session``/``_try_checkpoint_restore_session_
-    cache`` が処理済み列の途中で分岐したプロンプトでも直近チェックポイント
-    まで復元してから ``session`` を渡してくる。この関数はその復元の有無を
-    一切知らない —``_select_session`` が復元済みの ``session.processed`` を
-    渡してくる限り、ここの LCP 判定は常に「全体一致」として素通しする
-    (復元後の ``processed`` は新プロンプトの真の接頭辞になっていることが
-    ``_select_session`` 側で保証されている)。``checkpoints`` の記録自体は
-    ``FlashSpecEngine.generate_stream`` のプレフィルチャンク境界ごとに行う
-    (``mlxturbo.spec.CHECKPOINT_RETENTION``/``snapshot_untrimmable_caches`` を
-    そのまま流用、KV/indexer は trim 可能なので記録不要 — spec_flash.py の
-    ``generate_stream`` docstring 参照)。``KIND`` が ``"spec"`` ではない
-    ため、``server.py``/``cli.py`` の ``session_factory`` 選択
-    (``ChatSession if KIND == "spec" else FallbackSession``) はここを変えず
-    そのまま ``FallbackSession`` を選ぶ。
+    For session it reuses ``FallbackSession`` (singular ``.cache`` /
+    ``.processed``) as-is. Flash-Next is also a GDN hybrid and cannot rewind
+    the linear state to an intermediate position, so the reuse decision this
+    function itself makes is still the same two-way choice as
+    ``FallbackRunner``: "reuse only when the new prompt is a pure append to
+    the processed sequence, otherwise build a new one from scratch" — but the
+    range that can actually be reused is wider than that. Because
+    ``FallbackSession`` was given ``.checkpoints`` in the same shape as
+    ``mlxturbo.spec.ChatSession`` (added 2026-08-29, for thinking support),
+    ``server.py``'s ``_select_session``/``_try_checkpoint_restore_session_
+    cache`` restore up to the most recent checkpoint even for a prompt that
+    branched partway through the processed sequence, and only then hand over
+    ``session``. This function knows nothing at all about whether that
+    restore happened — as long as ``_select_session`` hands over a restored
+    ``session.processed``, the LCP check here always passes it through as a
+    "full match" (``_select_session`` guarantees that the post-restore
+    ``processed`` is a true prefix of the new prompt). Recording the
+    ``checkpoints`` themselves happens at each prefill chunk boundary inside
+    ``FlashSpecEngine.generate_stream``
+    (reusing ``mlxturbo.spec.CHECKPOINT_RETENTION``/
+    ``snapshot_untrimmable_caches`` as-is; the KV/indexer caches are
+    trimmable so they need no recording — see the ``generate_stream``
+    docstring in spec_flash.py). Because ``KIND`` is not ``"spec"``, the
+    ``session_factory`` selection in ``server.py``/``cli.py``
+    (``ChatSession if KIND == "spec" else FallbackSession``) is unchanged
+    here and still picks ``FallbackSession``.
 
-    ``SUPPORTED_SAMPLING_PARAMS``: ``SpecRunner`` と同じ理由で ``seed`` のみ
-    宣言する。temperature>0 は ``FlashSpecEngine.generate_stream`` が検証
-    forward の位置0/1の logits から直接サンプルする形で対応済みだが、
-    top_p/top_k/repetition_penalty 等でロジットを書き換えると target 分布
-    そのものが変わってしまい、この経路の温度サンプリングが前提にしている
-    「生の softmax(logits/temp) からサンプルする」ことと整合しなくなる。
-    ``SpecRunner`` と同様、対応するための再導出はこのタスクの範囲外と判断し、
-    (b) 案: server.py 側で 400 を返して弾く。``generate_stream`` 自身も
-    ``**extra`` を持たない固定シグネチャなので、万一ここへ未対応キーが
-    素通りしてきても TypeError で落ちる (二重の防御、``SpecRunner`` と同型)。
+    ``SUPPORTED_SAMPLING_PARAMS``: declares only ``seed``, for the same
+    reason as ``SpecRunner``. temperature>0 is already handled, in the form
+    of ``FlashSpecEngine.generate_stream`` sampling directly from the logits
+    at positions 0/1 of the verification forward, but rewriting the logits
+    with top_p/top_k/repetition_penalty and the like changes the target
+    distribution itself, which no longer squares with the premise this path's
+    temperature sampling rests on: "sample from the raw
+    softmax(logits/temp)". As with ``SpecRunner``, the re-derivation needed
+    to support them was judged out of scope for this task, so option (b):
+    server.py rejects them with a 400. ``generate_stream`` itself also has a
+    fixed signature with no ``**extra``, so if an unsupported key ever did
+    slip through to here it would fail with a TypeError (defense in depth,
+    the same shape as ``SpecRunner``).
     """
 
     KIND = "flash_spec"
@@ -177,19 +198,22 @@ class FlashSpecRunner:
         if seed is not None:
             mx.random.seed(seed)
 
-        # FallbackRunner.generate と同じ LCP (最長共通接頭辞) 契約: この関数
-        # 自身は「processed 全体が新プロンプトの接頭辞」だけを見る。実際には
-        # server.py の _select_session がチェックポイント経由で processed を
-        # 途中位置まで復元済みのことがあるが (このクラスの docstring 参照)、
-        # 復元後の processed は新プロンプトの真の接頭辞になっていることが
-        # 呼び出し側で保証されているので、ここでの判定は常にこの分岐で拾える。
+        # The same LCP (longest common prefix) contract as
+        # FallbackRunner.generate: this function itself only looks for "the
+        # whole of processed is a prefix of the new prompt". In practice
+        # server.py's _select_session may already have restored processed to
+        # an intermediate position via a checkpoint (see this class's
+        # docstring), but the caller guarantees that the post-restore
+        # processed is a true prefix of the new prompt, so the check here
+        # always catches it in this branch.
         #
-        # ``checkpoints`` は ``mlxturbo.spec.ChatSession`` と同じ流儀 (直接
-        # 参照を引き継ぎ、コピーしない) — ``FallbackSession.invalidate()`` は
-        # ``self.checkpoints`` を新しい空リストへ **再代入**するだけで、既に
-        # 拾ったこのローカル変数が指す旧リストは書き換えない。cache を作り
-        # 直す場合 (session が無い/新規/追記でない) は古い記録を引き継ぐ意味が
-        # 無いので空にする。
+        # ``checkpoints`` follows the same style as
+        # ``mlxturbo.spec.ChatSession`` (inherit the reference directly, do
+        # not copy) — ``FallbackSession.invalidate()`` merely **rebinds**
+        # ``self.checkpoints`` to a new empty list and does not rewrite the
+        # old list that this already-grabbed local variable points at. When
+        # the cache is rebuilt (no session / a new one / not an append) there
+        # is no point inheriting the old records, so it is emptied.
         prompt_cache = None
         reused = 0
         checkpoints: list | None = None
@@ -204,9 +228,10 @@ class FlashSpecRunner:
                 if lcp == len(pl) and lcp < len(prompt_ids):
                     prompt_cache = session.cache
                     reused = lcp
-                    # session.cache を以後このローカル変数が所有する。生成中の
-                    # 例外はここから先、publish() されるまで公開 session を
-                    # invalid のままにする (FallbackRunner と同じ理由)。
+                    # From here on this local variable owns session.cache. An
+                    # exception during generation leaves the published
+                    # session invalid from this point until publish() is
+                    # reached (the same reason as FallbackRunner).
                     session.invalidate()
             if prompt_cache is None:
                 prompt_cache = self.engine.model.make_cache()
@@ -250,7 +275,8 @@ class FlashSpecRunner:
             # ``checkpoints`` was extended in-place by ``generate_stream``
             # (or reset to ``[]`` above when this call built a fresh cache) —
             # publish it alongside so the next turn's _select_session can
-            # restore to it (mlxturbo/spec.py の ChatSession.publish と同じ形)。
+            # restore to it (the same shape as ChatSession.publish in
+            # mlxturbo/spec.py).
             session.publish(
                 prompt_cache, list(prompt_ids) + tokens[:-1], checkpoints=checkpoints
             )
@@ -260,43 +286,51 @@ class FlashSpecRunner:
             "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
             "prefill_reused": reused,
             "prefill_new": len(prompt_ids) - reused,
-            # mlxturbo.spec.SpecEngine.generate と同じ定義 (n_decode/steps):
-            # プレフィルが生んだ最初の1トークンを除いた、反復あたりの実効
-            # トークン数。rounds==0 (max_tokens<=1でループが一度も回らない)
-            # なら SpecEngine と同じく 0.0 とする。
+            # The same definition as mlxturbo.spec.SpecEngine.generate
+            # (n_decode/steps): the effective number of tokens per
+            # iteration, excluding the first token that prefill produced.
+            # When rounds==0 (max_tokens<=1, so the loop never runs once),
+            # report 0.0, the same as SpecEngine.
             "tokens_per_step": (n_decode / rounds) if rounds else 0.0,
         }
 
 
 class FallbackSession:
-    """FallbackRunner 用の会話ごとの mlx_lm prompt_cache 入れ物。
+    """Per-conversation container for the mlx_lm prompt_cache used by
+    FallbackRunner.
 
-    spec.ChatSession と同じ契約 (新プロンプトが前回処理列の純粋な追記なら
-    差分だけ prefill、そうでなければ全再構築) を、mlx_lm.models.cache の
-    汎用 KV キャッシュに対して行う。FallbackRunner が実際に通る唯一のモデル
-    (qwen4_exp/Flash-Next 系) は GDN ハイブリッドで、線形状態は途中位置へ
-    巻き戻せない (mlxturbo/spec.py の ChatSession docstring と同じ制約) ため、
-    ここでも部分巻き戻し (trim) は行わず、追記か全再構築かの二択に倒す。
+    It applies the same contract as spec.ChatSession (if the new prompt is a
+    pure append to the previously processed sequence, prefill only the delta;
+    otherwise rebuild everything) to the generic KV cache of
+    mlx_lm.models.cache. The only model FallbackRunner actually travels with
+    (the qwen4_exp/Flash-Next family) is a GDN hybrid whose linear state
+    cannot be rewound to an intermediate position (the same constraint as the
+    ChatSession docstring in mlxturbo/spec.py), so here too no partial rewind
+    (trim) is performed and it falls back to the two-way choice of append or
+    full rebuild.
 
-    ``processed``: これまでにこのキャッシュへ実際に feed 済みのトークン列
-    (prompt + それまでに生成したトークン)。mlx_lm.generate.stream_generate
-    は yield されたトークンを次ステップの入力として cache へ feed してから
-    出す (see FallbackRunner.generate 呼び出し側の解析)ので、生成が EOS で
-    早期終了しても max_tokens で打ち切られても、``tokens`` に集まった列は
-    そのままキャッシュへ feed 済みの列と一致する。
+    ``processed``: the token sequence actually fed into this cache so far
+    (prompt + the tokens generated up to that point).
+    mlx_lm.generate.stream_generate feeds a yielded token into the cache as
+    the input of the next step before emitting it (see the analysis at the
+    FallbackRunner.generate call site), so whether generation ends early on
+    EOS or is cut off at max_tokens, the sequence gathered in ``tokens``
+    matches exactly the sequence already fed into the cache.
 
-    ``checkpoints``: ``mlxturbo.spec.ChatSession.checkpoints`` と同じ形
-    (``[(position, snapshot), ...]``、position 昇順) — thinking マーカーの
-    再オープン等で処理済み列の途中から分岐した新プロンプトでも、直近の
-    プレフィルチャンク境界まで復元してから差分だけ prefill し直せる
-    (mlxturbo/server.py の ``_try_checkpoint_restore_session_cache`` が消費、
-    mlxturbo/runner.py の ``FlashSpecRunner`` docstring 参照)。
-    ``FallbackRunner`` (このクラスのもう一方の利用者) は ``mlx_lm.generate.
-    stream_generate`` を直接使い、チャンク境界ごとのスナップショットを
-    自分では作らないため、常に空のまま — ``_try_checkpoint_restore_session_
-    cache`` は空リストを falsy として即座に諦めるので、その経路にとっては
-    このフィールドが増えたこと自体、以前の「全体一致 or 新規スロット」の
-    二択から何も変わらない。
+    ``checkpoints``: the same shape as
+    ``mlxturbo.spec.ChatSession.checkpoints`` (``[(position, snapshot),
+    ...]``, ascending by position) — so that even a new prompt that branched
+    partway through the processed sequence (e.g. because a thinking marker
+    was reopened) can be restored up to the most recent prefill chunk
+    boundary and then have only the delta prefilled again (consumed by
+    ``_try_checkpoint_restore_session_cache`` in mlxturbo/server.py; see the
+    ``FlashSpecRunner`` docstring in mlxturbo/runner.py). ``FallbackRunner``
+    (this class's other user) uses ``mlx_lm.generate.stream_generate``
+    directly and does not take snapshots at chunk boundaries itself, so for
+    it this stays empty forever — ``_try_checkpoint_restore_session_cache``
+    treats an empty list as falsy and gives up immediately, so as far as that
+    path is concerned, the addition of this field itself changes nothing from
+    the previous two-way choice of "full match or a new slot".
     """
 
     def __init__(self):
@@ -318,16 +352,17 @@ class FallbackSession:
 
 
 def _logprob_entry(resp, tokenizer, top_n: int) -> dict:
-    """mlx_lm の ``GenerationResponse`` 1 個分を、OpenAI 形の logprobs
-    レコードへ変換する (Kimi K3 レビュー項目 17、``FallbackRunner.generate``
-    専用)。
+    """Convert one ``GenerationResponse`` from mlx_lm into an OpenAI-shaped
+    logprobs record (Kimi K3 review item 17; for ``FallbackRunner.generate``
+    only).
 
-    ``resp.logprobs`` は ``mlx_lm.generate.generate_step``/
-    ``speculative_generate_step`` がサンプリングの直前に計算する、その
-    デコードステップの語彙全体に対する log_softmax ベクトル
-    (``logits - logsumexp(logits)``、mlx_lm/generate.py 420/549 行目参照)。
-    実際にサンプルされたトークンの logprob も、top-N の代替候補も、この
-    同じベクトルから読むだけで済む — 追加の forward は要らない。
+    ``resp.logprobs`` is the log_softmax vector over the whole vocabulary for
+    that decode step (``logits - logsumexp(logits)``; see mlx_lm/generate.py
+    lines 420/549), computed by ``mlx_lm.generate.generate_step``/
+    ``speculative_generate_step`` immediately before sampling. Both the
+    logprob of the token actually sampled and the top-N alternative
+    candidates are obtained by simply reading from this same vector — no
+    additional forward pass is needed.
     """
 
     token_logprob = float(resp.logprobs[resp.token])
@@ -355,40 +390,49 @@ def _logprob_entry(resp, tokenizer, top_n: int) -> dict:
 
 
 class FallbackRunner:
-    """SpecEngine が受け付けないモデル向けの普通の (非投機) 生成経路。
+    """Ordinary (non-speculative) generation path for models SpecEngine does
+    not accept.
 
-    mlx_lm.generate.stream_generate をそのまま使う。session
-    (FallbackSession) が渡されれば、前回処理列との LCP (最長共通接頭辞) が
-    その session の処理済み列全体と一致する場合に限り mlx_lm の
-    prompt_cache をそのまま渡して差分だけを prefill する。一致しなければ
-    (会話が切り替わった・テンプレートが履歴を書き換えた等) 黙って新規
-    prompt_cache を作り、prompt 全体を流し直す — 部分巻き戻しは行わない
-    (FallbackSession docstring 参照)。session が None ならこの機構自体を
-    素通しし、旧来どおり mlx_lm 側の一時 cache に任せる (毎ターン全量
-    prefill)。n_draft/max_draft/fly_* も投機経路専用なので **extra で受け
-    取って無視するだけ。
+    Uses mlx_lm.generate.stream_generate directly. If a session
+    (FallbackSession) is passed, the mlx_lm prompt_cache is handed over
+    as-is and only the delta is prefilled, but only when the LCP (longest
+    common prefix) with the previously processed sequence matches that
+    session's entire processed sequence. If it does not match (the
+    conversation switched, the template rewrote the history, etc.), it
+    silently creates a new prompt_cache and runs the whole prompt through
+    again — no partial rewind is performed (see the FallbackSession
+    docstring). If session is None, this mechanism itself is bypassed and,
+    as before, the temporary cache on the mlx_lm side is relied upon (full
+    prefill every turn). n_draft/max_draft/fly_* are also for the
+    speculative paths only, so they are merely received via **extra and
+    ignored.
 
-    ``SUPPORTED_SAMPLING_PARAMS``: 投機の分布保証を気にする必要が無い経路
-    なので、mlx_lm.sample_utils がサポートするものは全部そのまま素通しする。
+    ``SUPPORTED_SAMPLING_PARAMS``: this path has no need to care about a
+    speculative distribution guarantee, so everything mlx_lm.sample_utils
+    supports is passed straight through.
 
-    ``logprobs``/``top_logprobs`` (Kimi K3 レビュー項目 17): 要求されたとき
-    だけ (``logprobs=True``) 収集する — 常に集めるとメモリと速度に響くため、
-    既定は収集しない (``logprobs=False``、結果 dict に ``"logprobs"`` キー
-    自体が現れない)。収集する場合、``res["logprobs"]`` は生成トークン列
-    ``res["tokens"]`` と 1:1 対応する ``list[dict]`` (各要素は
-    ``_logprob_entry`` 参照)。これは ``SUPPORTED_SAMPLING_PARAMS`` の恒等値
-    判定の対象ではない — server.py 側は ``_resolve_runner_for_request`` の
-    別枠の ``logprobs_requested`` 引数でルーティングを決める (投機経路で
-    logprobs が要求されたら、この runner へ降格させる — SpecRunner/
-    FlashSpecRunner/DraftSpecRunner の投機は分布保証の数式が top_p 等と同じ
-    理由でロジット処理を前提にしていない/していても閉形式が別なため、
-    生成後に「これが本当にサンプルされた分布の logprob だ」と言い切れる
-    のはこの非投機経路だけ)。
+    ``logprobs``/``top_logprobs`` (Kimi K3 review item 17): collected only
+    when requested (``logprobs=True``) — always collecting them would cost
+    memory and speed, so the default is not to collect (``logprobs=False``,
+    and the ``"logprobs"`` key does not even appear in the result dict).
+    When collected, ``res["logprobs"]`` is a ``list[dict]`` in 1:1
+    correspondence with the generated token sequence ``res["tokens"]`` (see
+    ``_logprob_entry`` for each element). This is not subject to the
+    identity-value check on ``SUPPORTED_SAMPLING_PARAMS`` — server.py
+    decides the routing via the separate ``logprobs_requested`` argument of
+    ``_resolve_runner_for_request`` (if logprobs are requested on a
+    speculative path, it demotes to this runner — the speculation in
+    SpecRunner/FlashSpecRunner/DraftSpecRunner either does not assume logit
+    processing in its distribution-guarantee math, for the same reason as
+    top_p and friends, or does assume it but with a different closed form, so
+    this non-speculative path is the only one where, after generation, we can
+    assert "this really is the logprob of the distribution that was
+    sampled").
 
-    ``fallback_reason``: build_runner がこの runner を選んだ理由 (str)。
-    build_runner が直接構築する場合のみ渡される — 単体テストが
-    ``FallbackRunner(model, tokenizer)`` を直接呼ぶ既存の使い方は省略時
-    None のままで壊れない。
+    ``fallback_reason``: the reason (str) build_runner chose this runner.
+    Passed only when build_runner constructs it directly — the existing usage
+    where unit tests call ``FallbackRunner(model, tokenizer)`` directly is
+    not broken, staying None when omitted.
     """
 
     KIND = "fallback"
@@ -444,12 +488,13 @@ class FallbackRunner:
             frequency_penalty=frequency_penalty,
         )
 
-        # session が渡されていれば LCP (最長共通接頭辞) が session の処理済み
-        # 列全体と一致するときだけ prompt_cache を再利用する (FallbackSession
-        # docstring 参照)。session が None なら旧来どおり prompt_cache 自体を
-        # 渡さない — stream_generate/generate_step が毎回内部で一時 cache を
-        # 作る、以前と完全に同じ経路 (単体テストが直接このメソッドを
-        # session=None で叩いても壊れないようにするための分岐でもある)。
+        # If a session was passed, reuse prompt_cache only when the LCP
+        # (longest common prefix) matches the session's entire processed
+        # sequence (see the FallbackSession docstring). If session is None,
+        # as before we do not pass prompt_cache at all — stream_generate/
+        # generate_step builds an internal temporary cache each time, exactly
+        # the same path as before (this branch also exists so that unit tests
+        # hitting this method directly with session=None do not break).
         prompt_cache = None
         reused = 0
         if session is not None:
@@ -462,11 +507,13 @@ class FallbackRunner:
                 if lcp == len(pl) and lcp < len(prompt_ids):
                     prompt_cache = session.cache
                     reused = lcp
-                    # session.cache を以後このローカル変数が所有する。
-                    # 生成中の例外 (KeyboardInterrupt 含む) はここから先、
-                    # publish() されるまで公開 session を invalid のままにする
-                    # (in-place で書き換わっていく cache を半端な状態で公開
-                    # しないため — spec.ChatSession と同じ理由)。
+                    # From here on this local variable owns session.cache.
+                    # An exception during generation (including
+                    # KeyboardInterrupt) leaves the published session invalid
+                    # from this point until publish() is reached (so that a
+                    # cache being rewritten in place is never published in a
+                    # half-finished state — the same reason as
+                    # spec.ChatSession).
                     session.invalidate()
             if prompt_cache is None:
                 from mlx_lm.models.cache import make_prompt_cache
@@ -476,10 +523,10 @@ class FallbackRunner:
         remaining_prompt = prompt_ids[reused:]
 
         tokens: list[int] = []
-        # 要求されたときだけ集める (項目 17、このクラスの docstring 参照) —
-        # None のままなら以下で一度も append されず、戻り値の dict に
-        # "logprobs" キー自体が現れない (常に集めてメモリと速度に響かせない
-        # ため)。
+        # Collected only when requested (item 17; see this class's docstring)
+        # — if it stays None nothing is ever appended below and the
+        # "logprobs" key itself does not appear in the returned dict (so that
+        # always collecting does not cost memory and speed).
         collected_logprobs: list[dict] | None = [] if logprobs else None
         t0 = time.perf_counter()
         ttft = None
@@ -498,11 +545,13 @@ class FallbackRunner:
             max_tokens=max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
-            # mlxturbo.spec.PREFILL_STEP_SIZE と明示的に共有する。この値を
-            # 渡さなければ mlx_lm.generate 側の既定 (2048、たまたま同じ) に
-            # 黙って乗るだけで、どちらかを変えたときに経路ごとに prefill の
-            # 刻み幅がずれる — 同じプロンプトが経路によって別のチャンク幅
-            # で処理され、出力が食い違うバグを自分で作ることになる。
+            # Explicitly shared with mlxturbo.spec.PREFILL_STEP_SIZE. Not
+            # passing this value would just mean silently riding on
+            # mlx_lm.generate's own default (2048, which happens to be the
+            # same), and changing either one would make the prefill step size
+            # diverge between the paths — the same prompt would be processed
+            # with a different chunk width depending on the path, which is
+            # creating a bug where the outputs disagree with our own hands.
             prefill_step_size=PREFILL_STEP_SIZE,
             **stream_kwargs,
         ):
@@ -523,9 +572,10 @@ class FallbackRunner:
         decode_time = time.perf_counter() - t0 - (ttft or 0.0)
         n_decode = max(len(tokens) - 1, 0)
         if session is not None:
-            # generate_step は yield したトークンを次ステップの入力として
-            # cache へ feed してから出す (EOS で早期終了しても同様) ので、
-            # tokens はそのまま prompt_cache へ feed 済みの生成列と一致する。
+            # generate_step feeds a yielded token into the cache as the input
+            # of the next step before emitting it (and likewise when it ends
+            # early on EOS), so tokens matches exactly the generated sequence
+            # already fed into prompt_cache.
             session.publish(prompt_cache, list(prompt_ids) + tokens)
         result = {
             "tokens": tokens,
@@ -533,8 +583,9 @@ class FallbackRunner:
             "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
             "prefill_reused": reused,
             "prefill_new": len(prompt_ids) - reused,
-            # 投機なしなので 1 ステップ = 1 トークン固定。cli.py の表示行が
-            # どちらの経路でも同じ res.keys() を仮定できるよう埋めておく。
+            # No speculation, so 1 step = 1 token, fixed. Filled in so that
+            # cli.py's display line can assume the same res.keys() on either
+            # path.
             "tokens_per_step": 1.0,
         }
         if collected_logprobs is not None:
@@ -543,58 +594,72 @@ class FallbackRunner:
 
 
 class DraftSpecRunner:
-    """mlx_lm 自身の draft-model 投機デコード (``mlx_lm.generate.
-    speculative_generate_step``、``stream_generate(..., draft_model=...)``)
-    をそのまま使う、アーキテクチャ非依存の投機経路 (Kimi K3 レビュー項目 13)。
+    """Architecture-independent speculative path that uses mlx_lm's own
+    draft-model speculative decoding (``mlx_lm.generate.
+    speculative_generate_step``, ``stream_generate(..., draft_model=...)``)
+    as-is (Kimi K3 review item 13).
 
-    ``mlxturbo.spec.SpecEngine``/``mlxturbo.spec_flash.FlashSpecEngine`` は
-    どちらも特定のモデル形状 (GDN ハイブリッドの qwen3_5/qwen4_exp、
-    ``validate_spec_model_contract`` が検査する層構成) に強く依存した専用
-    実装で、Llama/Gemma/Mistral/Mixtral のような素の dense transformer には
-    一切効かない (このモジュール冒頭の docstring 参照)。mlx_lm はそれとは
-    独立に、「小さいドラフトモデルで提案し、本命モデルで検証する」classical
-    な投機デコードを ``draft_model`` 引数として既に持っている
-    (``mlx_lm/generate.py`` の ``speculative_generate_step``) —
-    アーキテクチャを一切見ないので、対応表を作らずに任意の HF/MLX 変換済み
-    モデルへ投機を届けられる。自前でカーネルや検証ロジックを書く必要がなく、
-    upstream の実装をそのまま使う。
+    ``mlxturbo.spec.SpecEngine``/``mlxturbo.spec_flash.FlashSpecEngine`` are
+    both dedicated implementations that depend heavily on a specific model
+    shape (the GDN hybrids qwen3_5/qwen4_exp, the layer structure that
+    ``validate_spec_model_contract`` inspects) and do nothing whatsoever for
+    a plain dense transformer such as Llama/Gemma/Mistral/Mixtral (see the
+    docstring at the top of this module). Independently of that, mlx_lm
+    already has classical speculative decoding — "propose with a small draft
+    model, verify with the real model" — as its ``draft_model`` argument
+    (``speculative_generate_step`` in ``mlx_lm/generate.py``) — and since it
+    never looks at the architecture, it can deliver speculation to any
+    HF/MLX-converted model without building a compatibility table. There is
+    no need to write our own kernels or verification logic; the upstream
+    implementation is used as-is.
 
-    ``SUPPORTED_SAMPLING_PARAMS``: ``FallbackRunner`` と同じ全キー
-    (top_p/top_k/min_p/repetition_penalty/presence_penalty/
-    frequency_penalty/logit_bias/seed) を宣言する。``SpecRunner``/
-    ``FlashSpecRunner`` が top_p 等を弾く理由 (投機側が「生の
-    softmax(logits/temp) が検証対象分布」という前提の上で閉形式の受理長を
-    自前導出しているため、ロジット処理を挟むとその前提が壊れる) はここには
-    存在しない。``speculative_generate_step`` (mlx_lm/generate.py 473 行目〜)
-    を読むと、``sampler``/``logits_processors`` はドラフト側の
-    ``_step(draft_model, draft_cache, y)`` と検証側の ``_step(model,
-    model_cache, y, num_draft_tokens + 1)`` の両方に同一のクロージャで通り、
-    受理判定は「検証側が (同じ sampler で) その時点の真の接頭辞に対して
-    実際に独立サンプルした結果が、たまたまドラフト側の値と一致するか」だけ
-    を見る (626 行目 ``if tn != dtn: break``)。一致すればドラフト値がそのまま
-    emit されるが、それは検証側が独立に出したサンプルと同値なので target
-    分布からのサンプルそのものであり、不一致ならその場で検証側がサンプルした
-    ``tokens[n]`` を emit する (634 行目) — つまりどちらの分岐でも emit
-    されるトークンは「検証モデルの、その時点の真の接頭辞に対する sampler
-    適用後の 1 サンプル」であり続ける。ドラフトが当たった/外れたに関わらず
-    target 分布から生成し続けるので、top_p/top_k/repetition_penalty 等で
-    ロジットを変形しても分布保証は壊れない (SpecRunner/FlashSpecRunner の
-    ような閉形式の受理長導出には依存していない)。``repetition_penalty``/
-    ``presence_penalty``/``frequency_penalty`` が必要とする「これまでの
-    生成列」の状態 (``prev_tokens``) も、ドラフト段階で先食いした分を検証
-    直前に trim して二重カウントを避ける処理がライブラリ側に既にある
-    (616 行目 ``prev_tokens = prev_tokens[: ...]``)。
+    ``SUPPORTED_SAMPLING_PARAMS``: declares the same full set of keys as
+    ``FallbackRunner`` (top_p/top_k/min_p/repetition_penalty/
+    presence_penalty/frequency_penalty/logit_bias/seed). The reason
+    ``SpecRunner``/``FlashSpecRunner`` reject top_p and friends (the
+    speculative side derives a closed-form acceptance length itself, on the
+    premise that the raw softmax(logits/temp) is the distribution being
+    verified, so interposing logit processing breaks that premise) does not
+    exist here. Reading ``speculative_generate_step`` (mlx_lm/generate.py
+    from line 473), ``sampler``/``logits_processors`` are passed as the same
+    closure into both the draft side's ``_step(draft_model, draft_cache, y)``
+    and the verification side's ``_step(model, model_cache, y,
+    num_draft_tokens + 1)``, and the acceptance test only looks at whether
+    "the result the verification side actually sampled independently (with
+    the same sampler) against the true prefix at that point happens to match
+    the draft side's value" (line 626, ``if tn != dtn: break``). On a match
+    the draft's value is emitted as-is, but since it is equal to the sample
+    the verification side produced independently, it is itself a sample from
+    the target distribution; on a mismatch, the ``tokens[n]`` that the
+    verification side sampled is emitted on the spot (line 634) — that is, in
+    either branch the emitted token remains "one sample from the verification
+    model, after the sampler is applied, against the true prefix at that
+    point". Generation keeps coming from the target distribution whether the
+    draft hit or missed, so deforming the logits with
+    top_p/top_k/repetition_penalty and the like does not break the
+    distribution guarantee (it does not rely on a closed-form
+    acceptance-length derivation the way SpecRunner/FlashSpecRunner do). The
+    state that ``repetition_penalty``/``presence_penalty``/
+    ``frequency_penalty`` need — the "generated sequence so far"
+    (``prev_tokens``) — is also already handled on the library side, which
+    trims what was eaten ahead during the draft stage just before
+    verification so it is not double-counted (line 616,
+    ``prev_tokens = prev_tokens[: ...]``).
 
-    以上はすべて mlx_lm 側の実装 (このタスクでは書いていない、読んだだけ) の
-    挙動読解に基づく判断であり、この読解自体をこのタスクで実証してはいない —
-    実機で確認したのは「壊れた出力にならないこと」(貪欲一致、self-draft
-    構成) までで、非貪欲サンプリングの厳密な分布一致は実測していない
-    (docs/ 配下は今回の変更範囲外なので、この判断根拠はここに書く)。
+    All of the above is a judgement based on reading the behavior of the
+    mlx_lm-side implementation (not written in this task, only read), and
+    that reading has not itself been demonstrated in this task — what was
+    confirmed on real hardware is only that "the output does not come out
+    broken" (greedy match, self-draft configuration); the strict distribution
+    match under non-greedy sampling has not been measured (anything under
+    docs/ is outside the scope of this change, so the basis for this
+    judgement is written here).
 
-    session (会話ごとの prompt cache 再利用) は当面やらない: draft/target で
-    2 本の KV cache を一体で持ち運ぶ必要があり、``FallbackSession``
-    (``.cache`` 単数形) の契約に合わない。session が渡されても無視し、毎回
-    両モデルとも全量プレフィルする — 遅くはなるが誤動作はしない。
+    session (per-conversation prompt cache reuse) is not attempted for now:
+    it would require carrying two KV caches, draft and target, around as one
+    unit, which does not fit the contract of ``FallbackSession`` (singular
+    ``.cache``). A session, if passed, is ignored and both models are fully
+    prefilled every time — slower, but not incorrect.
     """
 
     KIND = "draft_spec"
@@ -644,7 +709,8 @@ class DraftSpecRunner:
         ttft = None
         n_from_draft = 0
         # stream_generate yields exactly one GenerationResponse per generated
-        # token (FallbackRunner.generate と同じ前提、その docstring 参照)。
+        # token (the same premise as FallbackRunner.generate; see its
+        # docstring).
         for resp in stream_generate(
             self.model,
             self.tokenizer,
@@ -665,14 +731,15 @@ class DraftSpecRunner:
                 on_tokens([resp.token], resp.text)
         decode_time = time.perf_counter() - t0 - (ttft or 0.0)
         n_decode = max(len(tokens) - 1, 0)
-        # mlx_lm の speculative_generate_step は round ごとに 0 個以上の
-        # from_draft=True (ドラフト的中) と、たかだか 1 個の from_draft=False
-        # (検証モデル自身がサンプルした、その round の締めのトークン) を yield
-        # する。厳密な round 数は stream_generate の外から見えないので、
-        # from_draft=False の個数を round 数の近似として使う (SpecRunner/
-        # FlashSpecRunner の tokens_per_step と同じ「1 ラウンドあたりの実効
-        # トークン数」を近似する observability 用の値であって、正しさには
-        # 関わらない)。
+        # mlx_lm's speculative_generate_step yields, per round, zero or more
+        # tokens with from_draft=True (draft hits) and at most one with
+        # from_draft=False (the closing token of that round, sampled by the
+        # verification model itself). The exact round count is not visible
+        # from outside stream_generate, so the number of from_draft=False
+        # tokens is used as an approximation of the round count (a value for
+        # observability that approximates the same "effective tokens per
+        # round" as tokens_per_step in SpecRunner/FlashSpecRunner; it has no
+        # bearing on correctness).
         n_verify_rounds = max(len(tokens) - n_from_draft, 1)
         return {
             "tokens": tokens,
@@ -689,22 +756,26 @@ class _FlashMTPDiscoveryError(RuntimeError):
 
 
 def _discover_flash_mtp_source(model_dir: Path) -> tuple[str, dict | str] | None:
-    """qwen4_exp (Flash-Next) 用、``--mtp`` 未指定のときの MTP 自動発見。
+    """MTP auto-discovery for qwen4_exp (Flash-Next) when ``--mtp`` is not
+    specified.
 
-    「特化モデルが自分のアクセラレータを持ち歩く」形にして、「渡し忘れて
-    フォールバック」の穴を消すためのもの。優先順位:
+    Its purpose is to make it so that "a specialized model carries its own
+    accelerator around with it", closing the hole of "forgot to pass it, so
+    it fell back". Priority order:
 
-    1. モデル本体の safetensors シャードの中 — ``model.safetensors.index.json``
-       の ``weight_map`` に ``mtp.`` で始まるキーがあれば、それを含む
-       シャードだけを ``mx.load`` で読み、``mtp.*`` キーだけを集めて返す
-       (全シャードは読まない — 該当シャードのみに絞る)。量子化配布では
-       MTP 重みがモデル本体に同梱されているのが通例
-    2. index の無い単一ファイルモデルなら ``model.safetensors`` 自体
-    3. モデルディレクトリ直下の ``mtp.safetensors`` サイドカー
+    1. Inside the model's own safetensors shards — if the ``weight_map`` in
+       ``model.safetensors.index.json`` has keys starting with ``mtp.``, read
+       only the shards containing them with ``mx.load``, gather just the
+       ``mtp.*`` keys and return them (not all shards are read — it is
+       narrowed to the relevant shards only). In quantized distributions it
+       is the norm for the MTP weights to be bundled into the model itself
+    2. For a single-file model with no index, ``model.safetensors`` itself
+    3. An ``mtp.safetensors`` sidecar directly under the model directory
 
-    見つかった場合 ``(source_label, spec)`` を返す。``spec`` は 1・2 のとき
-    ``dict`` (``mtp_flash.load_flash_mtp`` の ``weights=`` にそのまま渡す)、
-    3 のとき ``str`` (同 ``path``)。どれも無ければ ``None``。
+    When found, returns ``(source_label, spec)``. ``spec`` is a ``dict`` for
+    cases 1 and 2 (passed straight to ``weights=`` of
+    ``mtp_flash.load_flash_mtp``) and a ``str`` for case 3 (that same
+    function's ``path``). If none are found, ``None``.
     """
 
     discovery_errors: list[str] = []
@@ -773,12 +844,13 @@ def _discover_flash_mtp_source(model_dir: Path) -> tuple[str, dict | str] | None
     return None
 
 
-#: build_runner が返しうる Runner.KIND の全値。server.py の --require-runner
-#: がこの集合を choices に使う (KIND 文字列がここと build_runner の実際の
-#: 分岐とで散らばらないようにするための唯一の定義元)。"lookup_spec"
-#: (mlxturbo.lookup_spec.LookupSpecRunner) はここでは文字列リテラルで足す —
-#: 循環 import を避けるため (lookup_spec.py が runner.py の FallbackRunner を
-#: import するので、逆方向の import はできない)。
+#: Every value of Runner.KIND that build_runner can return. server.py's
+#: --require-runner uses this set as its choices (the single definition site,
+#: so that the KIND strings do not get scattered between here and
+#: build_runner's actual branches). "lookup_spec"
+#: (mlxturbo.lookup_spec.LookupSpecRunner) is added here as a string literal —
+#: to avoid a circular import (lookup_spec.py imports FallbackRunner from
+#: runner.py, so the reverse import is not possible).
 RUNNER_KINDS = frozenset(
     {
         SpecRunner.KIND,
@@ -799,32 +871,39 @@ def build_runner(
     max_draft: int = 8,
     log_prefix: str = "[mlxturbo]",
 ) -> Runner:
-    """``args.draft_model``/``args.lookup_spec`` の 2 つを、既存の spec/
-    flash_spec/fallback 選択 (``_build_base_runner``、この関数の従来の本体)
-    より手前で扱う薄いラッパー (Kimi K3 レビュー項目 13/12)。
+    """A thin wrapper that handles the two of
+    ``args.draft_model``/``args.lookup_spec`` ahead of the existing
+    spec/flash_spec/fallback selection (``_build_base_runner``, this
+    function's former body) (Kimi K3 review items 13/12).
 
-    - ``args.draft_model`` (str | None) が指定されたときだけ ``DraftSpecRunner``
-      経路に入り、``_build_base_runner`` の分岐 (qwen4_exp/SpecEngine/
-      FallbackRunner の選択) には一切触れない — 未指定なら従来どおりの選択
-      順序をそのまま通る。ドラフトモデルは ``mlx_lm.load`` でこの関数の中で
-      読み込む (本体モデルとは独立にロードする、2 本目のモデル)。トークナイザ
-      の vocab_size が本体と食い違う場合は ``mlx_lm.generate`` の CLI 自身が
-      する検査と同じ理由 (draft は本体と同じトークナイザである前提)
-      で ``SystemExit(1)`` する — ``--mtp`` の明示指定と同じ「逃げ道なし」
-      の扱い。同じモデルを draft に指定する self-draft (速くはならないが
-      配線の確認にはなる) も、この検査は素通りする (vocab_size が一致する
-      ため)。
-    - ``args.lookup_spec`` (bool) は ``_build_base_runner`` が選んだ結果が
-      ``FallbackRunner`` (= spec/flash_spec 契約に合わないモデル) のときだけ
-      ``mlxturbo.lookup_spec.LookupSpecRunner`` へ差し替える (Kimi K3 レビュー
-      項目 12)。spec/flash_spec が選ばれた場合は何もしない — 既にモデル
-      専用の投機が効いているので、n-gram lookup を上乗せする動機が無い。
+    - Only when ``args.draft_model`` (str | None) is specified does it enter
+      the ``DraftSpecRunner`` path, and it does not touch the branches of
+      ``_build_base_runner`` (the choice between qwen4_exp/SpecEngine/
+      FallbackRunner) at all — when unspecified, the same selection order as
+      before is followed unchanged. The draft model is loaded inside this
+      function with ``mlx_lm.load`` (a second model, loaded independently of
+      the main one). If the tokenizer's vocab_size disagrees with the main
+      model's, it raises ``SystemExit(1)`` for the same reason as the check
+      that ``mlx_lm.generate``'s own CLI performs (the draft is assumed to
+      use the same tokenizer as the main model) — the same "no escape hatch"
+      treatment as an explicit ``--mtp``. Self-drafting, i.e. specifying the
+      same model as the draft (which will not make things faster but does
+      verify the wiring), also passes this check (because the vocab_size
+      matches).
+    - ``args.lookup_spec`` (bool) swaps in
+      ``mlxturbo.lookup_spec.LookupSpecRunner`` only when what
+      ``_build_base_runner`` selected is a ``FallbackRunner`` (= a model that
+      does not fit the spec/flash_spec contract) (Kimi K3 review item 12). If
+      spec/flash_spec was selected it does nothing — model-specific
+      speculation is already in effect, so there is no motive to stack an
+      n-gram lookup on top.
 
-    ``args`` は ``model``/``original``/``mtp_bits``/``no_mtp``/``no_fused``/
-    ``draft_model``/``num_draft_tokens``/``lookup_spec``/``lookup_max_draft``/
-    ``lookup_min_match`` を持つ argparse.Namespace (cli.py / server.py の
-    どちらの引数もこの形。cli.py はこれらの新規フラグを持たないため、
-    ``getattr(..., None)``/``getattr(..., False)`` で欠落を許容する)。
+    ``args`` is an argparse.Namespace carrying ``model``/``original``/
+    ``mtp_bits``/``no_mtp``/``no_fused``/``draft_model``/
+    ``num_draft_tokens``/``lookup_spec``/``lookup_max_draft``/
+    ``lookup_min_match`` (the arguments of both cli.py and server.py have
+    this shape. cli.py does not have these newer flags, so
+    ``getattr(..., None)``/``getattr(..., False)`` tolerate their absence).
     """
 
     draft_model_path = getattr(args, "draft_model", None)
@@ -867,10 +946,11 @@ def build_runner(
             max_draft=getattr(args, "lookup_max_draft", None) or 8,
             min_match=getattr(args, "lookup_min_match", None) or 2,
         )
-        # 元の FallbackRunner が持っていた理由 (「なぜ spec/flash_spec が
-        # 選ばれなかったか」) は引き継ぐ — /health の fallback_reason はこの
-        # 経路でも意味のある情報のまま (「黙って fallback に落ちて気づけ
-        # ない」を防ぐ方針、build_runner の元の docstring 参照)。
+        # Carry over the reason the original FallbackRunner held ("why
+        # spec/flash_spec was not selected") — /health's fallback_reason
+        # stays meaningful information on this path too (the policy of
+        # preventing "silently dropping to the fallback with no way to
+        # notice"; see build_runner's original docstring).
         wrapped.fallback_reason = resolved.fallback_reason
         note = (
             "有効"
@@ -892,62 +972,73 @@ def _build_base_runner(
     max_draft: int = 8,
     log_prefix: str = "[mlxturbo]",
 ) -> Runner:
-    """SpecEngine の構築を試み、モデルの形が合わなければ通常生成へ落とす。
+    """Try to construct a SpecEngine and drop to ordinary generation if the
+    model's shape does not fit.
 
-    ``build_runner`` (この関数のもとの名前、``--draft-model``/
-    ``--lookup-spec`` を横取りする薄いラッパーが追加されたので分離した)
-    から呼ばれる、qwen4_exp/SpecEngine/FallbackRunner を選ぶ本体。
+    The body that chooses between qwen4_exp/SpecEngine/FallbackRunner, called
+    from ``build_runner`` (this function's original name; it was split out
+    because a thin wrapper that intercepts ``--draft-model``/
+    ``--lookup-spec`` was added).
 
-    ``args`` は ``model``/``original``/``mtp_bits``/``no_mtp``/``no_fused`` を
-    持つ argparse.Namespace (cli.py / server.py のどちらの引数もこの形)。
+    ``args`` is an argparse.Namespace carrying ``model``/``original``/
+    ``mtp_bits``/``no_mtp``/``no_fused`` (the arguments of both cli.py and
+    server.py have this shape).
 
-    フォールバックへ落としてよいのは「このモデルのレイアウトが SpecEngine の
-    契約に合わない」と判定できる場合だけに絞る。壊れた重みや Metal の確保
-    失敗のような本物の障害まで「非対応アーキテクチャ」に化けさせて黙って
-    フォールバックすると、原因が分からなくなる:
+    Dropping to the fallback is narrowed to only the cases where we can judge
+    that "this model's layout does not fit SpecEngine's contract". If genuine
+    failures such as corrupt weights or a Metal allocation failure were also
+    disguised as "unsupported architecture" and silently fell back, the cause
+    would become impossible to determine:
 
-    - ``model.args.text_config`` が無い (= そもそも VLM ラッパー形式ですら
-      ない) は ``AttributeError`` — これは正当な「対象外」判定
-    - ``load_cli_mtp`` は重み欠損を自分で吸収して ``None`` を返す (失敗を
-      ここまで伝播させない設計)。それでも伝播してきた例外は本物のバグ
-    - ``mx.eval(mtp.parameters())`` はここでは捕まえない。落ちるなら
-      Metal 確保失敗や壊れた重みで、フォールバック対象ではなく実害なので
-      大声で落とす
-    - ``SpecEngine(model, mtp)`` 構築時の ``validate_spec_model_contract``
-      が投げる ``TypeError``/``ValueError``/``RuntimeError`` だけが
-      「契約不一致 = 対象外」の正式なシグナル
+    - the absence of ``model.args.text_config`` (= not even in the VLM
+      wrapper form to begin with) is an ``AttributeError`` — this is a
+      legitimate "out of scope" verdict
+    - ``load_cli_mtp`` absorbs missing weights itself and returns ``None``
+      (designed not to propagate failures this far). An exception that
+      propagates here anyway is a genuine bug
+    - ``mx.eval(mtp.parameters())`` is not caught here. If it fails it is a
+      Metal allocation failure or corrupt weights, which is real damage
+      rather than a fallback case, so let it fail loudly
+    - only the ``TypeError``/``ValueError``/``RuntimeError`` thrown by
+      ``validate_spec_model_contract`` while constructing
+      ``SpecEngine(model, mtp)`` is the formal signal for "contract mismatch
+      = out of scope"
 
-    qwen4_exp (Flash-Next) の MTP は 3 段階で探す (優先順、``_discover_flash_mtp_source``
-    参照):
+    The MTP for qwen4_exp (Flash-Next) is looked for in 3 stages (in priority
+    order; see ``_discover_flash_mtp_source``):
 
-    1. ``--mtp PATH`` 明示指定 — 最優先。運用者の明示指定なので、読めない
-       まま黙って遅い (非投機の) 構成で起動することは「対象外」判定とは
-       別物として扱う。ロードは 1 回だけリトライし (外付け SSD 起因の一時的
-       な GPU Timeout を想定)、それでも読めなければフォールバックせず
-       ``SystemExit(1)`` で終了する — 逃げ道のフラグは無い
-    2. モデル本体の safetensors シャードの中 — ``model.safetensors.index.json``
-       の ``weight_map`` に ``mtp.`` で始まるキーがあれば、該当シャードだけ
-       読み ``mtp.*`` テンソルを集めて使う (量子化配布では MTP 重みが本体に
-       同梱されているのが通例)
-    3. モデルディレクトリ直下の ``mtp.safetensors`` サイドカー
+    1. an explicit ``--mtp PATH`` — highest priority. Because it is the
+       operator's explicit specification, starting up silently in a slow
+       (non-speculative) configuration when it cannot be read is treated as
+       something other than an "out of scope" verdict. The load is retried
+       exactly once (assuming a transient GPU Timeout caused by an external
+       SSD), and if it still cannot be read it does not fall back but exits
+       with ``SystemExit(1)`` — there is no escape-hatch flag
+    2. inside the model's own safetensors shards — if the ``weight_map`` in
+       ``model.safetensors.index.json`` has keys starting with ``mtp.``, read
+       only those shards, gather the ``mtp.*`` tensors and use them (in
+       quantized distributions it is the norm for the MTP weights to be
+       bundled into the model itself)
+    3. an ``mtp.safetensors`` sidecar directly under the model directory
 
-    2・3 (自動発見) の失敗は明示指定ではないので exit しない — リトライは
-    2・3 にも適用するが、それでも失敗すればフォールバックする。どれも
-    見つからなければ従来どおりフォールバック。
+    Failures of 2 and 3 (auto-discovery) are not an explicit specification,
+    so they do not exit — the retry applies to 2 and 3 as well, but if they
+    still fail it falls back. If none are found it falls back as before.
 
-    フォールバックした runner (``FallbackRunner``) は ``fallback_reason``
-    (str) に理由を持つ: ``"MTP が見つからない (...)"`` /
+    A runner that fell back (``FallbackRunner``) carries the reason in
+    ``fallback_reason`` (str): one of ``"MTP が見つからない (...)"`` /
     ``"MTP 自動発見 (<出典>) の読み込みに失敗: <理由>"`` /
-    ``"spec 契約検証に失敗: <理由>"`` のいずれか。フォールバック以外の
-    runner では ``fallback_reason`` は常に None (Runner Protocol 参照)。
+    ``"spec 契約検証に失敗: <理由>"``. On runners other than the fallback,
+    ``fallback_reason`` is always None (see the Runner Protocol).
     """
 
     from . import fused
     from .cli import load_cli_mtp
     from .ngram_stream import warn_if_not_installed
 
-    # --ngram を渡し忘れると n-gram 表が初期値のまま生成に使われる。
-    # 出力は最後まで出るので、ここで鳴らさないと気づけない
+    # If --ngram is forgotten, the n-gram table is used for generation still
+    # at its initial values. The output comes out to the very end regardless,
+    # so unless the alarm is sounded here nobody notices
     warn_if_not_installed(model)
 
     if args.no_fused:
@@ -957,12 +1048,14 @@ def _build_base_runner(
         print(f"{log_prefix} hyper-connections 融合カーネル有効 (moe_route/rms_norm_gated は実測で"
               " 空振りのため無効のまま)")
 
-    # Qwen3.8-Flash-Next (qwen4_exp) + MTP (明示指定 or 自動発見) ->
-    # FlashSpecEngine 経路 (docs/MTP-FLASH.md)。27B (qwen3_5) は model_type が
-    # 違うので以下の分岐には一切入らず、この関数の残り (既存の
-    # SpecEngine/FallbackRunner 分岐) をそのまま通る — 27B 側の経路は変えて
-    # いない。``args.mtp`` が無い cli.py 呼び出し (--mtp 引数を持たない) では
-    # getattr が None を返すので自動発見側に自然に落ちる。
+    # Qwen3.8-Flash-Next (qwen4_exp) + MTP (explicit or auto-discovered) ->
+    # the FlashSpecEngine path (docs/MTP-FLASH.md). The 27B (qwen3_5) has a
+    # different model_type, so it never enters the branch below at all and
+    # passes through the rest of this function (the existing
+    # SpecEngine/FallbackRunner branches) unchanged — the 27B-side path has
+    # not been altered. For cli.py calls without ``args.mtp`` (it has no
+    # --mtp argument), getattr returns None so it naturally lands on the
+    # auto-discovery side.
     mtp_path = getattr(args, "mtp", None)
     if getattr(model.args, "model_type", None) == "qwen4_exp":
         from . import mtp_flash, spec_flash
@@ -1011,24 +1104,28 @@ def _build_base_runner(
 
         mtp = None
         last_exc: Exception | None = None
-        # ロードは最大 2 回試みる (1 回だけリトライ)。直前に GPU Timeout の
-        # 実例があり (外付け SSD の mmap 読み出し起因の一時的失敗)、テンソル
-        # ごとの eval で主因は潰したがそれでも起こり得る一時的失敗のための
-        # 保険。明示指定 (--mtp) だけでなく自動発見 (モデル内蔵/サイドカー)
-        # にも同じリトライを適用する。2 回目も失敗すれば一時的ではなく
-        # 恒久的な失敗 (パス誤り・形式不一致等) とみなす。
+        # The load is attempted at most twice (retried exactly once). There
+        # was a real case of a GPU Timeout right before this (a transient
+        # failure caused by mmap reads from an external SSD); the main cause
+        # was eliminated by evaluating tensor by tensor, but this is
+        # insurance against the transient failures that can still happen.
+        # The same retry applies not only to the explicit specification
+        # (--mtp) but also to auto-discovery (bundled in the model /
+        # sidecar). If the second attempt fails too, it is deemed a permanent
+        # rather than a transient failure (wrong path, format mismatch, etc.).
         for attempt in range(2):
             try:
                 mtp = mtp_flash.load_flash_mtp(
                     load_path, model.args.text, quantize=quant, weights=load_weights
                 )
-                # 壊れた重み/Metal 確保失敗はここで大声で落ちる (意図的)。
-                # ただし一括 mx.eval にはしない: サイドカーは外付け SSD の
-                # 5.2GB を mmap で遅延読みしており、量子化カーネルを 1 つの
-                # コマンドバッファに全部積むと USB のページフォルトで GPU が
-                # 止まり Metal の watchdog (GPU Timeout Error) を毎回踏む。
-                # テンソルごとに eval を切れば 1 バッファが短くなり、読みの
-                # 遅さは待ち時間になるだけで済む。
+                # Corrupt weights / a Metal allocation failure fail loudly
+                # here (deliberately). But not as a single bulk mx.eval: the
+                # sidecar lazily mmap-reads 5.2GB from an external SSD, and
+                # piling every quantization kernel into one command buffer
+                # stalls the GPU on USB page faults and hits Metal's watchdog
+                # (GPU Timeout Error) every single time. Cutting the eval per
+                # tensor keeps each buffer short, so the slowness of the read
+                # merely turns into waiting time.
                 for _name, p in tree_flatten(mtp.parameters()):
                     mx.eval(p)
                 last_exc = None
@@ -1044,10 +1141,12 @@ def _build_base_runner(
 
         if last_exc is not None:
             if explicit:
-                # ``--mtp`` は運用者の明示指定なので、読めないまま黙って遅い
-                # (非投機の) 構成で起動することは「対象外アーキテクチャ」
-                # 判定とは別物として扱う — フォールバックせず、理由を明示
-                # して終了する。逃げ道のフラグは無い。
+                # ``--mtp`` is the operator's explicit specification, so
+                # starting up silently in a slow (non-speculative)
+                # configuration when it cannot be read is treated as
+                # something other than an "unsupported architecture" verdict
+                # — do not fall back; state the reason and exit. There is no
+                # escape-hatch flag.
                 print(
                     f"{log_prefix} --mtp {mtp_path} (qwen4_exp) を再試行しても"
                     f"読み込めません ({type(last_exc).__name__}: {last_exc})。"
@@ -1056,8 +1155,9 @@ def _build_base_runner(
                     " 無しで起動)。終了します。"
                 )
                 raise SystemExit(1)
-            # 自動発見 (モデル内蔵/サイドカー) の失敗は明示指定ではないので
-            # exit しない — フォールバックへ倒す。
+            # A failure of auto-discovery (bundled in the model / sidecar) is
+            # not an explicit specification, so do not exit — tip over to the
+            # fallback instead.
             reason = (
                 f"MTP 自動発見 ({source_label}) の読み込みに失敗: "
                 f"{type(last_exc).__name__}: {last_exc}"
@@ -1085,7 +1185,9 @@ def _build_base_runner(
 
     mtp = load_cli_mtp(args.model, config, text_args, args.original, args.mtp_bits, args.no_mtp)
     if mtp is not None:
-        mx.eval(mtp.parameters())  # 壊れた重み/Metal 確保失敗はここで大声で落ちる (意図的)
+        # Corrupt weights / a Metal allocation failure fail loudly here
+        # (deliberately).
+        mx.eval(mtp.parameters())
 
     try:
         engine = SpecEngine(model, mtp)

@@ -1,52 +1,55 @@
-"""qwen4_exp (Qwen3.8-Flash-Next) を利用者の mlx_lm へ書き込まずに解決する。
+"""Resolve qwen4_exp (Qwen3.8-Flash-Next) without writing into the user's mlx_lm.
 
-## 背景
+## Background
 
-Flash-Next のモデルクラスは mlx-lm 本体に無い (mlx-lm PR #1788 が未マージ)。
-このリポジトリは vendored 版を `tools/vendor/qwen4_exp.py` として持っている。
+The Flash-Next model class is not part of mlx-lm proper (mlx-lm PR #1788 is
+still unmerged). This repository carries a vendored copy as
+`tools/vendor/qwen4_exp.py`.
 
-mlx-lm がモデルクラスを解決する経路はただ一つ、
-`mlx_lm/utils.py:_get_classes()` の
+mlx-lm has exactly one path for resolving a model class,
 
     importlib.import_module(f"mlx_lm.models.{model_type}")
 
-だけで、mlx-lm 自身にプラグイン的な登録機構は無い。以前はこの vendored
-ファイルを `convert_flash.py install-arch` で利用者の site-packages
-(`<mlx_lm install先>/models/qwen4_exp.py`) へ物理コピーして解決させていたが、
-これは利用者の mlx_lm パッケージを書き換える — `uv sync` や mlx-lm の
-アップデートで消える、他のプロジェクトが同じ mlx_lm を使っていれば道連れに
-なる、という副作用があった (レビュー指摘: mlxturbo を試すだけで環境が壊れる)。
+in `mlx_lm/utils.py:_get_classes()`, and mlx-lm itself has no plugin-style
+registration mechanism. Previously we resolved this by having
+`convert_flash.py install-arch` physically copy the vendored file into the
+user's site-packages (`<mlx_lm install dir>/models/qwen4_exp.py`), but that
+rewrites the user's mlx_lm package, with the side effects that it disappears
+on `uv sync` or on an mlx-lm update, and that any other project sharing the
+same mlx_lm gets dragged along with it (review comment: merely trying out
+mlxturbo breaks your environment).
 
-## やっていること
+## What this does instead
 
-`sys.meta_path` に、`mlx_lm.models.qwen4_exp` という完全修飾名だけを
-vendored ファイルへ差し替える最小の finder を差し込む。この名前以外の
-import には一切関与しない (find_spec は None を返し、既定の finder に
-そのまま譲る) ので、mlx_lm を含めた他のあらゆる import に影響しない。
+It inserts into `sys.meta_path` a minimal finder that redirects only the fully
+qualified name `mlx_lm.models.qwen4_exp` to the vendored file. It takes no part
+in any other import (find_spec returns None and defers to the default finders
+as-is), so it affects nothing else, mlx_lm included.
 
-site-packages には何も書き込まない。`mlx_lm.models` パッケージの実体は
-そのまま (通常のインストール) を使い、`from .base import ...` のような
-vendored ファイル内の相対 import も、finder が spec に正しい `__name__` /
-`__package__` (= "mlx_lm.models") を持たせることで、通常の
-`mlx_lm.models.base` 解決に自然に乗る。
+Nothing is written into site-packages. The `mlx_lm.models` package itself stays
+as it is (the normal installation), and relative imports inside the vendored
+file such as `from .base import ...` ride naturally on the usual
+`mlx_lm.models.base` resolution, because the finder gives the spec the correct
+`__name__` / `__package__` (= "mlx_lm.models").
 
-## なぜ `sys.modules` への直接登録ではなく meta_path finder なのか
+## Why a meta_path finder rather than registering directly in `sys.modules`
 
-`sys.modules["mlx_lm.models.qwen4_exp"] = <exec 済みモジュール>` を
-mlxturbo の import 時に前もって置いておくだけでも、
-`import mlx_lm.models.qwen4_exp as Q` / `from mlx_lm.models import qwen4_exp` /
-`importlib.import_module(...)` のいずれの解決経路も (CPython の
-import-as / from-import は attribute 参照に失敗すると `sys.modules[fullname]`
-へフォールバックするため) 動く。だが vendored ファイル冒頭の
-`NGRAM_ON_DISK = os.environ.get("FASTMLX_NGRAM_DISK") == "1"` は
-モジュール実行時に 1 度だけ評価される値で、呼び出し側 (cli.py / server.py /
-convert_flash.py / tools 配下) は「実際に qwen4_exp を読み込む直前」に
-この環境変数を立てる規約になっている (mlxturbo の import 時点ではまだ
-立っていない)。`sys.modules` への前倒し登録だと、この規約より前に
-モジュール本体が実行されてしまい `FASTMLX_NGRAM_DISK` を無視した状態で
-固まる。meta_path finder なら、実際に `mlx_lm.models.qwen4_exp` の import
-が要求された瞬間 (= 呼び出し側が環境変数を立てた後) まで実行を遅らせられる
-ので、この規約を崩さない。
+Simply placing `sys.modules["mlx_lm.models.qwen4_exp"] = <already-executed
+module>` ahead of time when mlxturbo is imported would also work for every
+resolution path — `import mlx_lm.models.qwen4_exp as Q` /
+`from mlx_lm.models import qwen4_exp` / `importlib.import_module(...)` — because
+CPython's import-as / from-import fall back to `sys.modules[fullname]` when the
+attribute lookup fails. But
+`NGRAM_ON_DISK = os.environ.get("FASTMLX_NGRAM_DISK") == "1"` at the top of the
+vendored file is evaluated exactly once when the module executes, and the
+convention on the calling side (cli.py / server.py / convert_flash.py / things
+under tools) is to set that environment variable immediately before qwen4_exp
+is actually loaded (it is not yet set at the time mlxturbo is imported).
+Registering into `sys.modules` up front would execute the module body before
+that convention gets its chance, freezing it in a state that ignored
+`FASTMLX_NGRAM_DISK`. A meta_path finder lets us defer execution until the
+moment the import of `mlx_lm.models.qwen4_exp` is actually requested (= after
+the caller has set the environment variable), so the convention stays intact.
 """
 
 from __future__ import annotations
@@ -61,30 +64,31 @@ VENDOR_PATH = Path(__file__).resolve().parent.parent / "tools" / "vendor" / "qwe
 
 
 class _FlashNextArchFinder(importlib.abc.MetaPathFinder):
-    """`mlx_lm.models.qwen4_exp` だけを vendored ファイルへ差し替える。"""
+    """Redirect only `mlx_lm.models.qwen4_exp` to the vendored file."""
 
     def find_spec(self, fullname, path, target=None):
         if fullname != MODULE_NAME:
             return None
         if not VENDOR_PATH.exists():
-            # vendor が無い環境 (配布物から tools/ を外した等) では黙って
-            # 既定の finder に譲る。ここで例外を投げると qwen4_exp を使わない
-            # モデルの import まで巻き込んで壊れる
+            # In environments without the vendor file (e.g. a distribution that
+            # dropped tools/), silently defer to the default finders. Raising
+            # here would also break imports of models that never use qwen4_exp.
             return None
         return importlib.util.spec_from_file_location(fullname, VENDOR_PATH)
 
 
 def install() -> None:
-    """qwen4_exp を `mlx_lm.models` 名前空間へ解決できるようにする。
+    """Make qwen4_exp resolvable within the `mlx_lm.models` namespace.
 
-    べき等 (2 回呼んでも finder は 1 つしか積まない)。`mlxturbo` の
-    `__init__.py` から呼ばれるので、`mlxturbo` を import した時点で
-    (実際に qwen4_exp を使うかとは無関係に) 常に有効になる。
+    Idempotent (calling it twice still installs only one finder). It is called
+    from `mlxturbo`'s `__init__.py`, so it is always in effect as soon as
+    `mlxturbo` is imported (regardless of whether qwen4_exp actually gets used).
     """
 
     if any(isinstance(f, _FlashNextArchFinder) for f in sys.meta_path):
         return
-    # 既に site-packages に古い install-arch のコピーが残っていても、
-    # こちらを優先する (vendor が正本)。他の名前には関与しないため
-    # 先頭に挿しても他の import への影響は無い
+    # Even if an old install-arch copy is still sitting in site-packages, this
+    # one takes precedence (the vendored file is the source of truth). Since it
+    # takes no part in any other name, inserting it at the front has no effect
+    # on other imports.
     sys.meta_path.insert(0, _FlashNextArchFinder())

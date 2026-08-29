@@ -1,22 +1,28 @@
-"""MTP 自己投機デコード。
+"""MTP self-speculative decoding.
 
-draft: MTP ブロック(全体の ~1.5%)を連鎖させて n_draft 個の候補を出す。
-verify: 本体 1 回の forward で n_draft+1 トークンをまとめて検証する。
-m=2 の検証は m=1 の 1.04 倍しかかからない(実測)ので、受理された分が
-ほぼそのまま速度倍率になる。greedy では出力は非投機と完全一致する。
+draft: chain the MTP block (~1.5% of the whole model) to produce n_draft candidates.
+verify: verify n_draft+1 tokens together in a single forward pass of the main model.
+An m=2 verification costs only 1.04x an m=1 one (measured), so whatever gets
+accepted translates almost directly into the speed multiplier. Under greedy
+decoding the output matches non-speculative decoding exactly.
 
-線形アテンション 48 層の巻き戻し: 射影と conv は m トークン一括(帯域償却を
-維持)、再帰更新だけ位置ごとに回して全位置の状態を保持する。棄却時は
-該当位置の状態と conv 窓を差し替えるだけで再計算しない。
+Rollback across the 48 linear-attention layers: the projections and the conv run
+over all m tokens at once (keeping the bandwidth amortization), and only the
+recurrent update is looped per position so that the state of every position is
+retained. On rejection we merely swap in the state and the conv window for that
+position -- nothing is recomputed.
 
-Phase D 汎用パック (docs/RESEARCH.md, docs/KERNEL-INTEL.md「深度制御」節):
-D1 は MTP 連鎖の深度ラダーを AdaEDL 型の確信度 + 位置別受理率 EMA の
-継続/停止ゲートへ置換、D3 は文脈 lookup を suffix automaton (mlxturbo/sam.py)
-化して仲裁を ReSpec 流のエントロピー起動 + 候補 EMA へ置換、D4 は temp>0 の
-棄却サンプリングを Block Verification (arXiv:2403.10444) へ置換した。
-いずれも訓練不要・分布保証は不変 (D1/D3 は深度と提案元の選び方だけを変える
-ので正しさに無関係、D4 は棄却サンプリングと厳密同一分布であることを
-証明・実測で確認済み。詳細は docs/STATUS.md「Phase D 汎用パック」)。
+Phase D general-purpose pack (docs/RESEARCH.md, docs/KERNEL-INTEL.md, "depth
+control" section): D1 replaced the MTP chain's depth ladder with an AdaEDL-style
+confidence + per-position acceptance-rate EMA continue/stop gate; D3 turned the
+context lookup into a suffix automaton (mlxturbo/sam.py) and replaced the
+arbitration with ReSpec-style entropy triggering + a candidate EMA; D4 replaced
+the temp>0 rejection sampling with Block Verification (arXiv:2403.10444).
+None of them require training and none of them change the distribution guarantee
+(D1/D3 only change the depth and the choice of proposal source, so they are
+irrelevant to correctness; D4 has been confirmed by proof and by measurement to
+have exactly the same distribution as rejection sampling. Details in
+docs/STATUS.md, "Phase D general-purpose pack").
 """
 
 import math
@@ -41,13 +47,15 @@ from .kernels.dispatch import (
 )
 from .sam import SuffixAutomaton
 
-# ---------- D1: 確信度ゲート連鎖 ----------
+# ---------- D1: confidence-gated chaining ----------
 #
-# AdaEDL (arXiv:2410.18351) のエントロピー下界 1-sqrt(gamma*H) をリンクごとの
-# 確信度信号にし、KERNEL-INTEL.md「深度制御」の位置別受理率 EMA + 期待利得
-# 閾値 (reach *= p_d, threshold = h*(1+expected)/(1+d*h)) と等重み平均で
-# 併用する。gamma=0.2 は論文の既定値。h=0.19 は checkpoint 型巻き戻し
-# (mlxturbo の全位置状態保持) のレンジ 0.18-0.20 の中央値。
+# Take AdaEDL's (arXiv:2410.18351) entropy lower bound 1-sqrt(gamma*H) as the
+# per-link confidence signal, and use it together with the per-position
+# acceptance-rate EMA + expected-gain threshold from KERNEL-INTEL.md's "depth
+# control" (reach *= p_d, threshold = h*(1+expected)/(1+d*h)) as an equally
+# weighted average. gamma=0.2 is the paper's default value. h=0.19 is the median
+# of the 0.18-0.20 range for checkpoint-style rollback (mlxturbo retains the
+# state of every position).
 ADAEDL_GAMMA = 0.2
 GATE_ROLLBACK_COST = 0.19
 GATE_EMA_ALPHA = 0.2
@@ -56,8 +64,9 @@ GATE_EMA_ALPHA = 0.2
 # must not be dominated by the (possibly-pessimistic) EMA/prior yet -- see
 # _gate_depth docstring.
 GATE_EMA_WARMUP = 5
-# vanilla MTP 連鎖の位置別受理率の相場 (RESEARCH.md 引用の FastMTP 実測:
-# k=1 ~70% / k=2 ~11% / k=3 ~2%)。EMA が温まるまでの事前分布として使う。
+# Typical per-position acceptance rates for a vanilla MTP chain (the FastMTP
+# measurements quoted in RESEARCH.md: k=1 ~70% / k=2 ~11% / k=3 ~2%). Used as the
+# prior until the EMA warms up.
 _POS_ACCEPT_PRIOR = {1: 0.70, 2: 0.11, 3: 0.02}
 
 
@@ -67,13 +76,14 @@ def _pos_accept_prior(d: int) -> float:
     return 0.02 * (0.3 ** (d - 3))
 
 
-# ---------- D3: ReSpec 仲裁 ----------
+# ---------- D3: ReSpec arbitration ----------
 #
-# エントロピー閾値は ReSpec (arXiv:2511.01282) 実験値 theta_entropy=1.5,
-# 最大遡り長 l=3 をそのまま採用 (語彙サイズが異なるため較正の余地あり、
-# docs/STATUS.md に注記)。lambda_e (エントロピーと長さのトレードオフ) と
-# EMA 更新率 alpha, 品質閾値 theta_score=0.5 は論文本文に具体値の記載が
-# なかったため mlxturbo 側で選んだ較正値。
+# The entropy threshold adopts ReSpec's (arXiv:2511.01282) experimental values
+# theta_entropy=1.5 and maximum lookback length l=3 as they are (there is room
+# for recalibration since the vocabulary size differs; noted in docs/STATUS.md).
+# lambda_e (the entropy/length tradeoff), the EMA update rate alpha, and the
+# quality threshold theta_score=0.5 are calibration values chosen on the mlxturbo
+# side, because the body of the paper states no concrete values for them.
 RESPEC_LOOKBACK = 3
 RESPEC_LAMBDA_E = 1.0
 RESPEC_ENTROPY_THETA = 1.5
@@ -83,76 +93,88 @@ RESPEC_SCORE_PRIOR = 0.5
 RESPEC_BUCKET_WIDTH = 4
 RESPEC_MAX_BUCKET = 8
 
-# ---------- prefill チャンク分割 ----------
+# ---------- prefill chunking ----------
 #
-# 新規プロンプトを一括で _hidden_forward に流すと、注意スコア行列が
-# heads * S^2 * 2 バイトで確保され、Metal の 1 バッファ上限 (実測 86GB 強)
-# を S ≈ 43,000-52,000 トークン付近で超えて [metal::malloc] で落ちる
-# (実測: 42,688 は通り、約 57,000 は 103,639,939,200 = 16 * 57,000^2 * 2
-# で失敗)。PREFILL_STEP_SIZE トークンずつ流せば、そのチャンクの注意スコア
-# 行列は heads * chunk * S * 2 (S に対して線形) で収まる。
+# Feeding a new prompt into _hidden_forward in one shot allocates the attention
+# score matrix as heads * S^2 * 2 bytes, which exceeds Metal's single-buffer
+# limit (measured at a little over 86GB) somewhere around S ~ 43,000-52,000
+# tokens and dies in [metal::malloc] (measured: 42,688 passes, while about
+# 57,000 fails at 103,639,939,200 = 16 * 57,000^2 * 2). If we feed
+# PREFILL_STEP_SIZE tokens at a time, that chunk's attention score matrix is
+# heads * chunk * S * 2 (linear in S) and fits.
 #
-# mlxturbo/runner.py の FallbackRunner (mlx_lm.generate.stream_generate) が
-# 既にこの値で prefill を分割しており、Flash-Next の出荷経路はそちらを
-# 通っている。SpecEngine 側だけ別の刻み幅にすると「同じプロンプトなのに
-# 経路によって出力が違う」を自作することになるので、値はここ 1 箇所だけに
-# 置き、mlxturbo/runner.py はこの定数をそのまま import して両経路で共有する。
+# mlxturbo/runner.py's FallbackRunner (mlx_lm.generate.stream_generate) already
+# splits prefill at this value, and the Flash-Next shipping path goes through it.
+# Giving the SpecEngine side a different step size would mean manufacturing a
+# "same prompt, yet the output differs depending on the path" problem for
+# ourselves, so the value lives in this one place only and mlxturbo/runner.py
+# imports this constant directly so that both paths share it.
 #
-# 決定性の範囲: mx.quantized_matmul は行データが同じでもバッチ長 (M) が
-# 違うと異なる丸めを返す (実測で確認済み — 4-bit 量子化モデルの層 1 回の
-# 出力だけで ~0.4% の相対差、40 層を通すと ~30% まで拡大する)。したがって
-# 「チャンク幅を変えると出力が変わる」— 分割なしとは一致しない。保証する
-# のは「同一のチャンク幅・同一構成である限り決定的」ことと、投機デコードの
-# 受理判定が実際に計算された target logits と整合していること (= spec-on
-# と spec-off が同一チャンク幅の下で一致すること) の 2 点。前者は
-# vLLM/llama.cpp も提供しないビット不変性の話であり要求しない。詳細は
-# docs/PREFILL-CHUNKING-DETERMINISM.md。
+# Scope of determinism: mx.quantized_matmul returns different rounding when the
+# batch length (M) differs, even for identical row data (confirmed by
+# measurement -- the output of a single layer of a 4-bit quantized model alone
+# already shows ~0.4% relative difference, which grows to ~30% after 40 layers).
+# Therefore "changing the chunk width changes the output" -- it does not match
+# the unchunked result. What we guarantee is two things: that it is
+# "deterministic as long as the chunk width and the configuration are identical",
+# and that speculative decoding's acceptance decision is consistent with the
+# target logits that were actually computed (= spec-on and spec-off agree under
+# the same chunk width). The former is a matter of bit-exact invariance that
+# vLLM/llama.cpp do not provide either, and we do not require it. Details in
+# docs/PREFILL-CHUNKING-DETERMINISM.md.
 PREFILL_STEP_SIZE = 2048
 
 
-# ---------- 巻き戻せないレイヤーのチェックポイント ----------
+# ---------- checkpoints for layers that cannot be rolled back ----------
 #
-# GDN ハイブリッドの線形層 (mlx_lm.models.cache.ArraysCache: 再帰状態 + conv
-# 窓) は attention の KVCache と違い、任意の位置まで trim で戻す手段を
-# 持たない (is_trimmable() が常に False)。巻き戻せないものはスナップショット
-# で持てばよい、という方針で、_prefill_hidden がプレフィルのチャンク境界
-# ごと (このモジュール冒頭 PREFILL_STEP_SIZE と同じ刻み、新しい刻みは作らない)
-# にこれらのレイヤーだけの状態を退避しておく。次ターンの新プロンプトが
-# 処理済み列の途中 (チャンク境界より前) で分岐しても、直近のチェックポイント
-# まで復元してそこから差分だけ prefill し直せる (mlxturbo/server.py の
-# _try_checkpoint_restore_session_cache が消費する)。trim できるレイヤー
-# (KVCache) はスナップショット不要 — .trim() で任意の位置へ戻せる。
+# Unlike attention's KVCache, the linear layers of the GDN hybrid
+# (mlx_lm.models.cache.ArraysCache: recurrent state + conv window) have no means
+# of trimming back to an arbitrary position (is_trimmable() is always False).
+# Under the policy that whatever cannot be rolled back can simply be held as a
+# snapshot, _prefill_hidden saves the state of just those layers at every prefill
+# chunk boundary (the same step size as PREFILL_STEP_SIZE at the top of this
+# module; we do not create a new step size). Then, even if the next turn's new
+# prompt diverges in the middle of the already-processed sequence (before a chunk
+# boundary), we can restore back to the most recent checkpoint and re-prefill
+# only the difference from there (consumed by
+# _try_checkpoint_restore_session_cache in mlxturbo/server.py). Trimmable layers
+# (KVCache) need no snapshot -- .trim() takes them back to any position.
 #
-# 保持数とその根拠: text_config 実測 (docs/KERNEL-BRIEF-MOE-GDN.md 系列で
-# 確認済みの構成) で 40 層中 30 層が linear_attention。1 チェックポイント
-# あたり ~66MB (再帰状態: linear_num_value_heads=32 * linear_key_head_dim=128
-# * linear_value_head_dim=128, mamba_ssm_dtype=float32 で層あたり ~2.1MB、
-# + conv 状態: linear_conv_kernel_dim=4 で層あたり ~131KB、30 層分の合計)。
-# 直近 CHECKPOINT_RETENTION=8 件だけ残す (STATE.max_sessions の既定値と
-# 揃えた数 — 8 session が同時に上限まで抱えても保持コストが同じ桁になる
-# ようにしただけで、それ以上の意味は無い): 1 session あたり最大 ~528MB、
-# 8 session (プール上限) 全てが同時に最大量を抱えても ~4.2GB — 128GB 機
-# では誤差。8 * PREFILL_STEP_SIZE = 16,384 トークン分は直近のターン内で
-# 確実にカバーできるので、実際に直したい症状 (thinking マーカー再オープン
-# による末尾わずかなトークンのずれ) は確実に射程に入る。それより手前
-# (古いチェックポイントが押し出された範囲) まで戻る必要がある場合は、
-# 単に一致するチェックポイントが見つからず新規スロットへ倒れる (安全側)。
+# How many we retain, and the reasoning: in the measured text_config (a
+# configuration confirmed in the docs/KERNEL-BRIEF-MOE-GDN.md series), 30 of the
+# 40 layers are linear_attention. One checkpoint is ~66MB (recurrent state:
+# linear_num_value_heads=32 * linear_key_head_dim=128
+# * linear_value_head_dim=128, ~2.1MB per layer at mamba_ssm_dtype=float32,
+# + conv state: ~131KB per layer at linear_conv_kernel_dim=4, totaled over the 30
+# layers). We keep only the most recent CHECKPOINT_RETENTION=8 (a number aligned
+# with the default of STATE.max_sessions -- purely so that the retention cost
+# stays in the same order of magnitude even when 8 sessions hold their maximum
+# simultaneously; there is no meaning to it beyond that): at most ~528MB per
+# session, and ~4.2GB even if all 8 sessions (the pool limit) hold the maximum at
+# the same time -- a rounding error on a 128GB machine. 8 * PREFILL_STEP_SIZE =
+# 16,384 tokens' worth is reliably covered within the most recent turn, so the
+# symptom we actually want to fix (a slight drift of the trailing few tokens
+# caused by a thinking marker being reopened) is reliably within range. If we
+# need to go back further than that (into the range where the old checkpoints
+# have been pushed out), no matching checkpoint is simply found and we fall over
+# to a fresh slot (the safe side).
 CHECKPOINT_RETENTION = 8
 
 
 def snapshot_untrimmable_caches(caches) -> list[tuple[int, object, object, object]]:
-    """``caches`` のうち trim できないレイヤー (``is_trimmable()`` が False
-    — GDN ハイブリッドでは ArraysCache) の状態だけを退避する。trim できる
-    レイヤー (KVCache 等) は ``.trim()`` で任意の位置へ戻せるのでここでは
-    触らない。
+    """Save the state of only those layers of ``caches`` that cannot be trimmed
+    (``is_trimmable()`` is False -- ArraysCache in the GDN hybrid). Trimmable
+    layers (KVCache and the like) can be taken back to any position with
+    ``.trim()``, so they are left untouched here.
 
-    ``c.state`` が返す値がリスト (ArraysCache がそう) の場合、その getter は
-    内部の可変リストをそのまま返す — 後で ``cache[i] = new_array`` のように
-    別の位置が更新されても、参照だけ持っていると "スナップショット" のはず
-    が最新状態にすり替わってしまう (個々の mx.array 自体は不変だが、それを
-    指すリストのスロットは差し替えられるため)。ここで ``list(state)`` して
-    リスト自体は複製し、要素 (mx.array) は複製しない (mx.array は
-    ``__setitem__`` で明示的に書き換えない限り不変なので、要素の共有は安全)。
+    When the value returned by ``c.state`` is a list (as it is for ArraysCache),
+    that getter hands back the internal mutable list itself -- if some other slot
+    is updated later, as in ``cache[i] = new_array``, holding only the reference
+    means what was supposed to be a "snapshot" gets swapped out for the latest
+    state (each individual mx.array is itself immutable, but the list slot
+    pointing at it does get replaced). So here we ``list(state)`` to copy the list
+    itself, without copying the elements (mx.array is immutable unless explicitly
+    overwritten via ``__setitem__``, so sharing the elements is safe).
     """
 
     snapshot = []
@@ -169,7 +191,7 @@ def snapshot_untrimmable_caches(caches) -> list[tuple[int, object, object, objec
 
 
 def restore_untrimmable_caches(caches, snapshot) -> None:
-    """``snapshot_untrimmable_caches`` で退避した状態を書き戻す。"""
+    """Write back the state saved by ``snapshot_untrimmable_caches``."""
 
     for i, state, left_padding, lengths in snapshot:
         c = caches[i]
@@ -181,13 +203,14 @@ def restore_untrimmable_caches(caches, snapshot) -> None:
 
 
 class ChatSession:
-    """ターンをまたいで KV と線形状態を持ち越すための入れ物。
+    """A container for carrying KV and linear state across turns.
 
-    新プロンプトが処理済み列の純粋な追記なら差分だけ prefill する。追記
-    でなければ (テンプレートが履歴を書き換えた等)、``checkpoints`` に直近の
-    プレフィルチャンク境界のスナップショットがあれば、そこまで復元して
-    差分だけ prefill し直す (mlxturbo/server.py の _select_session 参照)。
-    どちらも使えなければ全再構築に落ちる。
+    If the new prompt is a pure append to the already-processed sequence, only
+    the difference is prefilled. If it is not an append (the template rewrote the
+    history, etc.), then if ``checkpoints`` holds a snapshot of a recent prefill
+    chunk boundary we restore back to it and re-prefill only the difference (see
+    _select_session in mlxturbo/server.py). If neither is usable, we fall back to
+    a full rebuild.
     """
 
     def __init__(self):
@@ -196,9 +219,10 @@ class ChatSession:
         self.mtp_valid = False
         self.processed = []
         self.h_last = None
-        # [(position, snapshot), ...] position 昇順。snapshot は
-        # snapshot_untrimmable_caches() の戻り値。直近 CHECKPOINT_RETENTION
-        # 件だけ保持する (_prefill_hidden 側で切り詰める)。
+        # [(position, snapshot), ...] in ascending order of position. snapshot
+        # is the return value of snapshot_untrimmable_caches(). Only the most
+        # recent CHECKPOINT_RETENTION entries are retained (trimmed on the
+        # _prefill_hidden side).
         self.checkpoints: list[tuple[int, list]] = []
 
     def invalidate(self):
@@ -255,10 +279,10 @@ class SpecEngine:
         with dispatch_scope():
             return self.text.lm_head(out)
 
-    # ---------- 本体 forward ----------
+    # ---------- main-model forward ----------
 
     def _hidden_forward(self, tokens: mx.array, caches, capture: bool):
-        """tokens: (S,)。戻り値: (最終 norm 前 hidden (1,S,D), 線形層の巻き戻し情報)"""
+        """tokens: (S,). Returns: (hidden before the final norm (1,S,D), rollback info for the linear layers)"""
         if capture and any(
             layer.is_linear and layer.linear_attn.sharding_group is not None
             for layer in self.inner.layers
@@ -290,30 +314,34 @@ class SpecEngine:
         checkpoints: list | None = None,
         base_pos: int = 0,
     ) -> mx.array:
-        """新規プロンプト分をチャンク分割して forward する (generate() の
-        最初の一括 prefill 専用)。
+        """Forward the new-prompt portion in chunks (used only for the initial
+        bulk prefill in generate()).
 
-        tokens 全体を _hidden_forward に一括で渡すと注意スコア行列が S^2 で
-        確保され Metal の上限を超える (モジュール冒頭の PREFILL_STEP_SIZE
-        docstring 参照)。PREFILL_STEP_SIZE トークンずつ常に (短いプロンプト
-        でも 1 チャンクとして) 流し、チャンクごとに mx.eval + mx.clear_cache()
-        してから次へ進む — mlxturbo/runner.py の FallbackRunner が使う
-        mlx_lm.generate の prefill ループと同じ形、同じ刻み幅。caches は
-        capture=False の通常経路 (KVCache.update_and_fetch / GDN の
-        cache.advance) でチャンクをまたいで状態を引き継ぐ。
+        Passing the whole of tokens to _hidden_forward at once allocates the
+        attention score matrix as S^2 and exceeds Metal's limit (see the
+        PREFILL_STEP_SIZE docstring at the top of this module). We always feed
+        PREFILL_STEP_SIZE tokens at a time (even a short prompt goes through as
+        a single chunk), doing mx.eval + mx.clear_cache() per chunk before moving
+        on -- the same shape and the same step size as the mlx_lm.generate
+        prefill loop that mlxturbo/runner.py's FallbackRunner uses. caches carries
+        state across chunks through the ordinary capture=False path
+        (KVCache.update_and_fetch / GDN's cache.advance).
 
-        分割の有無で hidden states の数値は変わり得る (mx.quantized_matmul
-        がバッチ長依存の丸めをするため、PREFILL_STEP_SIZE docstring 参照)。
-        ここが保証するのは同一チャンク幅での決定性と、投機の受理判定が
-        実際に計算された target logits と整合していることの 2 点であって、
-        分割なし処理とのビット一致ではない。
+        The numerics of the hidden states can differ depending on whether we
+        chunk or not (because mx.quantized_matmul rounds in a batch-length-
+        dependent way; see the PREFILL_STEP_SIZE docstring). What is guaranteed
+        here is two things -- determinism at the same chunk width, and that
+        speculation's acceptance decision is consistent with the target logits
+        that were actually computed -- not bit-exact agreement with unchunked
+        processing.
 
-        ``checkpoints`` (省略時 None): 指定されていれば、チャンク境界ごとに
-        巻き戻せないレイヤーの状態スナップショット (snapshot_untrimmable_
-        caches 参照) をこのリストへ in-place で追記する。位置は
-        ``base_pos`` (呼び出し元にとってこの呼び出し開始位置 = セッション
-        の再利用済みトークン数) を足した絶対位置。CHECKPOINT_RETENTION 件
-        を超えたら古いものから追い出す。
+        ``checkpoints`` (None when omitted): if given, a state snapshot of the
+        layers that cannot be rolled back (see snapshot_untrimmable_caches) is
+        appended in-place to this list at every chunk boundary. The position is
+        absolute, i.e. with ``base_pos`` added (the starting position of this
+        call from the caller's point of view = the number of tokens the session
+        has already reused). Once there are more than CHECKPOINT_RETENTION
+        entries, the oldest are evicted.
         """
         n = tokens.shape[0]
         step = getattr(self, "prefill_step_size", PREFILL_STEP_SIZE)
@@ -336,7 +364,7 @@ class SpecEngine:
         return chunks[0] if len(chunks) == 1 else mx.concatenate(chunks, axis=1)
 
     def _linear_capture(self, layer, x, cache, sink, mask=None):
-        """GatedDeltaNet と同じ計算を、位置ごとの再帰状態を残しながら行う。"""
+        """Perform the same computation as GatedDeltaNet while retaining the per-position recurrent state."""
         la = layer.linear_attn
         if la.sharding_group is not None:
             raise NotImplementedError(
@@ -456,32 +484,36 @@ class SpecEngine:
     # ---------- MTP ----------
 
     def _mtp_base(self, hiddens: mx.array) -> mx.array:
-        """checkpoint 契約 base_hidden_variant=post_norm に合わせて本体最終 norm を適用。
-        2x2 実測 (bench/results/mtp-2x2-*.json): post/post が全深度で優位。"""
+        """Apply the main model's final norm, to match the checkpoint contract
+        base_hidden_variant=post_norm. Measured 2x2
+        (bench/results/mtp-2x2-*.json): post/post wins at every depth."""
         return self.inner.norm(hiddens)
 
     def _mtp_append(self, tok_ids: mx.array, hiddens: mx.array, mtp_cache) -> mx.array:
-        """位置ごとの (embed(t_{i+1}), h_i) ペアを MTP に流し K/V を積む。"""
+        """Feed the per-position (embed(t_{i+1}), h_i) pairs to the MTP and accumulate K/V."""
         e = self.inner.embed_tokens(tok_ids[None])
         return self.mtp(e, hiddens, cache=mtp_cache)
 
-    # ---------- D1: 確信度ゲート連鎖 ----------
+    # ---------- D1: confidence-gated chaining ----------
 
     @staticmethod
     def _adaedl_bound(entropy: float, gamma: float = ADAEDL_GAMMA) -> float:
-        """AdaEDL (arXiv:2410.18351) の受理下界 1 - sqrt(gamma * H)。
+        """AdaEDL's (arXiv:2410.18351) acceptance lower bound 1 - sqrt(gamma * H).
 
-        H はドラフト分布 (このリンクの softmax) のシャノンエントロピー
-        (自然対数)。下界が負になり得る低確信域は 0 にクリップする。
+        H is the Shannon entropy (natural log) of the draft distribution (this
+        link's softmax). The low-confidence region, where the lower bound can go
+        negative, is clipped to 0.
         """
         return max(0.0, 1.0 - math.sqrt(max(gamma, 0.0) * max(entropy, 0.0)))
 
     @staticmethod
     def _expected_future_gain(pos_accept_ema: dict, d: int, cap: int) -> float:
-        """d より深く続けた場合に追加で受理できるトークン数の期待値。
+        """The expected number of additional tokens that can be accepted if we
+        continue deeper than d.
 
-        位置別 EMA (温まっていなければ FastMTP 実測を事前分布に) の
-        累積積を d+1..cap で足し合わせる (標準的な期待受理長の畳み込み)。
+        Sums the cumulative products of the per-position EMA (with the FastMTP
+        measurements as the prior if it has not warmed up) over d+1..cap (the
+        standard expected-acceptance-length convolution).
         """
         expected = 0.0
         running = 1.0
@@ -499,21 +531,25 @@ class SpecEngine:
         gamma: float = ADAEDL_GAMMA,
         h: float = GATE_ROLLBACK_COST,
     ) -> int:
-        """MTP 連鎖のうち実際に検証へ回す長さを確信度ゲートで決める。
+        """Decide, with a confidence gate, how much of the MTP chain is actually
+        sent to verification.
 
-        リンク d ごとに AdaEDL 下界と位置別受理率 EMA を混ぜた p_d で
-        reach (=prod p_d) を更新し、KERNEL-INTEL.md の
-        threshold = h*(1+expected)/(1+d*h) と比較する。reach が閾値を
-        下回った時点のリンクまでは残し (その位置自体は依然検証する価値が
-        ある)、それより深い分だけ切り捨てる。
+        For each link d, update reach (=prod p_d) with a p_d that blends the
+        AdaEDL lower bound and the per-position acceptance-rate EMA, and compare
+        it against KERNEL-INTEL.md's threshold = h*(1+expected)/(1+d*h). We keep
+        everything up to and including the link at which reach fell below the
+        threshold (that position itself is still worth verifying) and truncate
+        only what is deeper than it.
 
-        EMA の重みは観測回数で立ち上げる (w = n/(n+GATE_EMA_WARMUP))。
-        ゲートが浅い位置で止まった回よりリンクは深い位置の EMA を
-        更新できないので (打ち切った先は検証していない = 正解が無い)、
-        固定 50/50 で混ぜると「一度低く出た事前分布が観測不足のまま
-        効き続けて浅い判定を再生産する」飢餓状態に陥る。観測が少ない
-        うちは AdaEDL の瞬時確信度だけで判断し、EMA は実測が積み上がって
-        から効かせる。
+        The EMA's weight is ramped up by the observation count
+        (w = n/(n+GATE_EMA_WARMUP)). A step where the gate stopped at a shallow
+        position cannot update the EMA for links at deeper positions (what was
+        cut off was never verified = there is no ground truth), so blending at a
+        fixed 50/50 falls into a starvation state where "a prior that once came
+        out low keeps taking effect while still under-observed and reproduces the
+        shallow verdict". While observations are few we judge from AdaEDL's
+        instantaneous confidence alone, and let the EMA take effect only once
+        measurements have accumulated.
         """
         pos_obs_count = pos_obs_count or {}
         cap = len(entropies)
@@ -533,7 +569,7 @@ class SpecEngine:
                 break
         return keep
 
-    # ---------- D3: 文脈 lookup (SAM) + ReSpec 仲裁 ----------
+    # ---------- D3: context lookup (SAM) + ReSpec arbitration ----------
 
     @staticmethod
     def _respec_trigger(
@@ -542,13 +578,13 @@ class SpecEngine:
         lambda_e: float = RESPEC_LAMBDA_E,
         theta_entropy: float = RESPEC_ENTROPY_THETA,
     ) -> bool:
-        """ReSpec (arXiv:2511.01282) Algorithm 1 の entropy-guided trigger。
+        """The entropy-guided trigger of ReSpec (arXiv:2511.01282) Algorithm 1.
 
-        直近 confirmed トークンの target 分布エントロピーについて、
-        遡り長 k=1..lookback それぞれの平均エントロピー H_k と
-        confidence score C_k = H_k + lambda_e/k を計算し、C_k を最小化する
-        k* を選ぶ。その H_k* が theta_entropy 以下なら "予測しやすい文脈"
-        として retrieval を起動する。
+        Over the target-distribution entropies of the most recent confirmed
+        tokens, compute for each lookback length k=1..lookback the mean entropy
+        H_k and the confidence score C_k = H_k + lambda_e/k, and choose the k*
+        that minimizes C_k. If that H_k* is at or below theta_entropy, the
+        context counts as "easy to predict" and retrieval is triggered.
         """
         n = min(lookback, len(entropy_hist))
         if n == 0:
@@ -571,12 +607,14 @@ class SpecEngine:
         width: int = RESPEC_BUCKET_WIDTH,
         cap: int = RESPEC_MAX_BUCKET,
     ) -> int:
-        """SAM の一致長を EMA ランキングのバケットへ量子化する。
+        """Quantize SAM's match length into a bucket for the EMA ranking.
 
-        mlxturbo の lookup 候補は SAM が返す単一候補 (最長一致の最新出現) な
-        ので、ReSpec の「一致位置ごとの EMA」を「一致長バケットごとの EMA」
-        に対応させる: 一致が長いほど再出現が偶然でない可能性が高く、
-        バケット単位で信頼度を学習するのが自然な単一候補版の類推になる。
+        mlxturbo's lookup candidate is the single candidate SAM returns (the most
+        recent occurrence of the longest match), so ReSpec's "EMA per match
+        position" is mapped here onto "EMA per match-length bucket": the longer
+        the match, the higher the chance that the recurrence is not coincidental,
+        and learning the confidence per bucket is the natural single-candidate
+        analogue.
         """
         return min(match_len // width, cap)
 
@@ -632,7 +670,7 @@ class SpecEngine:
                 tau = length
         return tau
 
-    # ---------- 生成 ----------
+    # ---------- generation ----------
 
     def generate(
         self,
@@ -649,24 +687,27 @@ class SpecEngine:
         fly_theta: float = 0.0,
         fly_window: int = 6,
     ):
-        """MTP 連鎖の深度は確信度ゲートで、lookup 起動は ReSpec 流の
-        エントロピー閾値で、それぞれステップごとに決める (Phase D1/D3)。
+        """The depth of the MTP chain is decided by a confidence gate and the
+        lookup trigger by a ReSpec-style entropy threshold, each on a per-step
+        basis (Phase D1/D3).
 
-        MTP 連鎖 (source="mtp"): リンクごとに AdaEDL エントロピー下界と
-        位置別受理率 EMA を併用した reach/threshold ゲートで、実際に検証へ
-        送るリンク数を決める (``_gate_depth``)。深度上限は
-        ``max_draft if max_draft > 0 else n_draft`` を流用する。
+        MTP chain (source="mtp"): a reach/threshold gate that uses the AdaEDL
+        entropy lower bound together with the per-position acceptance-rate EMA on
+        each link decides how many links are actually sent to verification
+        (``_gate_depth``). The depth cap reuses
+        ``max_draft if max_draft > 0 else n_draft``.
 
-        文脈 lookup (source="lookup"): mlxturbo/sam.py の suffix automaton が
-        O(1) 償却で最長一致を追跡する。直近 confirmed トークンの target
-        エントロピー履歴が ReSpec の entropy-guided trigger
-        (``_respec_trigger``) を満たし、かつ一致長バケットの受理率 EMA が
-        閾値以上のときだけ起動する (``_respec_bucket``)。外れれば MTP へ
-        フォールバックする。
+        Context lookup (source="lookup"): the suffix automaton in
+        mlxturbo/sam.py tracks the longest match in O(1) amortized. It triggers
+        only when the target entropy history of the most recent confirmed tokens
+        satisfies ReSpec's entropy-guided trigger (``_respec_trigger``) and the
+        acceptance-rate EMA of the match-length bucket is at or above the
+        threshold (``_respec_bucket``). If it misses, we fall back to MTP.
 
-        temp>0 の検証は Block Verification (arXiv:2403.10444,
-        ``_block_verify_tau``) で、逐次棄却サンプリングと厳密同一分布の
-        まま受理長が単調非減少になる (docs/STATUS.md 参照)。
+        Verification for temp>0 is by Block Verification (arXiv:2403.10444,
+        ``_block_verify_tau``), which makes the accepted length monotonically
+        non-decreasing while keeping exactly the same distribution as sequential
+        rejection sampling (see docs/STATUS.md).
 
         ``n_draft=0, max_draft=0, lookup_len=0`` is the non-speculative
         baseline contract used by ``bench/gate.py``.
@@ -676,11 +717,11 @@ class SpecEngine:
         eos = set(eos_ids)
         prompt_ids = list(prompt_ids)
         if self.mtp is None:
-            # MTP チェックポイントが無い構成 (cli.py の load_cli_mtp が
-            # None を返した場合)。MTP 連鎖を丸ごと切り、lookup (D3, SAM)
-            # だけで投機を続ける。cap_base をここで潰しておくことで、
-            # 後続の draft ループと D7 拡張分岐 (どちらも self.mtp を呼ぶ)
-            # が発火しなくなる。
+            # A configuration with no MTP checkpoint (when load_cli_mtp in
+            # cli.py returned None). Cut the MTP chain entirely and keep
+            # speculating with lookup (D3, SAM) alone. Zeroing out cap_base here
+            # means the subsequent draft loop and the D7 extension branch (both
+            # of which call self.mtp) never fire.
             n_draft = 0
             max_draft = 0
         use_mtp = n_draft > 0 or max_draft > 0
@@ -688,11 +729,12 @@ class SpecEngine:
         caches = mtp_cache = None
         reused = 0
         reused_h_last = None
-        # session が無い呼び出し (bench/gate.py 等、直接 SpecEngine.generate
-        # を叩く経路) では次ターンという概念自体が無いのでチェックポイント
-        # も追わない (None なら _prefill_hidden がスナップショット取得ごと
-        # 丸ごとスキップする)。session があれば、新規スロットでも継続でも
-        # 必ず追う (公開は generate() の最後、session.publish 経由)。
+        # For calls with no session (bench/gate.py and other paths that hit
+        # SpecEngine.generate directly) there is no notion of a next turn at all,
+        # so we do not track checkpoints either (with None, _prefill_hidden skips
+        # snapshotting entirely). If there is a session we always track them,
+        # whether the slot is new or continued (they are published at the end of
+        # generate(), via session.publish).
         checkpoints: list | None = [] if session is not None else None
         if session is not None and session.caches is not None:
             pl = session.processed
@@ -701,14 +743,15 @@ class SpecEngine:
             while lcp < n and pl[lcp] == prompt_ids[lcp]:
                 lcp += 1
             if lcp == len(pl) and lcp < len(prompt_ids):
-                # KV/GDN 状態の再利用は MTP 連鎖の生死と切り離す — 対応する
-                # h_last の無い mtp_cache を引き継ぐと後段の concat で
-                # 落ちる (mtp_valid が False の session は h_last/mtp_cache
-                # が巻き戻し後の位置と対応しない、mlxturbo/server.py の
-                # _try_checkpoint_restore_session_cache 参照) ので、MTP は
-                # session.mtp_valid のときだけ引き継ぎ、そうでなければ後段
-                # の use_mtp ブロックが「セッション再利用なし」と同じ経路
-                # (prompt[1:] から作り直す) へ自然に落ちる。
+                # Reuse of the KV/GDN state is decoupled from whether the MTP
+                # chain survives -- carrying over an mtp_cache with no
+                # corresponding h_last makes the later concat fail (in a session
+                # where mtp_valid is False, h_last/mtp_cache do not correspond to
+                # the position after rollback; see
+                # _try_checkpoint_restore_session_cache in mlxturbo/server.py).
+                # So MTP is carried over only when session.mtp_valid, and
+                # otherwise the use_mtp block below naturally falls into the same
+                # path as "no session reuse" (rebuilding from prompt[1:]).
                 caches = session.caches
                 checkpoints = session.checkpoints
                 reused = lcp
@@ -778,8 +821,9 @@ class SpecEngine:
         fed_gen = []
         src_hist = {"lookup": Counter(), "mtp": Counter()}
         lookup_ext_hits = 0
-        # D6 (FLy) は明示 opt-in (fly_theta > 0)。温度付きは D4 の閉形式が
-        # 分布厳密性を担保しているので greedy 限定で適用する。
+        # D6 (FLy) is explicitly opt-in (fly_theta > 0). With a temperature it
+        # is D4's closed form that guarantees distributional exactness, so we
+        # apply this to greedy only.
         fly_active = fly_theta > 0.0 and temp == 0
         fly_defer_accepts = 0
         phase = {"draft": 0.0, "verify": 0.0, "maint": 0.0}
@@ -830,12 +874,14 @@ class SpecEngine:
                 if lk is None:
                     lookup_bucket = None
             if lk is None and triggered and cap >= 1 and proposal_cap >= 2:
-                # D7 (LogitSpec arXiv:2507.01449 の適応): 直接照合がミスした
-                # ときだけ、MTP 第 1 リンクの予測トークンで検索キーを 1 つ
-                # 延長して SAM を引き直す。第 1 リンクはミス時に MTP 連鎖の
-                # 1 本目へそのまま再利用するので、追加 GPU コストは同期 1 回。
-                # 品質 EMA は直接キーと母集団が違うため ("ext", bucket) で
-                # 別学習する (ReSpec の source-aware verification の類推)。
+                # D7 (an adaptation of LogitSpec arXiv:2507.01449): only when
+                # the direct match missed, extend the search key by one with the
+                # token predicted by the MTP's first link and query SAM again.
+                # On a miss the first link is reused as-is for the first entry of
+                # the MTP chain, so the extra GPU cost is one sync.
+                # The quality EMA is learned separately under ("ext", bucket)
+                # because its population differs from that of the direct key (by
+                # analogy with ReSpec's source-aware verification).
                 dh, dtok = self._mtp_base(h_last), y
                 h_mtp = self._mtp_append(dtok, dh, mtp_cache)
                 d_logits = self._head(h_mtp[:, -1:], self.mtp.norm)[0, -1]
@@ -927,14 +973,17 @@ class SpecEngine:
                 while a < n_avail and preds_l[a] == window_l[a + 1]:
                     a += 1
                 if fly_active and ent_l is not None:
-                    # D6 (FLy, arXiv:2511.22972 二段機構の greedy 適用、opt-in):
-                    # 最初の不一致 j で target の正規化エントロピー h_j >= theta
-                    # (= target 自身が迷っている) なら即棄却せず遅延し、後続
-                    # fly_window トークンが全て一致する (= モデルが代替表現に
-                    # 合意して続きが発散しない) 場合だけ j の draft トークンを
-                    # 受理する。h_j < theta の不一致は真のエラーとして即棄却。
-                    # 出力分布は厳密ではなくなる (既定 off、gate/正式ベンチは
-                    # 厳密のまま)。
+                    # D6 (FLy, arXiv:2511.22972; the two-stage mechanism applied
+                    # to greedy, opt-in): at the first mismatch j, if the
+                    # target's normalized entropy h_j >= theta (= the target
+                    # itself is unsure), do not reject immediately but defer, and
+                    # accept j's draft token only if all fly_window following
+                    # tokens match (= the model agrees with the alternative
+                    # phrasing and the continuation does not diverge). A mismatch
+                    # with h_j < theta is a genuine error and is rejected
+                    # immediately. The output distribution is no longer exact
+                    # (off by default; the gate and the official benchmarks stay
+                    # exact).
                     log_v = math.log(logits.shape[-1])
                     while a < n_avail:
                         if ent_l[a] / log_v < fly_theta:
@@ -960,10 +1009,13 @@ class SpecEngine:
                     next_tok = preds_l[a]
             else:
                 # D4: Block Verification (arXiv:2403.10444) replaces
-                # sequential rejection sampling. Draft は決定的提案 (delta
-                # 分布) なので受理長 tau の閉形式が p_l (逐次棄却と同じ
-                # target 確率列) だけで書ける (_block_verify_tau docstring
-                # と docs/STATUS.md に導出)。出力分布は逐次棄却と厳密同一。
+                # sequential rejection sampling. The draft is a deterministic
+                # proposal (a delta distribution), so the closed form for the
+                # accepted length tau can be written with p_l alone (the same
+                # sequence of target probabilities as sequential rejection); the
+                # derivation is in the _block_verify_tau docstring and
+                # docs/STATUS.md. The output distribution is exactly identical to
+                # sequential rejection.
                 lg = logits[0].astype(mx.float32) / temp
                 probs = mx.softmax(lg, axis=-1)
                 nw = window.shape[0] - 1

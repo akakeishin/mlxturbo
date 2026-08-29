@@ -1,11 +1,13 @@
-"""Qwen3.8 の MTP (multi-token prediction) ヘッド。
+"""The MTP (multi-token prediction) head of Qwen3.8.
 
-チェックポイントの mtp.* 重みから DeepSeek-V3 型の 1 ブロック draft ヘッドを
-組み立てる。mlx-lm はこの重みを読み込み時に捨てるので、ここで別途読む。
+Assembles a DeepSeek-V3 style single-block draft head from the checkpoint's
+mtp.* weights. mlx-lm throws these weights away at load time, so we read them
+separately here.
 
-norm の規約: qwen3_5 の plain RMSNorm は zero-centered で保存されている
-(mlx-lm の sanitize が本体側へ +1 している)。mtp 側の plain norm 7 本にも
-同じ +1 を適用する。pre_fc norm の生平均が負であることがこの規約の証拠。
+The norm convention: plain RMSNorm in qwen3_5 is stored zero-centered (mlx-lm's
+sanitize adds +1 on the main model side). We apply the same +1 to the 7 plain
+norms on the mtp side. The evidence for this convention is that the raw mean of
+the pre_fc norm is negative.
 """
 
 import glob
@@ -30,14 +32,15 @@ class MTPModule(nn.Module):
         self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.fc = nn.Linear(2 * args.hidden_size, args.hidden_size, bias=False)
-        # layer_idx は full_attention になる位置を渡す
+        # Pass a layer_idx that lands on a full_attention position
         self.layers = [DecoderLayer(args, layer_idx=args.full_attention_interval - 1)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(self, embeds: mx.array, hiddens: mx.array, cache=None) -> mx.array:
-        """embeds, hiddens: (B, S, D)。戻り値は最終 norm 前の hidden (B, S, D)。
+        """embeds, hiddens: (B, S, D). Returns the hidden before the final norm, (B, S, D).
 
-        位置 i の入力は (embed(t_{i+1}), h_i)。出力から lm_head で t_{i+2} を予測する。
+        The input at position i is (embed(t_{i+1}), h_i). From the output, lm_head
+        predicts t_{i+2}.
         """
         x = self.fc(
             mx.concatenate(
@@ -114,10 +117,10 @@ def load_mtp(
 def load_mtp_file(
     path: str, args: TextModelArgs, quantize: dict | None = None
 ) -> MTPModule:
-    """学習済みヘッド (train_mtp.py の成果物) を読む。
+    """Load a trained head (the artifact produced by train_mtp.py).
 
-    保存時点で norm の +1 シフトは適用済みなので、load_mtp と違い
-    ここでは一切シフトしない (二重適用の地雷を踏まない)。
+    The norm +1 shift was already applied at save time, so unlike load_mtp we do
+    not shift at all here (avoiding the double-application landmine).
     """
     weights = dict(mx.load(str(path)).items())
     mtp = MTPModule(args)

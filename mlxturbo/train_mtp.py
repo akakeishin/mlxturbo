@@ -1,17 +1,21 @@
-"""MTP ヘッドの FastMTP 式微調整 (D2 手順 3)。
+"""FastMTP-style fine-tuning of the MTP head (D2, step 3).
 
-- backbone は凍結。pre-norm hidden は SpecEngine._hidden_forward と同じ経路
-  (推論と同一の hidden 契約) から取る。
-- 同一ヘッドを深度 1..K に position-shared で再帰適用。深度間は勾配を通す。
-- 位置減衰 CE: w_k ∝ decay^(k-1) を正規化。損失は生成領域
-  (target が gen 側にある位置) のみ。
-- AdamW、linear warmup → cosine decay、マイクロバッチ 1 系列 × 勾配累積。
+- The backbone is frozen. Pre-norm hiddens are taken from the same path as
+  SpecEngine._hidden_forward (the same hidden contract as inference).
+- The same head is applied recursively, position-shared, at depths 1..K.
+  Gradients flow across depths.
+- Position-decayed CE: w_k ∝ decay^(k-1), normalized. The loss covers only the
+  generated region (positions whose target lies on the gen side).
+- AdamW, linear warmup → cosine decay, micro-batch of 1 sequence × gradient
+  accumulation.
 
-成果物は models/mtp-tuned/ に safetensors + meta.json。保存重みは norm の
-+1 シフト適用済み (mlx 規約) なので、読み戻しは load_mtp_file を使うこと。
-load_mtp (原本チェックポイント用) で読むと二重シフトになる。
+The artifacts land in models/mtp-tuned/ as safetensors + meta.json. The saved
+weights already have the norm +1 shift applied (the mlx convention), so read
+them back with load_mtp_file. Reading them with load_mtp (which is for the
+original checkpoints) applies the shift twice.
 
-使い方 (GPU 長時間。カーネル側セッションの計測と排他を確認してから):
+Usage (long GPU run; first make sure it does not collide with measurements in
+the kernel-side session):
   uv run python -m mlxturbo.train_mtp --data data/mtp_selfgen.jsonl \
       --limit 1000 --tag ckpt1k
 """
@@ -47,7 +51,7 @@ def load_dataset(path, max_len, limit, seed):
             plen = len(rec["prompt_tokens"])
             if len(tokens) > max_len:
                 tokens = tokens[:max_len]
-            # 生成領域が薄い系列は学習信号がないので捨てる
+            # Drop sequences with a thin generated region: no training signal
             if len(tokens) - plen < 16:
                 continue
             records.append((tokens, plen))
@@ -59,7 +63,7 @@ def load_dataset(path, max_len, limit, seed):
 
 
 def backbone_hiddens(engine, tokens):
-    """推論と同じ経路で pre-norm hidden を得る (勾配なし)。"""
+    """Get pre-norm hiddens through the same path as inference (no gradients)."""
     caches = engine.text.make_cache()
     h, _ = engine._hidden_forward(mx.array(tokens), caches, capture=False)
     return mx.stop_gradient(h)
@@ -74,20 +78,20 @@ def make_head_fn(model):
 
 
 def mtp_loss(mtp, head_fn, embed_fn, tokens, plen, h_true, k_depth, weights):
-    """深度 1..K の位置減衰 CE。戻り値: (loss, 深度別 (correct, count))。"""
+    """Position-decayed CE over depths 1..K. Returns (loss, per-depth (correct, count))."""
     L = len(tokens)
     tok = mx.array(tokens)
     losses = []
     stats = []
     h_in = h_true[:, : L - 1]
     for k in range(1, k_depth + 1):
-        # 深度 k のスロット i は (embed(T[i+k]), h_{k-1,i]) から T[i+k+1] を予測
+        # Slot i at depth k predicts T[i+k+1] from (embed(T[i+k]), h_{k-1,i])
         n_slots = L - k
         e = embed_fn(tok[k:][None])
         out = mtp(e, h_in, cache=None)
         logits = head_fn(mtp.norm(out[:, : n_slots - 1]))
         targets = tok[k + 1 :]
-        # 生成領域のみ: target の系列位置 i+k+1 >= plen
+        # Generated region only: the target's sequence position i+k+1 >= plen
         pos = mx.arange(n_slots - 1) + k + 1
         mask = pos >= plen
         n_valid = mask.sum()
@@ -141,7 +145,7 @@ def main():
         mtp = load_mtp_file(REPO / args.init, text_args)
     else:
         mtp = load_mtp(find_snapshot(args.original), text_args)
-    # 学習は fp32 で行い、保存時に bf16 へ戻す
+    # Train in fp32 and convert back to bf16 when saving
     mtp.update(tree_map(lambda p: p.astype(mx.float32), mtp.parameters()))
     mtp.train()
     engine = SpecEngine(model, mtp)

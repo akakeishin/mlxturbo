@@ -1,67 +1,73 @@
-"""Qwen3.8-Flash-Next (qwen4_exp) の MTP ヘッド。
+"""MTP head for Qwen3.8-Flash-Next (qwen4_exp).
 
-`mlxturbo/mtp.py` は qwen3_5 (27B) 用で、`mlx_lm.models.qwen3_5.DecoderLayer`
-で組んでいる。Flash-Next は構造が違うので別に持つ。27B 側は触らない。
+`mlxturbo/mtp.py` is for qwen3_5 (27B) and is built out of
+`mlx_lm.models.qwen3_5.DecoderLayer`. Flash-Next has a different structure, so it
+gets its own module here. The 27B side is left untouched.
 
-## サイドカーの重みから読み取った構造 (31 テンソル、bf16 5.21GB)
+## Structure read off the sidecar weights (31 tensors, bf16 5.21GB)
 
-    pre_fc_norm_embedding   (2560,)          埋め込み側の norm
-    pre_fc_norm_hidden      (10240,)         **hyper 状態 (4 レーン) の norm**
-    fc_embedding            (2560, 2560)     27B の 1 本の fc とは違い 2 本ある
+    pre_fc_norm_embedding   (2560,)          norm on the embedding side
+    pre_fc_norm_hidden      (10240,)         **norm of the hyper state (4 lanes)**
+    fc_embedding            (2560, 2560)     unlike 27B's single fc, there are two
     fc_hidden               (2560, 2560)
-    layers.0                完全な DecoderLayer (full_attention + 512 expert MoE
-                            + hyper_connection 2 個 + indexer)
+    layers.0                a complete DecoderLayer (full_attention + 512-expert MoE
+                            + 2 hyper_connection + indexer)
     hyper_connection_mixer  GatedResidual(use_combine=False)
 
-**本体と同じクラスで組める。**q_proj (12288, 2560) は
-`n_heads(24) * head_dim(256) * 2` (出力ゲート込み) と一致し、k/v (512) は
-`n_kv_heads(2) * 256`、o_proj (2560, 6144) は `n_heads * head_dim` と一致する。
-27B のように mlx_lm の sanitize が norm に +1 を入れる問題は起きない
-(vendored qwen4_exp の RMSNorm が `(1 + weight)` を自分で持っている)。
+**It can be assembled from the same classes as the model proper.** q_proj
+(12288, 2560) matches `n_heads(24) * head_dim(256) * 2` (output gate included),
+k/v (512) matches `n_kv_heads(2) * 256`, and o_proj (2560, 6144) matches
+`n_heads * head_dim`. The problem seen with 27B, where mlx_lm's sanitize inserts a
++1 into the norms, does not occur here (the vendored qwen4_exp's RMSNorm carries
+`(1 + weight)` itself).
 
-norm の規約は本体と同じ `(1 + weight)`。根拠は `pre_fc_norm_embedding` の
-平均が -0.764、`pre_fc_norm_hidden` が -0.328 と負であること (27B の
-`mlxturbo/mtp.py` が使ったのと同じ証拠の立て方)。
+The norm convention is the same as the model proper: `(1 + weight)`. The grounds are
+that the mean of `pre_fc_norm_embedding` is -0.764 and that of `pre_fc_norm_hidden`
+is -0.328, i.e. both negative (the same way of establishing evidence that the 27B
+`mlxturbo/mtp.py` used).
 
-## 合成の仕方は実測で決めた -> ``lane``
+## How to combine was decided by measurement -> ``lane``
 
-`pre_fc_norm_hidden` は 10240 なのに `fc_hidden` の入力は 2560 で、重みの形
-だけでは合成が決まらない。2 通り実装して実データで判定した
-(`tools/mtp_flash_probe.py`、v-l + 6 プロンプト)。
+`pre_fc_norm_hidden` is 10240, yet the input of `fc_hidden` is 2560, so the weight
+shapes alone do not pin down the combination. Two versions were implemented and
+judged on real data (`tools/mtp_flash_probe.py`, v-l + 6 prompts).
 
-- ``lane`` (既定): レーンごとに `fc_hidden` を適用して 10240 を作り、
-  `fc_embedding` の出力を 4 レーンに複製して足す。本体の
-  `h = mx.tile(h, (1, 1, hc))` と対称
-- ``mean``: hyper をレーン平均で 2560 に潰してから足し、結果を複製する
+- ``lane`` (the default): apply `fc_hidden` per lane to build the 10240, and add the
+  output of `fc_embedding` replicated across the 4 lanes. Symmetric with the model
+  proper's `h = mx.tile(h, (1, 1, hc))`
+- ``mean``: collapse hyper to 2560 by averaging over the lanes, add, then replicate
+  the result
 
-| 変種 | bits | t+2 的中率 | 平均 logprob |
+| variant | bits | t+2 hit rate | mean logprob |
 |---|---|---|---|
 | **lane** | bf16 | 0.499 | **-3.2172** |
 | mean | bf16 | 0.501 | -4.4764 |
 | lane | 4 | 0.489 | -3.3411 |
 | mean | 4 | 0.441 | -4.4526 |
 
-**的中率はほぼ同じでも対数尤度が 1.26 違う。**argmax だけ見ていたら見分け
-られなかった。`mean` が量子化で大きく崩れる (0.501 -> 0.441) のも、
-定式化が間違っている側の脆さ。
+**Even though the hit rates are almost the same, the log-likelihood differs by
+1.26.** Looking only at argmax would not have distinguished them. That `mean`
+collapses badly under quantization (0.501 -> 0.441) is also the brittleness of the
+side whose formulation is wrong.
 
-参考: 本体が t+1 を当てる率は 0.566。**2 トークン先を、本体が 1 トークン先を
-当てるのに近い精度で当てている。**
+For reference: the model proper's hit rate for t+1 is 0.566. **It hits 2 tokens
+ahead with accuracy close to what the model proper achieves 1 token ahead.**
 
-## 量子化は 4bit で十分
+## 4bit is enough for quantization
 
-| bits | t+2 的中率 | 平均 logprob | サイズ |
+| bits | t+2 hit rate | mean logprob | size |
 |---|---|---|---|
 | bf16 | 0.499 | -3.2172 | 4.9GiB |
 | 8 | 0.496 | -3.2627 | 2.4GiB |
 | 6 | 0.491 | -3.2303 | 1.8GiB |
 | **4** | **0.489** | **-3.3411** | **1.2GiB** |
 
-bf16 比で的中率 -0.010、logprob -0.124。**4bit なら v-xl (90.8GiB) に足しても
-上限 96GiB に対して余白 4GiB 残る。**
+Relative to bf16, the hit rate is -0.010 and logprob -0.124. **At 4bit, even added
+on top of v-xl (90.8GiB), 4GiB of headroom remains against the 96GiB ceiling.**
 
-なお MTP は draft なので、**ビットを下げても出力の正しさは本体の検証が
-保証する。**落ちるのは受理率 (= 速度) だけで、品質ではない。
+Note that MTP is a draft, so **even if you lower the bits, the correctness of the
+output is guaranteed by the model proper's verification.** What drops is only the
+acceptance rate (= speed), not quality.
 """
 
 from __future__ import annotations
@@ -76,20 +82,21 @@ VARIANTS = ("lane", "mean")
 
 
 def _arch():
-    """vendored された qwen4_exp を返す (install-arch 済みの site-packages)。"""
+    """Return the vendored qwen4_exp (the site-packages copy after install-arch)."""
     import mlx_lm.models.qwen4_exp as Q
 
     return Q
 
 
 class FlashMTPModule(nn.Module):
-    """1 ブロックの draft ヘッド。
+    """A single-block draft head.
 
-    位置 i の入力は `(embed(t_{i+1}), hyper_i)` で、出力を lm_head に通すと
-    `t_{i+2}` の予測になる (DeepSeek-V3 型、27B と同じ規約)。
+    The input at position i is `(embed(t_{i+1}), hyper_i)`, and passing the output
+    through lm_head yields the prediction of `t_{i+2}` (DeepSeek-V3 style, the same
+    convention as 27B).
 
-    `hyper_i` は**本体の最終 mixer を通す前の hyper 状態** (B, S, hc*d)。
-    `pre_fc_norm_hidden` が 10240 なのがその根拠。
+    `hyper_i` is **the model proper's hyper state before it passes through the final
+    mixer** (B, S, hc*d). That `pre_fc_norm_hidden` is 10240 is the grounds for it.
     """
 
     def __init__(self, args, variant: str = "lane"):
@@ -104,13 +111,14 @@ class FlashMTPModule(nn.Module):
         self.pre_fc_norm_hidden = Q.RMSNorm(self.hc * self.d, eps=args.rms_norm_eps)
         self.fc_embedding = nn.Linear(self.d, self.d, bias=False)
         self.fc_hidden = nn.Linear(self.d, self.d, bias=False)
-        # full_attention になる層番号を渡す。ple_layer_ids=[2] なので
-        # layer_idx=3 は PLE を持たない (MTP 側に PLE の重みは無い)
+        # Pass the layer number that becomes full_attention. Since
+        # ple_layer_ids=[2], layer_idx=3 has no PLE (there are no PLE weights on
+        # the MTP side)
         self.layers = [Q.DecoderLayer(args, layer_idx=args.full_attention_interval - 1)]
         self.hyper_connection_mixer = Q.GatedResidual(args, use_combine=False)
 
     def combine(self, embeds: mx.array, hyper: mx.array) -> mx.array:
-        """(embeds, hyper) -> layers[0] へ渡す hyper 状態 (B, S, hc*d)。"""
+        """(embeds, hyper) -> the hyper state (B, S, hc*d) passed to layers[0]."""
         shape = embeds.shape[:-1]
         e = self.fc_embedding(self.pre_fc_norm_embedding(embeds))
         h = self.pre_fc_norm_hidden(hyper)
@@ -124,16 +132,16 @@ class FlashMTPModule(nn.Module):
 
     def __call__(self, embeds, hyper, rope, mask=None, cache=None, idx_cache=None):
         x = self.combine(embeds, hyper)
-        # ple を持たない層なので ids / prev_ctx / conv_mask は使われない
+        # A layer that has no ple, so ids / prev_ctx / conv_mask go unused
         x = self.layers[0](x, rope, mask, None, cache, idx_cache, None, None)
         return self.hyper_connection_mixer(x)
 
 
 def _sanitize(weights: dict) -> dict:
-    """`mtp.` を剥がし、expert を SwitchGLU の 2 枚へ割る。
+    """Strip `mtp.` and split the experts across SwitchGLU's two sheets.
 
-    本体の `Qwen4ExpModel.sanitize` と同じ規約 (融合 (E, 2*inter, H) の
-    行の前半が gate、後半が up)。
+    Same convention as the model proper's `Qwen4ExpModel.sanitize` (in the fused
+    (E, 2*inter, H), the first half of the rows is gate and the second half is up).
     """
     out = {}
     for k, v in weights.items():
@@ -153,22 +161,25 @@ def _sanitize(weights: dict) -> dict:
 
 def load_flash_mtp(path: str | None, args, variant: str = "lane",
                    quantize: dict | None = None, weights: dict | None = None) -> FlashMTPModule:
-    """抽出済みサイドカー (`convert_flash extract-mtp` の出力) から組む。
+    """Assemble from the extracted sidecar (the output of `convert_flash extract-mtp`).
 
-    `quantize` は `{"group_size": 64, "bits": 4}`。MTP は draft なので、
-    ビットを下げても**出力の正しさは本体の検証が保証する**。落ちるのは
-    受理率 (= 速度) だけで、品質ではない。
+    `quantize` is `{"group_size": 64, "bits": 4}`. MTP is a draft, so even if you
+    lower the bits, **the correctness of the output is guaranteed by the model
+    proper's verification**. What drops is only the acceptance rate (= speed), not
+    quality.
 
-    `weights` (dict | None): 指定すると `path` を一切読まず、この dict
-    (`mtp.` 接頭辞つきの未 sanitize な生テンソル) をそのまま使う——本体の
-    safetensors シャードから `mtp.*` キーだけ読み集めて渡す口 (追加のみ:
-    未指定時の `path` 経由の挙動は 1 ビットも変えていない)。
+    `weights` (dict | None): if given, `path` is not read at all and this dict
+    (raw, un-sanitized tensors carrying the `mtp.` prefix) is used as-is — an entry
+    point for collecting just the `mtp.*` keys out of the model proper's safetensors
+    shards and handing them in (addition only: when it is not given, the behavior
+    that goes through `path` is unchanged down to the last bit).
     """
     raw_weights = dict(weights) if weights is not None else dict(mx.load(str(Path(path))).items())
     sanitized_weights = _sanitize(raw_weights)
     mtp = FlashMTPModule(args, variant=variant)
-    # **読んでから量子化する。**先に量子化すると scales/biases を持つ形に
-    # なってしまい、bf16 の重みが入らない (27B の load_mtp と同じ順序)
+    # **Load first, then quantize.** Quantizing first would leave it in a shape that
+    # carries scales/biases, and the bf16 weights would not fit (the same order as
+    # 27B's load_mtp)
     mtp.load_weights(list(sanitized_weights.items()))
     if quantize:
         gs = quantize.get("group_size", 64)
@@ -182,9 +193,10 @@ def load_flash_mtp(path: str | None, args, variant: str = "lane",
                 "入力次元が group_size で割り切れない: "
                 + ", ".join(f"{n}:K={k}" for n, k in bad)
             )
-        # class_predicate を渡さない = SwitchLinear (512 expert、bf16 5GB の
-        # 大半) も量子化される。27B は nn.Linear だけに絞っているが、
-        # Flash-Next は expert が本体なので絞ると意味が無い
+        # Not passing class_predicate = SwitchLinear (512 experts, the bulk of the
+        # 5GB of bf16) gets quantized too. 27B narrows this down to nn.Linear only,
+        # but for Flash-Next the experts are the main body, so narrowing would be
+        # pointless
         nn.quantize(mtp, group_size=gs, bits=quantize.get("bits", 4), mode="affine")
     mtp.eval()
     return mtp

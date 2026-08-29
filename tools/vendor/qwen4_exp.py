@@ -1,19 +1,23 @@
 # vendored from https://github.com/eauchs/mlx-lm branch add-qwen4-exp
-# (ml-explore/mlx-lm PR #1788, MIT ライセンス)。取り込み 2026-08-27。
-# mlxturbo 側の変更点:
-#   1. mtp.* を落とす (サイドカーへ別抽出する)
-#   2. model.language_model.* -> model.* に畳む (公開 ckpt は VLM 形状)
-#   3. mlp.experts.{gate_up,down}_proj -> switch_mlp.* へ分解・改名
-#   4. NGramEmbedding: ハッシュ乗数を再計算値でなく ckpt の実値から使う
-#   5. RMSNorm を (1 + weight) 規約に直す (参照実装と同じ Gemma 系)
-#   6. FASTMLX_NGRAM_DISK=1 で n-gram 表を持たない (ディスクから行を引く)
-# (mlx-lm 本体は MTP モジュールを持たないため strict load が失敗する。
-#  MTP は mlxturbo/convert_flash.py extract-mtp でサイドカーへ抽出して使う)。
-# 解決: `mlxturbo` を import すると `mlxturbo/_arch_registry.py` が
-# `sys.meta_path` フックを積み、`mlx_lm.models.qwen4_exp` の import を
-# このファイルへ直接差し替える。利用者の site-packages / mlx_lm 本体には
-# 一切書き込まない (旧 install-arch は site-packages へ物理コピーしていたが、
-# 利用者の mlx_lm を汚す副作用があったため撤廃した)。
+# (ml-explore/mlx-lm PR #1788, MIT license). Imported 2026-08-27.
+# Changes made on the mlxturbo side:
+#   1. Drop mtp.* (extracted separately into a sidecar)
+#   2. Fold model.language_model.* -> model.* (the public ckpt has VLM shape)
+#   3. Split and rename mlp.experts.{gate_up,down}_proj -> switch_mlp.*
+#   4. NGramEmbedding: take the hash multipliers from the ckpt's actual values
+#      rather than from a recomputation
+#   5. Fix RMSNorm to the (1 + weight) convention (the Gemma-style one, same as
+#      the reference implementation)
+#   6. With FASTMLX_NGRAM_DISK=1, do not hold the n-gram table (read rows from
+#      disk instead)
+# (mlx-lm proper has no MTP module, so a strict load fails. MTP is extracted
+#  into a sidecar with mlxturbo/convert_flash.py extract-mtp and used from there.)
+# Resolution: importing `mlxturbo` makes `mlxturbo/_arch_registry.py` install a
+# `sys.meta_path` hook that redirects the import of `mlx_lm.models.qwen4_exp`
+# straight to this file. Nothing is written into the user's site-packages or into
+# mlx_lm proper (the old install-arch physically copied the file into
+# site-packages, and was retired because of that side effect of polluting the
+# user's mlx_lm).
 # MLX port of Qwen3.8-Flash-Next (HF model_type: qwen4_exp)
 # New compared to qwen3_next: QSA sparse attention, gated residual
 # (hyper-connections), sharded n-gram / PLE embedding, split deltanet projections.
@@ -34,8 +38,9 @@ from .cache import ArraysCache, KVCache, _BaseCache
 from .gated_delta import gated_delta_update
 from .switch_layers import SwitchGLU
 
-# mlxturbo: n-gram 表 (51.2B params) を RAM に持たず、行だけディスクから引く
-# 運用に切り替える。変換時と読込時の両方でこの旗を立てる必要がある。
+# mlxturbo: switch to keeping the n-gram table (51.2B params) out of RAM and
+# reading only the needed rows from disk. This flag has to be set both at
+# conversion time and at load time.
 NGRAM_ON_DISK = os.environ.get("FASTMLX_NGRAM_DISK") == "1"
 
 
@@ -123,8 +128,8 @@ class RMSNorm(nn.Module):
 
     def __init__(self, dim: int, group_size: Optional[int] = None, eps: float = 1e-6):
         super().__init__()
-        # 参照実装 (Qwen4ExpTextRMSNorm) はゼロ初期化で、スケールを
-        # (1 + weight) として掛ける Gemma 系の規約
+        # The reference implementation (Qwen4ExpTextRMSNorm) initializes to zero
+        # and applies the scale as (1 + weight) — the Gemma-style convention
         self.weight = mx.zeros(dim)
         self.eps = eps
         self.group_size = group_size
@@ -132,9 +137,11 @@ class RMSNorm(nn.Module):
             raise ValueError(f"dim {dim} non divisible par group_size {group_size}")
 
     def __call__(self, x: mx.array) -> mx.array:
-        # mlxturbo: 元の port は x * weight で、+1 が抜けていた。学習済みの
-        # weight は 0 近傍の差分なので、掛けると信号が縮んで向きだけ残り、
-        # 活性の大きさはそれらしいまま情報だけ壊れる (生成が無意味な反復になる)
+        # mlxturbo: the original port used x * weight and was missing the +1.
+        # The trained weight is a delta near 0, so multiplying by it shrinks the
+        # signal down to just its direction; the magnitude of the activations
+        # still looks plausible while the information is destroyed (generation
+        # degenerates into meaningless repetition).
         if self.group_size is None:
             return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
         shape = x.shape
@@ -553,14 +560,16 @@ class NGramEmbedding(nn.Module):
             mults.append(
                 2 * (_splitmix64((base_seed + _GAMMA * (i + 1)) & _MASK64) % half) + 1
             )
-        # ここで組むのは checkpoint が無い場合の初期値でしかない。load_weights が
-        # 同名テンソルで上書きするので、実際に使うのは常にこちら (mlxturbo 変更点)。
-        # 元の port は `_`-prefix の再計算コピーを __call__ で使っていたが、
-        # layer_multipliers の再計算値は公開 checkpoint の実値と一致しない
-        # (vocab_sizes/offsets は一致する)。乗数が違うとハッシュ先が全部ずれて
-        # n-gram 埋め込みが丸ごと無意味になり、生成が壊れる。
-        # int64 は Module.set_dtype が浮動小数だけを触るので bf16 化で壊れない
-        # (変換後の safetensors 側で I64 のまま残ることを確認済み)。
+        # What we build here is only the initial value for the case where there is
+        # no checkpoint. load_weights overwrites it with the tensor of the same
+        # name, so what actually gets used is always that one (mlxturbo change).
+        # The original port used `_`-prefixed recomputed copies in __call__, but
+        # the recomputed layer_multipliers do not match the actual values in the
+        # public checkpoint (vocab_sizes/offsets do match). With different
+        # multipliers every hash lands somewhere else, which makes the whole
+        # n-gram embedding meaningless and breaks generation.
+        # int64 survives the bf16 conversion because Module.set_dtype only touches
+        # floating point (confirmed to stay I64 in the converted safetensors).
         self.layer_multipliers = mx.array(mults, dtype=mx.int64)
         self.ngram_heads_vocab_sizes = mx.array(sizes, dtype=mx.int64)
         self.ngram_heads_offsets = mx.array(offsets, dtype=mx.int64)
@@ -614,8 +623,9 @@ class _ShardedEmbedding(nn.Module):
         self.rows = rows
         self.dim = dim
         if NGRAM_ON_DISK:
-            # mlxturbo: 表を持たない。実体は mlxturbo.ngram_stream.install が
-            # サイドカー参照に差し替える。ここで確保すると 102GB 取られる
+            # mlxturbo: do not hold the table. mlxturbo.ngram_stream.install
+            # swaps in a sidecar-backed implementation. Allocating it here would
+            # take 102GB.
             return
         for i in range(n_shards):
             setattr(self, f"shard_{i}", nn.Embedding(rows, dim))
@@ -843,24 +853,27 @@ class Model(nn.Module):
         out = {}
         for k, v in weights.items():
             if k.startswith("model.language_model."):
-                # 公開 checkpoint は Qwen4ExpForConditionalGeneration (VLM) 形状で、
-                # テキスト側が model.language_model.* に入る。MLX 側の Model は
-                # model.* を期待するので中間の language_model を畳む
+                # The public checkpoint has Qwen4ExpForConditionalGeneration (VLM)
+                # shape, with the text side under model.language_model.*. The MLX
+                # Model expects model.*, so fold away the intermediate
+                # language_model.
                 k = "model." + k[len("model.language_model.") :]
             if k.startswith("language_model."):
                 k = k[len("language_model.") :]
             if k.startswith("vision_tower.") or k.startswith("model.visual."):
                 continue  # text-only pour l'instant
             if NGRAM_ON_DISK and "ngram_embedding.shard_" in k:
-                # mlxturbo: ディスク運用ではモデル本体に持たせない
+                # mlxturbo: in on-disk mode, don't keep this in the model itself
                 continue
             if k.startswith("mtp."):
-                # mlxturbo: MTP はサイドカーへ抽出して別ロードする (ヘッダ参照)
+                # mlxturbo: MTP is extracted into a sidecar and loaded separately
+                # (see the header)
                 continue
             if k.endswith("mlp.experts.gate_up_proj"):
-                # ckpt は融合 (E, 2*moe_inter, H)。transformers の Qwen3-Next 系と
-                # 同じく linear 出力を chunk(2) する規約なので、行の前半が gate、
-                # 後半が up。MLX の SwitchGLU は分離した 2 枚を持つ
+                # The ckpt is fused, (E, 2*moe_inter, H). As with the Qwen3-Next
+                # family in transformers, the convention is to chunk(2) the linear
+                # output, so the first half of the rows is gate and the second
+                # half is up. MLX's SwitchGLU holds the two as separate matrices.
                 base = k[: -len("experts.gate_up_proj")] + "switch_mlp."
                 gate, up = mx.split(v, 2, axis=1)
                 out[base + "gate_proj.weight"] = gate

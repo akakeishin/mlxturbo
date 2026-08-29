@@ -7,12 +7,14 @@
 
 公開前に以下を確認する。
 
-- [ ] `uv run pytest bench/test_server.py -q` が通る (改名作業が完了し、`mlxturbo/server.py` /
-      `mlxturbo/runner.py` / `mlxturbo/spec_flash.py` / `bench/test_server.py` 側の
-      `fastmlx` 文字列置換が完了していること — 詳細は改名時の報告を参照)
-- [ ] `uv run mlxturbo-serve --version` が `mlxturbo-serve <version>` を正しく表示する
-      (現状は `_FASTMLX_VERSION`/`_fastmlx_version()` が `fastmlx` という古いパッケージ名で
-      `importlib.metadata` を引いているため、`mlxturbo` へ直すまでは `0.0.0-unknown` 表示になる)
+- [ ] `uv run pytest bench/test_server.py -q` が通る (2026-08-30 時点で 346 件)
+- [ ] `uv run mlxturbo-serve --version` が `mlxturbo-serve 0.1.0` を表示する (改名時の
+      置き残しは解消済み)
+- [ ] `uv run mlxturbo --help` と `uv run mlxturbo-serve --help` が通る
+- [ ] コードのコメントと docstring が英語化されている。ユーザー向けの文字列 (ログ、
+      エラー、argparse の help) は日本語のままでよい
+- [ ] `git grep -nE "/Users/|/Volumes/"` が `bench/results/` 以外で何も返さない
+      (測定記録の中のパスは事実なので書き換えない)
 - [ ] `pip install fastmlx` で本プロジェクトとは無関係な Prince Canuma (Blaizzy) 氏の既存
       パッケージが入ることを README 等で明記済みか再確認 (名前衝突の周知)
 - [ ] LICENSE (MIT, akakeishin, 2026) の年・氏名が実態と合っているか確認

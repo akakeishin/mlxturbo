@@ -1,7 +1,7 @@
-"""mlxturbo 対話 CLI。
+"""mlxturbo interactive CLI.
 
-uv run mlxturbo                       # チャット REPL
-uv run mlxturbo --prompt "..."        # ワンショット
+uv run mlxturbo                       # chat REPL
+uv run mlxturbo --prompt "..."        # one-shot
 """
 
 import argparse
@@ -14,11 +14,13 @@ from .mtp import find_snapshot, load_mtp, load_mtp_file
 from .runner import FallbackSession, build_runner
 from .spec import ChatSession
 
-# --mtp PATH (server.py) を build_runner 経由の load_cli_mtp まで運ぶための
-# 環境変数。build_runner (mlxturbo/runner.py, 他レーンの担当領域につき編集不可)
-# は load_cli_mtp を固定の位置引数だけで呼ぶので、呼び出し元を編集せずに
-# 追加のパスを通す口が無い。--ngram を FASTMLX_NGRAM_DISK で先に立てて
-# from_env で拾わせているのと同じ手筋 (cli.py 冒頭のコメント参照)。
+# Environment variable used to carry --mtp PATH (server.py) through build_runner
+# down to load_cli_mtp. build_runner (mlxturbo/runner.py, owned by another lane
+# and therefore off limits for edits) calls load_cli_mtp with a fixed set of
+# positional arguments only, so there is no way to pass an extra path without
+# editing the caller. This is the same trick as setting FASTMLX_NGRAM_DISK up
+# front for --ngram and having from_env pick it up (see the comment at the top
+# of cli.py).
 MTP_PATH_ENV = "FASTMLX_MTP_PATH"
 
 
@@ -34,11 +36,12 @@ def load_cli_mtp(
 
     ``mtp_path`` (or, if omitted, the ``FASTMLX_MTP_PATH`` env var — see
     ``MTP_PATH_ENV`` above) points at a single-file MTP sidecar
-    (``load_mtp_file``の対象)。指定されていれば既存の探索 (バンドル済み
-    アーティファクト / ``--original`` の生チェックポイント) より優先する。
-    サイドカーの形式が ``load_mtp_file`` の想定 (テンソル名など) と合わず
-    読み込みに失敗しても、既存探索へフォールバックはしない — 「読めなかった
-    旨をログに出して MTP 無しで起動する」既存の姿勢をそのまま踏襲する。
+    (the thing ``load_mtp_file`` operates on). When given, it takes precedence
+    over the existing search (the bundled artifact / the raw ``--original``
+    checkpoint). If the sidecar's format does not match what ``load_mtp_file``
+    expects (tensor names and so on) and loading fails, we do *not* fall back to
+    the existing search — we keep the existing stance of logging that it could
+    not be read and starting up without MTP.
     """
 
     if no_mtp:
@@ -49,7 +52,7 @@ def load_cli_mtp(
         try:
             quant = {"bits": mtp_bits, "group_size": 64} if mtp_bits else None
             return load_mtp_file(mtp_path, text_args, quantize=quant)
-        except Exception as exc:  # サイドカー形式の不一致まで含め、無理に合わせない
+        except Exception as exc:  # incl. sidecar format mismatch; don't force a fit
             print(
                 f"[mlxturbo] --mtp {mtp_path} を読み込めないため無効化します "
                 f"({type(exc).__name__}: {exc}); lookup のみで投機します"
@@ -115,9 +118,9 @@ def main() -> None:
 
     t0 = time.perf_counter()
     if args.ngram:
-        # qwen4_exp.py の NGRAM_ON_DISK はモジュール import 時に評価されるので、
-        # (寄り遅延 import される mlx_lm.utils.load 経由でも) 読み込み呼び出し
-        # より前に立てておく必要がある。
+        # NGRAM_ON_DISK in qwen4_exp.py is evaluated when the module is imported,
+        # so it has to be set before the load call (this holds even when the
+        # import happens lazily by way of mlx_lm.utils.load).
         os.environ["FASTMLX_NGRAM_DISK"] = "1"
     model, tokenizer, config = mlx_lm_load(args.model, return_config=True)
     if args.ngram:
@@ -130,11 +133,12 @@ def main() -> None:
     )
 
     eos_ids = set(tokenizer.eos_token_ids)
-    # runner の種類に応じて session の型を選ぶ (server.py の main() と同じ理由):
-    # SpecRunner は ChatSession (spec.py 独自の caches/mtp_cache/h_last) を、
-    # FallbackRunner は FallbackSession (mlx_lm prompt_cache) を要求する。
-    # 両方に ChatSession を渡すと FallbackRunner 側で `.cache` 属性が無く
-    # AttributeError になる (FallbackRunner.generate 参照)。
+    # Pick the session type according to the kind of runner (same reason as in
+    # main() of server.py): SpecRunner requires a ChatSession (spec.py's own
+    # caches/mtp_cache/h_last), while FallbackRunner requires a FallbackSession
+    # (mlx_lm prompt_cache). Passing a ChatSession to both raises an
+    # AttributeError on the FallbackRunner side because the `.cache` attribute is
+    # missing (see FallbackRunner.generate).
     session = ChatSession() if getattr(runner, "KIND", None) == "spec" else FallbackSession()
 
     def run_turn(messages):

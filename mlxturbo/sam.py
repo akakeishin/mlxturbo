@@ -145,13 +145,16 @@ class SuffixAutomaton:
         return cont or None
 
     def peek_match(self, token: int) -> tuple[int, int | None]:
-        """``extend(token)`` 後に ``longest_match()`` が返す値を、状態を
-        一切変えずに計算する (LogitSpec 流の拡張キー照合、docs/RESEARCH.md D7)。
+        """Compute what ``longest_match()`` would return after ``extend(token)``,
+        without changing any state (LogitSpec-style extended-key matching,
+        docs/RESEARCH.md D7).
 
-        健全性: 返る一致は「現在列の suffix + token」の実出現に限られる。
-        現在列は token でまだ終わっていないので、suffix の末尾出現 (列の
-        終端) に token が続くことはあり得ず、遷移が示す出現は必ず終端より
-        前で完結している = draft の続きが実履歴から読める。
+        Soundness: the match returned is limited to actual occurrences of
+        "suffix of the current sequence + token". The current sequence does not
+        yet end with token, so the trailing occurrence of the suffix (the end of
+        the sequence) cannot be followed by token; the occurrence the transition
+        points at therefore always completes before the end, which means the
+        draft continuation can be read from real history.
         """
 
         states = self._states
@@ -167,10 +170,11 @@ class SuffixAutomaton:
     def draft_after(
         self, token: int, max_len: int, min_len: int = 1
     ) -> tuple[int, list[int] | None]:
-        """(仮に token が次に来るとした場合の一致長, その続きのドラフト)。
+        """(match length assuming token comes next, the draft continuing from it).
 
-        一致長が ``min_len`` 未満・出現が無い・続きが空なら (match_len, None)。
-        返るドラフトは token 自身を含まない (呼び出し側が [token] + cont を組む)。
+        Returns (match_len, None) if the match length is below ``min_len``, if
+        there is no occurrence, or if the continuation is empty. The returned
+        draft does not include token itself (the caller assembles [token] + cont).
         """
 
         match_len, end = self.peek_match(token)

@@ -1,30 +1,35 @@
-"""n-gram ハッシュ表を RAM から追い出し、必要な行だけディスクから引く。
+"""Evict the n-gram hash tables from RAM and fetch only the needed rows from disk.
 
-Flash-Next の n-gram 表は 51.2B params あって、bf16 なら 102GB、2bit に潰しても
-19.2GB を占める。モデル全体の 1/4 を食う最大の塊なのに、**1 トークンで触るのは
-16 行だけ** (ngram_heads = (ngram_size-1) * heads_per_ngram = 16)。行列積ではなく
-引きなので、常駐させる意味がほとんど無い。
+Flash-Next's n-gram tables are 51.2B params: 102GB in bf16, and still 19.2GB
+even crushed down to 2bit. They are the single largest block, eating a quarter
+of the whole model, and yet **only 16 rows are touched per token**
+(ngram_heads = (ngram_size-1) * heads_per_ngram = 16). It is a lookup, not a
+matmul, so there is almost no point in keeping it resident.
 
-実測 (docs/STATUS.md Phase Q):
-  - n-gram を 2bit (相対誤差 0.36) まで潰しても top1 一致は変わらなかった
-  - 誤差源として突出しているのは experts の方
-つまり n-gram に払っていた容量は experts に回した方が良い。ディスクに置けば
-RAM はゼロになり、しかも精度は上げられる (4bit で相対誤差 0.081)。
+Measurements (docs/STATUS.md Phase Q):
+  - Crushing the n-gram tables all the way to 2bit (relative error 0.36) left
+    top1 agreement unchanged
+  - The error source that stands out is the experts instead
+So the capacity that was being spent on the n-gram tables is better handed to
+the experts. Putting them on disk brings the RAM cost to zero, and on top of
+that the precision can be raised (relative error 0.081 at 4bit).
 
-サイドカーの形式は memmap しやすい生バイナリにする。safetensors だと 25GB の
-テンソルを 1 本抱えることになり、行単位の取り出しに余計な層が挟まる。
+The sidecar format is raw binary, so it is easy to memmap. With safetensors you
+would end up holding a single 25GB tensor, with an extra layer in the way of
+row-granular extraction.
 
-    <dir>/manifest.json   行数・次元・bits・group_size
+    <dir>/manifest.json   row count, dimension, bits, group_size
     <dir>/rows.bin        (rows, record_bytes) uint8
 
-**1 行を 1 レコードに連続配置する。**weight / scales / biases を別ファイルに
-すると、行を 1 つ引くのに 3 箇所へ触ることになり、毎トークン 16 行 x 3 =
-48 回のランダムアクセスが起きる。実測でこれが 1 トークンあたり 23.9ms
-(生成 21.3 -> 14.1 tok/s) を食っていた。連続配置ならフォルトは 1/3 になり、
-4KB ページに約 40 行が載るので局所性も出る。
+**One row is laid out contiguously as one record.** Putting weight / scales /
+biases in separate files would mean touching 3 places to fetch one row, i.e.
+16 rows x 3 = 48 random accesses per token. Measured, that was costing 23.9ms
+per token (generation 21.3 -> 14.1 tok/s). With contiguous layout the faults
+drop to a third, and since about 40 rows fit in a 4KB page you get locality too.
 
-128 枚のシャードは論理的に行ブロックを並べたものなので、連結して 1 枚の平坦な
-表として持つ。こうすると引くときのシャード計算が消える。
+The 128 shards are logically just row blocks laid end to end, so they are
+concatenated and held as a single flat table. That way the shard arithmetic
+disappears from the lookup path.
 """
 
 from __future__ import annotations
@@ -40,11 +45,12 @@ import numpy as np
 _SHARD_RE = "ngram_embedding.shard_"
 
 
-# --------------------------------------------------------------- サイドカー作成
+# --------------------------------------------------------- building the sidecar
 
 
 def _iter_shard_tensors(src: Path):
-    """bf16 アーカイブから n-gram のシャードを shard_0, shard_1, ... の順に返す。"""
+    """Yield the n-gram shards from the bf16 archive in shard_0, shard_1, ...
+    order."""
 
     found: dict[int, tuple[Path, int, int, list[int]]] = {}
     for shard in sorted(src.glob("model-*.safetensors")):
@@ -65,14 +71,17 @@ def _iter_shard_tensors(src: Path):
 def build_sidecar(
     src: Path, out: Path, bits: int = 4, group_size: int = 32, layout: str = "interleaved"
 ) -> dict:
-    """bf16 アーカイブから量子化済みサイドカーを作る。
+    """Build a quantized sidecar from the bf16 archive.
 
-    行ブロック単位で読み書きするのでメモリは数百 MB しか使わない。
+    Reading and writing happens in row blocks, so this only uses a few hundred
+    MB of memory.
 
-    layout="interleaved" は 1 行を 1 レコードに連続配置する。ディスクに置いた
-    まま引く用で、触るページが 1 行あたり 1 枚で済む。
-    layout="separate" は weight/scales/biases を別ファイルにする。RAM に載せて
-    `mx.take` で引く用で、こちらは 3 本の配列がそのまま要る。
+    layout="interleaved" lays out one row contiguously as one record. This is
+    for fetching while the data stays on disk, and touches only one page per
+    row.
+    layout="separate" puts weight/scales/biases in separate files. This is for
+    holding the table in RAM and fetching with `mx.take`, which needs the 3
+    arrays as-is.
     """
 
     import mlx.core as mx
@@ -155,29 +164,33 @@ def build_sidecar(
     return manifest
 
 
-# --------------------------------------------------------------- 実行時の引き
+# ------------------------------------------------------------ runtime lookups
 
 
 class StreamNGram:
-    """サイドカーから行だけ引く。`_ShardedEmbedding` と同じ呼び出し規約。
+    """Fetch only the needed rows from the sidecar. Same calling convention as
+    `_ShardedEmbedding`.
 
-    nn.Module ではない。パラメータを 1 つも持たないので、モデルの
-    `parameters()` に現れてはいけない (現れると保存や dtype 変換の対象になる)。
+    This is not an nn.Module. It holds no parameters at all, so it must not show
+    up in the model's `parameters()` (if it did, it would become a target for
+    saving and dtype conversion).
 
-    mmap の fancy index は 1 回のギャザーに見えるが、実体は行ごとにページ
-    フォールトを起こし、それがカーネル内で直列に処理される。実測で 16 行
-    (1 トークン分) の引きに 1.5-2ms かかっており、これがデコード全体の
-    7-9% を占めていた。ddalcu/mlx-serve (Zig 実装) が同じ設計で同じ問題を
-    踏んでいて、"serial mmap faults were ~5ms of every decode step" とある。
+    A fancy index into an mmap looks like a single gather, but what actually
+    happens is a page fault per row, processed serially inside the kernel.
+    Measured, fetching 16 rows (one token's worth) took 1.5-2ms, which was
+    7-9% of the entire decode. ddalcu/mlx-serve (a Zig implementation) hit the
+    same problem with the same design; it says "serial mmap faults were ~5ms of
+    every decode step".
 
-    `os.pread` は GIL を解放するので、行ごとに別スレッドで並列に投げれば
-    フォールトの直列化が消える。マイクロベンチ (tools/ngram_pread_bench.py)
-    では 16 行の引きが mmap 比 5-7x、128 行 (バッチ forward 相当) で
-    10-12x 速い。スレッド数は 8-24 の間でほぼ横ばいで、性能コア数
-    (このマシンでは 12) に合わせるのが無難と見て既定値にした。
+    `os.pread` releases the GIL, so dispatching each row on a separate thread in
+    parallel makes the serialization of the faults go away. In the microbenchmark
+    (tools/ngram_pread_bench.py), fetching 16 rows is 5-7x faster than mmap, and
+    128 rows (equivalent to a batched forward) is 10-12x faster. The thread count
+    is essentially flat between 8 and 24, and matching the performance core count
+    (12 on this machine) looked like the safe choice, so that is the default.
 
-    退行したときに戻せるよう mmap 経路は残す。`FASTMLX_NGRAM_BACKEND=mmap`
-    か `backend="mmap"` で切り替えられる。
+    The mmap path is kept so it can be reverted to if this regresses. Switch with
+    `FASTMLX_NGRAM_BACKEND=mmap` or `backend="mmap"`.
     """
 
     def __init__(
@@ -206,21 +219,24 @@ class StreamNGram:
             self.n_threads = n_threads or int(
                 os.environ.get("FASTMLX_NGRAM_THREADS", "12")
             )
-            # 呼び出しごとに作らない。プール生成はスレッド起動込みで数ms
-            # かかり、毎トークン作っていたら並列化した意味が消える
+            # Do not create this per call. Creating the pool takes a few ms
+            # including thread startup, and creating one per token would undo
+            # the point of parallelizing
             self._pool = ThreadPoolExecutor(max_workers=self.n_threads)
             self._fd = os.open(str(rows_bin), os.O_RDONLY)
 
     def _gather_pread(self, flat: np.ndarray) -> np.ndarray:
-        """行 id 配列を受けて、対応するレコードを並列 pread で埋める。"""
+        """Take an array of row ids and fill in the corresponding records with
+        parallel preads."""
 
         n = flat.shape[0]
         buf = np.empty((n, self.rec), dtype=np.uint8)
         rec_bytes = self.rec
 
         def read_one(i: int, row_id: int) -> None:
-            # os.pread は GIL を解放するので、ここで実際にディスク I/O が
-            # 並列に走る。書き込み先 buf[i] は行ごとに素なので競合しない
+            # os.pread releases the GIL, so the disk I/O really does run in
+            # parallel here. The destination buf[i] is disjoint per row, so
+            # there is no contention
             buf[i] = np.frombuffer(
                 os.pread(self._fd, rec_bytes, int(row_id) * rec_bytes), dtype=np.uint8
             )
@@ -237,10 +253,10 @@ class StreamNGram:
         if self.backend == "pread":
             rec = self._gather_pread(flat)
         else:
-            # numpy の fancy index は C 側で一度に集める。行ごとの Python
-            # ループにすると生成時に効いてくるので、ここは必ず 1 回の
-            # ギャザーで済ませる。1 行が連続レコードなので、触るページも
-            # 1 行あたり 1 枚で済む
+            # numpy's fancy index collects everything at once on the C side. A
+            # per-row Python loop would show up during generation, so always
+            # settle this with a single gather. Since one row is one contiguous
+            # record, this also touches only one page per row
             rec = self.mm[flat]
         n = rec.shape[0]
         w = mx.array(rec[:, : self.wb].copy().view(np.uint32).reshape(n, self.npack))
@@ -255,11 +271,11 @@ class StreamNGram:
 
 
 def install(model, sidecar: str | Path) -> None:
-    """読み込み済みモデルの n-gram 表をサイドカー参照に差し替える。
+    """Swap the n-gram tables of an already-loaded model for sidecar lookups.
 
-    量子化変換のときに `_ShardedEmbedding` をパラメータ無しの空実装にしてある
-    ので、チェックポイント側に n-gram のテンソルは入っていない。ここで実体を
-    与える。
+    At quantization/conversion time `_ShardedEmbedding` was made an empty
+    parameter-free implementation, so the checkpoint contains no n-gram tensors.
+    This is where the actual data gets supplied.
     """
 
     stream = StreamNGram(Path(sidecar))
@@ -278,9 +294,10 @@ def install(model, sidecar: str | Path) -> None:
         n += 1
     if n == 0:
         raise ValueError("PLE 層が見つからない")
-    # backend は環境変数でも決まるので、どちらを取ったかを必ず出す。
-    # FASTMLX_NGRAM_BACKEND=mmap が環境に残っていると 16 行の引きが 5-7 倍
-    # 遅くなる。出力は同じなので、黙って走られると公表値だけがずれる
+    # The backend can also be decided by an environment variable, so always
+    # print which one was taken. If FASTMLX_NGRAM_BACKEND=mmap is left in the
+    # environment, fetching 16 rows becomes 5-7x slower. The output is identical,
+    # so if it runs silently the only thing that shifts is the numbers we publish
     if stream.backend == "pread":
         how = f"backend=pread threads={stream.n_threads}"
     else:
@@ -292,16 +309,18 @@ def install(model, sidecar: str | Path) -> None:
 
 
 def warn_if_not_installed(model) -> bool:
-    """n-gram がサイドカーに差し替わっていない状態を起動時に鳴らす。
+    """Raise the alarm at startup when the n-gram tables have not been swapped
+    for the sidecar.
 
-    `--ngram` を渡し忘れると `FASTMLX_NGRAM_DISK` が立たず、qwen4_exp の
-    `_ShardedEmbedding` が表を自前で確保する形になる。サイドカーへ分離した
-    チェックポイントには n-gram のテンソルが入っていないので、その表は
-    初期値のままになる。生成そのものは最後まで走るため、黙っていると
-    会話にも計測にも紛れ込む。
+    Forgetting to pass `--ngram` means `FASTMLX_NGRAM_DISK` is never set, and
+    qwen4_exp's `_ShardedEmbedding` ends up allocating the tables itself. A
+    checkpoint whose n-gram data was split out into a sidecar contains no n-gram
+    tensors, so those tables stay at their initial values. Generation itself
+    runs to completion, so if nothing says anything this slips into both
+    conversations and measurements.
 
-    PLE 層を持たないモデル (Llama 等) では何もしない。差し替え済みなら
-    True を返す。
+    Does nothing for models with no PLE layers (Llama and the like). Returns
+    True if the swap has been done.
     """
 
     layers = getattr(getattr(model, "model", None), "layers", None)
@@ -338,16 +357,18 @@ __all__ = [
 
 
 class RamNGram:
-    """連結済みの n-gram 表を RAM に持ち、`mx.take` 一発で引く。
+    """Hold the concatenated n-gram table in RAM and fetch with a single
+    `mx.take`.
 
-    素の `_ShardedEmbedding` は 128 枚を別々に持つため、引くたびに
-    `np.unique` でホストへ降りて (= 毎トークン GPU 同期)、触れたシャードごとに
-    numpy と MLX を往復する。実測で 1 トークン 11-30ms を食っていた
-    (デコード全体の 38.5%、docs/STATUS.md)。
+    The stock `_ShardedEmbedding` holds the 128 shards separately, so every
+    lookup descends to the host via `np.unique` (= a GPU sync every token) and
+    round-trips between numpy and MLX once per shard touched. Measured, that was
+    costing 11-30ms per token (38.5% of the entire decode, docs/STATUS.md).
 
-    128 枚は論理的に行ブロックを並べたものなので、連結してしまえば
-    シャード計算も分岐も要らない。gather 3 回 + dequantize の 4 op で済み、
-    同期も Python ループも消える。メモリ量は連結前と同じ。
+    The 128 shards are logically just row blocks laid end to end, so once
+    concatenated neither the shard arithmetic nor the branching is needed. It
+    comes down to 4 ops — 3 gathers plus a dequantize — and both the sync and
+    the Python loop disappear. Memory usage is the same as before concatenation.
     """
 
     def __init__(self, sidecar: Path):
@@ -392,7 +413,8 @@ class RamNGram:
 
 
 def install_ram(model, sidecar: str | Path) -> None:
-    """n-gram 表を RAM 常駐の連結テーブルに差し替える (速度重視の経路)。"""
+    """Swap the n-gram tables for a RAM-resident concatenated table (the
+    speed-first path)."""
 
     table = RamNGram(Path(sidecar))
     n = 0

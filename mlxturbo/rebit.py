@@ -1,24 +1,27 @@
-"""読み込み済みモデルの一部を、その場で別のビット数に打ち直す。
+"""Re-quantize parts of an already-loaded model to a different bit width in place.
 
-焼き直さずにビット配分を試すための道具。内蔵ディスクの空きが 64GB しかなく、
-1 本 92GB の焼きを気軽に増やせないので、判定だけ先にこれで済ませる。
+A tool for trying out bit allocations without re-baking. The internal disk has
+only 64GB free and each bake is 92GB, so we cannot casually add more of them;
+this lets us settle the verdict first.
 
-打ち直しは 8bit -> 逆量子化 -> 4bit の二重量子化なので、bf16 から直接 4bit に
-焼いたものより必ず悪く出る。つまり「これで品質が保てるなら本番の焼きでも
-保てる」という向きの判定にしか使わない。逆は言えない。
+Re-quantizing goes 8bit -> dequantize -> 4bit, i.e. double quantization, so it
+always comes out worse than baking to 4bit directly from bf16. That means it is
+only usable for verdicts in the direction of "if quality holds up here, it will
+hold up in the real bake". The converse does not follow.
 
-RAM は減る方向に動く (元の重みを捨ててから新しいのを置く)。
+RAM moves downward (the original weights are dropped before the new ones are
+put in place).
 
     from mlxturbo import rebit
     rebit.apply(model, "gdn=4,hc=4")
 
-クラス名は byte_budget.py の分類と揃えてある:
-    gdn   GDN の投影 (in_proj_qkv/z/b/a, out_proj)。1 トークンあたり最大の読み手
-    hc    hyper-connections の 3 本
-    attn  full attention (12 層) の q/k/v/o
+The class names line up with the categories in byte_budget.py:
+    gdn   GDN projections (in_proj_qkv/z/b/a, out_proj). The largest reader per token
+    hc    the 3 hyper-connections
+    attn  q/k/v/o of full attention (12 layers)
     head  lm_head
-    router MoE のゲート
-    shared MoE の共有エキスパート
+    router the MoE gate
+    shared the MoE shared expert
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ CLASSES = ("gdn", "hc", "attn", "head", "router", "shared")
 
 
 def _targets(model, cls: str):
-    """(親モジュール, 属性名, 量子化線形) を列挙する。"""
+    """Enumerate (parent module, attribute name, quantized linear)."""
 
     def q(mod, attr):
         child = getattr(mod, attr, None)
@@ -79,8 +82,8 @@ def _requantize(lin, bits: int, group_size: int):
         group_size=lin.group_size, bits=lin.bits,
     )
     out_dims, in_dims = w.shape
-    # head_dim が group_size で割り切れないと mlx は黙って量子化を飛ばす。
-    # 7.942 bpw を踏んだのと同じ罠なので、ここで落とす
+    # If head_dim is not divisible by group_size, mlx silently skips the
+    # quantization. That is the same trap we hit with 7.942 bpw, so fail here.
     if in_dims % group_size:
         raise ValueError(
             f"in_dims={in_dims} が group_size={group_size} で割り切れない"

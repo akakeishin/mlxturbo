@@ -1,76 +1,88 @@
-"""OpenAI 互換 / Anthropic 互換 HTTP サーバー。
+"""OpenAI-compatible / Anthropic-compatible HTTP server.
 
-既存の投機デコードエンジン (mlxturbo.spec.SpecEngine) をそのまま使う。モデルは
-起動時に 1 回だけロードして常駐させ、リクエストはグローバルなロックで直列化
-する: 91GB 級のモデルを 128GB 機に載せている前提なので、同時実行 (並列
-バッチング) はまだしない (BatchGenerator ベースのスケジューラは次段)。待機中
-のリクエストもコネクションは保ったまま (asyncio のロック待ちで単に await
-するだけ)、ロックが空くまで待たせる。
+Uses the existing speculative decoding engine (mlxturbo.spec.SpecEngine) as-is.
+The model is loaded exactly once at startup and kept resident, and requests are
+serialized with a global lock: the premise is a 91GB-class model on a 128GB
+machine, so concurrent execution (parallel batching) is not done yet (a
+BatchGenerator-based scheduler is the next step). Waiting requests keep their
+connection open too (they simply await on the asyncio lock) until the lock
+frees up.
 
-会話履歴はクライアントが毎ターン全文を送り直す (OpenAI/Anthropic どちらの
-API も無状態) ので、session (SpecEngine 経路なら mlxturbo.spec.ChatSession、
-FallbackRunner 経路なら mlxturbo.runner.FallbackSession) はリクエスト単位で
-所有権を持つ ``STATE.session_pool`` (会話ごとの LRU プール、``_select_session``
-参照) から都度引き当てる。新しいプロンプトの先頭が既存スロットの処理済み
-トークン列全体と一致すれば (= 純粋な追記なら) そのスロットを引き当てて
-prefill を再利用する。一致しなければ新規スロットを割り当てる (プールが
-上限に達していれば最も長く使われていないスロットを ``popitem(last=False)``
-で捨てる)。91GB 級モデルの上に会話ごとの KV を無制限に積み上げないための
-上限であり、フィールド名は違うが SpecEngine/FallbackRunner どちらの経路でも
-同じプールを使う (``STATE.session_factory`` が起動時にどちらのクラスを
-積むか決める)。
+Because both the OpenAI and Anthropic APIs are stateless, the client resends
+the whole conversation history every turn, so the session (mlxturbo.spec.ChatSession
+on the SpecEngine path, mlxturbo.runner.FallbackSession on the FallbackRunner
+path) is looked up per request from ``STATE.session_pool`` (a per-conversation
+LRU pool, see ``_select_session``), which owns them for the duration of the
+request. If the head of the new prompt matches the entire already-processed
+token sequence of an existing slot (i.e. it is a pure append), that slot is
+picked up and its prefill reused. If nothing matches, a new slot is allocated
+(and if the pool has reached its limit, the least recently used slot is
+discarded with ``popitem(last=False)``). That limit exists so per-conversation
+KV does not pile up without bound on top of a 91GB-class model; the field names
+differ, but the same pool is used on both the SpecEngine and FallbackRunner
+paths (``STATE.session_factory`` decides at startup which class gets stacked
+into it).
 
-直列化ロック (``STATE.lock``) は今回はまだ外していない — 現状は「1 リクエスト
-= 1 生成」を保証する唯一の仕組みであり続けるが、session の所有権がリクエスト
-単位になったことで、ロックさえ外せば異なる会話を同時に生成しても互いの
-session を破壊しなくなる (ロックを外すこと自体は次のスケジューラの回でやる)。
-``STATE.session_pool`` 自体への並行アクセス (2 リクエストが同時にスロットを
-選ぶ・追い出す) はまだこのロックに守られている前提のままなので、ロックを
-外す際はプール操作自体にも別途排他が要る。
+The serialization lock (``STATE.lock``) has not been removed in this pass — for
+now it remains the only mechanism that guarantees "one request = one
+generation", but because session ownership is now per-request, merely removing
+the lock would no longer let simultaneous generations for different
+conversations destroy each other's session (removing the lock itself is work
+for the next scheduler pass). Concurrent access to ``STATE.session_pool``
+itself (two requests selecting or evicting slots at the same time) is still
+assumed to be protected by this lock, so when the lock is removed the pool
+operations themselves will need separate mutual exclusion.
 
-SpecEngine が受け付けないモデル (Llama/Gemma/dense Qwen や、GDN ハイブリッド
-でもレイアウトが異なるもの) では、起動時に mlxturbo.runner.build_runner が
-mlx_lm.generate.stream_generate による普通の (非投機) 生成に自動でフォール
-バックする。どちらの経路でも HTTP 層から見た形は同一 (Runner.generate が
-同じ dict を返す) で、起動時にどちらの経路が有効かを一行ログで出す。
-FallbackRunner も (SpecEngine と同じ LCP 契約で) mlx_lm の prompt_cache を
-session 経由で再利用する。詳細は mlxturbo/runner.py を参照。
+For models SpecEngine does not accept (Llama/Gemma/dense Qwen, or GDN hybrids
+whose layout differs), mlxturbo.runner.build_runner automatically falls back at
+startup to ordinary (non-speculative) generation via
+mlx_lm.generate.stream_generate. Both paths look identical from the HTTP layer
+(Runner.generate returns the same dict), and a one-line log at startup says
+which path is active. FallbackRunner also reuses mlx_lm's prompt_cache through
+the session (under the same LCP contract as SpecEngine). See mlxturbo/runner.py
+for details.
 
-MLX の計算グラフ (モデルの重み・KV キャッシュを含む) はロードしたスレッドに
-紐づく。asyncio.to_thread や汎用スレッドプールで別スレッドへ逃がすと
-"There is no Stream(gpu, N) in current thread" で落ちる (実測で確認済み:
-ロードと forward を同一スレッドで行えば通り、別スレッドだと通らない)。その
-ため、モデルのロードも生成呼び出しも**専用の単一ワーカースレッド**
-(``STATE.executor``, ``max_workers=1``) に固定して行う。requests はもともと
-グローバルロックで直列化する設計なので、単一スレッドに寄せても並行性は
-失わない。
+MLX's computation graph (including the model weights and the KV cache) is bound
+to the thread that loaded it. Escaping to another thread via asyncio.to_thread
+or a general-purpose thread pool crashes with "There is no Stream(gpu, N) in
+current thread" (confirmed by measurement: doing the load and the forward on
+the same thread works, on different threads it does not). Therefore both the
+model load and the generate calls are pinned to a **dedicated single worker
+thread** (``STATE.executor``, ``max_workers=1``). Requests were already
+designed to be serialized by the global lock, so concentrating them on a single
+thread loses no concurrency.
 
-ストリーミング経路はロックの中で ``executor.submit(worker)`` の Future を
-保持し、クライアント切断 (StreamingResponse がジェネレータを ``aclose()``
-する = ``GeneratorExit``) やエラーで早期に抜ける場合も、``finally`` でその
-Future を待ってからロックを解放する。そうしないと、まだ生成中のワーカーが
-このリクエストへ引き当てた session を触っている間に次のリクエストがロックを
-取れてしまい、同じ session を 2 つの生成が同時に書き換える。
+The streaming path holds the Future from ``executor.submit(worker)`` inside the
+lock, and even when it exits early because of a client disconnect
+(StreamingResponse calling ``aclose()`` on the generator = ``GeneratorExit``)
+or an error, it waits for that Future in ``finally`` before releasing the lock.
+Otherwise the next request could take the lock while a still-generating worker
+is touching the session assigned to this request, and two generations would be
+rewriting the same session at once.
 
-ストリーミング応答は、検証 (400 になりうるチェック全て) をエンドポイント
-関数内で StreamingResponse を組み立てる前に済ませたあと、生成の開始 (ロック
-獲得・ワーカー投入) を待たずに最初の SSE イベント (OpenAI なら role delta の
-チャンク、Anthropic なら message_start) を即座に流す — TTFT (prefill) が
-支配項のワークロードでは、クライアントが最初の 1 バイトを受け取るまでの
-時間そのものが切断の実因になるため。200 を返してから 400 相当が判明する
-経路にはなっていない (判明し得るチェックは全て StreamingResponse を返す前
-に完了している)。
+For streaming responses, validation (every check that could yield a 400) is
+completed inside the endpoint function before the StreamingResponse is
+assembled; after that, the first SSE event (the role delta chunk for OpenAI,
+message_start for Anthropic) is emitted immediately without waiting for
+generation to start (lock acquisition, worker submission) — in workloads where
+TTFT (prefill) dominates, the time until the client receives its first byte is
+itself the real cause of disconnects. There is no path where something
+400-worthy is discovered after 200 has been returned (every check that could
+discover one completes before StreamingResponse is returned).
 
-thinking (推論過程) の扱い: OpenAI の ``reasoning_effort`` / Anthropic の
-``thinking`` だけを読む (mlxturbo 独自フィールドは無い)。値はトークン予算
-(budget) に写し、``ThinkingRouter`` が生トークン列を reasoning/content の
-2 チャンネルへ振り分ける。マーカーは mlx_lm.TokenizerWrapper の公開 API
-(``has_thinking``/``think_start_tokens``/``think_end_tokens``) から引き、
-引けないモデルでは常に content 一本 (分離しない)。予算超過時は「思考を
-強制的に閉じて本文を続けさせる」その場再開はしていない (SpecEngine/
-mlx_lm.stream_generate のどちらも生成途中の割り込みを許さないため) —
-それ以降の出力をクライアントへ転送しないという、観測可能な形で打ち切る。
-詳細は ThinkingRouter の docstring を参照。
+Handling of thinking (the reasoning process): only OpenAI's
+``reasoning_effort`` and Anthropic's ``thinking`` are read (there are no
+mlxturbo-specific fields). The value is mapped to a token budget, and
+``ThinkingRouter`` splits the raw token stream into the two channels
+reasoning and content. The markers are taken from mlx_lm.TokenizerWrapper's
+public API (``has_thinking``/``think_start_tokens``/``think_end_tokens``); for
+models where they cannot be obtained, everything stays on a single content
+channel (no separation). When the budget is exceeded there is no in-place
+restart that "forcibly closes the thinking block and makes the model continue
+with the body" (because neither SpecEngine nor mlx_lm.stream_generate permits
+interrupting a generation in progress) — instead the cut-off is observable:
+output past that point is not forwarded to the client. See the ThinkingRouter
+docstring for details.
 """
 
 import argparse
@@ -107,10 +119,10 @@ app = FastAPI()
 
 
 def _mlxturbo_version() -> str:
-    """配布物としてのバージョン。pyproject.toml の ``[project] version`` を
-    (パッケージがインストールされた環境なら) ``importlib.metadata`` 経由で
-    そのまま返す — 別ファイルに二重管理しない。未インストール実行 (稀) は
-    フォールバックする。"""
+    """The version of this distribution. Returns ``[project] version`` from
+    pyproject.toml verbatim via ``importlib.metadata`` (when running in an
+    environment where the package is installed) — no second copy maintained in
+    a separate file. Running uninstalled (rare) falls back."""
 
     try:
         return _importlib_metadata.version("mlxturbo")
@@ -120,15 +132,17 @@ def _mlxturbo_version() -> str:
 
 _FASTMLX_VERSION = _mlxturbo_version()
 
-# --api-key / graceful shutdown が素通しする経路。監視・疎通用なので、鍵が
-# 立っていても・shutdown 中でも常に 200 を返す (main() docstring 相当の方針)。
+# Paths that --api-key / graceful shutdown let straight through. They exist for
+# monitoring and connectivity checks, so they always return 200 even when a key
+# is configured and even during shutdown (the policy described in main()'s
+# docstring).
 _UNGATED_PATHS = frozenset({"/health", "/api/hello"})
 
-# main() が SIGTERM/SIGINT の1回目で立てる。ゲートミドルウェアがこれを見て
-# 新規リクエストを 503 で断る (uvicorn 自身の graceful shutdown が処理中の
-# リクエストの完了を待つのとは別に、ASGI 層でも新規受付を止める必要がある —
-# 既存の keep-alive 接続に乗って来たリクエストは uvicorn がソケットを閉じる
-# だけでは弾けないため)。
+# Set by main() on the first SIGTERM/SIGINT. The gate middleware watches this
+# and refuses new requests with 503 (separately from uvicorn's own graceful
+# shutdown waiting for in-flight requests to finish, the ASGI layer also has to
+# stop accepting new ones — requests arriving over an existing keep-alive
+# connection cannot be turned away by uvicorn merely closing the socket).
 _SHUTTING_DOWN = False
 
 
@@ -137,8 +151,9 @@ def _protocol_for_path(path: str) -> str:
 
 
 def _busy_response(protocol: str, message: str) -> JSONResponse:
-    """503 (queue 上限 / graceful shutdown 中の新規リクエスト) をプロトコル
-    別の形で返す。クライアントがリトライを試せるよう Retry-After を付ける。"""
+    """Return a 503 (queue limit reached / new request during graceful
+    shutdown) in the shape of the given protocol. Attaches Retry-After so the
+    client can try again."""
 
     if protocol == "anthropic":
         resp = _anthropic_error(message, status=503, err_type="overloaded_error")
@@ -149,9 +164,9 @@ def _busy_response(protocol: str, message: str) -> JSONResponse:
 
 
 def _extract_api_key(request: Request) -> str | None:
-    """``Authorization: Bearer <key>`` と ``x-api-key: <key>`` の両方を、
-    どちらの経路 (OpenAI 系/Anthropic 系) でも受け付ける (クライアント実装の
-    揺れがあるため — server.py 冒頭の方針どおり)。"""
+    """Accept both ``Authorization: Bearer <key>`` and ``x-api-key: <key>`` on
+    either path (OpenAI-style/Anthropic-style), because client implementations
+    vary — following the policy at the top of server.py."""
 
     auth = request.headers.get("authorization")
     if auth and auth.lower().startswith("bearer "):
@@ -179,12 +194,14 @@ def _unauthorized_response(protocol: str) -> JSONResponse:
 
 @app.middleware("http")
 async def _gate_requests(request: Request, call_next):
-    """認証 (``--api-key``) と graceful shutdown 中の新規リクエスト拒否を、
-    ``/health``・``/api/hello`` を除く全経路の入り口でまとめて行う。
+    """Handle authentication (``--api-key``) and refusal of new requests during
+    graceful shutdown in one place, at the entrance to every path except
+    ``/health`` and ``/api/hello``.
 
-    どちらも各エンドポイント内の個別バリデーション (400 系) より手前、
-    リクエストを受け付けるかどうかの最初の関門として効く。認証キーは
-    ``STATE.api_keys`` (未起動時は空扱い = 認証なし、既定の挙動を変えない)。
+    Both act as the first gate deciding whether a request is accepted at all,
+    ahead of the per-endpoint validation (the 400 family) inside each endpoint.
+    The keys come from ``STATE.api_keys`` (treated as empty before startup has
+    completed = no authentication, which does not change the default behavior).
     """
 
     if request.url.path in _UNGATED_PATHS:
@@ -207,10 +224,11 @@ async def _gate_requests(request: Request, call_next):
 
 
 def _add_cors_middleware(fastapi_app: FastAPI, allowed_origins: list[str]) -> None:
-    """``--allowed-origins`` が指定されたときだけ main() から呼ぶ。既定
-    (未指定) では一切呼ばれない = CORSMiddleware 自体が付かず、ブラウザ
-    からのクロスオリジン fetch は常にブロックされたまま (ローカル専用)。
-    Open WebUI 等、ブラウザで動く UI から直接叩きたい場合に使う。
+    """Called from main() only when ``--allowed-origins`` is given. By default
+    (not specified) it is never called at all = no CORSMiddleware is installed,
+    and cross-origin fetches from a browser stay blocked (local use only). Use
+    it when you want to call this server directly from a browser-based UI such
+    as Open WebUI.
     """
 
     fastapi_app.add_middleware(
@@ -226,58 +244,67 @@ def _add_cors_middleware(fastapi_app: FastAPI, allowed_origins: list[str]) -> No
 class ModelState:
     runner: Runner
     tokenizer: object
-    # 会話ごとの session (ChatSession/FallbackSession) の LRU プール。キーは
-    # 会話の身元そのものではなく単なる挿入順管理用の連番 (_select_session
-    # 参照) — 選択はキーではなく各スロットの processed 列との LCP で行う。
+    # LRU pool of per-conversation sessions (ChatSession/FallbackSession). The
+    # key is not the identity of the conversation but merely a serial number
+    # for insertion-order bookkeeping (see _select_session) — selection is done
+    # by LCP against each slot's processed sequence, not by the key.
     session_pool: "OrderedDict[int, object]"
-    # runner の種類 (SpecRunner なら ChatSession、FallbackRunner なら
-    # FallbackSession) に応じて起動時に決める、新規スロット用のファクトリ。
+    # Factory for new slots, decided at startup according to the kind of runner
+    # (ChatSession for SpecRunner, FallbackSession for FallbackRunner).
     session_factory: Callable[[], object]
     lock: asyncio.Lock
     executor: concurrent.futures.ThreadPoolExecutor
-    model_name: str  # served id: GET /v1/models と全レスポンスの "model" 欄
+    model_name: str  # served id: GET /v1/models and the "model" field of every response
     eos_ids: set
     max_tokens_cap: int
     default_temp: float
     created_ts: int
-    max_sessions: int = 8  # session_pool の上限 (LRU)。91GB 級モデルの上に
-    # 会話ごとの KV を無制限に積まないための上限で、--max-sessions で変えられる。
-    # プロンプト長 (トークン数) の上限。既定はモデル config の
-    # max_position_embeddings と、Metal が一括確保できる実際の上限から
-    # 逆算した値の小さい方を自動で取る (_resolve_default_max_context_tokens)、
-    # --max-context-tokens で上書き可。None なら未検出でガード無効。
-    # _check_context_length が全 4 経路 (chat/anthropic/completions/responses)
-    # で参照する。
+    max_sessions: int = 8  # Limit on session_pool (LRU). It exists so that
+    # per-conversation KV does not pile up without bound on top of a 91GB-class
+    # model, and it can be changed with --max-sessions.
+    # Upper limit on prompt length (in tokens). By default it automatically
+    # takes the smaller of the model config's max_position_embeddings and the
+    # value derived from the actual limit Metal can allocate in one go
+    # (_resolve_default_max_context_tokens); --max-context-tokens overrides it.
+    # None means nothing was detected and the guard is disabled.
+    # _check_context_length consults it on all 4 paths
+    # (chat/anthropic/completions/responses).
     max_context_tokens: int | None = None
     session_key_seq: Iterator[int] = field(default_factory=lambda: itertools.count())
-    # model 不一致は既定で 404 (OpenAI 準拠の意図的な設計、_check_model_openai/
-    # _check_model_anthropic 参照)。クライアントが裏方処理 (例: Claude Code の
-    # 会話タイトル生成) で別の小さいモデル名を送ってくることがあり、それも
-    # 弾かれてしまう場合に --model-alias を起動時に (複数回) 指定して明示的に
-    # 許可するための集合。既定は空 = 既存の挙動のまま何も変わらない。
+    # A model mismatch is a 404 by default (a deliberate, OpenAI-conforming
+    # design; see _check_model_openai/_check_model_anthropic). Clients
+    # sometimes send a different, smaller model name for background work (e.g.
+    # Claude Code generating a conversation title), and when that gets rejected
+    # too, this set lets you allow it explicitly by passing --model-alias at
+    # startup (repeatable). The default is empty = nothing changes from the
+    # existing behavior.
     model_aliases: frozenset[str] = frozenset()
-    # --api-key (複数可)。空集合 (既定) = 認証なし、ローカル専用の従来挙動の
-    # まま。_gate_requests がこれを見て Authorization: Bearer / x-api-key の
-    # どちらか一致すれば通す (secrets.compare_digest で比較)。
+    # --api-key (repeatable). An empty set (the default) = no authentication,
+    # keeping the previous local-only behavior. _gate_requests consults it and
+    # lets a request through if either Authorization: Bearer or x-api-key
+    # matches (compared with secrets.compare_digest).
     api_keys: frozenset[str] = frozenset()
-    # 直列化ロックの待ち行列の上限 (--max-queue、既定 8)。queue_depth が
-    # これに達したリクエストは 503 (Retry-After 付き) で断る
-    # (_try_reserve_queue_slot/_release_queue_slot 参照)。
+    # Upper limit on the serialization lock's wait queue (--max-queue, default
+    # 8). A request arriving when queue_depth has reached this is refused with a
+    # 503 (carrying Retry-After)
+    # (see _try_reserve_queue_slot/_release_queue_slot).
     max_queue: int = 8
     queue_depth: int = 0
     version: str = ""
-    # STATE.runner が投機系 (SpecRunner/FlashSpecRunner) のとき、非恒等な
-    # サンプリングパラメータや logprobs を要求されたリクエストだけをこの
-    # runner (非投機の FallbackRunner) へその場で降格させる。400 で拒否する
-    # 代わりに、投機デコードの分布保証を「投機を使わない」ことで守ったまま
-    # 処理する (_resolve_runner_for_request 参照)。STATE.runner が既に
-    # fallback のとき (build_runner が起動時に自動フォールバックした場合)
-    # は降格が要らないので None のまま。
+    # When STATE.runner is a speculative one (SpecRunner/FlashSpecRunner), only
+    # requests that ask for non-identity sampling parameters or logprobs are
+    # downgraded on the spot to this runner (the non-speculative
+    # FallbackRunner). Instead of rejecting them with a 400, they are served
+    # while the speculative decoder's distribution guarantee is upheld by "not
+    # using speculation" (see _resolve_runner_for_request). When STATE.runner is
+    # already the fallback (build_runner fell back automatically at startup), no
+    # downgrade is needed, so this stays None.
     downgrade_runner: "Runner | None" = None
-    # /v1/responses の store:true で保存する応答の LRU (項目 15)。キーは
-    # response id、値は _ResponseRecord。永続化はしない — プロセス再起動で
-    # 全て失われる (このサーバーは元々レスポンスを永続化しない設計、
-    # server.py 冒頭の docstring 参照)。上限は --max-stored-responses。
+    # LRU of responses stored by /v1/responses with store:true (item 15). The
+    # key is the response id, the value a _ResponseRecord. Nothing is persisted
+    # — everything is lost on process restart (this server was never designed
+    # to persist responses; see the docstring at the top of server.py). The
+    # limit is --max-stored-responses.
     response_store: "OrderedDict[str, object]" = field(default_factory=OrderedDict)
     max_stored_responses: int = 50
 
@@ -316,27 +343,32 @@ def _validate_local_thinking_signature(text: str, signature) -> bool:
 
 
 def _try_trim_session_cache(sess, n_trim: int) -> bool:
-    """``sess`` (ChatSession/FallbackSession) の KV キャッシュを ``n_trim``
-    トークン分だけ巻き戻せるか確認し、できれば実際に巻き戻す。
+    """Check whether ``sess``'s (ChatSession/FallbackSession) KV cache can be
+    rewound by ``n_trim`` tokens, and actually rewind it if it can.
 
-    個々のキャッシュ実装 (mlx_lm.models.cache の ``KVCache`` は巻き戻せる。
-    GDN ハイブリッドの線形層に使う ``ArraysCache`` は再帰状態を途中位置へ
-    戻す手段が無く巻き戻せない — mlxturbo/spec.py の ChatSession docstring、
-    mlxturbo/runner.py の FallbackSession docstring 参照) をこの関数自身は
-    一切知らない。判定・実行はどちらも mlx_lm.models.cache の
-    ``can_trim_prompt_cache``/``trim_prompt_cache`` にそのまま委ねる —
-    構成する全レイヤーが ``is_trimmable()`` を申告したときだけ実際に trim
-    し、1 レイヤーでも無理なら何もせず False を返す (半端に書き換えて
-    壊れた状態を残さない)。
+    This function itself knows nothing about the individual cache
+    implementations (mlx_lm.models.cache's ``KVCache`` can be rewound; the
+    ``ArraysCache`` used for the linear layers of a GDN hybrid cannot, because
+    there is no way to return its recurrent state to an intermediate position —
+    see the ChatSession docstring in mlxturbo/spec.py and the FallbackSession
+    docstring in mlxturbo/runner.py). Both the decision and the execution are
+    delegated straight to mlx_lm.models.cache's
+    ``can_trim_prompt_cache``/``trim_prompt_cache`` — it trims for real only
+    when every constituent layer declares ``is_trimmable()``, and if even one
+    layer cannot, it changes nothing and returns False (leaving behind no
+    half-rewritten, broken state).
 
-    ``mtp_valid`` (ChatSession のみ) が立っている session は対象外にする:
-    MTP 連鎖用の ``h_last``/``mtp_cache`` はセッションの最終位置 1 点分の
-    状態しか持たず、途中位置まで KV を巻き戻しても対応する h_last が
-    無いため、巻き戻した位置での MTP 継続を保証できない。呼び出し側が
-    ``mtp_valid`` を立てて渡してくる可能性がある構成 (GDN ハイブリッド +
-    MTP、このサーバーの現行構成そのもの) では、そもそも ``ArraysCache``
-    が混ざっているため ``can_trim_prompt_cache`` が False を返して自然に
-    弾かれるはずだが、それに依存せずここでも明示的に弾く (二重の安全策)。
+    Sessions with ``mtp_valid`` set (ChatSession only) are excluded: the
+    ``h_last``/``mtp_cache`` used for the MTP chain hold state for only the one
+    final position of the session, so even after rewinding the KV to an
+    intermediate position there is no corresponding h_last, and MTP
+    continuation at the rewound position cannot be guaranteed. In
+    configurations where the caller may hand us a session with ``mtp_valid``
+    set (GDN hybrid + MTP, which is exactly this server's current
+    configuration), an ``ArraysCache`` is mixed in to begin with, so
+    ``can_trim_prompt_cache`` should return False and reject it naturally;
+    rather than rely on that, we reject it explicitly here as well (belt and
+    braces).
     """
 
     if getattr(sess, "mtp_valid", False):
@@ -344,11 +376,11 @@ def _try_trim_session_cache(sess, n_trim: int) -> bool:
     cache_list = getattr(sess, "caches", None)
     if cache_list is None:
         cache_list = getattr(sess, "cache", None)
-    # 実際の ChatSession.caches/FallbackSession.cache は常に
-    # mlx_lm.models.cache._BaseCache のインスタンスのリストだが、この
-    # 関数は runner の種類を知らない (テストの軽量フェイクは cache を
-    # 中身の無い sentinel オブジェクトにすることがある) ので、その形に
-    # なっていなければ trim できないものとして安全側に倒す。
+    # The real ChatSession.caches/FallbackSession.cache is always a list of
+    # mlx_lm.models.cache._BaseCache instances, but this function does not know
+    # which kind of runner it is dealing with (lightweight fakes in the tests
+    # sometimes make cache a contentless sentinel object), so if it is not in
+    # that shape we err on the safe side and treat it as un-trimmable.
     if not isinstance(cache_list, list) or not cache_list:
         return False
     from mlx_lm.models.cache import can_trim_prompt_cache, trim_prompt_cache
@@ -360,63 +392,72 @@ def _try_trim_session_cache(sess, n_trim: int) -> bool:
 
 
 def _try_checkpoint_restore_session_cache(sess, lcp: int) -> int | None:
-    """``_try_trim_session_cache`` が不発に終わる構成 (ArraysCache が混ざる
-    GDN ハイブリッド — このサーバーの実運用構成そのもの) 向けの代替経路。
+    """Alternative path for configurations where ``_try_trim_session_cache``
+    always comes up empty (a GDN hybrid with ArraysCache mixed in — exactly
+    this server's production configuration).
 
-    ``sess`` (ChatSession/FallbackSession のどちらでもよい — この関数は
-    ``.checkpoints``/``.caches`` or ``.cache``/``.processed`` を duck typing
-    で見るだけで runner の種類を知らない) が ``mlxturbo.spec._prefill_hidden``
-    (SpecEngine 経路) や ``mlxturbo.spec_flash.FlashSpecEngine.generate_stream``
-    (Flash-Next 経路) の途中で残しているチェックポイント (``sess.checkpoints``
-    — プレフィルのチャンク境界ごとの、巻き戻せないレイヤーだけのスナップ
-    ショット) の中から ``lcp`` 以下で最も近い位置を選び、そこまで復元する:
-    trim できるレイヤー (attention の KVCache) はそのチェックポイント位置
-    まで ``.trim()`` し、trim できないレイヤー (ArraysCache) はスナップ
-    ショットの状態をそのまま書き戻す。チェックポイント位置と ``lcp`` の間の
-    差分は、この関数の呼び出し元が ``sess.processed`` をチェックポイント
-    位置へ切り詰めることで、続く generate() 側の通常の (チャンク分割)
-    prefill 経路が forward 計算で自然に埋める — ここでは位置を巻き戻すだけ
-    で forward は一切行わない。
+    Among the checkpoints ``sess`` has left behind (``sess.checkpoints`` —
+    snapshots of only the un-rewindable layers, one per prefill chunk boundary)
+    partway through ``mlxturbo.spec._prefill_hidden`` (the SpecEngine path) or
+    ``mlxturbo.spec_flash.FlashSpecEngine.generate_stream`` (the Flash-Next
+    path), pick the closest position that is at most ``lcp`` and restore to it:
+    layers that can be trimmed (the attention KVCache) are ``.trim()``-ed down
+    to that checkpoint position, and layers that cannot (ArraysCache) get the
+    snapshot state written straight back. (``sess`` may be either a ChatSession
+    or a FallbackSession — this function only duck-types
+    ``.checkpoints``/``.caches`` or ``.cache``/``.processed`` and does not know
+    the kind of runner.) The gap between the checkpoint position and ``lcp`` is
+    filled in naturally by forward computation on the ordinary (chunked)
+    prefill path of the subsequent generate(), because this function's caller
+    truncates ``sess.processed`` to the checkpoint position — here we only
+    rewind the position and perform no forward at all.
 
-    trim できるレイヤーが Flash-Next の ``_AttnCache`` (KVCache 派生 +
-    ``.indexer``、mlxturbo/spec_flash.py 冒頭の表「KV と indexer」参照) の
-    ときは、``.trim()`` 自体は KV の offset しか戻さず indexer の生 keys
-    (``.indexer.keys``、QSAIndexer が毎 forward 1 回 ``.update()`` で積み
-    増すだけで trim も advance も持たない) には触れない。ただし indexer は
-    KV と常に同じ forward 呼び出しで同じ長さぶん更新される (qwen4_exp の
-    ``Attention.__call__`` — オフセットと indexer 長は単一系列では常に一致)
-    ので、trim 後にその層の ``.offset`` と同じ長さへ切り詰め直すだけで
-    KV/indexer が再び揃う (mlxturbo/spec_flash.py の ``rollback()`` が検証
-    forward 1 ラウンドぶんについて行っているのと同じ操作を、チェックポイント
-    という粒度でここでも行う)。``.indexer`` を持たない構成 (ChatSession が
-    実運用で使う 27B/qwen3_5) では単に no-op。
+    When the trimmable layer is Flash-Next's ``_AttnCache`` (derived from
+    KVCache plus an ``.indexer``; see the "KV and indexer" table at the top of
+    mlxturbo/spec_flash.py), ``.trim()`` itself only rewinds the KV offset and
+    does not touch the indexer's raw keys (``.indexer.keys``, which QSAIndexer
+    merely appends to with one ``.update()`` per forward, and which has neither
+    trim nor advance). However, the indexer is always updated by the same
+    length in the same forward call as the KV (qwen4_exp's
+    ``Attention.__call__`` — for a single sequence the offset and the indexer
+    length always agree), so simply re-truncating the indexer keys to the same
+    length as that layer's ``.offset`` after the trim brings KV and indexer
+    back in sync (the same operation ``rollback()`` in
+    mlxturbo/spec_flash.py performs for one round of verification forward,
+    done here at checkpoint granularity). In configurations without an
+    ``.indexer`` (the 27B/qwen3_5 that ChatSession uses in production) this is
+    simply a no-op.
 
-    ``_try_trim_session_cache`` と違い、``sess.mtp_valid`` では弾かない。
-    MTP を常用するこのサーバーの実運用では、公開済みの session は生成直後
-    ほぼ常に ``mtp_valid=True`` になる (mlxturbo/spec.py の ChatSession.publish
-    参照) ので、そこで弾くとこの経路自体が実運用で永久に不発になる。
-    代わりに、MTP 連鎖用の h_last/mtp_cache は復元後の位置に対応する状態を
-    持たない (``_try_trim_session_cache`` と同じ理由) ため、この関数自体は
-    それらに一切触れず、成功時は呼び出し側が ``sess.mtp_valid`` を落とす —
-    続く generate() 側はそれを見て MTP チェーンを最初から作り直す (KV/GDN
-    の再利用そのものは失わない。mlxturbo/spec.py の generate() docstring
-    参照)。
+    Unlike ``_try_trim_session_cache``, this does not reject on
+    ``sess.mtp_valid``. In this server's production use, where MTP is always
+    on, a published session is almost always ``mtp_valid=True`` right after
+    generation (see ChatSession.publish in mlxturbo/spec.py), so rejecting
+    there would make this path permanently useless in production. Instead,
+    because the h_last/mtp_cache used for the MTP chain hold no state
+    corresponding to the restored position (the same reason as in
+    ``_try_trim_session_cache``), this function never touches them at all, and
+    on success the caller clears ``sess.mtp_valid`` — the subsequent generate()
+    sees that and rebuilds the MTP chain from scratch (the KV/GDN reuse itself
+    is not lost; see the generate() docstring in mlxturbo/spec.py).
 
-    復元前に、trim できるレイヤー全てで ``n_trim <= offset`` (= trim が必ず
-    要求どおりの量だけ成功する) を確認してから初めて実際の変更を始める。
-    1 レイヤーでも要件を満たさなければ何も変更せず None を返す — 中途半端
-    に trim/復元した状態のスロットを残さない。
+    Before restoring, it first confirms that ``n_trim <= offset`` holds for
+    every trimmable layer (= the trim is certain to succeed by exactly the
+    requested amount), and only then begins making actual changes. If even one
+    layer fails the requirement it changes nothing and returns None — leaving
+    behind no slot in a half trimmed/restored state.
 
-    成功すれば復元後の位置 (選んだチェックポイントの位置。``lcp`` そのもの
-    ではないことに注意 — 呼び出し側は ``sess.processed`` をこの戻り値まで
-    切り詰めること) を、使えるチェックポイントが無ければ None を返す。
+    On success it returns the restored position (the position of the chosen
+    checkpoint; note that this is not ``lcp`` itself — the caller must truncate
+    ``sess.processed`` to this return value), and None when there is no usable
+    checkpoint.
     """
 
     checkpoints = getattr(sess, "checkpoints", None)
     if not checkpoints:
         return None
-    # ChatSession は複数形 .caches、FallbackSession (FlashSpecRunner が使う)
-    # は単数形 .cache — _try_trim_session_cache と同じフォールバック。
+    # ChatSession uses the plural .caches, FallbackSession (which
+    # FlashSpecRunner uses) the singular .cache — the same fallback as in
+    # _try_trim_session_cache.
     cache_list = getattr(sess, "caches", None)
     if cache_list is None:
         cache_list = getattr(sess, "cache", None)
@@ -432,15 +473,15 @@ def _try_checkpoint_restore_session_cache(sess, lcp: int) -> int | None:
         if pos <= lcp and (cp_pos is None or pos > cp_pos):
             cp_pos = pos
             cp_snapshot = snapshot
-    if not cp_pos:  # None または 0 (0 は「何も進んでいない」= 得るものが無い)
+    if not cp_pos:  # None or 0 (0 means "no progress at all" = nothing to gain)
         return None
 
     trimmable_idx = [i for i, c in enumerate(cache_list) if c.is_trimmable()]
     non_trimmable_idx = {i for i in range(len(cache_list)) if i not in trimmable_idx}
     snapshot_idx = {i for i, *_ in cp_snapshot}
-    # スナップショットが対象にしているレイヤー集合が、今の caches の
-    # trim 可否の割り振りと食い違っていたら (構成が変わるはずは無いが)
-    # 安全側に倒して復元しない。
+    # If the set of layers the snapshot covers disagrees with how the current
+    # caches divide into trimmable and non-trimmable (the configuration should
+    # never change, but still), err on the safe side and do not restore.
     if snapshot_idx != non_trimmable_idx:
         return None
 
@@ -450,23 +491,24 @@ def _try_checkpoint_restore_session_cache(sess, lcp: int) -> int | None:
         if offset is None or offset < n_trim:
             return None
 
-    # ここから先は全レイヤーで trim が要求どおりに成功することを確認済み。
+    # From here on, the trim is confirmed to succeed as requested on every layer.
     for i in trimmable_idx:
         c = cache_list[i]
         trimmed = c.trim(n_trim)
         if trimmed != n_trim:
-            # 事前の offset チェックと矛盾する = 想定外の cache 実装。
-            # 既にこのレイヤーは trim してしまっているが、processed/
-            # checkpoints はまだ書き換えていないので、呼び出し側には
-            # 「不発」として伝える (この特定の slot はもう安全に再利用
-            # できない可能性があるが、それは呼び出し側が新規スロットへ
-            # 倒すことで吸収する範囲外の話ではない — 実際に踏むことは
-            # ここまでの事前チェックがある限り無いはず)。
+            # This contradicts the earlier offset check = an unexpected cache
+            # implementation. This layer has already been trimmed, but
+            # processed/checkpoints have not been rewritten yet, so we report a
+            # miss to the caller (this particular slot may no longer be safe to
+            # reuse, but that is not outside what the caller absorbs by falling
+            # back to a new slot — and given the pre-checks up to this point it
+            # should never actually be hit).
             return None
-        # Flash-Next の _AttnCache は .indexer (生 keys、trim を持たない) を
-        # 抱える。KV と indexer は常に同じ長さぶん進むので、trim 後の offset
-        # に合わせて indexer の keys も切り詰め直せば揃う (このモジュール
-        # docstring 参照)。.indexer を持たない構成では no-op。
+        # Flash-Next's _AttnCache carries an .indexer (raw keys, with no trim).
+        # KV and indexer always advance by the same length, so re-truncating the
+        # indexer keys to match the post-trim offset brings them back in sync
+        # (see this function's docstring). In configurations without .indexer this
+        # is a no-op.
         indexer = getattr(c, "indexer", None)
         if indexer is not None and getattr(indexer, "keys", None) is not None:
             indexer.keys = indexer.keys[:, : c.offset]
@@ -476,52 +518,59 @@ def _try_checkpoint_restore_session_cache(sess, lcp: int) -> int | None:
 
 
 def _select_session(prompt_ids: list[int]):
-    """新しいプロンプトに対して使う session (ChatSession/FallbackSession) を
-    ``STATE.session_pool`` から選ぶ。
+    """Pick the session (ChatSession/FallbackSession) to use for a new prompt
+    out of ``STATE.session_pool``.
 
-    まず既存の安全な経路を最優先で試す: 「既存スロットの処理済みトークン列
-    全体が新プロンプトの接頭辞になっている (= 純粋な追記)」スロットが
-    あれば、キャッシュには一切触れずそのまま使う。会話の身元を messages
-    の内容から推測する (システムプロンプトのハッシュ等) のではなく、
-    SpecEngine の ChatSession が単一セッションで既にやっている LCP 判定
-    (mlxturbo/spec.py) をプール全体に広げただけなので、動的に変化しうる
-    システムプロンプト (現在時刻の埋め込み等) が混ざっていても「一致
-    しなければ次点へ」に自然に倒れる。一致するスロットが複数ありうる
-    状況では最長一致を優先する。
+    The existing safe path is tried first, with top priority: if there is a
+    slot whose entire already-processed token sequence is a prefix of the new
+    prompt (= a pure append), it is used as-is without touching the cache at
+    all. Rather than guessing the identity of the conversation from the content
+    of the messages (hashing the system prompt, etc.), this merely widens to
+    the whole pool the LCP test that SpecEngine's ChatSession already performs
+    for a single session (mlxturbo/spec.py), so even when a dynamically
+    changing system prompt (an embedded current timestamp, say) is involved, it
+    degrades naturally to "if it does not match, go to the next candidate".
+    Where several slots could match, the longest match wins.
 
-    全体一致が無ければ、部分一致 (処理済み列の一部だけが新プロンプトの
-    接頭辞) の中で LCP が長い順に、2 段階で再利用を試す (llama.cpp と同様、
-    最長共通接頭辞まで再利用してから戻す発想):
+    If there is no whole-sequence match, reuse is attempted in two stages over
+    the partial matches (only part of the processed sequence is a prefix of the
+    new prompt), in order of decreasing LCP (the same idea as llama.cpp: reuse
+    up to the longest common prefix, then roll back):
 
-    1. KV キャッシュをその LCP まで実際に巻き戻せるか (``_try_trim_session_
-       cache``)。構成する全レイヤーが trim 可能なときだけ成功し、成功すれば
-       ``processed`` を LCP 長へちょうど切り詰められる (差分 prefill が
-       一切要らない、最も安い経路)。GDN ハイブリッド層 (ArraysCache) が
-       混ざる構成では常に不発に終わる (上記 docstring 参照)。
-    2. 1 が不発なら、``_try_checkpoint_restore_session_cache`` で LCP 以下の
-       直近チェックポイントまで戻せるか試す。trim できるレイヤーはその
-       チェックポイント位置まで trim し、trim できないレイヤー (ArraysCache)
-       はスナップショットを書き戻す — 巻き戻せないものはスナップショットで
-       持つ、という考え方 (mlxturbo/spec.py の CHECKPOINT_RETENTION 参照)。
-       戻れるのはチェックポイント位置までなので、``processed`` はその位置
-       (LCP そのものではない) へ切り詰め、LCP までの差分は続く generate()
-       の通常のチャンク prefill が forward 計算で埋める。MTP 連鎖用の
-       h_last/mtp_cache は復元後の位置に対応する状態を持たないので、成功
-       時は必ず捨てる (``mtp_valid`` も落とす) — KV/GDN の再利用は失わない
-       が、MTP チェーンは次ターン最初から作り直す。
+    1. Can the KV cache actually be rewound to that LCP
+       (``_try_trim_session_cache``)? This succeeds only when every constituent
+       layer is trimmable, and on success ``processed`` can be truncated to
+       exactly the LCP length (the cheapest path, requiring no differential
+       prefill at all). In configurations with GDN hybrid layers (ArraysCache)
+       mixed in, it always comes up empty (see that docstring above).
+    2. If 1 comes up empty, try ``_try_checkpoint_restore_session_cache`` to
+       roll back to the most recent checkpoint at or below the LCP. Layers that
+       can be trimmed are trimmed to that checkpoint position, and layers that
+       cannot (ArraysCache) get the snapshot written back — the idea being that
+       what cannot be rewound is instead held as a snapshot (see
+       CHECKPOINT_RETENTION in mlxturbo/spec.py). Since we can only go back as
+       far as the checkpoint position, ``processed`` is truncated to that
+       position (not to the LCP itself), and the gap up to the LCP is filled in
+       by forward computation in the ordinary chunked prefill of the subsequent
+       generate(). Because the h_last/mtp_cache used for the MTP chain hold no
+       state corresponding to the restored position, they are always discarded
+       on success (and ``mtp_valid`` is cleared too) — the KV/GDN reuse is not
+       lost, but the MTP chain is rebuilt from scratch on the next turn.
 
-    どちらも不発なら (使えるチェックポイントも無ければ) この候補は諦め、
-    次点の LCP 候補へ、それも尽きれば従来どおり新規スロットへ倒す。誤った/
-    半端な状態のスロットを掴んで壊れることは無い。
+    If both come up empty (and there is no usable checkpoint either), this
+    candidate is abandoned in favour of the next LCP candidate, and when those
+    run out we fall back to a new slot as before. There is no way to grab a
+    slot in a wrong/half-finished state and break.
 
-    候補が 1 つも無ければ、プールが上限未満なら新規スロットを、上限なら
-    最も長く未使用のスロット (先頭 = LRU) を追い出して新規スロットを
-    割り当てる。
+    If there is no candidate at all, a new slot is allocated when the pool is
+    below its limit, and when it is at the limit the least recently used slot
+    (the head = LRU) is evicted first and then a new slot allocated.
 
-    呼び出し側は ``STATE.lock`` を保持した状態でこれを呼ぶこと — プール自体
-    への読み書きはこの関数もその後の session.publish/invalidate も排他して
-    いない (直列化ロックに守られている前提)。ロックを外す (次のスケジューラ
-    の回) ときは、ここにも別途排他が要る。
+    The caller must invoke this while holding ``STATE.lock`` — neither this
+    function nor the session.publish/invalidate that follows performs any
+    mutual exclusion on reads and writes of the pool itself (the assumption is
+    that the serialization lock protects it). When the lock is removed (the
+    next scheduler pass), separate mutual exclusion will be needed here too.
     """
 
     pool = STATE.session_pool
@@ -533,7 +582,8 @@ def _select_session(prompt_ids: list[int]):
             i += 1
         return i
 
-    # 1st pass: 全体一致 (純粋な追記) — キャッシュに触れない、既存の安全経路。
+    # 1st pass: whole-sequence match (a pure append) — the existing safe path,
+    # which does not touch the cache.
     best_key = None
     best_lcp = -1
     for key, sess in pool.items():
@@ -549,8 +599,8 @@ def _select_session(prompt_ids: list[int]):
         pool.move_to_end(best_key)
         return pool[best_key]
 
-    # 2nd pass: 部分一致。LCP が長い候補から順に、実際に巻き戻せるスロット
-    # が見つかるまで試す。
+    # 2nd pass: partial matches. Try candidates in order of decreasing LCP
+    # until a slot that can actually be rewound is found.
     partial = []
     for key, sess in pool.items():
         pl = sess.processed
@@ -594,27 +644,29 @@ def _select_session(prompt_ids: list[int]):
 
 
 async def _select_session_on_executor(prompt_ids: list[int]):
-    """``_select_session`` を ``STATE.executor`` (モデルをロードしたのと同じ
-    専用ワーカースレッド) 上で実行する。
+    """Run ``_select_session`` on ``STATE.executor`` (the same dedicated worker
+    thread that loaded the model).
 
-    ``_run_generate`` の docstring/直前コメントにある不変条件 (MLX の計算
-    グラフ・KV キャッシュはロード時のスレッドに紐づくため、別スレッドで
-    触ると "There is no Stream(gpu, N) in current thread" で落ちる、実測
-    確認済み) は ``STATE.runner.generate`` だけの話ではない — 全体一致
-    (純粋な追記) の 1st pass は ``sess.processed`` (Python の int リスト)
-    を読むだけなので無害だが、2026-08-29 に ``_try_trim_session_cache``/
-    ``_try_checkpoint_restore_session_cache`` が実際に触る 2nd pass
-    (``cache.trim()``、``indexer.keys`` のスライス、
-    ``restore_untrimmable_caches`` の ``c.state = state`` 代入) は同じ
-    意味で実際の MLX 配列操作であり、この関数を呼び出し側のイベント
-    ループのスレッドで直接実行すると同じエラーで落ちる (実測: thinking
-    有効の 2 ターン目、履歴が処理済み列の途中で分岐して 2nd pass の
-    checkpoint 復元が実際に発火したときに再現した)。1st pass しか通らない
-    経路 (このサーバーの既存テストの大半) は元々何も MLX 配列を触らない
-    ため症状が出ず、見逃されていた。
+    The invariant stated in ``_run_generate``'s docstring and the comment just
+    above it (MLX's computation graph and KV cache are bound to the thread that
+    loaded them, so touching them from another thread crashes with "There is no
+    Stream(gpu, N) in current thread"; confirmed by measurement) is not only
+    about ``STATE.runner.generate`` — the 1st pass for a whole-sequence match
+    (a pure append) merely reads ``sess.processed`` (a Python list of ints) and
+    is therefore harmless, but as of 2026-08-29 the 2nd pass that
+    ``_try_trim_session_cache``/``_try_checkpoint_restore_session_cache``
+    actually touch (``cache.trim()``, slicing ``indexer.keys``, the
+    ``c.state = state`` assignment in ``restore_untrimmable_caches``) consists
+    of real MLX array operations in the same sense, and running this function
+    directly on the caller's event-loop thread crashes with the same error
+    (measured: it reproduced on the 2nd turn with thinking enabled, when the
+    history diverged partway through the processed sequence and the 2nd pass's
+    checkpoint restore actually fired). Paths that only ever go through the 1st
+    pass (most of this server's existing tests) never touched an MLX array in
+    the first place, so the symptom did not appear and this was overlooked.
 
-    ``STATE.lock`` を held のまま呼ぶこと (``_select_session`` 自身の
-    docstring と同じ前提) — ここでは新たに獲得し直さない。
+    Call this while still holding ``STATE.lock`` (the same premise as
+    ``_select_session``'s own docstring) — it is not re-acquired here.
     """
 
     loop = asyncio.get_running_loop()
@@ -622,17 +674,19 @@ async def _select_session_on_executor(prompt_ids: list[int]):
 
 
 def _try_reserve_queue_slot() -> bool:
-    """``STATE.lock`` を使う (=生成を伴う) 4 経路が、実際に待ち行列へ並ぶ
-    前に呼ぶ。``STATE.queue_depth`` は「ロック待ち + 現在処理中」の合計
-    (直列化ロックの容量が 1 なので、単純にこの数だけで待ち行列の深さを
-    表せる)。上限 (``--max-queue``、既定 8) に達していれば枠を確保せず
-    False を返す (呼び出し側は 503 を返す)。
+    """Called by the 4 paths that use ``STATE.lock`` (= that generate) before
+    they actually queue up. ``STATE.queue_depth`` is the sum of "waiting for
+    the lock + currently being processed" (since the serialization lock has a
+    capacity of 1, this single number is enough to express the queue depth).
+    If the limit (``--max-queue``, default 8) has been reached, no slot is
+    reserved and False is returned (the caller responds with 503).
 
-    非ストリーミングはエンドポイント関数自身の finally で、ストリーミングは
-    生成側 (``_openai_stream`` 等) の finally で ``_release_queue_slot`` を
-    呼んで対にする — ストリーミングは StreamingResponse を組み立てる前
-    (この関数の直後) で確保するが、解放は実際に生成が終わる/切断される
-    ジェネレータ側でしか検知できないため。
+    The matching ``_release_queue_slot`` is called in the endpoint function's
+    own finally for non-streaming, and in the finally of the generating side
+    (``_openai_stream`` and friends) for streaming — streaming reserves the
+    slot before the StreamingResponse is assembled (immediately after this
+    function), but the release can only be detected on the generator side,
+    where generation actually finishes or the connection is dropped.
     """
 
     if STATE.queue_depth >= STATE.max_queue:
@@ -671,21 +725,24 @@ _SSE_KEEPALIVE_LINE = ": keepalive\n\n"
 
 
 async def _await_with_keepalive(coro, interval: float = _SSE_KEEPALIVE_INTERVAL):
-    """``coro`` の完了を待つ間、``interval`` 秒おきに SSE keepalive コメント行
-    (``("keepalive", line)``) を yield し、完了したら最後に
-    ``("result", 戻り値)`` を yield して終わる async generator。
+    """An async generator that, while waiting for ``coro`` to complete, yields
+    an SSE keepalive comment line (``("keepalive", line)``) every ``interval``
+    seconds, and once it completes yields ``("result", return value)`` last and
+    finishes.
 
-    実クライアント (プレフィル支配のワークロード、実測: Claude Code の 97k
-    トークンで約 3 分) が最初のトークンが出るまでの間コネクションをタイム
-    アウトで切るのを防ぐ (server.py 冒頭の docstring 参照)。SSE のコメント行
-    (``:`` で始まる行) は仕様上クライアントに無視されるため、ストリーミング
-    中のどこに混ざっても安全。
+    This stops real clients from timing out and dropping the connection while
+    waiting for the first token in a prefill-dominated workload (measured:
+    about 3 minutes for Claude Code's 97k tokens; see the docstring at the top
+    of server.py). SSE comment lines (lines beginning with ``:``) are ignored
+    by clients per the specification, so it is safe to mix them in anywhere
+    during streaming.
 
-    呼び出し側 (StreamingResponse を返すジェネレータ) が ``aclose()`` される
-    (クライアント切断) と ``GeneratorExit`` がここへ届く。``CancelledError``
-    と合わせて ``BaseException`` で受けて ``task`` を確実にキャンセルしてから
-    再送出する — 握り潰したまま放置すると ``task`` (ロック取得や
-    ``queue.Queue.get`` の待ち) が孤児のまま残る。
+    If the caller (the generator returned by StreamingResponse) is
+    ``aclose()``-d (client disconnect), ``GeneratorExit`` arrives here. Along
+    with ``CancelledError`` it is caught as ``BaseException`` so that ``task``
+    is reliably cancelled before re-raising — swallowing it and moving on would
+    leave ``task`` (waiting on a lock acquisition or on ``queue.Queue.get``)
+    orphaned.
     """
 
     task = asyncio.ensure_future(coro)
@@ -737,30 +794,34 @@ async def _acquire_lock_with_keepalive(
 
 
 def _requeue_front(q: "queue.Queue", item) -> None:
-    """keepalive 待ちのために ``q.get()`` で覗き見た最初の1件を、順序を
-    保ったまま ``q`` の先頭へ戻す小細工。既存の ``while True: kind, payload =
-    await asyncio.to_thread(q.get)`` ループ本体を一切変更せず、次の
-    ``q.get()`` で同じ要素をもう一度取れるようにする。``worker()`` スレッドは
-    ``q.put`` でしか触らないので、消費側だけのこの操作に ``q.mutex`` を
-    取れば競合しない。"""
+    """A small trick that puts back at the head of ``q``, order preserved, the
+    first item that was peeked at with ``q.get()`` in order to drive
+    keepalives. It lets the next ``q.get()`` fetch the same element again
+    without changing the body of the existing
+    ``while True: kind, payload = await asyncio.to_thread(q.get)`` loop at all.
+    The ``worker()`` thread only ever touches the queue through ``q.put``, so
+    taking ``q.mutex`` for this consumer-side-only operation avoids any
+    race."""
 
     with q.mutex:
         q.queue.appendleft(item)
 
 
-# ---------- 入力の正規化・検証 ----------
+# ---------- Normalization and validation of input ----------
 
 
 class ContentNormalizationError(ValueError):
-    """content の正規化中に見つかったクライアント側の入力不備の基底クラス。
-    5xx ではなく 400 (各プロトコルのエラー形式) で返すためのマーカー。"""
+    """Base class for client-side input defects found while normalizing
+    content. A marker that makes them come back as 400 (in each protocol's
+    error format) instead of 5xx."""
 
 
 class MultimodalContentError(ContentNormalizationError):
-    """content にテキスト以外のブロック (image_url/image/input_audio 等) が
-    含まれていた。mlxturbo はテキスト専用 (convert_flash.py が変換時に
-    vision_tower.*/model.visual.* を落としている) なので、黙って読み飛ばすと
-    クライアントは画像が読まれたと思って会話を続けてしまう。400 で明示する。
+    """The content contained a non-text block (image_url/image/input_audio and
+    the like). mlxturbo is text-only (convert_flash.py drops
+    vision_tower.*/model.visual.* during conversion), so silently skipping such
+    a block would leave the client believing the image was read and continuing
+    the conversation on that basis. Say so explicitly with a 400.
     """
 
     def __init__(self, block_type):
@@ -771,23 +832,26 @@ class MultimodalContentError(ContentNormalizationError):
 
 
 class InvalidContentError(ContentNormalizationError):
-    """content の形そのものが壊れている (キー欠落・型不一致等)。黙って空文字や
-    str() に丸めると壊れた入力がそのまま空プロンプトとして通ってしまうので、
-    ここで弾いて 400 にする。"""
+    """The shape of the content itself is broken (a missing key, a type
+    mismatch, and so on). Silently coercing it to an empty string or to str()
+    would let the broken input through as an empty prompt, so it is rejected
+    here with a 400."""
 
 
 def _content_to_text(content) -> str:
-    """OpenAI/Anthropic どちらの content 形式 (文字列 or ブロックのリスト) も
-    プレーンテキストへ落とす。tokenizer.apply_chat_template は文字列の
-    content しか想定していないため。
+    """Reduce either the OpenAI or the Anthropic content format (a string, or a
+    list of blocks) to plain text, because tokenizer.apply_chat_template only
+    expects string content.
 
-    ``type: "text"`` だけのブロック列は単一文字列と同じ結果に結合する。
-    それ以外の type (image_url/image/input_audio 等) を見つけたら
-    ``MultimodalContentError`` を送出する。それ以外の壊れた形 (content が
-    無い/null、ブロックに type が無い、text ブロックの text が文字列でない、
-    content 自体が文字列でもリストでもない) は黙って "" や str(...) に丸め
-    ず ``InvalidContentError`` を送出する: 壊れた入力を空プロンプトとして
-    通すと 500 にはならないが原因が分からない挙動になる。
+    A block list consisting solely of ``type: "text"`` blocks is joined into
+    the same result as a single string. If any other type (image_url/image/
+    input_audio and the like) is found, ``MultimodalContentError`` is raised.
+    Any other broken shape (content missing/null, a block without a type, a
+    text block whose text is not a string, content that is neither a string nor
+    a list) raises ``InvalidContentError`` rather than being silently coerced
+    to "" or str(...): letting broken input through as an empty prompt does not
+    produce a 500, but it does produce behavior whose cause cannot be worked
+    out.
     """
 
     if content is None:
@@ -823,8 +887,9 @@ def _content_to_text(content) -> str:
 
 
 def _validate_messages_shape(messages) -> str | None:
-    """messages が文字列や数値のリストだったりすると、後続の m.get(...) が
-    AttributeError で 500 になる。形だけ先に確認して 400 で弾く。"""
+    """If messages is a list of strings or numbers, the subsequent m.get(...)
+    raises AttributeError and turns into a 500. Check just the shape up front
+    and reject with a 400."""
 
     if not isinstance(messages, list):
         return "'messages' must be a list"
@@ -834,17 +899,18 @@ def _validate_messages_shape(messages) -> str | None:
     return None
 
 
-# ---------- tool calling: 履歴 (tool_calls / tool_result) の正規化 ----------
+# ---------- tool calling: normalizing history (tool_calls / tool_result) ----------
 #
-# apply_chat_template に渡す messages は、どちらのプロトコルから来ても
-# OpenAI 形式 (assistant: {"role","content","tool_calls":[{"id","type":
-# "function","function":{"name","arguments": <dict>}}]} / tool 結果:
-# {"role":"tool","tool_call_id","content"}) に揃える。チャットテンプレート
-# 自体が (mlx_lm の tool_parser 自動選択と同様に) OpenAI/Qwen 系の tool
-# calling 規約を前提にしているため。arguments は dict のまま渡す
-# (mlx_lm.server.process_message_content も同様に json.loads してから
-# テンプレートへ渡している — テンプレートは大抵 tojson でシリアライズし
-# 直すので、文字列を二重にエンコードしてはいけない)。
+# Whichever protocol they came from, the messages handed to
+# apply_chat_template are unified into the OpenAI format
+# (assistant: {"role","content","tool_calls":[{"id","type":
+# "function","function":{"name","arguments": <dict>}}]} / tool result:
+# {"role":"tool","tool_call_id","content"}), because the chat template itself
+# assumes the OpenAI/Qwen-family tool calling convention (just as mlx_lm's
+# automatic tool_parser selection does). arguments is passed through as a dict
+# (mlx_lm.server.process_message_content likewise runs json.loads before
+# handing it to the template — templates usually re-serialize it with tojson,
+# so the string must not be encoded twice).
 
 
 def _normalize_openai_messages(messages: list[dict]) -> list[dict]:
@@ -953,16 +1019,17 @@ def _normalize_anthropic_messages(messages: list[dict]) -> list[dict]:
                     {"role": "tool", "content": result_text, "tool_call_id": tuid}
                 )
             elif btype in ("thinking", "redacted_thinking"):
-                # 拡張思考 + tool use の Anthropic 規約: 直前ターンの
-                # thinking/redacted_thinking ブロックは次ターンの履歴に
-                # そのまま含めて送り返す必要がある (公式ドキュメントで
-                # 明記)。このサーバー自身が thinking 有効時にこのブロックを
-                # 返している (このモジュール内で "thinking" ブロックを組み
-                # 立てている箇所を参照) ので、tool を使う複数ターンの会話を
-                # 送り返すクライアント (例: Claude Code) は確実にこの型を
-                # 履歴へ含めてくる。mlxturbo 自身が発行した thinking signature
-                # は改変されていないことを確認する (他 provider の opaque
-                # signature は解釈できないので、そのまま受け付ける)。
+                # The Anthropic convention for extended thinking + tool use:
+                # the previous turn's thinking/redacted_thinking blocks must be
+                # sent back verbatim as part of the next turn's history (stated
+                # explicitly in the official documentation). This server itself
+                # returns such blocks when thinking is enabled (see where a
+                # "thinking" block is assembled in this module), so a client
+                # that sends back a multi-turn conversation using tools (e.g.
+                # Claude Code) will certainly include this type in the history.
+                # Verify that a thinking signature issued by mlxturbo itself
+                # has not been tampered with (opaque signatures from other
+                # providers cannot be interpreted, so they are accepted as-is).
                 if btype == "thinking":
                     thinking = block.get("thinking")
                     if not isinstance(thinking, str):
@@ -975,18 +1042,19 @@ def _normalize_anthropic_messages(messages: list[dict]) -> list[dict]:
                         raise InvalidContentError(
                             "thinking block was modified after its signature was issued"
                         )
-                # 中身をモデルに再度読ませる必要は無い
-                # (thinking 対応チャットテンプレートは確定した過去ターンの
-                # think 内容を履歴から落とす想定 — _apply_template の
-                # docstring 参照) ので、ここでは 400 にせず読み飛ばすだけ
-                # にする。
+                # There is no need to make the model read the contents again
+                # (a thinking-aware chat template is expected to drop the think
+                # contents of settled past turns from the history — see the
+                # _apply_template docstring), so rather than returning a 400 we
+                # simply skip it here.
                 pass
             else:
                 raise MultimodalContentError(btype)
-        # tool_result (前ターンの結果) はこのメッセージの通常テキストより
-        # 先に role: "tool" として並べる。同じ user メッセージ内でテキスト
-        # と tool_result が混在するのは稀だが、その場合も出現順を保つ
-        # (tool_result 群 -> このメッセージ自身のテキスト)。
+        # tool_result (the previous turn's results) is laid out as
+        # role: "tool" ahead of this message's ordinary text. Text and
+        # tool_result rarely coexist within the same user message, but even
+        # then the order of appearance is preserved (the tool_result group ->
+        # this message's own text).
         out.extend(tool_result_msgs)
         joined_text = "".join(text_parts)
         if role == "assistant" and tool_calls:
@@ -997,11 +1065,12 @@ def _normalize_anthropic_messages(messages: list[dict]) -> list[dict]:
 
 
 def _naive_prompt_ids(messages: list[dict]):
-    """tokenizer にチャットテンプレートが無いモデル向けの素朴なフォールバック。
+    """A naive fallback for models whose tokenizer has no chat template.
 
-    role: content を並べて素の文字列にするだけ。Qwen 系限定の前提を持ち
-    込まない (将来 gemma/kimi/glm を載せても、チャットテンプレートさえ
-    あればそちらを使い、無ければここに落ちる)。
+    It merely lines up "role: content" into a plain string. No Qwen-family-only
+    assumption is brought in (if gemma/kimi/glm are served in the future, their
+    chat template is used whenever there is one, and only otherwise do we land
+    here).
     """
 
     lines = [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages]
@@ -1012,28 +1081,30 @@ def _naive_prompt_ids(messages: list[dict]):
 def _apply_template(
     messages: list[dict], enable_thinking: bool | None = None, tools: list | None = None
 ):
-    """``enable_thinking`` は標準フィールド (reasoning_effort/thinking) から
-    解決済みの値。省略時 (None) はテンプレートの既定に任せる — mlx_lm の
-    TokenizerWrapper.apply_chat_template は enable_thinking が渡されなければ
-    ``self.has_thinking`` を自分で補う (thinking 対応モデルは既定 on)。
+    """``enable_thinking`` is the value already resolved from the standard
+    fields (reasoning_effort/thinking). When omitted (None) the template's own
+    default is left in charge — if enable_thinking is not passed, mlx_lm's
+    TokenizerWrapper.apply_chat_template fills in ``self.has_thinking`` itself
+    (thinking-capable models default to on).
 
-    thinking が有効なテンプレートの一部は、確定した過去ターンの assistant
-    メッセージを履歴へ組み込む際に <think>...</think> を落とす (再度読ませる
-    必要がないため)。そのため実際に生成されたトークン列より次ターンの
-    prompt が短くなり、ChatSession の LCP 再利用 (前回処理列がそのまま新
-    prompt の接頭辞であることを要求する) が原理的に成立しなくなる。
-    enable_thinking=False (reasoning_effort: "none" 等) を渡せばこの型の
-    モデルでも再利用の対象に戻る。
+    Some thinking-enabled templates drop <think>...</think> when folding a
+    settled past turn's assistant message into the history (because there is no
+    need to make the model read it again). The next turn's prompt is therefore
+    shorter than the token sequence that was actually generated, and
+    ChatSession's LCP reuse (which requires the previously processed sequence
+    to be a prefix of the new prompt as-is) can no longer hold even in
+    principle. Passing enable_thinking=False (reasoning_effort: "none", etc.)
+    brings this kind of model back into scope for reuse.
 
-    ``tools`` は tool_choice 解決後の OpenAI 形式の tools 配列 (None なら
-    このターンはツールを見せない)。呼び出し側が既に
-    ``_check_tool_calling_support`` で ``tokenizer.has_tool_calling`` を
-    確認済みである前提 — ここでは渡された tools をそのまま
-    ``apply_chat_template(tools=...)`` へ転送するだけ (HF の
-    apply_chat_template は tools を第一級の kwarg として受け付けるので、
-    黙って無視されることはない — 無視されるとしたらそれは
-    has_tool_calling が拾えていないモデルであり、その判定は呼び出し側の
-    責任)。
+    ``tools`` is the OpenAI-format tools array after tool_choice has been
+    resolved (None means no tools are shown to the model this turn). The
+    premise is that the caller has already checked
+    ``tokenizer.has_tool_calling`` via ``_check_tool_calling_support`` — here
+    the tools that were passed in are simply forwarded to
+    ``apply_chat_template(tools=...)`` (HF's apply_chat_template accepts tools
+    as a first-class kwarg, so it will not be silently ignored — if it were
+    ignored, that would be a model where has_tool_calling is not being picked
+    up, and making that determination is the caller's responsibility).
     """
 
     kwargs = {"add_generation_prompt": True}
@@ -1050,14 +1121,16 @@ def _apply_template(
         except ValueError:
             return _naive_prompt_ids(messages)
     except ValueError:
-        # チャットテンプレートを持たないモデル (chat_template が未設定)。
+        # A model with no chat template (chat_template is unset).
         return _naive_prompt_ids(messages)
 
 
-# reasoning_effort -> thinking トークン予算の目安。mlxturbo は思考の深さを
-# 直接は調整できないので、予算 (ThinkingRouter が数える生成済みトークン数の
-# 上限) に写して実際に効かせる。未知の値は 400 にせず medium 相当とする
-# (将来 effort の値が増えても壊れない)。
+# Rough mapping from reasoning_effort to a thinking token budget. mlxturbo
+# cannot adjust the depth of thinking directly, so the value is mapped to a
+# budget (the upper limit on the number of generated tokens ThinkingRouter
+# counts) to make it actually take effect. An unknown value is treated as
+# medium rather than rejected with a 400 (so that adding effort values in the
+# future does not break anything).
 _REASONING_EFFORT_BUDGET = {
     "minimal": 512,
     "low": 2048,
@@ -1070,13 +1143,15 @@ _REASONING_EFFORT_DEFAULT_BUDGET = _REASONING_EFFORT_BUDGET["medium"]
 
 
 def _resolve_thinking(body: dict, protocol: str) -> tuple[bool | None, int | None, str | None]:
-    """標準フィールドだけを読み、(enable_thinking 用の kwarg, 予算, エラー)
-    を返す。mlxturbo 独自フィールドは無い — 何も指定が無ければ
-    (None, None, None) (テンプレート任せ・予算強制なし)。
+    """Read only the standard fields and return (kwarg for enable_thinking,
+    budget, error). There are no mlxturbo-specific fields — if nothing is
+    specified, this returns (None, None, None) (leave it to the template, no
+    budget enforced).
 
-    予算: None = 強制なし (自然に終わるまで待つ)、0 = thinking 完全オフ、
-    正の整数 = ThinkingRouter がその数のトークンで打ち切る。呼び出し側で
-    max_tokens に対して clamp すること (ここでは知らないため)。
+    Budget: None = not enforced (wait for it to end naturally), 0 = thinking
+    completely off, a positive integer = ThinkingRouter cuts it off after that
+    many tokens. The caller must clamp it against max_tokens (which is not
+    known here).
     """
 
     if protocol == "openai":
@@ -1124,16 +1199,18 @@ def _resolve_thinking(body: dict, protocol: str) -> tuple[bool | None, int | Non
     )
 
 
-# ---------- tool calling: リクエスト側 (tools/tool_choice の検証・解決) ----------
+# ---------- tool calling: request side (validating/resolving tools/tool_choice) ----------
 #
-# tokenizer.apply_chat_template の ``tools=`` に渡す形式は OpenAI 形式
-# (``[{"type": "function", "function": {"name", "description", "parameters"}}]``)
-# に統一する。Anthropic の ``input_schema`` 形式はここで OpenAI 形式へ変換
-# してから渡す (jinja 側のテンプレートはどのみち Qwen 系の json_tools 前提
-# なので、テンプレートへ渡す形は 1 通りに揃えておいたほうが破綻しにくい)。
-# tokenizer.tool_parser (mlx_lm 側で自動選択されるモデル固有パーサ、例:
-# qwen3_coder は tools の parameters.properties から引数の型を引く) もこの
-# OpenAI 形式の tools を期待するので、同じ変換結果を使い回せる。
+# The format passed to tokenizer.apply_chat_template's ``tools=`` is unified on
+# the OpenAI format
+# (``[{"type": "function", "function": {"name", "description", "parameters"}}]``).
+# Anthropic's ``input_schema`` format is converted to the OpenAI format here
+# before being passed along (the jinja template assumes Qwen-family json_tools
+# anyway, so keeping the shape handed to the template down to a single variant
+# is less likely to fall apart). tokenizer.tool_parser (the model-specific
+# parser mlx_lm selects automatically; qwen3_coder, for example, looks up
+# argument types from the tools' parameters.properties) also expects tools in
+# this OpenAI format, so the same conversion result can be reused for it.
 
 
 def _validate_openai_tools(tools) -> str | None:
@@ -1174,14 +1251,16 @@ def _anthropic_tools_to_openai(tools: list[dict]) -> list[dict]:
 
 
 def _resolve_tool_choice_openai(body: dict) -> tuple[list | None, str | None]:
-    """``tools``/``tool_choice`` (OpenAI 形式) を読み、apply_chat_template へ
-    渡す tools (OpenAI 形式のまま) を解決する。tools が無い/空なら
-    (None, None) (tool_choice は無視する — 実 API も同様)。
+    """Read ``tools``/``tool_choice`` (OpenAI format) and resolve the tools to
+    hand to apply_chat_template (still in OpenAI format). If tools is
+    missing/empty, return (None, None) (tool_choice is ignored — the real API
+    behaves the same way).
 
-    ``tool_choice: "none"`` は「tools を渡さない」で済ませる (このターンは
-    ツールを見せない、渡された tools 自体は無視)。``"required"`` と特定
-    関数指定は、モデル側を強制する手段が無いので 400 にする (黙って auto
-    として扱わない)。
+    ``tool_choice: "none"`` is handled simply by not passing tools at all (no
+    tools are shown to the model this turn; the tools that were passed in are
+    themselves ignored). ``"required"`` and naming a specific function are
+    rejected with a 400, because there is no way to force the model's hand (we
+    do not silently treat them as auto).
     """
 
     tools = body.get("tools")
@@ -1212,9 +1291,10 @@ def _resolve_tool_choice_openai(body: dict) -> tuple[list | None, str | None]:
 
 
 def _resolve_tool_choice_anthropic(body: dict) -> tuple[list | None, str | None]:
-    """Anthropic 形式版。戻り値の tools は (Anthropic 形式のままではなく)
-    ``_anthropic_tools_to_openai`` で OpenAI 形式へ変換済みのもの — 呼び出し
-    側は apply_chat_template/tool_parser のどちらにもこれをそのまま渡せる。
+    """The Anthropic-format version. The returned tools are not left in
+    Anthropic format but have already been converted to the OpenAI format by
+    ``_anthropic_tools_to_openai`` — the caller can pass them straight to
+    either apply_chat_template or tool_parser.
     """
 
     tools = body.get("tools")
@@ -1242,11 +1322,12 @@ def _resolve_tool_choice_anthropic(body: dict) -> tuple[list | None, str | None]
 
 
 def _check_tool_calling_support(resolved_tools) -> str | None:
-    """resolved_tools (tool_choice 解決後、None なら今回はツールを見せない)
-    が None でなければ、tokenizer が tool_call マーカーを持つか
-    (``has_tool_calling``、mlx_lm の TokenizerWrapper がチャットテンプレート
-    文字列から自動検出する — has_thinking と同じ仕組み) を確認する。持た
-    なければ黙って無視せず 400 にする。
+    """If resolved_tools (after tool_choice resolution; None means no tools are
+    shown this time) is not None, check whether the tokenizer has tool_call
+    markers (``has_tool_calling``, which mlx_lm's TokenizerWrapper detects
+    automatically from the chat template string — the same mechanism as
+    has_thinking). If it does not, return a 400 rather than silently ignoring
+    the request.
     """
 
     if resolved_tools is None:
@@ -1261,29 +1342,32 @@ def _check_tool_calling_support(resolved_tools) -> str | None:
 
 
 def _prompt_already_thinking(prompt_ids: list[int]) -> bool:
-    """``_apply_template`` が描画したプロンプトが、未閉鎖の thinking ブロック
-    で終わっているか (= チャットテンプレート自身が生成プロンプトの末尾で
-    既に ``<think>`` を開いているか) を判定する。
+    """Determine whether the prompt rendered by ``_apply_template`` ends with an
+    unclosed thinking block (= whether the chat template itself has already
+    opened ``<think>`` at the end of the generation prompt).
 
-    実モデル (Qwen3.6 / Flash-Next) で確認済みのバグ: これらのテンプレートは
-    ``<|im_start|>assistant\\n<think>\\n`` のように、モデルへ渡す時点で既に
-    ``<think>`` を開いた状態でプロンプトを終える。モデル自身は (開き済みの
-    マーカーをもう一度は出さないので) ``<think>`` を生成しない。一方
-    ``ThinkingRouter`` は常に ``phase="detect"`` (冒頭が think_start と一致
-    するかをこれから待つ) から始まるため、「冒頭が一致しない = 考えていない」
-    と誤判定して全文を content へ流してしまい、思考が本文に混入したうえ
-    ``</think>`` だけが閉じ側の生テキストとして残る。
+    A bug confirmed on real models (Qwen3.6 / Flash-Next): these templates end
+    the prompt with ``<think>`` already open by the time it is handed to the
+    model, as in ``<|im_start|>assistant\\n<think>\\n``. The model itself does
+    not generate ``<think>`` (it will not emit an already-opened marker a
+    second time). ``ThinkingRouter``, meanwhile, always starts from
+    ``phase="detect"`` (waiting to see whether the beginning matches
+    think_start), so it misjudges "the beginning does not match = it is not
+    thinking" and pours the entire output into content; the reasoning then
+    contaminates the body and only the ``</think>`` is left behind as raw
+    closing text.
 
-    判定は「think_start_tokens の最後の出現位置より後ろに think_end_tokens
-    が無く、start より後ろが空白だけ」= 生成プロンプトの末尾が開きっぱなし
-    の thinking ブロック、で行う。末尾の完全一致だけを見ないのは、
-    ``<think>`` の直後に改行トークン等が続くテンプレートで取りこぼさない
-    ため。逆に user/history 内のリテラルな ``<think>`` から assistant の
-    generation suffix までには空白以外の role delimiter が続くので、誤って
-    thinking 開始扱いにしない。
+    The test is "there is no think_end_tokens after the last occurrence of
+    think_start_tokens, and everything after that start is whitespace" = the
+    end of the generation prompt is a thinking block left open. We do not look
+    only for an exact match at the very end, so as not to miss templates where
+    a newline token or similar follows immediately after ``<think>``.
+    Conversely, between a literal ``<think>`` inside the user/history text and
+    the assistant generation suffix there is always a role delimiter that is
+    not whitespace, so such a case is not mistaken for the start of thinking.
 
-    ``has_thinking`` が False (このモデルではそもそも thinking を分離
-    しない) なら常に False。
+    Always False when ``has_thinking`` is False (this model does not separate
+    thinking at all).
     """
 
     tokenizer = STATE.tokenizer
@@ -1330,73 +1414,83 @@ def _prompt_already_thinking(prompt_ids: list[int]) -> bool:
 
 
 class ThinkingRouter:
-    """モデルの生トークン列を reasoning (thinking) / content の 2 チャンネル
-    へ振り分ける。マーカーは推測せず、mlx_lm.TokenizerWrapper の公開 API
-    (``has_thinking``/``think_start_tokens``/``think_end_tokens``、Qwen の
-    ``<think>``/``</think>`` や channel 方式のモデルも同じ口でカバーされる)
-    から引く。引けないモデル (``has_thinking`` が False) では常に content
-    一本になる — 「このモデルでは thinking を分離できない」という意味で、
-    全文が従来どおり本文に入る。
+    """Route the model's raw token stream into the two channels reasoning
+    (thinking) and content. The markers are not guessed but taken from
+    mlx_lm.TokenizerWrapper's public API
+    (``has_thinking``/``think_start_tokens``/``think_end_tokens``, which covers
+    Qwen's ``<think>``/``</think>`` and channel-style models through the same
+    interface). For models where they cannot be obtained (``has_thinking`` is
+    False) there is always a single content channel — meaning "thinking cannot
+    be separated for this model", and the whole output goes into the body as
+    before.
 
-    マーカー境界をまたいで正しくデコードするため、reasoning と content で
-    別々のストリーミング detokenizer を使う (BPE の trailing-space マージ
-    等は各チャンネル内で完結する)。マーカートークン列 (複数トークンのことが
-    ある) を跨いだ誤検出を避けるため、マーカー長ぶんの生トークンを常に
-    バッファして先読みし、一致しないと分かった分だけ確定でどちらかの
-    detokenizer へ流す。
+    To decode correctly across marker boundaries, separate streaming
+    detokenizers are used for reasoning and for content (BPE's trailing-space
+    merging and the like then stay contained within each channel). To avoid
+    false detections spanning a marker token sequence (which can be several
+    tokens long), a marker's worth of raw tokens is always buffered for
+    lookahead, and only the portion known not to match is committed to one
+    detokenizer or the other.
 
-    budget (int | None): thinking ブロック内で許すトークン数の上限。None は
-    無制限 (自然に終わるまで待つ)。0 は「thinking 完全オフ」で、そもそも
-    ルーティングしない。
+    budget (int | None): the upper limit on tokens permitted inside a thinking
+    block. None is unlimited (wait for it to end naturally). 0 means "thinking
+    completely off", in which case no routing happens at all.
 
-    予算超過時にできることの限界: SpecEngine (spec.py) も
-    mlx_lm.generate.stream_generate も、生成の途中で外部から割り込んで
-    「ここで打ち切り、続きを別のプロンプトから作り直す」ライブな口を持たな
-    い (on_tokens の戻り値は見ていない — 呼び出し元を変えても、既存の
-    投機デコードエンジンにその変更を入れない限り実現できない)。そのため
-    ここで実装しているのは「予算に達した後のトークンはクライアントへ転送
-    しない」までで、「思考を強制的に閉じて本文を続けさせる」その場再開は
-    やっていない。budget_exceeded フラグで検知でき、呼び出し側はこれを
-    finish_reason/stop_reason に反映する。
-    (2 段構えの再開そのものは技術的に不可能ではない: 予算に達した時点で
-    現在の generate() 呼び出しを見限り、prompt_ids + それまでに生成された
-    トークン + </think> を新しい prompt として generate() をもう一度呼べば、
-    ChatSession の LCP 再利用によって prefill の再計算は避けられる。ただし
-    ストリーミング/非ストリーミング両経路・SpecRunner/FallbackRunner 両方で
-    このチャンク分割を整合させる実装コストとバグ面積が、この機能の価値に
-    見合わないと判断し、今回は見送った。)
+    The limit of what can be done when the budget is exceeded: neither
+    SpecEngine (spec.py) nor mlx_lm.generate.stream_generate offers a live
+    interface for interrupting a generation from outside to "cut off here and
+    rebuild the rest from a different prompt" (the return value of on_tokens is
+    not looked at — changing the caller alone cannot achieve it without making
+    that change inside the existing speculative decoding engine). So what is
+    implemented here goes only as far as "tokens after the budget is reached
+    are not forwarded to the client"; there is no in-place restart that
+    "forcibly closes the thinking block and makes the model continue with the
+    body". It can be detected via the budget_exceeded flag, which the caller
+    reflects into finish_reason/stop_reason.
+    (The two-stage restart itself is not technically impossible: on reaching
+    the budget, give up on the current generate() call and call generate()
+    again with prompt_ids + the tokens generated so far + </think> as the new
+    prompt; ChatSession's LCP reuse would then avoid recomputing the prefill.
+    However, the implementation cost and bug surface of making this chunk split
+    consistent across both the streaming and non-streaming paths and across
+    both SpecRunner and FallbackRunner were judged not to be worth the value of
+    the feature, so it was deferred this time.)
 
-    tool_calling_enabled (bool): この生成でツール呼び出し検出も行うかどうか
-    (呼び出し側が resolved_tools を渡した = tool_choice が "none" ではなく
-    tools が実際に指定されたか、に対応)。tokenizer 側が tool_call マーカーを
-    持たない場合は無条件で無効になる (``has_thinking`` と同じパターン、
-    ``self.tool_enabled`` 参照)。
+    tool_calling_enabled (bool): whether this generation should also detect
+    tool calls (corresponding to whether the caller passed resolved_tools =
+    whether tool_choice was not "none" and tools were actually specified). It
+    is unconditionally disabled if the tokenizer has no tool_call markers (the
+    same pattern as ``has_thinking``; see ``self.tool_enabled``).
 
-    有効なとき、content フェーズの間 ``tokenizer.tool_call_start_tokens``
-    の出現を先読みで監視し (thinking フェーズが end marker を待つのと同じ
-    ローリングウィンドウ方式)、一致したら "tool" フェーズへ入って
-    ``tokenizer.tool_call_end_tokens`` までのテキストを "tool" チャンネルと
-    して返す (マーカー自体はどちらのチャンネルにも含まれない — mlx_lm の
-    ToolCallFormatter/_process_control_tokens と同じ扱い)。1 回の生成内で
-    ツール呼び出しは複数回起こりうるので content <-> tool は何度でも往復
-    する。"tool" フェーズへの出入りはテキストが空でも必ず ("tool_start", "")
-    / ("tool_end", matched: bool) を 1 回ずつ返すので、呼び出し側はそれを
-    境界として個々の呼び出しをグルーピングできる (feed() が空セグメントを
-    省略する都合上、境界自体を独立したイベントにしないと "たまたま前後の
-    テキストが空だった 2 回の呼び出し" を誤って 1 回に結合してしまう)。
-    ``tool_end`` の bool は「本当に終了マーカーで閉じたか」— False は
-    max_tokens 等で強制的に打ち切られたことを示し、呼び出し側は再構成時に
-    終了マーカー文字列を足さない判断に使う。
+    When enabled, occurrences of ``tokenizer.tool_call_start_tokens`` are
+    watched with lookahead during the content phase (the same rolling-window
+    scheme by which the thinking phase waits for its end marker), and on a
+    match it enters the "tool" phase and returns the text up to
+    ``tokenizer.tool_call_end_tokens`` as the "tool" channel (the markers
+    themselves are included in neither channel — the same treatment as mlx_lm's
+    ToolCallFormatter/_process_control_tokens). Tool calls can occur several
+    times within one generation, so content <-> tool can go back and forth any
+    number of times. Entering and leaving the "tool" phase always returns
+    ("tool_start", "") / ("tool_end", matched: bool) exactly once each, even
+    when the text is empty, so the caller can use those as boundaries for
+    grouping the individual calls (because feed() omits empty segments, without
+    making the boundaries themselves independent events, "two calls that
+    happened to have empty text around them" would be wrongly merged into one).
+    The bool in ``tool_end`` says "did it really close with the end marker" —
+    False indicates it was forcibly cut off by max_tokens or similar, and the
+    caller uses it to decide not to append the end-marker string when
+    reconstructing.
 
-    ``already_thinking`` (bool): ``_apply_template`` が描画したプロンプトの
-    末尾が既に未閉鎖の ``<think>`` で終わっている場合 (``_prompt_already_thinking``
-    参照) に True を渡す。この場合モデル自身は think_start マーカーを生成
-    しない (テンプレート側が既に出している) ので、``phase="detect"`` から
-    始めて先頭が think_start と一致するのを待つと「考えていない」と誤判定
-    してしまう。True なら ``phase`` をいきなり ``"thinking"`` から始める
-    (detect をスキップする) — budget の計上・ストリーミング/非ストリーミング・
-    tool calling の各経路は全て ``phase`` の値だけで分岐しているので、この
-    初期値を変えるだけで全経路に一貫して効く。
+    ``already_thinking`` (bool): pass True when the prompt rendered by
+    ``_apply_template`` already ends with an unclosed ``<think>`` (see
+    ``_prompt_already_thinking``). In that case the model itself does not
+    generate the think_start marker (the template has already emitted it), so
+    starting from ``phase="detect"`` and waiting for the beginning to match
+    think_start would misjudge it as "not thinking". When True, ``phase``
+    starts directly at ``"thinking"`` (skipping detect) — budget accounting,
+    the streaming and non-streaming paths, and tool calling all branch solely
+    on the value of ``phase``, so changing this initial value alone takes
+    effect consistently on every path.
     """
 
     def __init__(
@@ -1417,9 +1511,9 @@ class ThinkingRouter:
         if not self.enabled:
             self.phase = "content"
         elif already_thinking:
-            # テンプレートが既に <think> を開いた状態でプロンプトを終えて
-            # いる。モデルは think_start を生成し直さないので detect を
-            # 経由せず、いきなり thinking フェーズから始める。
+            # The template ended the prompt with <think> already open. The
+            # model will not re-emit think_start, so skip detect and start
+            # directly in the thinking phase.
             self.phase = "thinking"
         else:
             self.phase = "detect"
@@ -1430,9 +1524,11 @@ class ThinkingRouter:
         self.tool_detok = tokenizer.detokenizer
         self.thinking_token_count = 0
         self.budget_exceeded = False
-        # Qwen 系は thinking 終了マーカーの直後に回答との区切りとして
-        # ``\n\n`` を生成する。この framing を可視本文へ混ぜない。ただし
-        # thinking を通らない応答の先頭改行はモデル出力そのものなので触らない。
+        # Qwen-family models generate ``\n\n`` right after the thinking end
+        # marker as a separator from the answer. Do not mix this framing into
+        # the visible body. Leading newlines in a response that never went
+        # through thinking are model output proper, though, so leave them
+        # alone.
         self._strip_post_thinking_newlines = False
         self._start_tokens = list(tokenizer.think_start_tokens) if self.enabled else []
         self._end_tokens = list(tokenizer.think_end_tokens) if self.enabled else []
@@ -1464,10 +1560,10 @@ class ThinkingRouter:
         return True
 
     def _feed_content_token(self, t: int, out: list) -> None:
-        """content フェーズの 1 トークンを処理する。tool ルーティングが
-        無効なら即デコードするだけ (従来どおり)。有効なら
-        ``tool_call_start`` への先読みバッファを持つ ("thinking" フェーズが
-        end marker を待つのと同型のローリングウィンドウ)。"""
+        """Process one token of the content phase. If tool routing is disabled,
+        just decode it immediately (as before). If it is enabled, keep a
+        lookahead buffer for ``tool_call_start`` (a rolling window of the same
+        form by which the "thinking" phase waits for its end marker)."""
 
         if not self.tool_enabled:
             self.content_detok.add_token(t)
@@ -1531,11 +1627,13 @@ class ThinkingRouter:
                     self.phase = "thinking"
                     self.buf = []
                 else:
-                    # 冒頭が think_start と一致しない = このターンは考えて
-                    # いない。貯めていた分は content フェーズのロジック
-                    # (tool_call_start 監視込み) へそのまま再投入する —
-                    # ここで無条件に content_detok へ流すと、たまたま冒頭が
-                    # tool_call_start の先頭と重なっていた場合を取りこぼす。
+                    # The beginning does not match think_start = this turn is
+                    # not thinking. Re-feed everything buffered so far into the
+                    # content phase logic (including tool_call_start
+                    # watching) — pouring it unconditionally into
+                    # content_detok here would miss the case where the
+                    # beginning happened to coincide with the head of
+                    # tool_call_start.
                     self.phase = "content"
                     pending, self.buf = self.buf, []
                     for pt in pending:
@@ -1549,8 +1647,9 @@ class ThinkingRouter:
                         self.buf = []
                         self._strip_post_thinking_newlines = True
                     continue
-                # ウィンドウが end marker 長を超えた分だけ確定で thinking へ
-                # 流す (末尾は常に marker 長ぶん保持して先読みを続ける)。
+                # Commit to thinking only the amount by which the window
+                # exceeds the end marker length (always keeping a marker's
+                # worth at the tail to continue the lookahead).
                 cut = len(self.buf) - len(self._end_tokens)
                 flush, self.buf = self.buf[:cut], self.buf[cut:]
                 for ft in flush:
@@ -1578,14 +1677,15 @@ class ThinkingRouter:
         if self.budget_exceeded:
             return out
         if self.phase == "detect":
-            # マーカー長に届かないまま生成が終わった (極端に短い max_tokens
-            # 等)。安全側で content 扱いにする (tool_call_start 監視込み)。
+            # Generation ended before reaching the marker length (an extremely
+            # small max_tokens, for example). Err on the safe side and treat it
+            # as content (including tool_call_start watching).
             pending, self.buf = self.buf, []
             for t in pending:
                 self._feed_content_token(t, out)
         elif self.phase == "thinking":
-            # </think> を出さないまま max_tokens/eos に達した。バッファに
-            # 残る未確定トークンは thinking として確定させる。
+            # max_tokens/eos was reached without emitting </think>. Commit the
+            # uncommitted tokens left in the buffer as thinking.
             for t in self.buf:
                 if not self._feed_thinking_token(t):
                     break
@@ -1595,9 +1695,9 @@ class ThinkingRouter:
             if seg:
                 out.append(("reasoning", seg))
         elif self.phase == "tool":
-            # </tool_call> を出さないまま max_tokens/eos に達した。バッファに
-            # 残る未確定トークンは tool として確定させ、"tool_end" は
-            # (本当の終了マーカーではないので) False で知らせる。
+            # max_tokens/eos was reached without emitting </tool_call>. Commit
+            # the uncommitted tokens left in the buffer as tool, and report
+            # "tool_end" as False (since it was not a real end marker).
             for t in self.tool_buf:
                 self.tool_detok.add_token(t)
             self.tool_buf = []
@@ -1606,9 +1706,10 @@ class ThinkingRouter:
             if seg:
                 out.append(("tool", seg))
             out.append(("tool_end", False))
-        # content フェーズで tool_call_start の先読み中 (まだ marker と
-        # 確定していないトークン列) のまま生成が終わった分は、確定させて
-        # content 側へ落とす (取りこぼし防止の安全弁)。
+        # Whatever was still in tool_call_start lookahead in the content phase
+        # (a token sequence not yet confirmed to be a marker) when generation
+        # ended is committed and dropped into content (a safety valve against
+        # losing output).
         for t in self.tool_buf:
             self.content_detok.add_token(t)
         self.tool_buf = []
@@ -1620,14 +1721,15 @@ class ThinkingRouter:
 
 
 def _parse_positive_int(raw, cap: int, field_name: str) -> tuple[int, str | None]:
-    """int に変換して 1..cap へ収める。変換できない・0 以下は 400 対象の
-    エラー文字列を返す (呼び出し側が protocol 形式へ包む)。"""
+    """Convert to int and clamp into 1..cap. If it cannot be converted, or is 0
+    or less, return an error string destined for a 400 (the caller wraps it in
+    the protocol's format)."""
 
     try:
         value = int(raw)
     except (TypeError, ValueError):
         return 0, f"'{field_name}' must be an integer"
-    if isinstance(raw, bool):  # bool は int のサブクラスなので明示的に弾く
+    if isinstance(raw, bool):  # bool is a subclass of int, so reject it explicitly
         return 0, f"'{field_name}' must be an integer"
     if value < 1:
         return 0, f"'{field_name}' must be a positive integer"
@@ -1635,10 +1737,11 @@ def _parse_positive_int(raw, cap: int, field_name: str) -> tuple[int, str | None
 
 
 def _resolve_max_tokens_openai(body: dict, cap: int) -> tuple[int, str | None]:
-    """OpenAI では ``max_tokens`` は非推奨、新しい SDK は ``max_completion_tokens``
-    を送る。両方読み、後者を優先する。OpenAI は 0 を不正とする (Anthropic と
-    違い ``max_tokens: 0`` の特別扱いは無い) ので、そのまま _parse_positive_int
-    (1 未満は 400) に通す。"""
+    """In OpenAI, ``max_tokens`` is deprecated and newer SDKs send
+    ``max_completion_tokens``. Read both, preferring the latter. OpenAI treats
+    0 as invalid (unlike Anthropic there is no special handling of
+    ``max_tokens: 0``), so it goes straight through _parse_positive_int (below
+    1 is a 400)."""
 
     raw = body.get("max_completion_tokens")
     if raw is None:
@@ -1649,9 +1752,10 @@ def _resolve_max_tokens_openai(body: dict, cap: int) -> tuple[int, str | None]:
 
 
 def _parse_anthropic_max_tokens(raw, cap: int) -> tuple[int, str | None]:
-    """Anthropic の実 API は ``max_tokens: 0`` を正当な入力として許容する
-    (生成せずに終わる特別なレスポンスを返す)。OpenAI 側の
-    ``_parse_positive_int`` と違い 0 だけは通し、負数と非整数は 400 にする。"""
+    """Anthropic's real API accepts ``max_tokens: 0`` as legitimate input (it
+    returns a special response that ends without generating). Unlike the
+    OpenAI-side ``_parse_positive_int``, 0 alone is let through, while negative
+    numbers and non-integers become a 400."""
 
     try:
         value = int(raw)
@@ -1702,9 +1806,10 @@ def _parse_optional_int(
     raw = body.get(field)
     if raw is None:
         return None, None
-    # bool はサブクラスなので明示的に弾く。float はここでは真の整数値
-    # (5.0 等) でも拒否する: int(1.5) は例外を出さず黙って 1 に切り捨てる
-    # ため、"'field' must be an integer" のつもりが静かに違う値を通してしまう。
+    # bool is a subclass, so reject it explicitly. Floats are rejected here even
+    # when they hold a true integer value (5.0 and the like): int(1.5) raises no
+    # exception and silently truncates to 1, so something meant as "'field' must
+    # be an integer" would quietly let a different value through.
     if isinstance(raw, bool) or not isinstance(raw, int):
         return None, f"'{field}' must be an integer"
     if lo is not None and raw < lo:
@@ -1725,13 +1830,15 @@ def _parse_logit_bias(body: dict) -> tuple[dict[int, float] | None, str | None]:
     return parsed, None
 
 
-# OpenAI と Anthropic のどちらも同じフィールド名 (top_p/top_k/min_p/
-# repetition_penalty/presence_penalty/frequency_penalty/logit_bias/seed) を
-# 使うので、プロトコル分岐なしで共通のパーサ 1 つで足りる (thinking/
-# stop_sequences のように呼び名が違うものだけプロトコル別処理が必要)。
+# OpenAI and Anthropic both use the same field names (top_p/top_k/min_p/
+# repetition_penalty/presence_penalty/frequency_penalty/logit_bias/seed), so a
+# single shared parser with no protocol branching suffices (only things that go
+# by different names, such as thinking/stop_sequences, need per-protocol
+# handling).
 #
-# 指定されなかったキーは戻り値の dict に含めない — Runner.generate 側の
-# デフォルト引数 (= 無効化された値) にそのまま委ねるため。
+# Keys that were not specified are left out of the returned dict — so that
+# Runner.generate's own default arguments (= the disabled values) take over
+# unchanged.
 def _parse_sampling_params(body: dict) -> tuple[dict, str | None]:
     params: dict = {}
 
@@ -1786,18 +1893,23 @@ def _parse_sampling_params(body: dict) -> tuple[dict, str | None]:
     return params, None
 
 
-# サンプリングパラメータの「恒等値」(分布を一切変えない既定値) の一覧。
-# 例えば top_p=1.0 は確率質量を 100% 残すので分布を変えない。SpecRunner が
-# SUPPORTED_SAMPLING_PARAMS に挙げていないキーでも、実際に渡ってきた値が
-# ここに列挙された恒等値なら投機デコードの分布保証を何も脅かさないので、
-# _resolve_runner_for_request は 400 で弾かない (恒等値でない場合はリクエスト
-# 単位降格、項目 7 参照)。マジックナンバーを条件式へ散らさず
-# ここへ集約する。logit_bias は「None または空 dict」が恒等値なので、
-# 値そのものではなく _is_identity_sampling_value 側で特別扱いする。
+# The list of "identity values" for sampling parameters (default values that do
+# not change the distribution at all). top_p=1.0, for example, leaves 100% of
+# the probability mass, so it does not change the distribution. Even for keys
+# that SpecRunner does not list in SUPPORTED_SAMPLING_PARAMS, if the value that
+# actually arrived is one of the identity values enumerated here it threatens
+# nothing about the speculative decoder's distribution guarantee, so
+# _resolve_runner_for_request does not reject it with a 400 (when it is not an
+# identity value, the request is downgraded per request; see item 7). This
+# keeps the magic numbers gathered here instead of scattered through
+# conditionals. For logit_bias the identity value is "None or an empty dict",
+# so it is special-cased inside _is_identity_sampling_value rather than by
+# value.
 #
-# top_k の -1 は 0 と同じく「top-k を無効化する」恒等値として扱う。
-# FallbackRunner が使う mlx_lm.make_sampler も ``top_k > 0`` のときだけ
-# フィルタを有効化するため、この値をそのまま渡しても分布は変わらない。
+# -1 for top_k is treated, like 0, as an identity value that "disables top-k".
+# mlx_lm.make_sampler, which FallbackRunner uses, also enables the filter only
+# when ``top_k > 0``, so passing this value straight through does not change
+# the distribution.
 _IDENTITY_SAMPLING_VALUES: dict[str, tuple] = {
     "top_p": (0.0, 1.0),
     "top_k": (0, -1),
@@ -1809,49 +1921,55 @@ _IDENTITY_SAMPLING_VALUES: dict[str, tuple] = {
 
 
 def _is_identity_sampling_value(name: str, value) -> bool:
-    """``value`` が ``name`` というサンプリングパラメータにとって恒等値
-    (分布を一切変えない値) なら True。未指定 (None) は _parse_sampling_params
-    が params dict に入れない設計だが、防御的にここでも通す。"""
+    """True if ``value`` is an identity value (one that does not change the
+    distribution at all) for the sampling parameter ``name``. By design
+    _parse_sampling_params never puts an unspecified value (None) into the
+    params dict, but defensively it is let through here as well."""
 
     if value is None:
         return True
     if name == "logit_bias":
-        return not value  # None または {} (空 dict) はバイアス無し
+        return not value  # None or {} (an empty dict) means no bias
     return value in _IDENTITY_SAMPLING_VALUES.get(name, ())
 
 
 def _resolve_runner_for_request(
     params: dict, *, logprobs_requested: bool = False
 ) -> tuple[object, str | None, str | None]:
-    """このリクエストで実際に使う runner を決める。戻り値は
-    ``(runner, downgrade_reason, error)``。
+    """Decide which runner this request actually uses. The return value is
+    ``(runner, downgrade_reason, error)``.
 
-    現在の ``STATE.runner`` (SpecRunner/FlashSpecRunner) が受け付けない
-    非恒等サンプリングパラメータ (例: top_p=0.9) や logprobs が指定された
-    場合、以前は 400 で拒否していた (Kimi K3 レビュー項目 7)。実クライアント
-    (opencode/OpenAI SDK 等) は top_p 等を既定値以外でも普通に送ってくるため、
-    投機デコード対応モデルというだけでいきなり弾かれる体験になっていた。
+    When non-identity sampling parameters (top_p=0.9, say) or logprobs are
+    specified that the current ``STATE.runner`` (SpecRunner/FlashSpecRunner)
+    does not accept, they used to be rejected with a 400 (Kimi K3 review item
+    7). Real clients (opencode, the OpenAI SDK, and so on) routinely send top_p
+    and friends with non-default values, so the experience was that merely
+    being a speculative-decoding-capable model got you rejected out of hand.
 
-    ここでは 400 にする代わりに、``STATE.downgrade_runner`` (main() が
-    起動時に用意した非投機の FallbackRunner、runner.py 参照) が使えるなら
-    このリクエストだけそちらへ降格する。投機デコードの分布保証
-    (SpecRunner/FlashSpecRunner docstring 参照) は「投機を使わない」ことで
-    自明に守られるので、値そのものを正しく反映したまま処理できる —
-    黙って降格するのではなく、理由をサーバーログへ出す (呼び出し側は
-    これをレスポンスにも乗せること。「黙って fallback に落ちて気づけない」
-    を防ぐ、このリポジトリ全体の方針 — build_runner の fallback_reason と
-    同じ考え方)。
+    Here, instead of a 400, if ``STATE.downgrade_runner`` (the non-speculative
+    FallbackRunner main() prepared at startup; see runner.py) is available, this
+    request alone is downgraded to it. The speculative decoder's distribution
+    guarantee (see the SpecRunner/FlashSpecRunner docstring) is trivially upheld
+    by "not using speculation", so the request can be served with the values
+    themselves correctly honored — and rather than downgrading silently, the
+    reason is written to the server log (the caller must also put it into the
+    response). This follows this repository's overall policy of preventing
+    "silently falling back to the fallback with no way to notice" — the same
+    idea as build_runner's fallback_reason.
 
-    降格しなかった場合の副作用は元の _check_and_strip_sampling_params と
-    同じ: ``params`` を破壊的に書き換え、現 runner がサポートしないが恒等値
-    なので通すキーを削除する (SpecEngine.generate() 等、**kwargs を持たない
-    generate() への型不一致な引数漏れを防ぐ)。
+    When no downgrade happens, the side effect is the same as in the original
+    _check_and_strip_sampling_params: ``params`` is mutated in place, deleting
+    the keys that the current runner does not support but that are let through
+    because they are identity values (this prevents type-mismatched arguments
+    leaking into a generate() that has no **kwargs, such as
+    SpecEngine.generate()).
 
-    降格もできない (= STATE.downgrade_runner が無い。起動時に既に fallback
-    だったモデルでは常にこの経路) のに非恒等値が来た場合だけ、旧来どおり
-    400 相当のエラー文字列を返す — 通常は起こらない (fallback runner は
-    全キーをサポート宣言しているため) が、将来別の runner 種別が増えたとき
-    の安全網として残す。
+    Only when a non-identity value arrives and a downgrade is also impossible
+    (= there is no STATE.downgrade_runner; a model that was already on the
+    fallback at startup always takes this path) is a 400-worthy error string
+    returned as before — this normally does not happen (the fallback runner
+    declares support for every key), but it is kept as a safety net for when
+    other runner kinds are added in the future.
     """
 
     supported = getattr(STATE.runner, "SUPPORTED_SAMPLING_PARAMS", frozenset())
@@ -1888,18 +2006,19 @@ def _resolve_runner_for_request(
             "sampling against the exact target distribution) assumes temperature-only "
             "sampling; changing the base distribution would silently break that guarantee.",
         )
-    # ここに残っているのは全て「runner がサポートしないが恒等値」のキー。
-    # 分布を変えないので拒否はしないが、runner.generate() が知らない
-    # キーワード引数として受け取らないよう、渡す前に落としておく。
+    # Everything left here is a key that "the runner does not support but that
+    # is an identity value". It does not change the distribution, so it is not
+    # rejected; but drop it before passing it on, so that runner.generate()
+    # does not receive it as a keyword argument it does not know.
     for name in unrecognized:
         del params[name]
     return STATE.runner, None, None
 
 
 def _parse_logprobs_openai_chat(body: dict) -> tuple[bool, int, str | None]:
-    """OpenAI chat-completions の logprobs 契約: ``logprobs: bool`` (既定
-    false) + ``logprobs: true`` のときだけ意味を持つ ``top_logprobs: int``
-    (0-20)。Kimi K3 レビュー項目 17。"""
+    """The logprobs contract of OpenAI chat-completions: ``logprobs: bool``
+    (default false) plus ``top_logprobs: int`` (0-20), which is only meaningful
+    when ``logprobs: true``. Kimi K3 review item 17."""
 
     raw = body.get("logprobs", False)
     if not isinstance(raw, bool):
@@ -1916,8 +2035,9 @@ def _parse_logprobs_openai_chat(body: dict) -> tuple[bool, int, str | None]:
 
 
 def _parse_logprobs_openai_legacy(body: dict) -> tuple[bool, int, str | None]:
-    """OpenAI 旧 ``/v1/completions`` の logprobs 契約: ``logprobs: int | null``
-    そのものが top-N の件数を兼ねる (chat 版のような別の bool は無い)。"""
+    """The logprobs contract of OpenAI's legacy ``/v1/completions``:
+    ``logprobs: int | null`` itself doubles as the top-N count (there is no
+    separate bool as in the chat version)."""
 
     top_n, err = _parse_optional_int(body, "logprobs", 0)
     if err is not None:
@@ -1937,11 +2057,12 @@ def _utf8_bytes_or_none(token: str) -> list[int] | None:
 
 
 def _build_chat_logprobs(entries: list[dict] | None) -> dict | None:
-    """``FallbackRunner.generate`` が返す ``res["logprobs"]``
-    (mlxturbo/runner.py の ``_logprob_entry`` 参照、生成トークン列と 1:1
-    対応する) を OpenAI chat-completions の ``choices[].logprobs`` 形へ
-    変換する。要求されていない/対応していない runner なら呼び出し側が
-    そもそもこれを呼ばない (``res`` に ``"logprobs"`` キー自体が無い)。"""
+    """Convert the ``res["logprobs"]`` returned by ``FallbackRunner.generate``
+    (see ``_logprob_entry`` in mlxturbo/runner.py; it corresponds 1:1 with the
+    generated token sequence) into the ``choices[].logprobs`` shape of OpenAI
+    chat-completions. If it was not requested, or the runner does not support
+    it, the caller does not call this at all (``res`` has no ``"logprobs"`` key
+    in the first place)."""
 
     if not entries:
         return None
@@ -1965,9 +2086,9 @@ def _build_chat_logprobs(entries: list[dict] | None) -> dict | None:
 
 
 def _build_legacy_logprobs(entries: list[dict] | None) -> dict | None:
-    """同じ ``res["logprobs"]`` を旧 ``/v1/completions`` の
-    ``choices[].logprobs`` 形 (``tokens``/``token_logprobs``/``top_logprobs``/
-    ``text_offset`` の並列配列) へ変換する。"""
+    """Convert the same ``res["logprobs"]`` into the ``choices[].logprobs``
+    shape of the legacy ``/v1/completions`` (the parallel arrays
+    ``tokens``/``token_logprobs``/``top_logprobs``/``text_offset``)."""
 
     if not entries:
         return None
@@ -1990,9 +2111,9 @@ def _build_legacy_logprobs(entries: list[dict] | None) -> dict | None:
 
 
 def _stop_sequences(body: dict) -> list[str]:
-    """OpenAI の ``stop`` (文字列または配列) と Anthropic の
-    ``stop_sequences`` (配列) の両方を受け付ける。どちらのエンドポイントでも
-    同じ処理を使う (リクエストの本体形式にしか依らないため)。"""
+    """Accept both OpenAI's ``stop`` (a string or an array) and Anthropic's
+    ``stop_sequences`` (an array). The same handling is used on either endpoint
+    (it depends only on the shape of the request body)."""
 
     raw = body.get("stop")
     if raw is None:
@@ -2007,7 +2128,8 @@ def _stop_sequences(body: dict) -> list[str]:
 
 
 def _find_stop(text: str, stops: list[str]) -> tuple[int, str] | None:
-    """`stops` のうち `text` 中で最も早く始まる一致を返す (開始位置, 一致文字列)。"""
+    """Return the match among `stops` that starts earliest in `text`, as
+    (start position, matched string)."""
 
     best = None
     for s in stops:
@@ -2018,12 +2140,13 @@ def _find_stop(text: str, stops: list[str]) -> tuple[int, str] | None:
 
 
 def _check_response_format(body: dict) -> str | None:
-    """``response_format`` (OpenAI の JSON mode) は制約付きデコードの実装が
-    無いので黙って無視しない (Kimi K3 レビュー項目 8)。JSON を期待する
-    agentic なクライアントが素のテキストを受け取ってパースに失敗する事故を、
-    previous_response_id (このファイル内の既存の 400) と同じ「対応しない
-    ものは明示的に断る」方針で防ぐ。``{"type": "text"}`` (未指定と等価) は
-    無変換なのでそのまま通す。"""
+    """``response_format`` (OpenAI's JSON mode) is not silently ignored, since
+    there is no constrained-decoding implementation (Kimi K3 review item 8).
+    This prevents the accident where an agentic client expecting JSON receives
+    plain text and fails to parse it, following the same "explicitly refuse
+    what is not supported" policy as previous_response_id (the existing 400 in
+    this file). ``{"type": "text"}`` (equivalent to not specifying it) involves
+    no transformation, so it is let through as-is."""
 
     rf = body.get("response_format")
     if rf is None:
@@ -2042,12 +2165,12 @@ def _check_response_format(body: dict) -> str | None:
 
 
 def _downgrade_headers(downgrade_reason: str | None) -> dict[str, str] | None:
-    """リクエスト単位降格 (項目 7) が起きたことをストリーミング応答でも
-    観測できるようにする HTTP ヘッダ。SSE の各チャンクは OpenAI/Anthropic の
-    標準スキーマなので、そこへ独自フィールドを混ぜると agentic クライアント
-    のスキーマ検証を壊しかねない — ヘッダなら per-chunk の JSON 形状を一切
-    変えずに同じ情報を出せる。降格していなければ None (StreamingResponse は
-    headers=None を「デフォルトのまま」として扱う)。"""
+    """An HTTP header that makes a per-request downgrade (item 7) observable in
+    streaming responses too. Each SSE chunk follows the standard OpenAI/
+    Anthropic schema, so mixing a custom field into it could break an agentic
+    client's schema validation — a header conveys the same information without
+    changing the per-chunk JSON shape at all. None when no downgrade occurred
+    (StreamingResponse treats headers=None as "leave the defaults alone")."""
 
     if downgrade_reason is None:
         return None
@@ -2055,11 +2178,12 @@ def _downgrade_headers(downgrade_reason: str | None) -> dict[str, str] | None:
 
 
 def _attach_downgrade_reason(body: dict, downgrade_reason: str | None) -> None:
-    """非ストリーミング応答の JSON ボディへ、リクエスト単位降格 (項目 7) の
-    理由をそのまま追加する。降格していなければ何もしない (キー自体を
-    出さない — /health の fallback_reason と同じ流儀)。標準スキーマに無い
-    追加フィールドだが、`/health` の fallback_reason 同様、このリポジトリは
-    「黙って降格しない」ことをレスポンス形状より優先する。"""
+    """Add the reason for a per-request downgrade (item 7) verbatim to the JSON
+    body of a non-streaming response. Does nothing if no downgrade occurred
+    (the key itself is omitted — the same manner as /health's
+    fallback_reason). It is an extra field not present in the standard schema,
+    but just as with `/health`'s fallback_reason, this repository prioritizes
+    "never downgrade silently" over the shape of the response."""
 
     if downgrade_reason is not None:
         body["downgrade_reason"] = downgrade_reason
@@ -2091,21 +2215,22 @@ def _anthropic_error(message: str, status: int = 400, err_type: str = "invalid_r
 
 
 def _model_name_allowed(requested: str) -> bool:
-    """サーブ中の名前そのもの、または起動時に --model-alias で明示的に
-    許可した別名のどちらかと一致すれば通す。既定 (--model-alias 未指定) は
-    STATE.model_aliases が空集合なので、従来どおりサーブ中の名前だけを許可
-    する厳密一致のまま変わらない — 「不一致は 404」という OpenAI 準拠の
-    意図的な設計そのものは崩さず、黙って何でも受け付ける形にはしない。"""
+    """Let a request through if it matches either the served name itself or an
+    alias explicitly permitted with --model-alias at startup. By default
+    (--model-alias not specified) STATE.model_aliases is the empty set, so this
+    remains the exact match that permits only the served name, as before — the
+    deliberate, OpenAI-conforming design of "a mismatch is a 404" is left
+    intact, and it never turns into silently accepting anything."""
 
     return requested == STATE.model_name or requested in STATE.model_aliases
 
 
 def _check_model_openai(body: dict):
-    """リクエストの model がサーブ中のモデル (または --model-alias で許可
-    した別名) と違えば 404 (OpenAI の model_not_found 相当)。省略時は許容。
-    一致してもしなくても、応答の "model" 欄には常に STATE.model_name (サーブ
-    中の名前) を入れる — クライアントが送った文字列 (別名含む) をそのまま
-    echo しない。"""
+    """If the request's model differs from the served model (or from an alias
+    permitted with --model-alias), return 404 (the equivalent of OpenAI's
+    model_not_found). Omitting it is allowed. Whether or not it matches, the
+    response's "model" field always carries STATE.model_name (the served name)
+    — the string the client sent (aliases included) is never echoed back."""
 
     requested = body.get("model")
     if requested is not None and not _model_name_allowed(requested):
@@ -2128,18 +2253,19 @@ def _check_model_anthropic(body: dict):
 
 
 def _check_context_length(prompt_ids: list[int], protocol: str):
-    """プロンプトが起動時に決めた上限 (モデル config の max_position_embeddings
-    と、Metal が一括確保できる実際の上限から逆算した値のうち小さい方。
-    ``--max-context-tokens`` で上書き可。``_resolve_default_max_context_tokens``
-    参照) を超えていれば 400 を返す。
+    """Return 400 if the prompt exceeds the limit decided at startup (the
+    smaller of the model config's max_position_embeddings and the value derived
+    from the actual limit Metal can allocate in one go; overridable with
+    ``--max-context-tokens``; see ``_resolve_default_max_context_tokens``).
 
-    Metal がアテンション行列を一括確保できず [metal::malloc] で落ちて
-    そのまま 500 になる事故 (実測で ~57,000 トークン付近から発生) を防ぐ
-    ための事前チェック。SpecEngine は新規プロンプトを一括で forward する
-    (チャンク分割は 4-bit 量子化モデルで mx.quantized_matmul がバッチ長に
-    応じて異なる丸めを返し、分割の有無で生成トークン列が一致しなくなる
-    ことを実測で確認したため見送った) ので、この上限が実質的な唯一の
-    ガードになる。"""
+    This is an up-front check that prevents the accident where Metal cannot
+    allocate the attention matrix in one go, dies with [metal::malloc], and
+    turns into a 500 (measured to occur from around ~57,000 tokens). SpecEngine
+    forwards a new prompt in one go (chunk splitting was dropped because, on
+    4-bit quantized models, mx.quantized_matmul was measured to return
+    different rounding depending on the batch length, so the generated token
+    sequence no longer matched between the split and unsplit cases), so this
+    limit is effectively the only guard."""
 
     limit = STATE.max_context_tokens
     if limit is None or len(prompt_ids) <= limit:
@@ -2183,13 +2309,14 @@ def _responses_terminal_state(
 
 
 def _usage_dict(prompt_tokens: int, completion_tokens: int, cached_tokens: int) -> dict:
-    """OpenAI 形式の usage。``prompt_tokens_details.cached_tokens`` は
-    ChatSession の prefill 再利用実測 (``res["prefill_reused"]``) をそのまま
-    載せる (mlx_lm:1339-1346 / 1567-1575 と同じ形)。0 のとき (再利用なし、
-    または FallbackRunner のように prefill 再利用機構を持たない経路) も
-    キー自体は出す — 「対応しているが今回は 0 件」と「対応していない」を
-    レスポンス形状からは区別しない (mlx_lm も同様、prompt_cache_count が
-    0 以上ならフィールドを出す)。
+    """OpenAI-format usage. ``prompt_tokens_details.cached_tokens`` carries the
+    measured prefill reuse of the ChatSession (``res["prefill_reused"]``)
+    verbatim (the same shape as mlx_lm:1339-1346 / 1567-1575). The key is
+    emitted even when it is 0 (no reuse, or a path such as FallbackRunner that
+    has no prefill reuse mechanism) — the shape of the response does not
+    distinguish "supported but zero this time" from "not supported" (mlx_lm
+    does the same, emitting the field whenever prompt_cache_count is 0 or
+    more).
     """
 
     usage = {
@@ -2203,25 +2330,27 @@ def _usage_dict(prompt_tokens: int, completion_tokens: int, cached_tokens: int) 
 
 
 def _anthropic_usage(prompt_tokens: int, completion_tokens: int, res: dict) -> dict:
-    """Anthropic 形式の usage。prefill 再利用の実測 (``res["prefill_reused"]``/
-    ``res["prefill_new"]``、cli.py の表示行や ``_log_gen_stats`` と同じ数値)
-    を Anthropic のキャッシュ関連フィールドへマッピングする (Kimi K3 レビュー
-    項目 16)。Claude Code 等が送ってくる ``cache_control`` 自体は読まない —
-    「どこまでキャッシュするか」の指示だが、このサーバーはリクエスト単位で
-    session の LCP から再利用量を機械的に決めるだけで、ブロック単位の
-    キャッシュ境界という概念を持たないため、受け取って無視する (無視して
-    いることをそのまま報告に明記する、というタスク側の指示どおり)。
+    """Anthropic-format usage. Maps the measured prefill reuse
+    (``res["prefill_reused"]``/``res["prefill_new"]``, the same numbers as
+    cli.py's display line and ``_log_gen_stats``) onto Anthropic's cache-related
+    fields (Kimi K3 review item 16). The ``cache_control`` that Claude Code and
+    others send is itself not read — it is an instruction about "how far to
+    cache", but this server merely decides the amount of reuse mechanically per
+    request from the session's LCP and has no notion of block-level cache
+    boundaries, so it accepts and ignores it.
 
-    Anthropic 実 API の意味に合わせる: ``input_tokens`` はキャッシュから
-    読んだ分を除いた「実際に処理した」トークン数 (= prefill_new)、
-    ``cache_read_input_tokens`` が再利用された分 (= prefill_reused)。
-    ``cache_creation_input_tokens`` は新規に処理して session へ書き込んだ分
-    (= prefill_new) をそのまま採る — このサーバーの session はターンごとに
-    KV を積み増すので、新規処理分は原則すべて次ターン以降の再利用候補になる
-    (エフェメラル 5m/1h の内訳までは持たない、フラットな合計のみ)。
-    ``res`` に prefill 情報が無い runner (通常は無いが、防御的に既定 0) でも
-    フィールド自体は常に出す — 0 と「対応していない」をレスポンス形状から
-    区別しない、``_usage_dict`` と同じ方針。
+    Aligned with the meaning in Anthropic's real API: ``input_tokens`` is the
+    number of tokens "actually processed" excluding what was read from the
+    cache (= prefill_new), and ``cache_read_input_tokens`` is the reused part
+    (= prefill_reused). ``cache_creation_input_tokens`` takes the newly
+    processed part written into the session (= prefill_new) verbatim — this
+    server's session stacks up KV every turn, so in principle everything newly
+    processed becomes a candidate for reuse on subsequent turns (there is no
+    ephemeral 5m/1h breakdown, only a flat total). Even for a runner whose
+    ``res`` carries no prefill information (normally there is none, but
+    defensively the default is 0), the fields themselves are always emitted —
+    the same policy as ``_usage_dict``: the shape of the response does not
+    distinguish 0 from "not supported".
     """
 
     prefill_reused = res.get("prefill_reused", 0)
@@ -2235,8 +2364,9 @@ def _anthropic_usage(prompt_tokens: int, completion_tokens: int, res: dict) -> d
 
 
 def _log_gen_stats(res: dict) -> None:
-    """prefill 再利用が効いているかは OpenAI/Anthropic のレスポンス形式には
-    無い数値なので、cli.py の表示行と同じ内容を運用者向けに一行ログへ出す。"""
+    """Whether prefill reuse is working is a number that does not exist in the
+    OpenAI/Anthropic response formats, so the same content as cli.py's display
+    line is written to a one-line log for the operator."""
 
     print(
         f"[mlxturbo-serve] prefill reused={res.get('prefill_reused', 0)} "
@@ -2244,23 +2374,25 @@ def _log_gen_stats(res: dict) -> None:
     )
 
 
-# ---------- 生成の下回り ----------
+# ---------- generation plumbing ----------
 #
-# on_tokens は投機の受理まとめて複数トークンを一度に渡してくる。生トークン
-# 列は常に渡ってくる (SpecRunner はそれしか持たず、FallbackRunner も
-# on_tokens(toks, text) の toks は必ず渡す) ので、ThinkingRouter はどちらの
-# 経路でも同じロジックで reasoning/content を振り分けられる。thinking の
-# 分離が絡む場合は FallbackRunner の precomputed text (二重デコード回避策)
-# を使わず、ここで raw id から必ず再デトケナイズする — マーカー境界をまたぐ
-# 判定に生トークンが要るのと、reasoning/content で detokenizer を分ける
-# 必要があるため。
+# on_tokens hands over several tokens at once, batched by what speculation
+# accepted. The raw token sequence is always passed (SpecRunner has nothing
+# else, and FallbackRunner always passes toks in on_tokens(toks, text)), so
+# ThinkingRouter can split reasoning/content with the same logic on either
+# path. When thinking separation is involved, FallbackRunner's precomputed text
+# (a workaround to avoid double decoding) is not used and we always
+# re-detokenize from the raw ids here — because the raw tokens are needed to
+# judge across marker boundaries, and because reasoning and content need
+# separate detokenizers.
 #
-# STATE.runner.generate は同期・長時間実行なので、モデルをロードしたのと
-# 同じ専用ワーカースレッド (STATE.executor) に必ず投げる。asyncio の汎用
-# スレッドプール (asyncio.to_thread の既定 executor) や threading.Thread で
-# 別スレッドに逃がすと、モデルの重み・KV キャッシュがロード時のスレッドに
-# 紐づいているため "There is no Stream(gpu, N) in current thread" で落ちる
-# (実測で確認済み: server.py の docstring 参照)。
+# STATE.runner.generate is synchronous and long-running, so it is always
+# submitted to the same dedicated worker thread that loaded the model
+# (STATE.executor). Escaping to another thread via asyncio's general-purpose
+# thread pool (asyncio.to_thread's default executor) or threading.Thread
+# crashes with "There is no Stream(gpu, N) in current thread", because the
+# model weights and the KV cache are bound to the thread that loaded them
+# (confirmed by measurement: see the docstring in server.py).
 
 
 class _GenerationCancelled(Exception):
@@ -2270,9 +2402,10 @@ class _GenerationCancelled(Exception):
 async def _run_generate(
     prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, runner=None, **sampling_kwargs
 ):
-    """``runner`` を省略すると ``STATE.runner`` (通常経路)。リクエスト単位
-    降格 (項目 7、``_resolve_runner_for_request`` 参照) されたリクエストは
-    呼び出し側が ``STATE.downgrade_runner`` を明示的に渡す。"""
+    """Omitting ``runner`` means ``STATE.runner`` (the normal path). For a
+    request that was downgraded per request (item 7; see
+    ``_resolve_runner_for_request``), the caller explicitly passes
+    ``STATE.downgrade_runner``."""
 
     loop = asyncio.get_running_loop()
     fn = functools.partial(
@@ -2309,13 +2442,16 @@ async def _run_generate(
 
 
 def _chunk_string(s: str, size: int = 24) -> list[str]:
-    """引数 JSON 文字列を固定長で分割する。OpenAI/Anthropic どちらの
-    ストリーミング規約も「引数は分割して流れる」形が慣例だが、実際には
-    tool call のテキスト全体をマーカーが閉じるまでバッファしてから初めて
-    JSON として解釈できる (壊れていたら捏造しないため、途中経過のまま
-    部分 JSON を流すことはできない)。そのため、パース確定後にこの関数で
-    人為的に分割してイベント化する — 結合すれば必ず元の JSON 文字列に戻る
-    ので、クライアント側の「断片を連結してから parse する」実装と矛盾しない。
+    """Split the arguments JSON string into fixed-length pieces. In both the
+    OpenAI and Anthropic streaming conventions it is customary for "arguments
+    to stream in pieces", but in reality the whole text of a tool call can only
+    be interpreted as JSON after it has been buffered until the marker closes
+    (partial JSON cannot be streamed mid-flight, because we do not fabricate
+    anything if it turns out to be broken). So once parsing has settled, this
+    function splits it artificially into events — concatenating them always
+    reproduces the original JSON string, so this does not conflict with the
+    client-side implementation that "concatenates the fragments and then
+    parses".
     """
 
     if not s:
@@ -2324,21 +2460,22 @@ def _chunk_string(s: str, size: int = 24) -> list[str]:
 
 
 def _parse_tool_calls_text(raw: str, tools_for_parsing) -> list[dict] | None:
-    """tool_call マーカーの間に挟まれていた生テキストを 1 個以上の構造化
-    tool call へ変換する。``tokenizer.tool_parser`` (mlx_lm がチャット
-    テンプレート文字列から自動選択するモデル固有パーサ、例えば Qwen の
-    素朴な JSON 形式なら ``json.loads`` そのもの、Qwen3-Coder の
-    ``<function=...>`` XML 風なら専用パーサ) をそのまま使う — マーカー
-    文字列の検出は ThinkingRouter が既に済ませているので、ここでは中身の
-    構文解析だけでよい。
+    """Convert the raw text that was enclosed between tool_call markers into
+    one or more structured tool calls. It uses ``tokenizer.tool_parser`` as-is
+    (the model-specific parser mlx_lm selects automatically from the chat
+    template string — for Qwen's naive JSON format that is ``json.loads``
+    itself, and for Qwen3-Coder's ``<function=...>`` XML-like format a
+    dedicated parser) — detection of the marker strings has already been done
+    by ThinkingRouter, so only the syntactic parsing of the contents is needed
+    here.
 
-    1 個のマーカー区間から複数の呼び出しが取れるパーサ (pythonic 等) にも
-    対応するため、戻り値が list ならそのまま展開する (mlx_lm.server の
-    ToolCallFormatter と同じ扱い)。
+    To support parsers that can extract several calls from a single marker
+    region (pythonic and the like), a list return value is expanded as-is (the
+    same treatment as ToolCallFormatter in mlx_lm.server).
 
-    解析に失敗した場合 (JSON 壊れ・name 欠落等) は None を返す — 呼び出し
-    側はこれを「tool call を捏造せず、生テキストをそのまま content として
-    返す」フォールバックのトリガーに使う。
+    If parsing fails (broken JSON, a missing name, and so on) None is returned
+    — the caller uses this as the trigger for the fallback of "do not fabricate
+    a tool call; return the raw text as content instead".
     """
 
     parser = getattr(STATE.tokenizer, "tool_parser", None)
@@ -2379,22 +2516,23 @@ def _parse_tool_calls_text(raw: str, tools_for_parsing) -> list[dict] | None:
 
 
 class SegmentAssembler:
-    """ThinkingRouter が返す (channel, payload) 列を、呼び出し側が使う
-    高レベルイベント ``("reasoning_delta", text)`` / ``("content_delta",
-    text)`` / ``("tool_call", {"id","name","arguments"})`` へ変換する。
+    """Convert the (channel, payload) stream returned by ThinkingRouter into
+    the high-level events the caller uses: ``("reasoning_delta", text)`` /
+    ``("content_delta", text)`` / ``("tool_call", {"id","name","arguments"})``.
 
-    "tool"/"tool_start"/"tool_end" チャンネルはマーカー区間の生テキストを
-    バッファし、区間が閉じた ("tool_end") 時点で初めて
-    ``_parse_tool_calls_text`` に通す: 成功すれば tool_call イベントを
-    (複数呼び出しなら複数個) 返し、失敗すれば "捏造せず、テキストとして
-    そのまま返す" というサーバー全体の方針どおり、マーカー文字列を含めた
-    生テキストを content_delta として返す (tool_end が実マーカーで閉じて
-    いなければ終了マーカー文字列は付けない — max_tokens 等で打ち切られた
-    ことが分かるように)。
+    The "tool"/"tool_start"/"tool_end" channels buffer the raw text of the
+    marker region and only run it through ``_parse_tool_calls_text`` once the
+    region closes ("tool_end"): on success it returns tool_call events (several
+    of them if there were several calls), and on failure it returns, as a
+    content_delta, the raw text including the marker strings, following the
+    server-wide policy of "do not fabricate; return it as text" (if tool_end
+    did not close with a real marker, the end-marker string is not appended —
+    so that it is visible that it was cut off by max_tokens or similar).
 
-    ストリーミング (on_tokens から都度 push する) ・非ストリーミング
-    (生成後にまとめて push する) のどちらでも同じインスタンスをそのまま
-    使い回せる — 状態は tool_buf (未確定の tool テキスト断片) だけ。
+    The same instance can be reused as-is for both streaming (pushing each time
+    from on_tokens) and non-streaming (pushing everything at once after
+    generation) — the only state is tool_buf (the uncommitted tool text
+    fragments).
     """
 
     def __init__(self, tools_for_parsing):
@@ -2441,33 +2579,35 @@ def _start_generation(
     runner=None,
     **sampling_kwargs,
 ):
-    """ワーカーを STATE.executor へ投げ、(キュー, Future, stop Event,
-    raw_token_count) を返す。
+    """Submit the worker to STATE.executor and return (queue, Future, stop
+    Event, raw_token_count).
 
-    ``session`` はこのリクエスト用に ``_select_session`` が引き当てた
-    session (ChatSession/FallbackSession) — 呼び出し側が ``STATE.lock`` の
-    中で選んで渡す (グローバル状態の STATE.session は無い)。
+    ``session`` is the session (ChatSession/FallbackSession) that
+    ``_select_session`` assigned for this request — the caller selects it
+    inside ``STATE.lock`` and passes it in (there is no global STATE.session).
 
-    ``runner`` を省略すると ``STATE.runner``。リクエスト単位降格 (項目 7、
-    ``_resolve_runner_for_request`` 参照) されたリクエストは呼び出し側が
-    ``STATE.downgrade_runner`` を明示的に渡す。
+    Omitting ``runner`` means ``STATE.runner``. For a request that was
+    downgraded per request (item 7; see ``_resolve_runner_for_request``), the
+    caller explicitly passes ``STATE.downgrade_runner``.
 
-    ``raw_token_count`` は ``[int]`` の 1 要素リスト (呼び出し側から見える
-    可変箱) — ``on_tokens`` が実際に処理した生トークン数を都度加算する。
-    stop 文字列一致で cancel_event.set() して早期打ち切る場合 (項目 18)、
-    runner.generate() は正常な res dict を返さず ``("cancelled", None)`` に
-    なるため usage の completion_tokens をこれで代替する。
+    ``raw_token_count`` is a one-element ``[int]`` list (a mutable box visible
+    to the caller) — ``on_tokens`` adds to it the number of raw tokens actually
+    processed each time. When a stop string matches and generation is cut off
+    early via cancel_event.set() (item 18), runner.generate() does not return a
+    normal res dict but yields ``("cancelled", None)``, so this stands in for
+    usage's completion_tokens.
 
-    キューに積まれる要素: ``("reasoning_delta", text)`` / ``("content_delta",
-    text)`` / ``("tool_call", {"id","name","arguments"})`` (成功裏に解析
-    できた tool call 1 個ぶん) / ``("budget_exceeded", None)`` (予算超過を
-    検知した回だけ 1 回) / ``("done", res)`` / ``("cancelled", None)`` /
-    ``("error", exc)``。
+    The elements pushed onto the queue: ``("reasoning_delta", text)`` /
+    ``("content_delta", text)`` / ``("tool_call", {"id","name","arguments"})``
+    (one successfully parsed tool call) / ``("budget_exceeded", None)`` (once,
+    only on the round where the budget overrun is detected) /
+    ``("done", res)`` / ``("cancelled", None)`` / ``("error", exc)``.
 
-    呼び出し側は必ずこの Future を最後まで待つこと (正常終了・エラー・
-    クライアント切断のどの経路でも)。そうしないと、まだ実行中のワーカーが
-    この ``session`` を触っている間に次のリクエストがロックを取れてしまい、
-    同じ session を 2 つの生成が同時に書き換えるレースになる。
+    The caller must always wait for this Future to the very end (on every path:
+    normal completion, error, and client disconnect). Otherwise the next
+    request could take the lock while a still-running worker is touching this
+    ``session``, producing a race in which two generations rewrite the same
+    session at once.
     """
 
     q: queue.Queue = queue.Queue()
@@ -2523,19 +2663,22 @@ def _start_generation(
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as an SSE error event
             q.put(("error", exc))
 
-    # 生成専用スレッド (executor) へ投げる。結果はキュー経由で非同期側が
-    # asyncio.to_thread(q.get) で拾う (queue.Queue の待ち合わせだけなので
-    # MLX のスレッド固定とは無関係、こちらは汎用スレッドプールで構わない)。
+    # Submit to the generation-only thread (executor). The async side picks up
+    # results through the queue with asyncio.to_thread(q.get) (that is only a
+    # queue.Queue wait, unrelated to MLX's thread pinning, so a general-purpose
+    # thread pool is fine there).
     future = STATE.executor.submit(worker)
     return q, future, cancel_event, raw_token_count
 
 
 async def _await_worker(future) -> None:
-    """ワーカー Future を待つ。ワーカー内の例外は worker() 自身が
-    q.put(("error", ...)) で拾って握り潰しているので、ここで raise される
-    のは future 自体の生成/キャンセル絡みの想定外のみ。ジェネレータの
-    finally から呼ぶので通常の例外は飲む。一方、呼び出し Task の cancellation
-    は何度届いても worker 終了まで延期し、終了後にだけ再送出する。"""
+    """Wait for the worker Future. Exceptions inside the worker are caught and
+    swallowed by worker() itself via q.put(("error", ...)), so the only things
+    raised here are unexpected problems around the creation/cancellation of the
+    future itself. Since this is called from a generator's finally, ordinary
+    exceptions are swallowed. Cancellation of the calling Task, on the other
+    hand, is deferred until the worker finishes no matter how many times it
+    arrives, and re-raised only afterwards."""
 
     wrapped = asyncio.wrap_future(future)
     cancelled: asyncio.CancelledError | None = None
@@ -2565,17 +2708,19 @@ def _collect_events(
     tool_calling_enabled: bool,
     tools_for_parsing,
 ) -> tuple[list[tuple[str, object]], bool]:
-    """非ストリーム向け: 最終トークン列をまとめて ThinkingRouter +
-    SegmentAssembler に通し、順序を保った高レベルイベント列 (``feed()``/
-    ``push()`` と同じ語彙: reasoning_delta/content_delta/tool_call) と
-    budget_exceeded を返す。ストリーミング経路 (_start_generation) が
-    on_tokens のたびに逐次行っているのと同じ変換を、非ストリームでは
-    生成後に一括で行うだけ。
+    """For the non-streaming case: run the final token sequence through
+    ThinkingRouter + SegmentAssembler in one go and return the order-preserving
+    high-level event stream (the same vocabulary as ``feed()``/``push()``:
+    reasoning_delta/content_delta/tool_call) together with budget_exceeded.
+    This is the very same conversion that the streaming path
+    (_start_generation) performs incrementally on every on_tokens, just done in
+    one batch after generation for the non-streaming case.
 
-    ``prompt_ids`` は ``_apply_template`` が描画した実際のプロンプト —
-    ``_prompt_already_thinking`` でテンプレートが既に ``<think>`` を開いた
-    状態かどうかを判定し、``ThinkingRouter`` の初期 phase に反映する
-    (server.py の ``_prompt_already_thinking`` docstring 参照)。"""
+    ``prompt_ids`` is the actual prompt rendered by ``_apply_template`` —
+    ``_prompt_already_thinking`` uses it to decide whether the template has
+    already opened ``<think>``, and that is reflected into ``ThinkingRouter``'s
+    initial phase (see the ``_prompt_already_thinking`` docstring in
+    server.py)."""
 
     router = ThinkingRouter(
         STATE.tokenizer,
@@ -2599,11 +2744,12 @@ def _split_response_final(
     tool_calling_enabled: bool = False,
     tools_for_parsing=None,
 ) -> tuple[str, str, list[dict], bool]:
-    """OpenAI 非ストリーム向け: (reasoning_text, content_text, tool_calls,
-    budget_exceeded) を返す。tool_calls は成功裏に解析できた呼び出しだけ
-    (解析に失敗したものは content_text 側にマーカーごと生テキストとして
-    含まれる — 捏造しない方針)。``prompt_ids`` は ``_collect_events`` へ
-    そのまま渡す (already_thinking 判定用)。"""
+    """For the OpenAI non-streaming case: return (reasoning_text,
+    content_text, tool_calls, budget_exceeded). tool_calls contains only the
+    calls that were parsed successfully (those that failed to parse are
+    included on the content_text side as raw text, markers and all — the
+    policy of not fabricating anything). ``prompt_ids`` is passed straight
+    through to ``_collect_events`` (for the already_thinking decision)."""
 
     events, budget_exceeded = _collect_events(
         prompt_ids, tokens, budget, tool_calling_enabled, tools_for_parsing
@@ -2617,11 +2763,12 @@ def _split_response_final(
 def _truncate_content_events(
     events: list[tuple[str, object]], cut_pos: int
 ) -> list[tuple[str, object]]:
-    """Anthropic 非ストリーム向け: stop_sequence が content_delta の連結
-    文字列上の ``cut_pos`` で一致したとき、それ以降のイベントを切り捨てる。
-    tool_calls が絡む場合はこの関数を呼ばない (呼び出し側の分岐で保証する
-    — stop_sequence と tool calling の組み合わせは対応範囲外、既知の制限)
-    ので、ここでは reasoning_delta/content_delta しか来ない前提でよい。"""
+    """For the Anthropic non-streaming case: when a stop_sequence matched at
+    ``cut_pos`` in the concatenation of the content_delta strings, truncate
+    every event from there on. This function is not called when tool_calls are
+    involved (the caller's branching guarantees that — the combination of
+    stop_sequence and tool calling is out of scope, a known limitation), so it
+    is safe to assume that only reasoning_delta/content_delta arrive here."""
 
     out: list[tuple[str, object]] = []
     acc = 0
@@ -2643,12 +2790,12 @@ def _truncate_content_events(
 
 
 def _anthropic_blocks_from_events(events: list[tuple[str, object]]) -> list[dict]:
-    """順序を保った高レベルイベント列を Anthropic の content ブロック列へ
-    組み立てる。連続する content_delta は 1 個の text ブロックへ結合し、
-    tool_call は独立した tool_use ブロックにする (Anthropic の実 API も
-    tool_use を挟むと text ブロックが分かれる)。reasoning_delta はここでは
-    扱わない (呼び出し側が既存どおり thinking ブロックを別途・常に先頭に
-    組み立てる)。"""
+    """Assemble the order-preserving high-level event stream into Anthropic's
+    content block list. Consecutive content_deltas are merged into a single
+    text block, and each tool_call becomes an independent tool_use block (in
+    Anthropic's real API too, interposing a tool_use splits the text blocks).
+    reasoning_delta is not handled here (the caller, as before, always
+    assembles the thinking block separately and puts it first)."""
 
     blocks: list[dict] = []
 
@@ -2670,7 +2817,7 @@ def _anthropic_blocks_from_events(events: list[tuple[str, object]]) -> list[dict
     return blocks
 
 
-# ---------- OpenAI 互換 ----------
+# ---------- OpenAI-compatible ----------
 
 
 @app.get("/v1/models")
@@ -2691,16 +2838,17 @@ async def list_models():
 
 @app.get("/health")
 async def health():
-    """mlx_lm の /health (``{"status": "ok"}`` だけ) より詳しく返す: モデル名・
-    ロード済みかどうか・どちらの runner (投機 or 通常生成) か・リクエストを
-    処理中かどうか・待ち行列の深さ・バージョン。処理中かどうかは
-    ``STATE.lock.locked()`` を見るだけ (直列化の設計上、ロックが空いていれば
-    idle、取られていれば busy と等価)。
+    """Returns more than mlx_lm's /health (which is just ``{"status": "ok"}``):
+    the model name, whether it is loaded, which runner (speculative or ordinary
+    generation), whether a request is being processed, the queue depth, and the
+    version. Whether it is processing is simply ``STATE.lock.locked()`` (given
+    the serialized design, a free lock is equivalent to idle and a held lock to
+    busy).
 
-    runner が fallback (非投機) のときだけ ``fallback_reason`` を追加する
-    (mlxturbo.runner.build_runner が理由文字列を runner に持たせる — 「黙って
-    fallback に落ちて気づけない」を防ぐためのもの)。fallback でなければ
-    このキー自体を出さない。
+    ``fallback_reason`` is added only when the runner is the fallback
+    (non-speculative) one (mlxturbo.runner.build_runner attaches the reason
+    string to the runner — it exists to prevent "silently falling back with no
+    way to notice"). When it is not the fallback, the key itself is omitted.
     """
 
     if STATE is None:
@@ -2726,40 +2874,46 @@ async def health():
 @app.get("/api/hello")
 @app.head("/api/hello")
 async def api_hello():
-    """Claude Code の疎通確認 (GET/HEAD /api/hello) 用。実装が無いと 404 に
-    なり (会話自体は成立するので実害は無いが)、起動直後のログにノイズが
-    乗る。中身に意味は無く、200 を返すことだけが要件。"""
+    """For Claude Code's connectivity check (GET/HEAD /api/hello). Without an
+    implementation it 404s and, although there is no real harm (the
+    conversation itself still works), it puts noise in the log right after
+    startup. The body means nothing; the only requirement is to return 200."""
 
     return {"status": "ok"}
 
 
 @app.post("/v1/embeddings")
 async def embeddings(request: Request):
-    """Kimi K3 レビュー項目 14: 未対応であることを 501 で明示する。
+    """Kimi K3 review item 14: state explicitly with a 501 that this is not
+    supported.
 
-    調べた結論: 「不可能」ではなく「このサーバーの現在の構成では正しく実装
-    できる保証が無いので、無理に実装しない」という判断。理由は 2 つ:
+    The conclusion after investigating: not "impossible", but the judgment that
+    "there is no guarantee it can be implemented correctly in this server's
+    current configuration, so do not force it". There are two reasons:
 
-    1. このサーバーがロードするのは生成用モデル (Qwen3.6-35B-A3B / Flash-
-       Next 系) で、埋め込み専用モデルではない。生成モデルの最終隠れ状態
-       (lm_head 直前) をプーリングして埋め込み代わりに使う手法自体は存在
-       する (LLM2Vec/GritLM 等) が、それは対象モデルに合わせた pooling
-       方式の選定・検証を伴う専用の実装であって、「とりあえず forward して
-       プーリングする」だけでは品質を保証できない。
+    1. What this server loads is a generation model (Qwen3.6-35B-A3B /
+       Flash-Next family), not a dedicated embedding model. Techniques that
+       pool a generation model's final hidden state (just before lm_head) and
+       use it in place of an embedding do exist (LLM2Vec, GritLM, and so on),
+       but they are dedicated implementations that involve selecting and
+       validating a pooling scheme suited to the target model; quality cannot
+       be guaranteed by merely "forwarding and pooling and calling it a day".
 
-    2. 隠れ状態を取り出すための forward 呼び出しはモデルのラッパー構造
-       (VLM 形式なら ``model.language_model.model``、GDN ハイブリッドの
-       cache 構築など) に依存する — この構造を正しく踏まえた実装は
-       mlxturbo/spec.py の SpecEngine が既に持っている領域であり、今回
-       server.py だけを触ってよい制約の中でそれを別実装として持ち込むと、
-       spec.py 側の実装と食い違うリスクを抱えたまま検証もできない状態で
-       レビューに晒すことになる。
+    2. The forward call needed to extract hidden states depends on the model's
+       wrapper structure (``model.language_model.model`` in the VLM format,
+       cache construction for a GDN hybrid, and so on) — an implementation that
+       correctly accounts for that structure is territory that SpecEngine in
+       mlxturbo/spec.py already covers, and bringing in a separate
+       implementation of it under this pass's constraint of touching only
+       server.py would mean exposing it to review carrying the risk of
+       diverging from spec.py's implementation and with no way to validate it.
 
-    したがって、黙って何か (誤った) 埋め込みを返すよりは 501 で明示する
-    ことを選んだ。real な埋め込みが必要なら、専用の埋め込みモデル
-    (mlx-embeddings 等) を別途ロードして両立させる構成が筋が良いはずだが、
-    それはこのサーバーのモデル管理 (1 モデル常駐・専用スレッド固定) の
-    設計そのものに関わる変更で、今回の変更範囲を超える。
+    Therefore, rather than silently returning some (wrong) embedding, we chose
+    to say so explicitly with a 501. If real embeddings are needed, the sound
+    arrangement should be to load a dedicated embedding model (mlx-embeddings
+    or similar) separately and run both, but that is a change touching the very
+    design of this server's model management (one resident model, pinned to a
+    dedicated thread) and goes beyond the scope of this change.
     """
 
     return _openai_error(
@@ -2836,12 +2990,13 @@ async def chat_completions(request: Request):
         return _openai_error(lp_err)
     stream = bool(body.get("stream", False))
     if logprobs_requested and stream:
-        # 項目 17 (Kimi K3 レビュー): logprobs はストリーミングでは実装して
-        # いない (per-chunk の逐次 logprobs は ThinkingRouter/SegmentAssembler
-        # のチャンネル分岐・バッファリングと token 単位で正しく対応付けるのが
-        # 難しく、今回のタスクの範囲では見送った — 黙って null を返すより、
-        # 明示的に 400 で断る方が「要求したのに何も返らない」より誠実)。
-        # 非ストリームなら以下でそのまま処理する。
+        # Item 17 (Kimi K3 review): logprobs is not implemented for streaming
+        # (correlating per-chunk incremental logprobs token by token with
+        # ThinkingRouter/SegmentAssembler's channel branching and buffering is
+        # difficult, and it was deferred as out of scope for this task —
+        # refusing explicitly with a 400 is more honest than silently returning
+        # null, which would amount to "you asked and got nothing back").
+        # Non-streaming requests are handled normally below.
         return _openai_error(
             "'logprobs' is not supported together with 'stream': true in this server "
             "(yet); request without streaming to get logprobs"
@@ -2852,17 +3007,19 @@ async def chat_completions(request: Request):
     if unsupported_err is not None:
         return _openai_error(unsupported_err)
     if logprobs_requested and gen_runner.KIND == FallbackRunner.KIND:
-        # logprobs は SUPPORTED_SAMPLING_PARAMS の恒等値チェックの外にある
-        # 別枠のフラグ (_resolve_runner_for_request の logprobs_requested 引数)
-        # なので、ここで初めて sampling_params に足す。要求されていて、かつ
-        # 実際に解決された runner が FallbackRunner (非投機) のときだけ足す —
-        # SpecRunner/FlashSpecRunner/DraftSpecRunner/LookupSpecRunner の
-        # generate() はこのキーワードを知らない構成があり得る (SpecEngine.
-        # generate/generate_stream は **kwargs を持たない固定シグネチャ)。
-        # logprobs が要求されたリクエストは _resolve_runner_for_request が
-        # 必ず fallback へ降格させる (降格先が無い場合だけ、STATE.runner
-        # 自体が既に fallback) ので、通常はここに来る runner は常に
-        # FallbackRunner のはずだが、それでも二重に確認しておく。
+        # logprobs is a separate flag outside the SUPPORTED_SAMPLING_PARAMS
+        # identity-value check (the logprobs_requested argument of
+        # _resolve_runner_for_request), so it is only added to sampling_params
+        # here. It is added only when it was requested and the runner that was
+        # actually resolved is FallbackRunner (non-speculative) —
+        # SpecRunner/FlashSpecRunner/DraftSpecRunner/LookupSpecRunner may have
+        # a generate() that does not know this keyword (SpecEngine.generate/
+        # generate_stream have a fixed signature with no **kwargs). A request
+        # asking for logprobs is always downgraded to the fallback by
+        # _resolve_runner_for_request (and only when there is nowhere to
+        # downgrade to is STATE.runner itself already the fallback), so the
+        # runner arriving here should always be FallbackRunner; even so, we
+        # double-check.
         sampling_params["logprobs"] = True
         sampling_params["top_logprobs"] = top_logprobs_n
     stops = _stop_sequences(body)
@@ -2884,9 +3041,10 @@ async def chat_completions(request: Request):
         return _busy_response("openai", "server is busy: too many queued requests")
 
     if stream:
-        # _openai_stream 側 (finally) がこのリクエストぶんのキュー枠を解放
-        # する — StreamingResponse は生成器を最後まで読み切る/aclose する
-        # ことが保証されているため、ここでの解放は不要 (むしろ二重解放になる)。
+        # _openai_stream's finally releases this request's queue slot —
+        # StreamingResponse is guaranteed to read the generator to the end or
+        # aclose it, so releasing here is unnecessary (and would in fact be a
+        # double release).
         return StreamingResponse(
             _queue_owned_stream(
                 _openai_stream(
@@ -2911,12 +3069,13 @@ async def chat_completions(request: Request):
 
     try:
         async with STATE.lock:
-            # 降格したリクエストは session プールに触らない: FallbackRunner
-            # は FallbackSession (.cache 単数形) を期待するが、STATE.runner
-            # が spec なら session プールの中身は ChatSession (.caches 複数形)
-            # で型が合わない。session=None で渡せば FallbackRunner.generate
-            # は毎回新規 prompt_cache を作るだけの経路に自然に倒れる
-            # (_resolve_runner_for_request の docstring 参照)。
+            # A downgraded request does not touch the session pool:
+            # FallbackRunner expects a FallbackSession (singular .cache), but
+            # if STATE.runner is a spec runner the pool holds ChatSessions
+            # (plural .caches) and the types do not match. Passing session=None
+            # makes FallbackRunner.generate fall naturally onto the path where
+            # it simply builds a fresh prompt_cache every time (see the
+            # _resolve_runner_for_request docstring).
             session = None if downgrade_reason is not None else await _select_session_on_executor(
                 prompt_ids
             )
@@ -2952,16 +3111,17 @@ async def chat_completions(request: Request):
             finish_reason = "stop"
             content_truncated_by_stop = True
 
-    # res["logprobs"] (FallbackRunner.generate、mlxturbo/runner.py 参照) は
-    # 生の生成トークン列 res["tokens"] と 1:1 対応する。reasoning/tool_calls
-    # が絡む、または stop 文字列でコンテンツが文字位置で切り詰められた場合、
-    # 「どの生トークンが実際に content に残ったか」を正しく再導出するには
-    # _split_response_final 側にトークン単位の分割情報を持たせる変更が要り、
-    # このタスクの範囲を超える (捏造したデータを返すよりは null の方が
-    # 誠実、という判断 — 見送りの理由をここに書く)。それ以外 (プレーンな
-    # 生成で、reasoning/tool_calls/stop 切り詰めのいずれも無い) なら
-    # res["logprobs"] は content の全トークンとそのまま 1:1 対応するので、
-    # そのまま使う。
+    # res["logprobs"] (from FallbackRunner.generate; see mlxturbo/runner.py)
+    # corresponds 1:1 with the raw generated token sequence res["tokens"]. When
+    # reasoning/tool_calls are involved, or the content was truncated at a
+    # character position by a stop string, correctly re-deriving "which raw
+    # tokens actually remained in the content" would require a change giving
+    # _split_response_final token-level split information, which goes beyond
+    # this task's scope (the judgment being that null is more honest than
+    # returning fabricated data — the reason for deferring it is recorded
+    # here). Otherwise (a plain generation with no reasoning, no tool_calls and
+    # no stop truncation) res["logprobs"] corresponds 1:1 with every token of
+    # the content as-is, so it is used directly.
     choice_logprobs = None
     if logprobs_requested and not (reasoning_text or tool_calls or content_truncated_by_stop):
         choice_logprobs = _build_chat_logprobs(res.get("logprobs"))
@@ -3020,11 +3180,12 @@ async def _openai_stream(
     tools_for_parsing=None,
     runner=None,
 ):
-    # 受付 (検証) は呼び出し側で StreamingResponse を組み立てる前に完了して
-    # いる。生成の開始 (ロック獲得・ワーカー投入) を待たずに最初のイベントを
-    # 出すことで、TTFT が支配項のワークロードでも「最初の 1 バイト」を早く
-    # 返す (server.py の docstring 参照)。ここから先で 400 相当が判明する
-    # 経路は無い。
+    # Acceptance (validation) has already completed on the caller's side,
+    # before the StreamingResponse was assembled. Emitting the first event
+    # without waiting for generation to start (lock acquisition, worker
+    # submission) returns "the first byte" quickly even in workloads where TTFT
+    # dominates (see the docstring in server.py). Beyond this point there is no
+    # path on which something 400-worthy could still be discovered.
     first = {
         "id": req_id,
         "object": "chat.completion.chunk",
@@ -3036,26 +3197,29 @@ async def _openai_stream(
         first["usage"] = None
     yield f"data: {json.dumps(first)}\n\n"
 
-    # ロック待ちの間も keepalive を流す (queue が詰まっていると、ここが実質
-    # 「最初のトークンが出るまで」の大半を占めることがある)。queue の所有は
-    # _queue_owned_stream、lock の所有は以下の owned フラグに一本化する。
+    # Keep sending keepalives while waiting for the lock too (when the queue is
+    # backed up, this can effectively account for most of the "time until the
+    # first token"). Ownership of the queue slot is centralized in
+    # _queue_owned_stream, and ownership of the lock in the owned flag below.
     owned = [False]
     try:
         async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
             yield keepalive
 
-        # 降格したリクエスト (runner が STATE.runner と別物 = STATE.downgrade_
-        # runner) は session プールに触らない — 型が合わない
-        # (_resolve_runner_for_request の docstring 参照)。
+        # A downgraded request (whose runner differs from STATE.runner =
+        # STATE.downgrade_runner) does not touch the session pool — the types
+        # do not match (see the _resolve_runner_for_request docstring).
         downgraded = runner is not None and runner is not STATE.runner
         session = None if downgraded else await _select_session_on_executor(prompt_ids)
-        # ``_select_session`` はスロットを選んだ時点で processed 列を「実際に
-        # 再利用される長さ」ちょうどへ切り詰め済み (全体一致ならそのまま、
-        # 部分一致なら trim/checkpoint 復元後の長さ) なので、ここで読んだ
-        # 値は runner.generate() が内部で計算する prefill_reused と一致する。
-        # stop 文字列一致で早期打ち切り (cancel_event.set(), 項目 18) した
-        # ときは runner が res dict を返さない ("cancelled") ため、usage の
-        # cached_tokens をこの事前計算値で代替する。
+        # By the time ``_select_session`` has chosen a slot it has already
+        # truncated the processed sequence to exactly "the length that will
+        # actually be reused" (unchanged for a whole-sequence match, the
+        # post-trim/post-checkpoint-restore length for a partial match), so the
+        # value read here matches the prefill_reused that runner.generate()
+        # computes internally. When a stop string matches and generation is cut
+        # off early (cancel_event.set(), item 18), the runner does not return a
+        # res dict ("cancelled"), so usage's cached_tokens falls back to this
+        # precomputed value.
         reused_at_select = len(session.processed) if session is not None else 0
         q, future, cancel_event, raw_token_count = _start_generation(
             prompt_ids,
@@ -3069,10 +3233,12 @@ async def _openai_stream(
             **(sampling_params or {}),
         )
         try:
-            # 生成開始 (ワーカー投入) 自体は即座に終わるが、最初のキュー
-            # 要素が届くまで (= プレフィル中) は同様に keepalive を流す。
-            # 覗き見た最初の1件は _requeue_front で q の先頭へ戻し、以下の
-            # while ループを一切変更せず同じ経路でもう一度処理させる。
+            # Starting generation (submitting the worker) finishes immediately,
+            # but keepalives are likewise sent until the first queue element
+            # arrives (= during prefill). The first item that was peeked at is
+            # put back at the head of q with _requeue_front, so that the while
+            # loop below processes it again on the same path without being
+            # changed at all.
             first_item = None
             async for _ka_kind, _ka_val in _await_with_keepalive(asyncio.to_thread(q.get)):
                 if _ka_kind == "keepalive":
@@ -3085,10 +3251,11 @@ async def _openai_stream(
             n_completion = 0
             cached_tokens = 0
             acc_text = ""
-            stopped = False  # stop 文字列に一致してからはクライアントへの
-            # 転送だけ止め、実際の生成が終わる ("done") まではキューを
-            # 空読みし続ける (正確な usage を得るのと、Future を待つ前提を
-            # 崩さないため)。budget_exceeded も同様の「転送だけ止める」形。
+            stopped = False  # Once a stop string matches, only the forwarding
+            # to the client stops; the queue keeps being drained until
+            # generation actually ends ("done") (to get accurate usage and to
+            # not break the premise of waiting for the Future). budget_exceeded
+            # takes the same "stop only the forwarding" form.
             budget_exceeded = False
             made_tool_call = False
             tool_call_index = 0
@@ -3176,14 +3343,18 @@ async def _openai_stream(
                             keep_len = idx - len(acc_text)
                             visible = payload[:keep_len] if keep_len > 0 else ""
                             stopped = True
-                            # 項目 18: 一致した瞬間に生成そのものを打ち切る。
-                            # 従来はここで転送だけ止め、実際の生成は max_tokens
-                            # まで裏で回り続けていた (無駄な decode)。visible
-                            # の計算 (=クライアントへ見せる文字列) はここより
-                            # 前で確定済みなので、打ち切っても出力内容は変わ
-                            # らない — 変わるのは以降の decode を省く分の速さ
-                            # だけ。session はこの後 publish されない (次ターン
-                            # は fresh prefill、cancel_event の既存の契約どおり)。
+                            # Item 18: cut generation itself off the instant it
+                            # matches. Previously only the forwarding stopped
+                            # here, and the actual generation kept running in
+                            # the background all the way to max_tokens (wasted
+                            # decoding). The computation of visible (= the
+                            # string shown to the client) has already settled
+                            # above this point, so cutting off does not change
+                            # the output content — the only difference is the
+                            # speed gained by skipping the remaining decoding.
+                            # The session is not published afterwards (the next
+                            # turn gets a fresh prefill, per cancel_event's
+                            # existing contract).
                             cancel_event.set()
                         acc_text = new_acc
                     if visible:
@@ -3213,12 +3384,14 @@ async def _openai_stream(
                     _log_gen_stats(payload)
                     break
                 elif kind == "cancelled":
-                    # stop 文字列一致による早期打ち切り (上の content_delta
-                    # 分岐で cancel_event.set() した結果) だけがここへ来る —
-                    # クライアント切断はこのループ自体を async generator の
-                    # GeneratorExit で中断させるので、ここには来ない。runner
-                    # は res dict を返さないので、usage は on_tokens が数えた
-                    # raw_token_count と session 選択時点の reused で代替する。
+                    # Only the early cut-off caused by a stop string match (the
+                    # result of cancel_event.set() in the content_delta branch
+                    # above) reaches here — a client disconnect aborts this
+                    # loop itself through the async generator's GeneratorExit
+                    # and never gets here. The runner returns no res dict, so
+                    # usage falls back to the raw_token_count that on_tokens
+                    # counted and the reuse figure from when the session was
+                    # selected.
                     finish_reason = "stop"
                     n_completion = raw_token_count[0]
                     cached_tokens = reused_at_select
@@ -3264,9 +3437,11 @@ async def _openai_stream(
 
             yield "data: [DONE]\n\n"
         finally:
-            # クライアント切断 (GeneratorExit) でここに来た場合も含め、
-            # 次の token callback で協調停止し、ワーカーが実際に終わるまで
-            # ロックを離さない (prefill/実行中 kernel は割り込めない)。
+            # Including the case where we arrive here through a client
+            # disconnect (GeneratorExit), stop cooperatively at the next token
+            # callback and do not release the lock until the worker has
+            # actually finished (prefill and an in-flight kernel cannot be
+            # interrupted).
             cancel_event.set()
             await _await_worker(future)
     finally:
@@ -3274,7 +3449,7 @@ async def _openai_stream(
             STATE.lock.release()
 
 
-# ---------- Anthropic 互換 ----------
+# ---------- Anthropic-compatible ----------
 
 
 @app.post("/v1/messages")
@@ -3300,17 +3475,18 @@ async def anthropic_messages(request: Request):
         return _anthropic_error(shape_err)
 
     try:
-        # トップレベルの ``system`` に加えて、``messages`` 内に role: "system"
-        # の要素が混ざって送られてくるクライアントがいる (実例: Claude Code
-        # — 捕獲したボディでは ['user', 'system'] の順で、system が末尾に来る。
-        # Anthropic の公開仕様は role: "system" を messages に許していないが、
-        # 実クライアントは普通に送ってくる)。チャットテンプレート
-        # (Qwen 系) は system メッセージが先頭に無いと
-        # "System message must be at the beginning" で落ちるので、トップ
-        # レベルの system と messages 内の system ロールを両方とも先頭へ
-        # 寄せて 1 個の system メッセージへ連結する。連結順は「トップ
-        # レベル -> messages に現れた順」で元の順序を保つ (どちらも
-        # 崩さない)。system 以外のメッセージは元の相対順序のまま残す。
+        # Some clients send role: "system" items mixed into ``messages`` in
+        # addition to the top-level ``system`` (a real example: Claude Code —
+        # in a captured body the order was ['user', 'system'], with system
+        # last. Anthropic's published specification does not permit
+        # role: "system" inside messages, but real clients send it routinely).
+        # The chat template (Qwen family) dies with "System message must be at
+        # the beginning" unless the system message comes first, so both the
+        # top-level system and the system roles inside messages are gathered to
+        # the front and concatenated into a single system message. The
+        # concatenation order preserves the original order, "top level -> the
+        # order they appeared in messages" (neither is disturbed). Messages
+        # other than system keep their original relative order.
         normalized = _normalize_anthropic_messages(messages)
         system_parts: list[str] = []
         top_system = body.get("system")
@@ -3369,8 +3545,9 @@ async def anthropic_messages(request: Request):
     msg_id = f"msg_{uuid.uuid4().hex}"
 
     if max_tokens == 0:
-        # Anthropic の実 API に合わせる: 0 は「生成せずに終わる」有効な入力
-        # だが、ストリームでは意味を成さないので 400 にする。
+        # Aligned with Anthropic's real API: 0 is valid input meaning "end
+        # without generating", but it makes no sense for a stream, so return a
+        # 400.
         if stream:
             return _anthropic_error("'max_tokens: 0' is not supported when 'stream' is true")
         return {
@@ -3388,8 +3565,8 @@ async def anthropic_messages(request: Request):
         return _busy_response("anthropic", "server is busy: too many queued requests")
 
     if stream:
-        # _anthropic_stream 側 (finally) がこのリクエストぶんのキュー枠を
-        # 解放する (openai 経路の chat_completions と同じ理由)。
+        # _anthropic_stream's finally releases this request's queue slot (the
+        # same reason as chat_completions on the openai path).
         return StreamingResponse(
             _queue_owned_stream(
                 _anthropic_stream(
@@ -3412,8 +3589,9 @@ async def anthropic_messages(request: Request):
 
     try:
         async with STATE.lock:
-            # 降格したリクエストは session プールに触らない (chat_completions
-            # と同じ理由、_resolve_runner_for_request の docstring 参照)。
+            # A downgraded request does not touch the session pool (the same
+            # reason as chat_completions; see the _resolve_runner_for_request
+            # docstring).
             session = None if downgrade_reason is not None else await _select_session_on_executor(
                 prompt_ids
             )
@@ -3445,9 +3623,9 @@ async def anthropic_messages(request: Request):
     elif tool_calls:
         stop_reason = "tool_use"
     elif stops:
-        # tool_calls が絡む場合の stop_sequence 対応は既知の制限として
-        # 見送っている (elif で never reached) — 詳細は
-        # _truncate_content_events の docstring を参照。
+        # stop_sequence support when tool_calls are involved is deferred as a
+        # known limitation (never reached, thanks to the elif) — see the
+        # _truncate_content_events docstring for details.
         content_text_concat = "".join(v for k, v in events if k == "content_delta")
         hit = _find_stop(content_text_concat, stops)
         if hit is not None:
@@ -3498,11 +3676,12 @@ async def _anthropic_stream(
     def sse(event, data):
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
-    # 受付 (検証) は呼び出し側で StreamingResponse を組み立てる前に完了して
-    # いる。生成の開始 (ロック獲得・ワーカー投入) を待たずに message_start を
-    # 出すことで、TTFT が支配項のワークロードでも「最初の 1 バイト」を早く
-    # 返す (server.py の docstring 参照)。ここから先で 400 相当が判明する
-    # 経路は無い。
+    # Acceptance (validation) has already completed on the caller's side,
+    # before the StreamingResponse was assembled. Emitting message_start
+    # without waiting for generation to start (lock acquisition, worker
+    # submission) returns "the first byte" quickly even in workloads where TTFT
+    # dominates (see the docstring in server.py). Beyond this point there is no
+    # path on which something 400-worthy could still be discovered.
     yield sse(
         "message_start",
         {
@@ -3549,10 +3728,11 @@ async def _anthropic_stream(
                     first_item = _ka_val
             _requeue_front(q, first_item)
 
-            # content_block_start は最初のデルタが来てから、その channel
-            # (thinking が起きたかどうか) に応じて出す。事前には分からない
-            # ため (実 API も、最初のブロックを送る直前に content_block_start
-            # を出す形なので、順序としては同じ)。
+            # content_block_start is emitted only after the first delta
+            # arrives, according to its channel (whether thinking happened),
+            # because it cannot be known in advance (the real API also emits
+            # content_block_start immediately before sending the first block,
+            # so the ordering is the same).
 
             n_out = 0
             prefill_reused = 0
@@ -3564,9 +3744,9 @@ async def _anthropic_stream(
             budget_exceeded = False
             made_tool_call = False
             current_block: str | None = None  # None | "reasoning" | "content"
-            any_block_emitted = False  # current_block だけだと「tool_use を
-            # 出し終えて None に戻した」のと「まだ何も出していない」を
-            # 区別できないので、別フラグで持つ。
+            any_block_emitted = False  # current_block alone cannot distinguish
+            # "finished emitting a tool_use and reset to None" from "nothing
+            # has been emitted yet", so this is kept as a separate flag.
             next_index = 0
             block_index: dict[str, int] = {}
             thinking_text_by_index: dict[int, str] = {}
@@ -3664,8 +3844,9 @@ async def _anthropic_stream(
                             visible = payload[:keep_len] if keep_len > 0 else ""
                             stopped = True
                             matched_stop = matched
-                            # 項目 18: 一致した瞬間に生成そのものを打ち切る
-                            # (_openai_stream の同じ変更と同一の理由)。
+                            # Item 18: cut generation itself off the instant it
+                            # matches (the same reason as the identical change
+                            # in _openai_stream).
                             cancel_event.set()
                         acc_text = new_acc
                     if not visible:
@@ -3711,8 +3892,9 @@ async def _anthropic_stream(
                     _log_gen_stats(payload)
                     break
                 elif kind == "cancelled":
-                    # stop 文字列一致による早期打ち切り (_openai_stream の
-                    # 同じ分岐と同じ理由・同じ契約)。
+                    # Early cut-off caused by a stop string match (the same
+                    # reason and the same contract as the identical branch in
+                    # _openai_stream).
                     n_out = raw_token_count[0]
                     prefill_reused = reused_at_select
                     prefill_new = max(len(prompt_ids) - reused_at_select, 0)
@@ -3733,11 +3915,12 @@ async def _anthropic_stream(
                 for event in close_block(current_block):
                     yield event
             elif not any_block_emitted:
-                # 何も生成されなかった (例: max_tokens が極端に小さい)。
-                # 「content_block が最低 1 つはある」前提を壊さないよう、
-                # 空の text ブロックを開いてすぐ閉じる。tool_use ブロックを
-                # 1 個以上出し終えて current_block が None に戻っている
-                # だけの場合はここには来ない (any_block_emitted で判別)。
+                # Nothing was generated (e.g. max_tokens is extremely small).
+                # So as not to break the premise that "there is at least one
+                # content_block", open an empty text block and close it
+                # immediately. The case where one or more tool_use blocks have
+                # been emitted and current_block has merely returned to None
+                # does not reach here (any_block_emitted tells them apart).
                 idx, start_evt = open_block("content")
                 yield start_evt
                 yield sse("content_block_stop", {"type": "content_block_stop", "index": idx})
@@ -3747,10 +3930,12 @@ async def _anthropic_stream(
                 {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": matched_stop},
-                    # input_tokens は message_start で即座に流した (生成開始
-                    # 前の) 素朴な len(prompt_ids) のままなので上書きしない —
-                    # ここではキャッシュ実測 (項目 16) が生成後にしか分から
-                    # ない cache_read/cache_creation_input_tokens だけ足す。
+                    # input_tokens stays the naive len(prompt_ids) that was
+                    # streamed out immediately in message_start (before
+                    # generation began), so it is not overwritten — here we add
+                    # only cache_read/cache_creation_input_tokens, the measured
+                    # cache figures (item 16) that are not known until after
+                    # generation.
                     "usage": {
                         "output_tokens": n_out,
                         "cache_creation_input_tokens": prefill_new,
@@ -3767,22 +3952,25 @@ async def _anthropic_stream(
             STATE.lock.release()
 
 
-# ---------- OpenAI 互換 (legacy /v1/completions) ----------
+# ---------- OpenAI-compatible (legacy /v1/completions) ----------
 #
-# chat template を通さず、渡された prompt をそのまま生成に流すレガシー
-# エンドポイント。thinking の分離は行わない (raw completion にターン構造が
-# 無いので reasoning_effort の意味を持たせようがない) — thinking_budget=0 を
-# _start_generation/_split_response_final に渡すことで ThinkingRouter を
-# 強制的に content-only モードにし (budget=0 は has_thinking の値に関わらず
-# enabled=False)、既存の on_tokens 配線をそのまま再利用する。tool calling
-# も同様に有効化しない (tool_calling_enabled は既定 False のまま渡さない)。
+# A legacy endpoint that does not go through the chat template and feeds the
+# prompt it was given straight into generation. Thinking is not separated
+# (there is no turn structure in a raw completion, so there is no way to give
+# reasoning_effort any meaning) — passing thinking_budget=0 to
+# _start_generation/_split_response_final forces ThinkingRouter into
+# content-only mode (budget=0 means enabled=False regardless of the value of
+# has_thinking) and reuses the existing on_tokens wiring as-is. Tool calling is
+# likewise not enabled (tool_calling_enabled is simply not passed and stays at
+# its default of False).
 
 
 def _prompt_to_ids(prompt) -> tuple[list[int] | None, str | None]:
-    """``prompt`` は文字列 (tokenizer.encode に通す) か、事前トークナイズ済み
-    の int 配列のどちらかを受け付ける。OpenAI の legacy completions は
-    文字列配列やトークン配列の配列 (バッチ) も許すが、mlxturbo はリクエストを
-    直列化する設計 (1 リクエスト = 1 生成) なのでバッチは扱わない。
+    """``prompt`` is accepted either as a string (run through
+    tokenizer.encode) or as a pre-tokenized array of ints. OpenAI's legacy
+    completions also permits an array of strings or an array of token arrays (a
+    batch), but mlxturbo is designed to serialize requests (one request = one
+    generation), so batches are not handled.
     """
 
     if isinstance(prompt, str):
@@ -3834,8 +4022,8 @@ async def completions(request: Request):
         return _openai_error(lp_err)
     stream = bool(body.get("stream", False))
     if logprobs_requested and stream:
-        # chat_completions と同じ理由 (項目 17 の docstring 参照): logprobs
-        # のストリーミング per-chunk 対応は今回見送った。
+        # The same reason as chat_completions (see the item 17 docstring):
+        # per-chunk logprobs support for streaming was deferred this time.
         return _openai_error(
             "'logprobs' is not supported together with 'stream': true in this server "
             "(yet); request without streaming to get logprobs"
@@ -3867,8 +4055,8 @@ async def completions(request: Request):
         return _busy_response("openai", "server is busy: too many queued requests")
 
     if stream:
-        # _completions_stream 側 (finally) がこのリクエストぶんのキュー枠を
-        # 解放する (openai chat 経路と同じ理由)。
+        # _completions_stream's finally releases this request's queue slot (the
+        # same reason as the openai chat path).
         return StreamingResponse(
             _queue_owned_stream(
                 _completions_stream(
@@ -3921,9 +4109,10 @@ async def completions(request: Request):
             finish_reason = "stop"
             content_truncated_by_stop = True
 
-    # chat_completions と同じ制限 (その docstring 参照): reasoning/tool_call
-    # マーカーが混ざった、または stop 文字列で文字位置切り詰めが起きた場合は
-    # res["logprobs"] (生トークン列と 1:1) と text の対応が崩れるので null。
+    # The same limitation as chat_completions (see its docstring): if
+    # reasoning/tool_call markers were mixed in, or a stop string truncated at
+    # a character position, the correspondence between res["logprobs"] (1:1
+    # with the raw token sequence) and text breaks down, so it is null.
     choice_logprobs = None
     if logprobs_requested and not (reasoning_text or tool_calls or content_truncated_by_stop):
         choice_logprobs = _build_legacy_logprobs(res.get("logprobs"))
@@ -3969,8 +4158,8 @@ async def _completions_stream(
         downgraded = runner is not None and runner is not STATE.runner
         session = None if downgraded else await _select_session_on_executor(prompt_ids)
         reused_at_select = len(session.processed) if session is not None else 0
-        # thinking_budget=0: ThinkingRouter を content-only に固定する
-        # (has_thinking に関わらず) ので reasoning_delta は絶対に来ない。
+        # thinking_budget=0 pins ThinkingRouter to content-only (regardless of
+        # has_thinking), so reasoning_delta can never arrive.
         q, future, cancel_event, raw_token_count = _start_generation(
             prompt_ids, max_tokens, temp, 0, session=session, runner=runner, **(sampling_params or {})
         )
@@ -4002,7 +4191,7 @@ async def _completions_stream(
                             keep_len = idx - len(acc_text)
                             visible = payload[:keep_len] if keep_len > 0 else ""
                             stopped = True
-                            cancel_event.set()  # 項目 18: 早期打ち切り
+                            cancel_event.set()  # Item 18: early cut-off
                         acc_text = new_acc
                     if visible:
                         chunk = {
@@ -4023,9 +4212,9 @@ async def _completions_stream(
                             chunk["usage"] = None
                         yield f"data: {json.dumps(chunk)}\n\n"
                 elif kind in ("reasoning_delta", "budget_exceeded", "tool_call"):
-                    # thinking_budget=0・tool_calling_enabled=False (既定)
-                    # なのでここには来ないはずだが、念のため無視するだけに
-                    # しておく (クラッシュより安全)。
+                    # With thinking_budget=0 and tool_calling_enabled=False
+                    # (the default) these should never arrive here, but just in
+                    # case we only ignore them (safer than crashing).
                     continue
                 elif kind == "done":
                     finish_reason = "stop" if stopped else _finish_reason_openai(payload["tokens"])
@@ -4034,8 +4223,8 @@ async def _completions_stream(
                     _log_gen_stats(payload)
                     break
                 elif kind == "cancelled":
-                    # stop 文字列一致による早期打ち切り (_openai_stream と
-                    # 同じ理由・同じ契約)。
+                    # Early cut-off caused by a stop string match (the same
+                    # reason and the same contract as _openai_stream).
                     finish_reason = "stop"
                     n_completion = raw_token_count[0]
                     cached_tokens = reused_at_select
@@ -4083,36 +4272,38 @@ async def _completions_stream(
             STATE.lock.release()
 
 
-# ---------- OpenAI 互換 (Responses API, /v1/responses) ----------
+# ---------- OpenAI-compatible (Responses API, /v1/responses) ----------
 #
-# Codex CLI (2026-02-01 以降) は wire_api として "responses" しか受け付け
-# なくなった (旧 "chat" は削除済み) ので、これを実装しない限り Codex は
-# 動かない。Chat Completions とは構造が別物 (messages ではなく input、
-# choices ではなく output 配列、tools はネストではなくフラット) だが、
-# 生成そのもの・thinking の分離・tool call の解析・サンプリングパラメータ・
-# session 選択・stop 判定は Chat Completions/Anthropic 経路と完全に共有
-# する — ここで新しく書くのは「input を既存の内部 messages 形式へ正規化
-# する」「イベント列 (_collect_events と同じ語彙) を output 配列/SSE
-# イベントへ組み立てる」の 2 つだけで、生成ロジックを 3 つ目のプロトコル
-# として複製しない。
+# Codex CLI (from 2026-02-01 onwards) accepts only "responses" as its wire_api
+# (the old "chat" has been removed), so Codex does not work unless this is
+# implemented. The structure differs from Chat Completions (input rather than
+# messages, an output array rather than choices, flat rather than nested
+# tools), but generation itself, thinking separation, tool call parsing,
+# sampling parameters, session selection and stop detection are shared
+# completely with the Chat Completions/Anthropic paths — the only things
+# written anew here are "normalize input into the existing internal messages
+# format" and "assemble the event stream (the same vocabulary as
+# _collect_events) into an output array / SSE events"; the generation logic is
+# not duplicated as a third protocol.
 #
-# store / previous_response_id によるサーバー側での会話継続は、メモリ上の
-# LRU (STATE.response_store) だけで実装している — 永続化はしない (プロセス
-# 再起動で全て失われる、モジュール冒頭の docstring の「会話履歴はクライアント
-# が毎ターン全文を送り直す」設計自体は変えていない。previous_response_id は
-# その全文送り直しの手間を省く「サーバー側にも同じ履歴を持たせておく」薄い
-# 最適化に過ぎない)。詳細は _resolve_previous_response/_store_response_if_
-# requested を参照。
+# Server-side conversation continuation via store / previous_response_id is
+# implemented purely with an in-memory LRU (STATE.response_store) — nothing is
+# persisted (everything is lost on process restart; the design stated in the
+# module docstring at the top, that "the client resends the whole conversation
+# history every turn", is itself unchanged. previous_response_id is no more
+# than a thin optimization that "keeps the same history on the server side
+# too", saving the effort of resending everything). See
+# _resolve_previous_response/_store_response_if_requested for details.
 
 
 def _responses_content_to_text(content) -> str:
-    """Responses API の 1 アイテムぶんの content (文字列、または
-    input_text/output_text/refusal などの型付きパーツの配列) をプレーン
-    テキストへ落とす。``_content_to_text`` (Chat Completions/Anthropic 用)
-    と同じ方針: image/audio/file 系のパーツは黙って読み飛ばさず
-    ``MultimodalContentError`` (400) にする (mlxturbo はテキスト専用モデル
-    しか served しないため)。壊れた形 (パーツに type が無い、text が
-    文字列でない等) も同様に ``InvalidContentError`` (400) にする。
+    """Reduce one Responses API item's content (a string, or an array of typed
+    parts such as input_text/output_text/refusal) to plain text. Same policy as
+    ``_content_to_text`` (for Chat Completions/Anthropic): image/audio/file
+    parts are not silently skipped but turned into
+    ``MultimodalContentError`` (400) (because mlxturbo only serves text-only
+    models). Broken shapes (a part with no type, a text that is not a string,
+    and so on) likewise become ``InvalidContentError`` (400).
     """
 
     if content is None:
@@ -4141,9 +4332,10 @@ def _responses_content_to_text(content) -> str:
                 parts.append(text)
                 continue
             if ptype == "refusal":
-                # モデル自身が出した refusal ブロックの echo。読み飛ばさず
-                # テキストとして扱う (捏造ではなく、クライアントが実際に
-                # 前ターンで受け取った文字列をそのまま送り返してくる)。
+                # An echo of a refusal block the model itself produced. It is
+                # not skipped but treated as text (this is not fabrication: the
+                # client is sending back verbatim the string it actually
+                # received on the previous turn).
                 refusal = part.get("refusal")
                 if isinstance(refusal, str):
                     parts.append(refusal)
@@ -4156,41 +4348,44 @@ def _responses_content_to_text(content) -> str:
 
 
 def _normalize_responses_input(input_value, instructions) -> list[dict]:
-    """Responses API の ``input`` (+ ``instructions``) を、``_apply_template``
-    が受け付ける既存の内部 messages 形式 (``_normalize_openai_messages`` と
-    同じ形: role/content の他、assistant は ``tool_calls``、tool 結果は
-    role: "tool" + ``tool_call_id``) へ変換する。ここで既存形式へ寄せる
-    ことで、これより後ろの経路 (apply_chat_template 以降) を Chat
-    Completions/Anthropic と完全に共有できる。
+    """Convert the Responses API's ``input`` (plus ``instructions``) into the
+    existing internal messages format that ``_apply_template`` accepts (the
+    same shape as ``_normalize_openai_messages``: role/content, plus
+    ``tool_calls`` for assistant and role: "tool" + ``tool_call_id`` for tool
+    results). Converging on the existing format here lets everything after this
+    point (apply_chat_template onwards) be shared completely with Chat
+    Completions/Anthropic.
 
-    ``input`` の各アイテムは type で分岐する (type 省略時は "message" 扱い
-    — Codex CLI 等、素朴な ``{"role":..., "content":...}`` 形で送ってくる
-    クライアントに対応するため):
+    Each item in ``input`` branches on its type (a missing type is treated as
+    "message" — to accommodate clients such as Codex CLI that send the naive
+    ``{"role":..., "content":...}`` shape):
 
-    - ``message``: role (user/assistant/system/developer) + content。
-      developer は system と同じ扱いにする (このサーバーに system 相当が
-      2 種類ある意味は無い)。
-    - ``function_call``: 前ターンでモデルが行った tool 呼び出し。連続する
-      function_call は 1 個の assistant メッセージの ``tool_calls`` へ
-      まとめる (Chat Completions の assistant.tool_calls と同じ形)。
-    - ``function_call_output``: tool 実行結果。role: "tool" のメッセージへ
-      変換する。
-    - ``reasoning``/``item_reference``: 前ターンの reasoning 要約や
-      (このサーバーが対応しない previous_response_id 前提の) 参照アイテム。
-      再度モデルに読ませる必要は無いので読み飛ばす (bug 2: thinking ブロック
-      の扱いと同じ方針)。
-    - それ以外の未知の type は黙って無視せず 400 にする (壊れた/対応外の
-      入力を空プロンプトとして通さない、というこのサーバー全体の方針に
-      揃える)。
+    - ``message``: role (user/assistant/system/developer) + content.
+      developer is treated the same as system (there is no point in this server
+      having two kinds of system-equivalent role).
+    - ``function_call``: a tool call the model made on a previous turn.
+      Consecutive function_calls are gathered into the ``tool_calls`` of a
+      single assistant message (the same shape as Chat Completions'
+      assistant.tool_calls).
+    - ``function_call_output``: the result of executing a tool. Converted into
+      a role: "tool" message.
+    - ``reasoning``/``item_reference``: a previous turn's reasoning summary, or
+      a reference item (which presumes a previous_response_id this server does
+      not support). There is no need to make the model read them again, so they
+      are skipped (the same policy as bug 2: the handling of thinking blocks).
+    - Any other unknown type becomes a 400 rather than being silently ignored
+      (in line with this server's overall policy of not letting broken or
+      unsupported input through as an empty prompt).
 
-    Codex CLI は ``instructions`` (トップレベル) に加えて、``input`` の
-    先頭付近に role: "developer" のメッセージを混ぜてくる (捕獲したボディ
-    で確認済み)。developer は system と同じ扱いにするため、そのままだと
-    system 相当のメッセージが 2 個、非連続または「先頭以外」の位置に並ぶ
-    ことになり、Anthropic 経路の bug (System message must be at the
-    beginning) と同じ理由でチャットテンプレートが落ちる。system/developer
-    の内容はすべて集めて、``instructions`` -> ``input`` に現れた順で
-    1 個の system メッセージへ連結し、必ず先頭へ置く。
+    In addition to the top-level ``instructions``, Codex CLI mixes a
+    role: "developer" message in near the head of ``input`` (confirmed on a
+    captured body). Since developer is treated the same as system, leaving it
+    alone would line up two system-equivalent messages, non-consecutively or in
+    a position other than the head, and the chat template would die for the
+    same reason as the bug on the Anthropic path (System message must be at the
+    beginning). All system/developer content is collected, concatenated into a
+    single system message in the order ``instructions`` -> the order it
+    appeared in ``input``, and always placed first.
     """
 
     system_parts: list[str] = []
@@ -4269,8 +4464,9 @@ def _normalize_responses_input(input_value, instructions) -> list[dict]:
             )
             continue
 
-        # function_call 以外のアイテムが来たら、直前まで貯めていた
-        # function_call 群をここで確定させる (message アイテムと同じ扱い)。
+        # When an item other than a function_call arrives, commit the group of
+        # function_calls buffered up to that point (the same treatment as for a
+        # message item).
         flush_pending()
 
         if itype == "function_call_output":
@@ -4287,24 +4483,25 @@ def _normalize_responses_input(input_value, instructions) -> list[dict]:
 
 
 def _flatten_responses_tools(tools: list) -> list:
-    """Codex CLI が ``tools`` に混ぜてくる非 ``function`` 型を処理する。
+    """Handle the non-``function`` types Codex CLI mixes into ``tools``.
 
-    実際に捕獲したボディで確認した 2 種類:
+    Two kinds confirmed on actually captured bodies:
 
-    - ``{"type": "namespace", "tools": [...]}``: サブエージェント関連の
-      ツール群をまとめる入れ物で、それ自体は呼び出し可能なツールではない。
-      中の ``tools`` (中身は通常の ``{"type": "function", ...}``) を
-      展開してトップレベルへ引き上げる。入れ子になっている場合に備えて
-      再帰的に展開する。
-    - ``{"type": "web_search", ...}``: このサーバーには web 検索を実行する
-      主体が無い (mlxturbo はローカルモデルへの単純な forward しか持たない)
-      ので、渡されても実行できない。黙って握りつぶすとクライアントは
-      検索が使えると思ったまま話を進めてしまうので、落としたことを
-      運用者向けログへ残してから除く (_log_gen_stats と同じ
-      ``[mlxturbo-serve]`` 一行ログの作法)。
+    - ``{"type": "namespace", "tools": [...]}``: a container that groups
+      subagent-related tools; it is not itself a callable tool. Its inner
+      ``tools`` (whose contents are ordinary ``{"type": "function", ...}``) are
+      expanded and lifted to the top level. The expansion is recursive, in case
+      they are nested.
+    - ``{"type": "web_search", ...}``: this server has nothing that performs
+      web search (mlxturbo has nothing but a simple forward into a local
+      model), so it cannot execute it even if it is passed. Swallowing it
+      silently would leave the client proceeding in the belief that search is
+      available, so it is removed after recording in the operator-facing log
+      that it was dropped (the same one-line ``[mlxturbo-serve]`` log style as
+      _log_gen_stats).
 
-    ``function`` 型はそのまま素通しする (後続の ``_validate_responses_tools``
-    がその形自体を検証する)。
+    ``function`` types pass straight through (the subsequent
+    ``_validate_responses_tools`` validates their shape itself).
     """
 
     flat: list = []
@@ -4341,10 +4538,11 @@ def _validate_responses_tools(tools) -> str | None:
 
 
 def _responses_tools_to_openai(tools: list[dict]) -> list[dict]:
-    """Responses API のフラットな tool 定義 (``{"type":"function","name":...,
-    "parameters":...}``) を、``apply_chat_template``/``tool_parser`` が
-    期待する OpenAI (Chat Completions) 形式のネスト
-    (``{"type":"function","function":{"name",...}}``) へ変換する。"""
+    """Convert the Responses API's flat tool definitions
+    (``{"type":"function","name":..., "parameters":...}``) into the nested
+    OpenAI (Chat Completions) format
+    (``{"type":"function","function":{"name",...}}``) that
+    ``apply_chat_template``/``tool_parser`` expect."""
 
     return [
         {
@@ -4360,9 +4558,9 @@ def _responses_tools_to_openai(tools: list[dict]) -> list[dict]:
 
 
 def _resolve_tool_choice_responses(body: dict) -> tuple[list | None, str | None]:
-    """``_resolve_tool_choice_openai`` の Responses API 版。tools の形が
-    フラットな点以外は解決ロジック (auto/none/required/特定関数指定) は
-    完全に同じ。"""
+    """The Responses API version of ``_resolve_tool_choice_openai``. Apart from
+    the tools being flat in shape, the resolution logic
+    (auto/none/required/naming a specific function) is exactly the same."""
 
     tools = body.get("tools")
     if not tools:
@@ -4403,9 +4601,9 @@ def _resolve_max_output_tokens(body: dict, cap: int) -> tuple[int, str | None]:
 
 
 def _resolve_thinking_responses(body: dict) -> tuple[bool | None, int | None, str | None]:
-    """``_resolve_thinking`` の Responses API 版。読むフィールドは
-    ``reasoning: {"effort": ...}`` — budget への写し方 (`_REASONING_EFFORT_BUDGET`)
-    は OpenAI 側と共有する。"""
+    """The Responses API version of ``_resolve_thinking``. The field read is
+    ``reasoning: {"effort": ...}`` — the mapping onto a budget
+    (`_REASONING_EFFORT_BUDGET`) is shared with the OpenAI side."""
 
     value = body.get("reasoning")
     if not value:
@@ -4423,12 +4621,13 @@ def _resolve_thinking_responses(body: dict) -> tuple[bool | None, int | None, st
 
 
 def _responses_output_items_from_events(events: list[tuple[str, object]]) -> list[dict]:
-    """順序を保った高レベルイベント列 (``_collect_events`` と同じ語彙:
-    reasoning_delta/content_delta/tool_call) を Responses API の ``output``
-    配列 (型付きアイテム) へ組み立てる。``_anthropic_blocks_from_events``
-    の Responses 版 — 連続する reasoning_delta/content_delta はそれぞれ
-    1 個の reasoning/message アイテムへ結合し、tool_call は独立した
-    function_call アイテムにする。"""
+    """Assemble the order-preserving high-level event stream (the same
+    vocabulary as ``_collect_events``: reasoning_delta/content_delta/tool_call)
+    into the Responses API's ``output`` array (typed items). The Responses
+    version of ``_anthropic_blocks_from_events`` — consecutive
+    reasoning_deltas and content_deltas are each merged into a single
+    reasoning/message item, and each tool_call becomes an independent
+    function_call item."""
 
     items: list[dict] = []
     text_buf: list[str] = []
@@ -4487,29 +4686,31 @@ def _responses_output_items_from_events(events: list[tuple[str, object]]) -> lis
     return items
 
 
-# ---------- previous_response_id / store (項目 15) ----------
+# ---------- previous_response_id / store (item 15) ----------
 #
-# メモリ上の LRU (STATE.response_store) だけで会話を継続する。永続化は
-# しない — プロセスが再起動すれば全て失われる (このサーバーは元々レスポン
-# スを永続化しない設計、モジュール冒頭の docstring 参照)。保存する内容は
-# 「その応答を生成するために実際に使った raw input アイテム列 + その応答
-# 自身の output アイテム列」— どちらも _normalize_responses_input がその
-# まま受け付ける形 (Responses API の生アイテム形状) なので、次ターンは
-# それを ``input`` の前に連結してもう一度 _normalize_responses_input へ
-# 通すだけで会話全体を再構成できる。新しい変換ロジックを別に持たない。
+# The conversation is continued purely with an in-memory LRU
+# (STATE.response_store). Nothing is persisted — everything is lost if the
+# process restarts (this server was never designed to persist responses; see
+# the docstring at the top of the module). What is stored is "the raw input
+# item sequence actually used to generate that response + that response's own
+# output item sequence" — both in the shape _normalize_responses_input accepts
+# as-is (the Responses API's raw item shape), so the next turn can reconstruct
+# the whole conversation simply by concatenating it in front of ``input`` and
+# running it through _normalize_responses_input once more. No separate new
+# conversion logic is kept.
 
 
 def _resolve_previous_response(
     body: dict,
 ) -> tuple[list, str | None, "JSONResponse | None"]:
-    """``previous_response_id`` を解決する。戻り値は
-    ``(prior_items, effective_instructions, error_response)``。
+    """Resolve ``previous_response_id``. The return value is
+    ``(prior_items, effective_instructions, error_response)``.
 
-    見つからなければ 404 (OpenAI 準拠、_check_model_openai と同じ流儀)。
-    このサーバーは再起動すると全て失う LRU でしかないので、"見つからない"
-    は「そもそも store:true で保存されていない」「LRU から追い出された」
-    「プロセスが再起動した」のどれとも区別しない — 404 のメッセージで
-    その旨を説明する。
+    If it is not found, return 404 (OpenAI-conforming, in the same manner as
+    _check_model_openai). Since this server has nothing but an LRU that is lost
+    entirely on restart, "not found" does not distinguish between "it was never
+    stored with store:true in the first place", "it was evicted from the LRU"
+    and "the process restarted" — the 404 message explains as much.
     """
 
     previous_response_id = body.get("previous_response_id")
@@ -4540,13 +4741,15 @@ def _resolve_previous_response(
 
 
 def _combine_responses_input(raw_input, prior_items: list) -> tuple[list | None, str | None]:
-    """今回の ``input`` を ``prior_items`` (previous_response_id から復元した
-    raw アイテム列、無ければ空) の後ろへ連結する。今回分が文字列なら
-    ``_normalize_responses_input`` の「input が文字列のときの単一 user
-    メッセージ」変換と同じ形へ先に開いてから連結する — prior_items (リスト)
-    と混在させるため。previous_response_id が無い (prior_items が空の)
-    通常経路では、文字列をここで開いても最終的に _normalize_responses_input
-    へ渡す中身は以前と完全に同じメッセージ列になる (list 分岐を通るだけ)。
+    """Concatenate this turn's ``input`` after ``prior_items`` (the raw item
+    sequence restored from previous_response_id, empty when there is none). If
+    this turn's part is a string, it is first expanded into the same shape as
+    ``_normalize_responses_input``'s "single user message when input is a
+    string" conversion and only then concatenated — so that it can be mixed
+    with prior_items (a list). On the normal path where there is no
+    previous_response_id (prior_items is empty), expanding the string here
+    still ends up handing _normalize_responses_input exactly the same message
+    sequence as before (it merely goes through the list branch).
     """
 
     if raw_input is None:
@@ -4567,13 +4770,14 @@ def _store_response_if_requested(
     combined_input: list | None,
     output_items: list[dict],
 ) -> None:
-    """``store: true`` のときだけ、この応答を STATE.response_store へ積む
-    (LRU、上限 STATE.max_stored_responses、超えたら最も長く未使用のものを
-    捨てる)。``combined_input`` (今回実際に使った raw アイテム列。前ターン
-    から復元した分含む) + ``output_items`` (この応答自身の output、reasoning
-    アイテムも含めて丸ごと持つ — 読み出し側の _normalize_responses_input が
-    reasoning/item_reference を読み飛ばすので害はない) を次ターンがそのまま
-    連結できる形で保存する。"""
+    """Only when ``store: true``, push this response into STATE.response_store
+    (an LRU with a limit of STATE.max_stored_responses; when it is exceeded the
+    least recently used entry is discarded). ``combined_input`` (the raw item
+    sequence actually used this time, including what was restored from the
+    previous turn) + ``output_items`` (this response's own output, kept whole
+    including the reasoning items — harmless, since the reading side,
+    _normalize_responses_input, skips reasoning/item_reference) are stored in a
+    form the next turn can concatenate as-is."""
 
     if not store:
         return
@@ -4595,13 +4799,15 @@ async def responses_endpoint(request: Request):
     if not isinstance(body, dict):
         return _openai_error("request body must be a JSON object")
 
-    # previous_response_id/store (項目 15): サーバー側にメモリ上の LRU
-    # (STATE.response_store, main() --max-stored-responses、永続化はしない)
-    # を持ち、store:true で保存した応答を後続ターンの previous_response_id
-    # から辿れるようにする。以前はどちらも黙って無視せず 400 で断っていた
-    # (このコメントの旧版と _resolve_previous_response の docstring 参照) が、
-    # OpenAI 公式の agentic な例 (前ターンの id だけを送り、全文を送り直さ
-    # ない) がそのままでは動かない指摘を受けて実装した。
+    # previous_response_id/store (item 15): the server keeps an in-memory LRU
+    # (STATE.response_store, main()'s --max-stored-responses; nothing is
+    # persisted) so that a response saved with store:true can be reached from a
+    # later turn's previous_response_id. Previously both were refused with a
+    # 400 rather than silently ignored (see the older version of this comment
+    # and the _resolve_previous_response docstring), but this was implemented
+    # after it was pointed out that OpenAI's official agentic example (sending
+    # only the previous turn's id and not resending the full text) does not
+    # work as-is.
     prior_items, effective_instructions, prev_err = _resolve_previous_response(body)
     if prev_err is not None:
         return prev_err
@@ -4662,8 +4868,8 @@ async def responses_endpoint(request: Request):
         return _busy_response("openai", "server is busy: too many queued requests")
 
     if stream:
-        # _responses_stream 側 (finally) がこのリクエストぶんのキュー枠を
-        # 解放する (他の openai 経路と同じ理由)。
+        # _responses_stream's finally releases this request's queue slot (the
+        # same reason as the other openai paths).
         return StreamingResponse(
             _queue_owned_stream(
                 _responses_stream(
@@ -4754,16 +4960,17 @@ async def _responses_stream(
     combined_input: list | None = None,
     effective_instructions: str | None = None,
 ):
-    """Responses の主要な lifecycle イベント列を出す: response.created ->
-    response.output_item.added -> response.output_text.delta /
+    """Emit the Responses API's main lifecycle event sequence: response.created
+    -> response.output_item.added -> response.output_text.delta /
     response.reasoning_summary_text.delta / response.function_call_arguments.delta
-    -> 各 done イベント -> response.output_item.done ->
-    response.completed / response.incomplete / response.failed。
+    -> the respective done events -> response.output_item.done ->
+    response.completed / response.incomplete / response.failed.
 
-    受付 (検証) は呼び出し側で StreamingResponse を組み立てる前に完了して
-    いる — OpenAI/Anthropic の既存ストリーミング経路 (server.py の docstring
-    参照) と同じ方針で、生成の開始を待たずに response.created を即座に
-    流す。
+    Acceptance (validation) has already completed on the caller's side, before
+    the StreamingResponse was assembled — following the same policy as the
+    existing OpenAI/Anthropic streaming paths (see the docstring in server.py),
+    response.created is streamed out immediately without waiting for generation
+    to start.
     """
 
     sequence_number = 0
@@ -5032,11 +5239,13 @@ async def _responses_stream(
             }
             if incomplete_reason is not None:
                 final_response["incomplete_details"] = {"reason": incomplete_reason}
-            # 項目 15: store:true ならここで保存する。status が "incomplete"
-            # (max_tokens 打ち切り等) でも、非ストリームと同じ扱いで output
-            # をそのまま保存する — 部分的な応答でも previous_response_id で
-            # 続けられた方が有用なため。"failed" は上の return で既に抜けて
-            # いるので保存しない (壊れた応答を次ターンへ持ち越さない)。
+            # Item 15: if store:true, save here. Even when the status is
+            # "incomplete" (cut off by max_tokens, and so on), the output is
+            # saved as-is, the same as in the non-streaming case — because
+            # being able to continue from a partial response via
+            # previous_response_id is more useful. "failed" has already left
+            # through the return above and is therefore not saved (a broken
+            # response is not carried over to the next turn).
             _store_response_if_requested(
                 store, resp_id, effective_instructions, combined_input, output_items
             )
@@ -5055,19 +5264,22 @@ async def _responses_stream(
             STATE.lock.release()
 
 
-# ---------- 起動 ----------
+# ---------- startup ----------
 
 
 def _resolve_model_max_context(config: dict) -> int | None:
-    """モデル自身が申告する文脈長上限を、起動時にロードした生の config
-    (``mlx_lm_load(..., return_config=True)`` の戻り値) から取る。
-    ハードコードしない — ``--max-context-tokens`` が優先され、これは
-    未指定時のフォールバックにだけ使う。
+    """Take the context-length limit the model itself declares from the raw
+    config loaded at startup (the return value of
+    ``mlx_lm_load(..., return_config=True)``). Nothing is hardcoded —
+    ``--max-context-tokens`` takes precedence, and this is used only as the
+    fallback when it is not specified.
 
-    VLM ラッパー形式 (Qwen3.6-35B-A3B 等) は ``max_position_embeddings`` が
-    トップレベルではなく ``text_config`` の下にネストされているので、
-    見つからなければ 1 段だけ潜って探す。見つからなければ None を返し、
-    ``_check_context_length`` はガード無効 (無制限) のまま動く。
+    In the VLM wrapper format (Qwen3.6-35B-A3B and the like)
+    ``max_position_embeddings`` is nested under ``text_config`` rather than at
+    the top level, so if it is not found we descend exactly one level and look
+    there. If it is still not found, None is returned and
+    ``_check_context_length`` keeps running with the guard disabled
+    (unlimited).
     """
 
     if isinstance(config.get("max_position_embeddings"), int):
@@ -5081,29 +5293,33 @@ def _resolve_model_max_context(config: dict) -> int | None:
 
 
 def _metal_safe_prefill_limit(config: dict) -> int | None:
-    """SpecEngine が新規プロンプトを forward できる、Metal の実際の確保上限
-    から逆算したトークン数上限。
+    """The token-count limit derived from Metal's actual allocation ceiling, up
+    to which SpecEngine can forward a new prompt.
 
-    SpecEngine (mlxturbo/spec.py) は新規プロンプトを PREFILL_STEP_SIZE
-    (既定 2048) トークンずつチャンク分割して forward する
-    (``SpecEngine._prefill_hidden``)。そのため 1 回の forward で確保される
-    注意スコア行列は ``num_attention_heads * PREFILL_STEP_SIZE * T *
-    bytes_per_elem`` (T は処理済みトークン数の総量、最後のチャンクで最大)
-    — 分割前の ``num_attention_heads * T^2 * bytes_per_elem`` (T に対して
-    二次) から、T に対して線形に下がっている。それでも Metal の 1 バッファ
-    上限 (``mx.device_info()["max_buffer_length"]``、実機で 86,586,540,032
-    バイト) を超えると ``[metal::malloc]`` でリクエストが失敗する。
+    SpecEngine (mlxturbo/spec.py) forwards a new prompt split into chunks of
+    PREFILL_STEP_SIZE (2048 by default) tokens
+    (``SpecEngine._prefill_hidden``). The attention score matrix allocated in
+    one forward is therefore ``num_attention_heads * PREFILL_STEP_SIZE * T *
+    bytes_per_elem`` (T being the total number of processed tokens, largest on
+    the final chunk) — down from the pre-split
+    ``num_attention_heads * T^2 * bytes_per_elem`` (quadratic in T) to linear
+    in T. Even so, exceeding Metal's single-buffer limit
+    (``mx.device_info()["max_buffer_length"]``, 86,586,540,032 bytes on the
+    actual machine) makes the request fail with ``[metal::malloc]``.
 
-    ``max_position_embeddings`` (モデルが申告する学習時文脈長) だけを見ると
-    現実的にはまず届かない桁の値を返すこともあるので、その値をそのまま
-    上限にはせず、ここで求めた値と ``_resolve_model_max_context`` の値の
-    小さい方を実際の上限として使う (``_resolve_default_max_context_tokens``)。
-    多くのモデルでは max_position_embeddings の方が先に効く — 分割後の壁は
-    非常に大きい (このモデルでは 100 万トークン超) ため。
+    Looking only at ``max_position_embeddings`` (the training-time context
+    length the model declares) can return a value of an order that is
+    realistically never reached, so that value is not used as the limit
+    directly; instead the smaller of the value computed here and the value from
+    ``_resolve_model_max_context`` is used as the actual limit
+    (``_resolve_default_max_context_tokens``). For most models
+    max_position_embeddings binds first — because the post-split wall is very
+    high (over 1 million tokens for this model).
 
-    理論上ちょうど 1 バッファを埋め切る T (割ると即失敗する境界) に 0.9 を
-    掛けて安全側に倒す — アテンション行列以外にも同時に確保されるバッファ
-    がある分、理論値ちょうどまでは安全とは言えないため。
+    The theoretical T that exactly fills one buffer (the boundary at which
+    exceeding it fails immediately) is multiplied by 0.9 to err on the safe
+    side — because buffers other than the attention matrix are allocated at the
+    same time, so it cannot be called safe right up to the theoretical value.
     """
 
     text_config = config.get("text_config", config)
@@ -5125,10 +5341,11 @@ def _metal_safe_prefill_limit(config: dict) -> int | None:
 
 
 def _resolve_default_max_context_tokens(config: dict) -> int | None:
-    """``--max-context-tokens`` 未指定時の既定値: モデルが申告する上限
-    (``_resolve_model_max_context``) と、Metal が実際に確保できる上限から
-    逆算した値 (``_metal_safe_prefill_limit``) の小さい方。どちらも取れな
-    ければ None (ガード無効)。"""
+    """The default when ``--max-context-tokens`` is not specified: the smaller
+    of the limit the model declares (``_resolve_model_max_context``) and the
+    value derived from what Metal can actually allocate
+    (``_metal_safe_prefill_limit``). None if neither can be obtained (the guard
+    is disabled)."""
 
     candidates = [
         v
@@ -5139,31 +5356,35 @@ def _resolve_default_max_context_tokens(config: dict) -> int | None:
 
 
 def _install_graceful_shutdown(server_obj: "uvicorn.Server") -> None:
-    """SIGTERM/SIGINT の 1 回目: ``_SHUTTING_DOWN`` を立てて (以後の新規
-    リクエストは ``_gate_requests`` が 503 で断る) が、uvicorn 本体の
-    ``should_exit`` はまだ立てない。
+    """On the first SIGTERM/SIGINT: set ``_SHUTTING_DOWN`` (so that
+    ``_gate_requests`` refuses subsequent new requests with 503) but do not yet
+    set uvicorn's own ``should_exit``.
 
-    実機で確認した理由: uvicorn の ``Server.shutdown()`` は最初の一手で
-    リスニングソケットを閉じる (``for server in self.servers: server.close()``)。
-    これは ``should_exit`` が立った直後の ``main_loop`` 終了とほぼ同時に走る
-    ため、シグナルの数百ミリ秒後には新規の TCP 接続そのものが
-    「connection refused」になり、ASGI 層 (``_gate_requests``) が 503 を
-    返す機会が無いまま終わる (実測: SIGTERM 送出 0.2 秒後の新規リクエストが
-    HTTP レベルにすら届かず接続失敗になることを確認)。
+    The reason, confirmed on the actual machine: uvicorn's
+    ``Server.shutdown()`` closes the listening socket as its very first move
+    (``for server in self.servers: server.close()``). That runs almost
+    simultaneously with the end of ``main_loop`` right after ``should_exit`` is
+    set, so within a few hundred milliseconds of the signal a new TCP
+    connection itself becomes "connection refused", and everything ends without
+    the ASGI layer (``_gate_requests``) ever getting a chance to return a 503
+    (measured: a new request 0.2 seconds after sending SIGTERM was confirmed to
+    fail at connection time, without even reaching the HTTP level).
 
-    そこで ``_drain_and_exit`` (``startup`` をラップして常駐させる監視
-    タスク) が ``STATE.queue_depth`` (処理中の生成リクエスト数) が 0 に
-    なるまでリスナーを開けたまま待ち、その間の新規リクエストは
-    ``_gate_requests`` が実際の 503 レスポンスとして断れるようにする。
-    キューが空になった時点で初めて ``should_exit`` を立て、uvicorn 本体の
-    通常のシャットダウン (リスナーを閉じて残り接続を待つ) に入る。
+    So ``_drain_and_exit`` (a watchdog task made resident by wrapping
+    ``startup``) keeps the listener open and waits until ``STATE.queue_depth``
+    (the number of generation requests being processed) reaches 0, so that new
+    requests during that window can be refused by ``_gate_requests`` as real
+    503 responses. Only once the queue is empty is ``should_exit`` set, and
+    uvicorn's own ordinary shutdown (close the listener and wait for the
+    remaining connections) begins.
 
-    2 回目のシグナル (種類は問わない) は ``os._exit`` で即時終了する。
-    uvicorn 自身の ``should_exit``/``force_exit`` 経由の終了は、生成中の
-    ワーカースレッド (``STATE.executor``、既定非 daemon) が MLX の同期
-    生成コードを実行中だと、通常のインタプリタ終了処理がそのスレッドの
-    完了を待ってしまい「即時」にならない (実測で確認: 500 トークン生成の
-    完了を待ってからプロセスが終了した)。"""
+    A second signal (of any kind) terminates immediately via ``os._exit``.
+    Exiting via uvicorn's own ``should_exit``/``force_exit`` is not
+    "immediate" when the worker thread that is generating (``STATE.executor``,
+    non-daemon by default) is executing MLX's synchronous generation code,
+    because the ordinary interpreter shutdown waits for that thread to finish
+    (confirmed by measurement: the process exited only after a 500-token
+    generation had completed)."""
 
     original_startup = server_obj.startup
     signal_count = {"n": 0}
@@ -5177,12 +5398,13 @@ def _install_graceful_shutdown(server_obj: "uvicorn.Server") -> None:
                 "[mlxturbo-serve] シグナル受信: graceful shutdown 開始 "
                 "(新規リクエストは 503、処理中のリクエストは完了を待つ)"
             )
-            # ここでは original_handle_exit を呼ばない (= uvicorn 本体の
-            # should_exit をまだ立てない)。上の docstring 参照 —
-            # _drain_and_exit がキューの空きを見てから立てる。
+            # Do not call original_handle_exit here (= do not yet set
+            # uvicorn's own should_exit). See the docstring above —
+            # _drain_and_exit sets it after seeing the queue drain.
         else:
-            # os._exit で OS レベルの即時終了に落とす (理由は docstring 参照)。
-            # ASGI lifespan の shutdown もこの後は一切走らない。
+            # Drop to an immediate OS-level exit via os._exit (see the
+            # docstring for the reason). The ASGI lifespan's shutdown does not
+            # run at all after this either.
             print("[mlxturbo-serve] 2 度目のシグナルを受信: 即時終了します", flush=True)
             server_obj.force_exit = True
             os._exit(1)
@@ -5196,13 +5418,15 @@ def _install_graceful_shutdown(server_obj: "uvicorn.Server") -> None:
 
 
 async def _drain_and_exit(server_obj: "uvicorn.Server") -> None:
-    """``_install_graceful_shutdown`` が起動時に常駐させる監視タスク。
+    """The watchdog task ``_install_graceful_shutdown`` makes resident at
+    startup.
 
-    ``_SHUTTING_DOWN`` が立つ (1 回目のシグナル) まで待ち、そこから
-    ``STATE.queue_depth`` (生成系 4 経路の処理中リクエスト数) が 0 になる
-    まで待ってから、初めて uvicorn 本体の ``should_exit`` を立てる (=
-    リスニングソケットを閉じさせる)。2 回目のシグナル (``force_exit``) が
-    先に来た場合はキューの状態に関わらず即座に抜ける。"""
+    It waits until ``_SHUTTING_DOWN`` is set (the first signal), then waits
+    until ``STATE.queue_depth`` (the number of in-flight requests across the 4
+    generating paths) reaches 0, and only then sets uvicorn's own
+    ``should_exit`` (= makes it close the listening socket). If a second signal
+    (``force_exit``) arrives first, it returns immediately regardless of the
+    state of the queue."""
 
     while not _SHUTTING_DOWN and not server_obj.force_exit:
         await asyncio.sleep(0.1)
@@ -5216,13 +5440,14 @@ async def _drain_and_exit(server_obj: "uvicorn.Server") -> None:
 def _enforce_required_runner(
     runner: Runner, required_kind: str | None, log_prefix: str = "[mlxturbo-serve]"
 ) -> None:
-    """``--require-runner`` が指定されているのに解決された runner の
-    ``KIND`` が一致しなければ、フォールバックせず理由を明示して
-    ``SystemExit(1)`` する。
+    """If ``--require-runner`` was specified but the resolved runner's ``KIND``
+    does not match, do not fall back: state the reason explicitly and raise
+    ``SystemExit(1)``.
 
-    未指定 (``required_kind is None``) なら何もしない — 従来どおり黙って
-    fallback を許すが、fallback なら ``/health`` の ``fallback_reason`` で
-    見える (mlxturbo.runner.build_runner のクラス docstring 参照)。
+    When it is not specified (``required_kind is None``) this does nothing —
+    falling back is silently permitted as before, but a fallback is visible via
+    ``fallback_reason`` on ``/health`` (see the class docstring of
+    mlxturbo.runner.build_runner).
     """
 
     if required_kind is None:
@@ -5264,7 +5489,7 @@ def main() -> None:
         "--served-model-name",
         default=None,
         help="GET /v1/models とレスポンスの \"model\" 欄で名乗る id。既定は --model の"
-        " basename (例: /Users/ht/models/qwen38fn-mlx-v-fast6 なら qwen38fn-mlx-v-fast6)。"
+        " basename (例: ~/models/qwen38fn-mlx-v-fast6 なら qwen38fn-mlx-v-fast6)。"
         " リクエストの model がこれと違えば 404 (OpenAI の model_not_found と同じ)",
     )
     ap.add_argument("--host", default="127.0.0.1")
@@ -5438,10 +5663,10 @@ def main() -> None:
 
     served_name = args.served_model_name or Path(args.model).name
 
-    # モデルの重み・KV キャッシュはロードしたスレッドに紐づく (docstring
-    # 参照)。以後すべての生成呼び出しもこのスレッドに固定するので、ロード
-    # 自体もここで行う。max_workers=1 でスレッドは 1 本だけ、プロセス生涯
-    # 使い回す。
+    # The model weights and the KV cache are bound to the thread that loaded
+    # them (see the docstring). Every subsequent generate call is pinned to
+    # this thread too, so the load itself is done here. With max_workers=1
+    # there is only one thread, reused for the lifetime of the process.
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="mlxturbo-mlx"
     )
@@ -5449,15 +5674,16 @@ def main() -> None:
     def _load():
         t0 = time.perf_counter()
         if args.ngram:
-            # qwen4_exp.py の NGRAM_ON_DISK はモジュール import 時に評価される
-            # ので、読み込み呼び出しより前に立てておく必要がある (cli.py と
-            # 同じ理由)。
+            # NGRAM_ON_DISK in qwen4_exp.py is evaluated at module import time,
+            # so it has to be set before the load call (the same reason as in
+            # cli.py).
             os.environ["FASTMLX_NGRAM_DISK"] = "1"
         if args.mtp:
-            # build_runner (mlxturbo/runner.py) は load_cli_mtp を固定の位置
-            # 引数だけで呼ぶため、--mtp のパスを直接渡す口が無い。cli.py の
-            # load_cli_mtp がこの環境変数を読む (MTP_PATH_ENV 参照) — --ngram
-            # と同じ、呼び出し元を編集せずに配線する手筋。
+            # build_runner (mlxturbo/runner.py) calls load_cli_mtp with fixed
+            # positional arguments only, so there is no way to pass the --mtp
+            # path directly. cli.py's load_cli_mtp reads this environment
+            # variable (see MTP_PATH_ENV) — the same trick as --ngram for
+            # wiring things up without editing the caller.
             os.environ[MTP_PATH_ENV] = args.mtp
         model, tokenizer, config = mlx_lm_load(args.model, return_config=True)
         if args.ngram:
@@ -5478,11 +5704,13 @@ def main() -> None:
                 max_context_tokens, source = from_config, "config"
             else:
                 max_context_tokens, source = from_metal, "Metal 一括確保上限から逆算"
-        # runner が既に非投機 (fallback) なら降格の余地が無いので構築しない。
-        # 投機系 (spec/flash_spec) のときだけ、このリクエスト単位の降格用に
-        # 同じ model/tokenizer を指す FallbackRunner をもう1つ持つ (項目 7)。
-        # 構築自体は参照を持つだけで GPU 計算を伴わないので、専用スレッド外
-        # (この _load() の戻り値を受け取った後) で作っても安全。
+        # If the runner is already non-speculative (the fallback) there is no
+        # room to downgrade, so nothing is constructed. Only for the
+        # speculative ones (spec/flash_spec) do we keep a second FallbackRunner
+        # pointing at the same model/tokenizer, for this per-request downgrade
+        # (item 7). Construction merely takes references and involves no GPU
+        # computation, so it would also be safe to create it outside the
+        # dedicated thread (after receiving this _load()'s return value).
         downgrade_runner = None if runner.KIND == FallbackRunner.KIND else FallbackRunner(
             model, tokenizer
         )
@@ -5502,10 +5730,11 @@ def main() -> None:
             " --max-context-tokens で指定可)"
         )
 
-    # runner の種類に応じて会話ごとのスロットが積むクラスを決める。
-    # SpecRunner なら SpecEngine 用の ChatSession、それ以外 (FallbackRunner)
-    # なら mlx_lm prompt_cache 用の FallbackSession — どちらも .processed を
-    # 持ち、_select_session はこれを見るだけなので中身は気にしない。
+    # Decide, according to the kind of runner, which class the per-conversation
+    # slots hold. ChatSession (for SpecEngine) for SpecRunner, and otherwise
+    # (FallbackRunner) FallbackSession (for mlx_lm's prompt_cache) — both have
+    # .processed, and _select_session looks only at that, so it does not care
+    # about the rest.
     session_factory = ChatSession if getattr(runner, "KIND", None) == "spec" else FallbackSession
 
     STATE = ModelState(

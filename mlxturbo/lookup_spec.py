@@ -1,32 +1,37 @@
-"""n-gram lookup (SAM) だけを使う、モデル非依存の投機デコード経路。
+"""Model-agnostic speculative decoding path that uses n-gram lookup (SAM) only.
 
-Kimi K3 レビュー項目 12。``mlxturbo.spec.SpecEngine`` の投機は 2 つの部品
-(MTP によるドラフトと、n-gram lookup (SAM) によるドラフト) からできているが、
-後者は「これまでに実際に出た/読まれたトークン列の中に、今の続きの接頭辞と
-同じ並びが前にも出ていないか」を見るだけの純粋な文字列 (トークン ID 列) 照合
-で、モデルの重みも層構成も一切見ない。``mlxturbo/sam.py`` の
-``SuffixAutomaton`` (この変更では一切書き換えていない、既存の汎用ユーティリ
-ティ) がその照合を O(1) 償却で行う。
+Kimi K3 review item 12. Speculation in ``mlxturbo.spec.SpecEngine`` is built out of
+two parts (a draft from MTP, and a draft from n-gram lookup (SAM)), but the latter
+is pure string (token ID sequence) matching that only asks "among the tokens
+actually emitted/read so far, has the same run as the prefix of the current
+continuation appeared before?" — it never looks at the model's weights or its layer
+structure. ``SuffixAutomaton`` in ``mlxturbo/sam.py`` (an existing general-purpose
+utility, not rewritten at all by this change) performs that matching in amortized
+O(1).
 
-``mlxturbo/spec.py`` は触らない制約 (実測検証済みのエンジン本体) なので、
-lookup 部分だけを ``SuffixAutomaton`` から直接組み立て直す、独立した runner
-としてここに書く。対象は「KV キャッシュが ``trim()`` 可能なモデル」に限る:
-GDN のような線形状態は途中位置へ巻き戻せない (``mlxturbo/spec.py`` の
-``ChatSession`` docstring と同じ制約) が、全層 attention (KV だけ) のモデル
-なら ``mlx_lm.models.cache.trim_prompt_cache`` で素直に巻き戻せる。
+Since ``mlxturbo/spec.py`` is under a do-not-touch constraint (it is the engine
+proper, already verified by measurement), the lookup part alone is rebuilt directly
+on top of ``SuffixAutomaton`` and written here as an independent runner. The scope
+is limited to "models whose KV cache can be ``trim()``ed": a linear state such as
+GDN cannot be rewound to a midway position (the same constraint as the
+``ChatSession`` docstring in ``mlxturbo/spec.py``), but a model that is attention
+(KV only) in every layer can be rewound straightforwardly with
+``mlx_lm.models.cache.trim_prompt_cache``.
 
-対応するのは貪欲 (temperature 0) だけ。temperature > 0 は「ドラフトが外れた
-ときに、検証側の分布から正しく再サンプルする」導出が要る
-(``mlxturbo.runner.DraftSpecRunner`` が使う ``mlx_lm.generate.
-speculative_generate_step`` はこれを検証側の sampler 呼び出し1回で解決して
-いるが、それは「検証モデル自身がドラフトとは独立にサンプルし、一致すれば
-それを使う」という mlx_lm 側の設計に依存しており、lookup ドラフト側にはその
-「検証モデル」に相当するものが無い — ドラフト自体が「モデルの外」の文字列
-照合なので、同じ組み方はできない)。ここでは非対応のまま踏み込まず、
-``temp > 0`` (または repetition_penalty 等、貪欲でも出力を変える logits
-processor が要求された) ときは ``FallbackRunner`` へその場で委譲する
-(``generate()`` 内部での降格 — server.py 側のルーティングを増やさずに済む、
-このモジュール docstring 末尾の判断参照)。
+Only greedy (temperature 0) is supported. temperature > 0 requires a derivation for
+"resampling correctly from the verifier-side distribution when the draft misses"
+(``mlx_lm.generate.speculative_generate_step``, which
+``mlxturbo.runner.DraftSpecRunner`` uses, solves this with a single sampler call on
+the verifier side, but that depends on mlx_lm's design in which "the verifier model
+itself samples independently of the draft, and if they agree, that sample is used",
+and on the lookup-draft side there is nothing corresponding to that "verifier
+model" — the draft itself is string matching "outside the model", so the same
+construction is not possible). We do not step into it here and leave it
+unsupported; when ``temp > 0`` (or when a logits processor that changes the output
+even under greedy, such as repetition_penalty, is requested) we delegate to
+``FallbackRunner`` on the spot (a demotion inside ``generate()`` — this avoids
+adding routing on the server.py side; see the decision at the end of this module
+docstring).
 """
 
 from __future__ import annotations
@@ -42,11 +47,11 @@ from .spec import PREFILL_STEP_SIZE
 
 
 def _prefill(model, cache, y: mx.array, step: int) -> mx.array:
-    """``mlx_lm.generate.speculative_generate_step._prefill`` と同じ形
-    (公開 API である ``mlx_lm.models.cache`` の上に書いた、独立した実装 —
-    ``mlxturbo/spec.py`` は読んでも参照してもいない)。最後の 1 トークンだけ
-    未 feed のまま残す (呼び出し側がそれを最初の「確定済みだが未 feed」の
-    ペンディングトークンとして使う)。"""
+    """Same shape as ``mlx_lm.generate.speculative_generate_step._prefill``
+    (an independent implementation written on top of the public API
+    ``mlx_lm.models.cache`` — ``mlxturbo/spec.py`` is neither read nor
+    referenced). Leaves just the last token un-fed (the caller uses it as the
+    first "already decided but not yet fed" pending token)."""
 
     while y.size > 1:
         n = min(step, y.size - 1)
@@ -62,10 +67,11 @@ def _needs_logits_processors(
     frequency_penalty: float | None,
     logit_bias: dict | None,
 ) -> bool:
-    """恒等値 (分布/貪欲結果を変えない既定値) かどうか。server.py の
-    ``_IDENTITY_SAMPLING_VALUES`` と同じ値の集合を使う (このモジュールは
-    server.py に依存させたくないので、値そのものをここへ複製している —
-    どちらかを変えたら両方直すこと)。"""
+    """Whether the values are identity values (defaults that change neither the
+    distribution nor the greedy result). Uses the same set of values as
+    ``_IDENTITY_SAMPLING_VALUES`` in server.py (we do not want this module to
+    depend on server.py, so the values themselves are duplicated here — if you
+    change one, fix both)."""
 
     if logit_bias:
         return True
@@ -79,17 +85,20 @@ def _needs_logits_processors(
 
 
 class LookupSpecRunner:
-    """n-gram lookup (SAM) だけで投機する runner。モデルのアーキテクチャを
-    一切見ないので、``mlxturbo.runner.build_runner`` が spec/flash_spec の
-    契約を満たさないと判定したモデル (= 通常なら ``FallbackRunner``) に
-    かぶせて使う (``build_runner`` の ``--lookup-spec`` 分岐参照)。
+    """A runner that speculates using n-gram lookup (SAM) only. It never looks
+    at the model architecture at all, so it is layered over models that
+    ``mlxturbo.runner.build_runner`` judged not to satisfy the spec/flash_spec
+    contract (= normally ``FallbackRunner``); see the ``--lookup-spec`` branch
+    in ``build_runner``.
 
-    ``SUPPORTED_SAMPLING_PARAMS``: ``FallbackRunner`` と同じ全キーを宣言する
-    — このクラスは、値の組み合わせによって「n-gram lookup 投機」か「plain
-    (無投機) 生成」かを自分の中で選ぶだけで、どちらの経路でも最終的な出力
-    分布は変えない (plain 経路は内部で保持する ``FallbackRunner`` インスタンス
-    にそのまま委譲する、以下 ``generate()`` 参照)。あるリクエストにとって
-    どちらが選ばれるかは呼び出し側から見えないし、見る必要もない。
+    ``SUPPORTED_SAMPLING_PARAMS``: declares all the same keys as
+    ``FallbackRunner`` — this class merely picks, internally and based on the
+    combination of values, between "n-gram lookup speculation" and "plain
+    (non-speculative) generation", and neither path changes the final output
+    distribution (the plain path delegates as-is to the ``FallbackRunner``
+    instance it holds internally; see ``generate()`` below). Which of the two
+    is chosen for a given request is invisible to the caller, and does not need
+    to be visible.
     """
 
     KIND = "lookup_spec"
@@ -101,14 +110,16 @@ class LookupSpecRunner:
         self.max_draft = max_draft
         self.min_match = min_match
         self.fallback_reason = None
-        # plain (無投機) 経路への委譲用。session 付きリクエストがこちらへ
-        # 落ちた場合、FallbackRunner 自身の LCP 再利用がそのまま効く
-        # (FallbackSession の契約どおり) — 実装を複製せず、委譲だけで済む。
+        # For delegating to the plain (non-speculative) path. When a request
+        # with a session falls through to here, FallbackRunner's own LCP reuse
+        # works as-is (per the FallbackSession contract) — no need to duplicate
+        # the implementation, delegation alone is enough.
         self._fallback = FallbackRunner(model, tokenizer)
-        # KV キャッシュが trim 可能かどうかはモデルの層構成 (GDN 混在か
-        # どうか) で決まり、リクエストごとに変わらないので構築時に 1 度だけ
-        # 判定する。実際に確保するのはダミーの空キャッシュ (make_prompt_cache
-        # はここでは Python オブジェクトを作るだけで GPU 計算は伴わない)。
+        # Whether the KV cache can be trimmed is determined by the model's
+        # layer structure (whether GDN is mixed in) and does not change per
+        # request, so decide it once at construction time. What is actually
+        # allocated is a dummy empty cache (make_prompt_cache here only builds
+        # Python objects and involves no GPU computation).
         probe_cache = make_prompt_cache(model)
         self.trimmable = can_trim_prompt_cache(probe_cache)
 
@@ -138,11 +149,11 @@ class LookupSpecRunner:
             )
         )
         if plain_only:
-            # temp==0 なら top_p/top_k/min_p は mlx_lm.sample_utils.make_sampler
-            # 自身が argmax に短絡して無視する (mlx_lm/sample_utils.py の
-            # make_sampler 46 行目) ので、ここで気にする必要はない —
-            # 気にする必要があるのは logits_processors 側 (repetition_penalty
-            # 等) と logit_bias だけ。
+            # When temp==0, mlx_lm.sample_utils.make_sampler itself
+            # short-circuits to argmax and ignores top_p/top_k/min_p (line 46 of
+            # make_sampler in mlx_lm/sample_utils.py), so there is no need to
+            # care about them here — the only things to care about are the
+            # logits_processors side (repetition_penalty etc.) and logit_bias.
             return self._fallback.generate(
                 prompt_ids,
                 max_tokens,
@@ -161,32 +172,36 @@ class LookupSpecRunner:
                 **extra,
             )
         if seed is not None:
-            # 貪欲なので乱数は出力に影響しないが、SpecRunner/FallbackRunner
-            # と同じく引数として受けた以上は消費しておく (呼び出し側の
-            # 「seed を渡したのに黙って無視された」を避ける)。
+            # Greedy, so randomness does not affect the output, but since we
+            # accepted it as an argument just like SpecRunner/FallbackRunner, we
+            # consume it anyway (avoids the caller's "I passed a seed and it was
+            # silently ignored").
             mx.random.seed(seed)
         return self._lookup_generate(prompt_ids, max_tokens, eos_ids, on_tokens)
 
     def _lookup_generate(self, prompt_ids, max_tokens, eos_ids, on_tokens) -> dict:
-        """貪欲、n-gram lookup 投機の本体。
+        """The greedy n-gram lookup speculation proper.
 
-        1 ラウンドにつき: (a) 直前までに確定した接頭辞と同じ並びが履歴の
-        どこかに前にも出ていれば、その続きを ``draft`` として提案
-        (``SuffixAutomaton.draft``)、(b) ペンディングトークン + draft を
-        まとめて 1 回 forward (teacher forcing)、(c) 各位置の argmax が
-        draft の次の要素と一致する間だけ受理し、最初の不一致位置の argmax
-        を「ボーナストークン」として emit、(d) 受理されなかった draft 分は
-        ``trim_prompt_cache`` で KV を巻き戻す。
+        Per round: (a) if the same run as the prefix decided up to now has
+        appeared earlier somewhere in the history, propose its continuation as
+        ``draft`` (``SuffixAutomaton.draft``); (b) forward the pending token +
+        draft together in a single pass (teacher forcing); (c) accept for as
+        long as the argmax at each position matches the next element of the
+        draft, and emit the argmax at the first mismatching position as a
+        "bonus token"; (d) for the part of the draft that was not accepted,
+        rewind the KV with ``trim_prompt_cache``.
 
-        draft が無い/空なら (b) は 1 トークンだけの forward になり、通常の
-        1 トークンずつの貪欲デコードと同じコスト・同じ出力になる — 一致が
-        起きない場面で遅くならないことの根拠 (実測は別途、docs/ 配下は
-        今回の変更範囲外なのでここに書く)。
+        If there is no draft / it is empty, (b) becomes a forward of just one
+        token, with the same cost and the same output as ordinary
+        one-token-at-a-time greedy decoding — this is the grounds for it not
+        getting slower in situations where no match occurs (measurements are
+        separate; anything under docs/ is outside the scope of this change, so
+        it is written here).
 
-        session (会話ごとの prompt cache 再利用) はここでは扱わない —
-        毎回そのリクエスト専用の cache を新規に作る (呼び出し側の session
-        は読みも書きもしない。次ターンでは通常どおり全量再プレフィルになる
-        だけで、誤動作はしない)。
+        session (per-conversation prompt cache reuse) is not handled here — a
+        cache dedicated to that request is created anew every time (the caller's
+        session is neither read nor written. On the next turn it simply
+        re-prefills everything as usual; it does not misbehave).
         """
 
         t0 = time.perf_counter()
@@ -204,9 +219,10 @@ class LookupSpecRunner:
         while len(tokens) < max_tokens and not stop:
             rounds += 1
             budget_left = max_tokens - len(tokens)
-            # ボーナストークン用に必ず 1 枠残す (draft を全部受理しても
-            # 最後にちょうど 1 個「新しい」トークンが出る、DraftSpecRunner/
-            # mlx_lm.speculative_generate_step と同じ構造)。
+            # Always leave exactly 1 slot for the bonus token (even if the
+            # whole draft is accepted, exactly 1 "new" token comes out at the
+            # end — the same structure as DraftSpecRunner /
+            # mlx_lm.speculative_generate_step).
             draft_cap = max(0, min(self.max_draft, budget_left - 1))
             draft = sam.draft(draft_cap, min_len=self.min_match) if draft_cap > 0 else None
             cand = y.tolist() + (draft or [])

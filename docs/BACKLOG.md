@@ -31,23 +31,34 @@
 
 継続バッチングを投機デコードと GDN の再帰状態の上に載せるのは片手間の規模ではない。着手するなら `verify_batch_real.py` の実行が最初の一歩。
 
-## 3. 他モデル対応 (gemma / kimi / glm)
+## 3. 他モデル対応で投機を効かせる (一部済み)
 
-サーバーは「spec/flash_spec の契約に合わなければ通常生成にフォールバック」なので、**載せれば喋る**。fallback の理由は `/health` の `fallback_reason` に出る。ただし投機デコードは効かない。
+契約に合わないモデルでも「載せれば喋る」状態は元からある (fallback、理由は `/health` の
+`fallback_reason` に出る)。2026-08-30 に、投機を効かせる汎用経路を 2 つ足した。どちらも
+既定 off。
 
-- 27B 系の `SpecEngine` は `mlxturbo/_mlx_compat.py:111` の契約 (GDN ハイブリッド固有の形) を要求する
-- Flash-Next 系は `spec_flash.py` の `FlashSpecEngine` (qwen4_exp 固有)
-- 他アーキテクチャで投機を効かせるには契約の一般化が要る。lookup (SAM) 側はモデル非依存なので、そちらだけ先に切り出す手はある
+`--draft-model` (`DraftSpecRunner`) は mlx_lm 自身の `speculative_generate_step` を包む
+だけなので、アーキテクチャに依存しない。ただし**適合する小型ドラフトが要る**。手元に
+無く、self-draft では 367 → 248 tok/s と当然ながら悪化した。真の高速化ケースは未測定で、
+ここが残っている最大の穴。
 
-この Mac では VRAM が先に効くので、載せられるサイズが実質的な制約になる。
+`--lookup-spec` (`LookupSpecRunner`) は n-gram lookup だけを使う。trim 可能なキャッシュ
+かつ貪欲限定。繰り返しの多い入力で 361 → 427 tok/s (+18%) だが、**繰り返しの無い自然文
+では 367 → 245 tok/s (-32%) と遅くなる**。自前ループが mlx_lm の `generate_step` が持つ
+`async_eval` 二重バッファを持たないため。ここを埋めれば常時 on にできる可能性がある。
 
-## 4. n / logprobs (公開後の需要待ち)
+残るのは、`spec` / `flash_spec` 級の速度 (1.25-1.39x) を他アーキテクチャで出すこと。
+それには MTP 相当のドラフトヘッドか、アーキテクチャ固有の状態捕獲が要る。
 
-一度「この Mac では不要」と見送ったが、**公開して他のモデル・他の機械で使われるなら判断が変わり得る**ので、却下ではなく保留に格上げしておく。
+## 4. `n` (複数候補)
 
-`n` (複数候補) は、直列のままだと生成時間が候補数倍になるので §2 のバッチ化が前提。同一プロンプトの n 候補は §2 のバッチにそのまま載る。
+直列のままだと生成時間が候補数倍になるので §2 のバッチ化が前提。同一プロンプトの n 候補は
+§2 のバッチにそのまま載る。
 
-`logprobs` は投機経路では正しい値を返しにくい。ドラフトのまま受理されたトークンの logprob は verify 時点のロジットにあり、棄却後に引き直したトークンのそれは残差分布にある。区別せず最終ロジットの softmax を返すと、投機の痕跡が消えた不正確な値になる。fallback 経路に限れば素直に実装できる。
+`logprobs` は 2026-08-30 に fallback / 降格経路限定で実装した。投機経路で要求されたら
+自動で非投機に降格する。ストリーミングとの併用は 400 で断っている — ThinkingRouter や
+tool_calls が絡むとトークン列と content の対応が崩れ、正しく対応付ける実装が要るため。
+そこを埋めるのは残件。
 
 ## 5. prefill の高速化 (体感の本丸)
 
@@ -77,4 +88,6 @@ fastmlx/mlxturbo 側の現状:
 
 - **tool calling** → 73e061a で実装。opencode / Codex / Claude Code の 3 クライアントで実機検証済み。懸念だった「モデルが構文を安定して出すか」は Qwen3.6 / Flash-Next とも問題なし
 - **MTP の価値の決着** → 決着した。27B の数字から引いた「現 base では 1.2 倍遅くなる」は Flash-Next には当てはまらず、専用エンジン (`spec_flash.py`、深さ 1) で **1.26〜1.44 倍**。MTP 重みは元 checkpoint から抽出したサイドカー (5.2GB、4 段の量子化成果物で共用)。経緯と実測は `docs/MTP-FLASH.md`
+- **公開の前提** → `fastmlx` から `mlxturbo` へ改名 (PyPI/GitHub の `fastmlx` は競合の既存プロジェクト)、MIT ライセンス、README の書き直し (「汎用高速推論ランタイム」とは名乗らない)、docs の整理、CI、運用手引き、個人パスの除去、コメントの英語化。手順は `docs/RELEASE.md`
+- **プロトコル層の穴** → 非恒等サンプリングの 400 をリクエスト単位の非投機降格に変更 (実クライアントは `top_p` を既定で送るので、看板構成が最初の 1 発で 400 を返していた)、`response_format` の 400 明示、stop の早期打ち切り (ストリームで 11 倍)、Responses の `store`/`previous_response_id`、Anthropic の usage キャッシュ量、`/v1/embeddings` の 501 明示
 - **サーバーの配布準備** → 認証・キュー上限・SSE keepalive・graceful shutdown・文脈長ガード・prompt cache 再利用・MTP 自動発見・`--require-runner`。接続手順は `docs/SERVER.md`

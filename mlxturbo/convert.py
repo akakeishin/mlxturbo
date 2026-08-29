@@ -1,21 +1,27 @@
-"""mtp.* を保持したまま group_size 可変で 4bit 量子化する mlx-lm 互換コンバータ。
+"""An mlx-lm compatible converter that quantizes to 4bit with a variable group_size while keeping mtp.* intact.
 
-mlx_lm.convert は読み込み時の sanitize (qwen3_5.py の TextModel.sanitize) で
-mtp.* を丸ごと捨てる。ここでは本体は mlx_lm と同じ経路（同じ sanitize、同じ
-量子化関数）で変換しつつ、mtp.* は mlxturbo.mtp.load_mtp に通して同じ +1 norm
-シフトを適用したうえで量子化し、"mtp." キーのまま同じ safetensors シャード集合
-に同梱保存する。group_size は本体・mtp 側とも CLI から可変。
+mlx_lm.convert discards mtp.* wholesale in the sanitize applied at load time
+(TextModel.sanitize in qwen3_5.py). Here the model proper is converted through the
+same path as mlx_lm (the same sanitize, the same quantization function), while mtp.*
+is put through mlxturbo.mtp.load_mtp so that the same +1 norm shift is applied
+before quantizing, and it is saved with its "mtp." keys as they are, bundled into
+the same set of safetensors shards. group_size is settable from the CLI for both the
+model proper and the mtp side.
 
-mlx_lm.convert からの差分（詳細は README/報告参照）:
-  - mtp.* を破棄せず、mlxturbo.mtp の shift 規約で量子化して同梱保存する
-  - --group-size で本体・mtp 双方の量子化グループサイズを指定できる
-  - config.json に "fastmlx_mtp": true と "mtp_quantization" を書く
-  - --dry-run で本体の先頭 N 層 + mtp.* だけを変換し、ロード検証と逆量子化誤差
-    確認ができる（フル 56GB 読みを避けるための開発用モード）
-  - upload-repo / mixed quant recipe / dequantize など mlx_lm.convert の付随機能は
-    持たない（このプロジェクトの用途はローカル 1 回変換のみのため）
+Differences from mlx_lm.convert (see the README / report for details):
+  - mtp.* is not discarded; it is quantized under mlxturbo.mtp's shift convention and
+    saved alongside
+  - --group-size lets you specify the quantization group size for both the model
+    proper and mtp
+  - "fastmlx_mtp": true and "mtp_quantization" are written into config.json
+  - --dry-run converts only the first N layers of the model proper + mtp.*, which
+    allows load verification and dequantization-error checking (a development mode
+    for avoiding the full 56GB read)
+  - it does not carry mlx_lm.convert's ancillary features such as upload-repo, mixed
+    quant recipe, or dequantize (because this project's use is a one-off local
+    conversion only)
 
-使い方:
+Usage:
     uv run python -m mlxturbo.convert --group-size 128 --out /path/to/out
     uv run python -m mlxturbo.convert --group-size 128 --out /tmp/dry --dry-run
 """
@@ -45,19 +51,20 @@ from ._mlx_compat import (
 
 from .mtp import MTPModule, find_snapshot, load_mtp
 
-# mlx_lm.convert.MODEL_CONVERSION_DTYPES と同じ集合。float 型 config dtype だけ
-# キャスト対象にする。
+# The same set as mlx_lm.convert.MODEL_CONVERSION_DTYPES. Only float config dtypes
+# are subject to the cast.
 MODEL_CONVERSION_DTYPES = ("float16", "bfloat16", "float32")
 
 DEFAULT_HF_PATH = "Qwen/Qwen3.8-27B"
 
 
 def resolve_hf_path(hf_path: str) -> str:
-    """repo id ならローカルキャッシュのスナップショットへ解決する。
+    """Resolve a repo id to a snapshot in the local cache.
 
-    mlx_lm.utils.load はローカルに無いパスを渡すとネットワークからダウンロード
-    しようとする。56GB のチェックポイントで意図せぬ取得が起きないよう、ここでは
-    mlxturbo.mtp.find_snapshot (ローカルキャッシュ限定) で解決してから渡す。
+    mlx_lm.utils.load tries to download from the network when handed a path that
+    does not exist locally. So that an unintended fetch does not happen with a 56GB
+    checkpoint, we resolve it here with mlxturbo.mtp.find_snapshot (local cache
+    only) before passing it on.
     """
     p = Path(hf_path)
     if p.exists():
@@ -66,10 +73,10 @@ def resolve_hf_path(hf_path: str) -> str:
 
 
 def cast_to_config_dtype(model: nn.Module, config: dict) -> None:
-    """mlx_lm.convert.convert と同じ dtype キャストを行う。
+    """Perform the same dtype cast as mlx_lm.convert.convert.
 
-    config の torch_dtype (無ければ text_config.dtype) が float 系なら、
-    model.cast_predicate (A_log を除外する) を尊重してキャストする。
+    If the config's torch_dtype (or text_config.dtype when that is absent) is a
+    float type, cast while honoring model.cast_predicate (which excludes A_log).
     """
     dtype = config.get("torch_dtype")
     if dtype is None and (text_config := config.get("text_config")):
@@ -89,12 +96,14 @@ def cast_to_config_dtype(model: nn.Module, config: dict) -> None:
 
 
 def truncate_layers(model: nn.Module, num_layers: int) -> None:
-    """--dry-run 用: 本体の decoder layers を先頭 num_layers 本に切り詰める。
+    """For --dry-run: truncate the model proper's decoder layers to the first
+    num_layers.
 
-    mlx.nn.Module はリスト属性の再代入でパラメータツリーが更新されるため、
-    tree_flatten(model.parameters()) はここで切り詰めた本数分しか含まなくなる。
-    以降の量子化・保存はこのツリーだけを対象にするので、元の safetensors
-    シャード自体は mx.load の遅延評価により読まれない。
+    Because reassigning a list attribute on an mlx.nn.Module updates the parameter
+    tree, tree_flatten(model.parameters()) then contains only the number of layers
+    truncated to here. Quantization and saving from this point on target only that
+    tree, so the original safetensors shards themselves are never read, thanks to
+    mx.load's lazy evaluation.
     """
     layers = model.language_model.model.layers
     if num_layers >= len(layers):
@@ -130,11 +139,12 @@ def normalize_quantization(
 
 
 def flatten_mtp_weights(mtp: nn.Module) -> dict:
-    """MTPModule のパラメータを 'mtp.' プレフィックス付きでフラット化する。
+    """Flatten MTPModule's parameters with an 'mtp.' prefix.
 
-    元チェックポイントの mtp.* キー命名 (mtp.fc.weight, mtp.layers.0...,
-    mtp.norm.weight, mtp.pre_fc_norm_*.weight) と一致させることで、
-    mlxturbo.mtp.load_mtp と同じキー規約のまま量子化済みとして保存できる。
+    By matching the original checkpoint's mtp.* key naming (mtp.fc.weight,
+    mtp.layers.0..., mtp.norm.weight, mtp.pre_fc_norm_*.weight), it can be saved as
+    already quantized while keeping the same key convention as
+    mlxturbo.mtp.load_mtp.
     """
     return {f"mtp.{k}": v for k, v in tree_flatten(mtp.parameters())}
 
@@ -164,12 +174,13 @@ def base_weights_for_mtp_artifact(model: nn.Module) -> dict:
 
 
 def load_quantized_mtp(out_dir, text_args: TextModelArgs) -> MTPModule:
-    """変換済みディレクトリから mtp.* を量子化済みとして読み込む。
+    """Load mtp.* from a converted directory as already quantized.
 
-    mlxturbo.mtp.load_mtp は生の bf16 チェックポイントから読んで自前で量子化する
-    経路しか持たない。ここでは convert() が書いた config["mtp_quantization"] を
-    見て同じ形の量子化スケルトンを組み、保存済みの mtp.weight/scales/biases を
-    そのまま load_weights する — これが「mlx_lm.load(out) 相当」の mtp 版。
+    mlxturbo.mtp.load_mtp only has the path that reads from a raw bf16 checkpoint
+    and quantizes on its own. Here we look at the config["mtp_quantization"] that
+    convert() wrote, assemble a quantization skeleton of the same shape, and
+    load_weights the saved mtp.weight/scales/biases directly — this is the mtp
+    version of "the equivalent of mlx_lm.load(out)".
     """
     out_dir = Path(out_dir)
     config = json.loads((out_dir / "config.json").read_text())
@@ -206,7 +217,8 @@ def save_with_mtp(
     tokenizer,
     config: dict,
 ) -> None:
-    """mlx_lm.utils.save 相当。本体の重みに mtp.* を同じシャード集合へ混ぜて保存する。"""
+    """Equivalent of mlx_lm.utils.save. Saves the model proper's weights with mtp.*
+    mixed into the same set of shards."""
     dst_path.mkdir(parents=True, exist_ok=True)
 
     weights = base_weights_for_mtp_artifact(model)
@@ -264,16 +276,19 @@ def convert(
     dry_run: bool = False,
     dry_run_layers: int = 4,
 ) -> dict:
-    """本体 + mtp.* を group_size 可変で 4bit 量子化して out に保存する。
+    """Quantize the model proper + mtp.* to 4bit with a variable group_size and save
+    to out.
 
-    dry_run=True の場合、本体は先頭 dry_run_layers 本だけを対象にする。
-    mtp.* は元々 1 ブロックしかないため常にフル量子化される。
-    戻り値は診断用に最終 config と mtp モジュールを含む dict。
+    When dry_run=True, only the first dry_run_layers layers of the model proper are
+    targeted. mtp.* originally has only 1 block, so it is always fully quantized.
+    The return value is a dict containing the final config and the mtp module, for
+    diagnostics.
 
-    dry_run_layers は full_attention_interval (Qwen3.8-27B では 4) 以上を
-    推奨する。qwen3_5.Qwen3_5TextModel は fa_idx = full_attention_interval - 1
-    を固定のフル注意キャッシュ位置として forward 時に参照するため、それより
-    層数が少ないと (mtp.* とは無関係に) forward がインデックス範囲外で落ちる。
+    dry_run_layers is recommended to be at least full_attention_interval (4 for
+    Qwen3.8-27B). qwen3_5.Qwen3_5TextModel refers to
+    fa_idx = full_attention_interval - 1 as a fixed full-attention cache position
+    during forward, so with fewer layers than that the forward dies on an
+    out-of-range index (unrelated to mtp.*).
     """
     out_path = Path(out)
     if out_path.exists():
@@ -302,8 +317,9 @@ def convert(
         config = copy.deepcopy(config)
         config["text_config"]["num_hidden_layers"] = dry_run_layers
         if layer_types := config["text_config"].get("layer_types"):
-            # transformers の AutoConfig は num_hidden_layers と layer_types の
-            # 長さ一致を検証するため、tokenizer 読み込み時に壊れないよう揃える。
+            # transformers' AutoConfig validates that num_hidden_layers and the
+            # length of layer_types agree, so line them up to avoid breaking when
+            # the tokenizer is loaded.
             config["text_config"]["layer_types"] = layer_types[:dry_run_layers]
 
     cast_to_config_dtype(model, config)
