@@ -396,6 +396,7 @@ class FlashSpecEngine:
         eos_ids=(),
         checkpoints: list | None = None,
         base_pos: int = 0,
+        resume: tuple | None = None,
     ):
         """The token-by-token version of ``generate()`` (for mlxturbo-serve's
         streaming).
@@ -461,6 +462,30 @@ class FlashSpecEngine:
         (full attention) is trimmable, so it needs no snapshot -- the restore
         side (``_try_checkpoint_restore_session_cache`` in mlxturbo/server.py)
         handles it with ``.trim()`` and by following along the indexer keys.
+
+        ``resume`` (mlxturbo-serve wiring, added 2026-08-30): a
+        ``(logits_last, hyper_prev)`` pair captured by a previous call at
+        *exactly* this same position (see the return value below), for when
+        ``ids`` has zero new tokens (a prompt that matches a session's cache
+        down to the very last position -- a resend of the same prompt, a
+        regenerate). The chunk loop above never executes for an empty
+        ``ids`` and ``cap``/``logits`` would stay unset, so this path skips
+        the loop outright and resumes decoding straight from the saved
+        state; the MTP draft cache starts cold (empty) since there is no
+        freshly-prefilled tail to prime it from -- this costs a little draft
+        acceptance on the first few rounds, not correctness (the target
+        model's own verification is what the output distribution rests on).
+        Ignored (falls back to the normal loop) unless ``ids`` is actually
+        empty -- a mismatched caller never gets a shortcut.
+
+        Returns/yields the same as before, except the final ``(accepted,
+        rounds)`` is now a 3-tuple ``(accepted, rounds, (logits_last,
+        hyper_prev))`` -- the pair at the prefill/decode boundary of *this*
+        call (untouched by the decode loop below, unlike the ``hyper_prev``
+        local variable that keeps advancing), passed straight through
+        unchanged when ``resume`` was used. Callers thread it back in via
+        ``resume`` on a session's next call (mlxturbo/runner.py's
+        ``FlashSpecRunner``).
         """
         if max_tokens < 0:
             raise ValueError("max_tokens must be non-negative")
@@ -469,69 +494,90 @@ class FlashSpecEngine:
         caches = caches if caches is not None else model.make_cache()
 
         n = ids.shape[1]
-        step = PREFILL_STEP_SIZE
-        i = 0
-        logits = None
-        cap = None
-        # The trailing prefill chunks' hyper state (B, chunk_len, hc*d), kept
-        # to prime the MTP's own cache below. Only the last HYPER_KEEP_CHUNKS
-        # are retained: priming reads at most PRIME_WINDOW+1 positions, and at
-        # this model's 262144-token ceiling holding all of them would be
-        # gigabytes. capture(light=True) records only GatedResidual's hyper, so
-        # this does not reintroduce the OOM that `light` exists to avoid.
-        hyper_chunks = []
-        while i < n:
-            j = min(i + step, n)
-            chunk = ids[:, i:j]
-            if j == n:
-                # light=True: this chunk uses only cap.hyper[:, -1:] (referenced
-                # right below). Full capture (cap.gdn/cap.ple) unconditionally
-                # allocated memory proportional to T (this chunk's length, at
-                # most PREFILL_STEP_SIZE) for all 36 layers, and OOMed the actual
-                # machine at a few thousand tokens (see the docstring for
-                # capture()'s light argument). The decode loop's verification
-                # forward (below, T<=2) stays on full capture as before
-                with capture(model, light=True) as cap:
-                    logits = model(chunk, cache=caches)
-                    mx.eval(logits)
-            else:
-                # light=True (added for MTP priming): only the cheap
-                # GatedResidual hook runs, so this branch's computation and
-                # cache updates are unchanged -- we additionally record
-                # cap.hyper for this chunk.
-                with capture(model, light=True) as cap:
-                    h = model.model(chunk, cache=caches)
-                    mx.eval(h)
-                for c in caches:
-                    state = getattr(c, "state", None)
-                    if state is not None:
-                        mx.eval(state)
-                mx.clear_cache()
-            hyper_chunks.append(cap.hyper)
-            del hyper_chunks[:-HYPER_KEEP_CHUNKS]
-            i = j
-            if checkpoints is not None:
-                checkpoints.append((base_pos + i, snapshot_untrimmable_caches(caches)))
-                del checkpoints[:-CHECKPOINT_RETENTION]
-        hyper_prev = cap.hyper[:, -1:]
+        use_resume = resume is not None and n == 0
+        if use_resume:
+            logits_tail, hyper_tail0 = resume
+            mtp_cache = _arch()._AttnCache()
+        else:
+            step = PREFILL_STEP_SIZE
+            i = 0
+            logits = None
+            cap = None
+            # The trailing prefill chunks' hyper state (B, chunk_len, hc*d),
+            # kept to prime the MTP's own cache below. Only the last
+            # HYPER_KEEP_CHUNKS are retained: priming reads at most
+            # PRIME_WINDOW+1 positions, and at this model's 262144-token
+            # ceiling holding all of them would be gigabytes.
+            # capture(light=True) records only GatedResidual's hyper, so this
+            # does not reintroduce the OOM that `light` exists to avoid.
+            hyper_chunks = []
+            while i < n:
+                j = min(i + step, n)
+                chunk = ids[:, i:j]
+                if j == n:
+                    # light=True: this chunk uses only cap.hyper[:, -1:]
+                    # (referenced right below). Full capture (cap.gdn/cap.ple)
+                    # unconditionally allocated memory proportional to T (this
+                    # chunk's length, at most PREFILL_STEP_SIZE) for all 36
+                    # layers, and OOMed the actual machine at a few thousand
+                    # tokens (see the docstring for capture()'s light
+                    # argument). The decode loop's verification forward
+                    # (below, T<=2) stays on full capture as before
+                    with capture(model, light=True) as cap:
+                        logits = model(chunk, cache=caches)
+                        mx.eval(logits)
+                else:
+                    # light=True (added for MTP priming): only the cheap
+                    # GatedResidual hook runs, so this branch's computation and
+                    # cache updates are unchanged -- we additionally record
+                    # cap.hyper for this chunk.
+                    with capture(model, light=True) as cap:
+                        h = model.model(chunk, cache=caches)
+                        mx.eval(h)
+                    for c in caches:
+                        state = getattr(c, "state", None)
+                        if state is not None:
+                            mx.eval(state)
+                    mx.clear_cache()
+                hyper_chunks.append(cap.hyper)
+                del hyper_chunks[:-HYPER_KEEP_CHUNKS]
+                i = j
+                if checkpoints is not None:
+                    checkpoints.append((base_pos + i, snapshot_untrimmable_caches(caches)))
+                    del checkpoints[:-CHECKPOINT_RETENTION]
+            # mx.contiguous, not a bare slice: a slice keeps its parent
+            # buffer alive, and these two outlive the call (they are published
+            # as the session's tail for a later diff-0 resume). The last
+            # chunk's ``logits`` is (1, chunk_len, vocab) -- 2GB at
+            # PREFILL_STEP_SIZE with this vocabulary -- so holding a view of it
+            # in every pooled session would retain gigabytes per slot.
+            hyper_tail0 = mx.contiguous(cap.hyper[:, -1:])
+            logits_tail = mx.contiguous(logits[:, -1])
+            if max_tokens == 0:
+                # Keep the successfully prefetched cache, but do not expose the
+                # first sampled ``cur``.  This mirrors SpecEngine.generate(0) and
+                # lets FlashSpecRunner publish exactly the prompt as processed.
+                return 0, 0, (logits_tail, hyper_tail0)
+            hyper_tail = (
+                hyper_chunks[0] if len(hyper_chunks) == 1
+                else mx.concatenate(hyper_chunks, axis=1)
+            )
+            mtp_cache = self._prime_draft_cache(ids[:, -hyper_tail.shape[1]:], hyper_tail)
+
         if max_tokens == 0:
-            # Keep the successfully prefetched cache, but do not expose the
-            # first sampled ``cur``.  This mirrors SpecEngine.generate(0) and
-            # lets FlashSpecRunner publish exactly the prompt as processed.
-            return 0, 0
-        hyper_tail = (
-            hyper_chunks[0] if len(hyper_chunks) == 1
-            else mx.concatenate(hyper_chunks, axis=1)
-        )
-        mtp_cache = self._prime_draft_cache(ids[:, -hyper_tail.shape[1]:], hyper_tail)
-        cur = self._sample(logits[:, -1], temp)
+            # Only reachable via ``use_resume`` -- the normal path already
+            # returned above.
+            return 0, 0, (logits_tail, hyper_tail0)
+
+        hyper_prev = hyper_tail0
+        cur = self._sample(logits_tail, temp)
 
         first = int(cur.item())
         out = [first]
         yield [first]
         accepted, rounds = 0, 0
         if first in eos:
-            return accepted, rounds
+            return accepted, rounds, (logits_tail, hyper_tail0)
 
         while len(out) < max_tokens:
             draft = self._draft(cur, hyper_prev, mtp_cache)
@@ -568,7 +614,7 @@ class FlashSpecEngine:
             if cut is not None:
                 break
 
-        return accepted, rounds
+        return accepted, rounds, (logits_tail, hyper_tail0)
 
 
 __all__ = ["Capture", "FlashSpecEngine", "capture", "rollback", "snapshot_pre"]

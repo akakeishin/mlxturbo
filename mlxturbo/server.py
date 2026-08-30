@@ -583,6 +583,12 @@ def _select_session(prompt_ids: list[int]):
     run out we fall back to a new slot as before. There is no way to grab a
     slot in a wrong/half-finished state and break.
 
+    The LCP itself is normally capped one token short of the new prompt (see
+    ``reuse_cap`` below), but is widened to the full prompt length for a
+    session whose ``.tail`` was stamped at exactly that position — letting
+    generate()/generate_stream() resume decoding from the saved state there
+    instead of prefilling. See ``_reuse_cap_for``.
+
     If there is no candidate at all, a new slot is allocated when the pool is
     below its limit, and when it is at the limit the least recently used slot
     (the head = LRU) is evicted first and then a new slot allocated.
@@ -603,14 +609,33 @@ def _select_session(prompt_ids: list[int]):
     # already processed (the same prompt sent again, a regenerate, a
     # conversation stepped back a turn) -- was excluded by both passes below
     # and fell through to a fresh slot and a full prefill.
+    #
+    # Widened to len(prompt_ids) itself (2026-08-30) for a session that holds
+    # a ``.tail`` -- a (position, state) pair a previous generate()/
+    # generate_stream() call saved at *exactly* the position where its own
+    # prefill ended (ChatSession.tail in mlxturbo/spec.py,
+    # FallbackSession.tail in mlxturbo/runner.py) -- stamped at this same
+    # len(prompt_ids). Only then can generate()/generate_stream() resume
+    # decoding straight from that saved state instead of entering their
+    # prefill loop with nothing left to feed it (the very crash this cap
+    # exists to avoid). Every other session -- no tail, or one stamped at a
+    # different position -- keeps the one-token-short cap unchanged, so this
+    # is additive: it only ever widens what a specific, already-resumable
+    # session can reach.
     reuse_cap = len(prompt_ids) - 1
 
-    def _lcp(pl: list[int]) -> int:
+    def _reuse_cap_for(sess) -> int:
+        tail = getattr(sess, "tail", None)
+        if tail is not None and tail[0] == len(prompt_ids):
+            return len(prompt_ids)
+        return reuse_cap
+
+    def _lcp(pl: list[int], sess) -> int:
         n = min(len(pl), len(prompt_ids))
         i = 0
         while i < n and pl[i] == prompt_ids[i]:
             i += 1
-        return min(i, reuse_cap)
+        return min(i, _reuse_cap_for(sess))
 
     # 1st pass: whole-sequence match (a pure append) — the existing safe path,
     # which does not touch the cache.
@@ -620,7 +645,7 @@ def _select_session(prompt_ids: list[int]):
         pl = sess.processed
         if not pl:
             continue
-        lcp = _lcp(pl)
+        lcp = _lcp(pl, sess)
         if lcp == len(pl) and lcp > best_lcp:
             best_lcp = lcp
             best_key = key
@@ -636,7 +661,7 @@ def _select_session(prompt_ids: list[int]):
         pl = sess.processed
         if not pl:
             continue
-        lcp = _lcp(pl)
+        lcp = _lcp(pl, sess)
         if 0 < lcp < len(pl):
             partial.append((lcp, key, sess))
     partial.sort(key=lambda c: -c[0])
@@ -648,6 +673,8 @@ def _select_session(prompt_ids: list[int]):
                 sess.mtp_cache = None
             if hasattr(sess, "h_last"):
                 sess.h_last = None
+            if hasattr(sess, "tail") and (sess.tail is None or sess.tail[0] != lcp):
+                sess.tail = None
             pool.move_to_end(key)
             return sess
 
@@ -662,6 +689,8 @@ def _select_session(prompt_ids: list[int]):
                 sess.h_last = None
             if hasattr(sess, "mtp_valid"):
                 sess.mtp_valid = False
+            if hasattr(sess, "tail") and (sess.tail is None or sess.tail[0] != cp_pos):
+                sess.tail = None
             pool.move_to_end(key)
             return sess
 

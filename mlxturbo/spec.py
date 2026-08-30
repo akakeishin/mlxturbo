@@ -191,11 +191,24 @@ def snapshot_untrimmable_caches(caches) -> list[tuple[int, object, object, objec
 
 
 def restore_untrimmable_caches(caches, snapshot) -> None:
-    """Write back the state saved by ``snapshot_untrimmable_caches``."""
+    """Write back the state saved by ``snapshot_untrimmable_caches``.
+
+    ``ArraysCache.state``'s setter (mlx_lm.models.cache) merely aliases
+    (``self.cache = v``), and its ``__setitem__`` mutates that list in place
+    (``self.cache[idx] = value``). Handing it the snapshot's list as-is would
+    therefore make the live cache and the archived checkpoint snapshot the
+    *same* list object -- invisible on this first restore (nothing has
+    written to it yet), but the very next decode round's ``cache[i] = ...``
+    would then silently corrupt the snapshot too, breaking a *second* restore
+    from the same checkpoint entry (measured: a regenerate/exact-repeat sent a
+    third time). So we copy the list here (not its elements -- mx.array is
+    immutable), the same as ``snapshot_untrimmable_caches`` already does on
+    the capture side.
+    """
 
     for i, state, left_padding, lengths in snapshot:
         c = caches[i]
-        c.state = state
+        c.state = list(state) if isinstance(state, list) else state
         if left_padding is not None:
             c.left_padding = left_padding
         if lengths is not None:
@@ -224,6 +237,14 @@ class ChatSession:
         # recent CHECKPOINT_RETENTION entries are retained (trimmed on the
         # _prefill_hidden side).
         self.checkpoints: list[tuple[int, list]] = []
+        # (position, h) -- the hidden state right at the prefill/decode
+        # boundary of the most recent call that actually ran a fresh prefill
+        # (position == the full prompt_ids length of that call), independent
+        # of h_last above (which keeps moving as decode proceeds). Lets
+        # _select_session (mlxturbo/server.py) reuse a slot with zero tokens
+        # left to prefill when a new prompt matches this position exactly --
+        # see generate()'s use of it below.
+        self.tail: tuple[int, mx.array] | None = None
 
     def invalidate(self):
         """Drop every published field before aliased caches are mutated."""
@@ -234,8 +255,11 @@ class ChatSession:
         self.processed = []
         self.h_last = None
         self.checkpoints = []
+        self.tail = None
 
-    def publish(self, caches, mtp_cache, mtp_valid, processed, h_last, checkpoints=None):
+    def publish(
+        self, caches, mtp_cache, mtp_valid, processed, h_last, checkpoints=None, tail=None
+    ):
         """Publish one internally consistent session snapshot after success."""
 
         self.caches = caches
@@ -244,6 +268,7 @@ class ChatSession:
         self.processed = processed
         self.h_last = h_last
         self.checkpoints = checkpoints if checkpoints is not None else []
+        self.tail = tail
 
 
 class SpecEngine:
@@ -729,6 +754,7 @@ class SpecEngine:
         caches = mtp_cache = None
         reused = 0
         reused_h_last = None
+        reused_tail = None
         # For calls with no session (bench/gate.py and other paths that hit
         # SpecEngine.generate directly) there is no notion of a next turn at all,
         # so we do not track checkpoints either (with None, _prefill_hidden skips
@@ -742,7 +768,7 @@ class SpecEngine:
             lcp = 0
             while lcp < n and pl[lcp] == prompt_ids[lcp]:
                 lcp += 1
-            if lcp == len(pl) and lcp < len(prompt_ids):
+            if lcp == len(pl) and lcp <= len(prompt_ids):
                 # Reuse of the KV/GDN state is decoupled from whether the MTP
                 # chain survives -- carrying over an mtp_cache with no
                 # corresponding h_last makes the later concat fail (in a session
@@ -758,6 +784,7 @@ class SpecEngine:
                 if session.mtp_valid:
                     mtp_cache = session.mtp_cache
                     reused_h_last = session.h_last
+                reused_tail = session.tail
                 # The local variables now own these mutable caches.  Any error,
                 # including KeyboardInterrupt or a callback failure, leaves the
                 # public session invalid instead of half-published.
@@ -767,26 +794,50 @@ class SpecEngine:
         if mtp_cache is None:
             mtp_cache = KVCache()
 
+        # Diff-0 reuse: _select_session (mlxturbo/server.py) only widens its
+        # cap to let `reused` reach len(prompt_ids) exactly when it also found
+        # a session.tail stamped at that same position, so this should always
+        # resolve. If that invariant is ever violated regardless, prefilling
+        # zero new tokens is not something _prefill_hidden supports (an empty
+        # chunk list) -- fall back to leaving one token to prefill, the cap
+        # this module used before the tail mechanism existed.
+        resume_h = None
+        if reused > 0 and reused == len(prompt_ids):
+            if reused_tail is not None and reused_tail[0] == reused:
+                resume_h = reused_tail[1]
+            else:
+                reused -= 1
+
         prompt = mx.array(prompt_ids[reused:])
 
         t0 = time.perf_counter()
-        h_all = self._prefill_hidden(prompt, caches, checkpoints=checkpoints, base_pos=reused)
-        if use_mtp:
-            if reused and reused_h_last is not None:
-                mtp_hiddens = mx.concatenate(
-                    [reused_h_last, h_all[:, :-1]], axis=1
-                )
-                self._mtp_append(prompt, self._mtp_base(mtp_hiddens), mtp_cache)
-            elif prompt.shape[0] > 1:
-                self._mtp_append(prompt[1:], self._mtp_base(h_all[:, :-1]), mtp_cache)
-        h_last = h_all[:, -1:]
+        if resume_h is not None:
+            h_last = resume_h
+        else:
+            h_all = self._prefill_hidden(
+                prompt, caches, checkpoints=checkpoints, base_pos=reused
+            )
+            if use_mtp:
+                if reused and reused_h_last is not None:
+                    mtp_hiddens = mx.concatenate(
+                        [reused_h_last, h_all[:, :-1]], axis=1
+                    )
+                    self._mtp_append(prompt, self._mtp_base(mtp_hiddens), mtp_cache)
+                elif prompt.shape[0] > 1:
+                    self._mtp_append(prompt[1:], self._mtp_base(h_all[:, :-1]), mtp_cache)
+            h_last = h_all[:, -1:]
+        # The hidden state right at this call's prefill/decode boundary
+        # (position == len(prompt_ids)), kept aside from h_last (which the
+        # decode loop below keeps reassigning) so it can be published as
+        # session.tail for a future diff-0 reuse of this exact position.
+        tail = (len(prompt_ids), h_last)
 
         if max_tokens == 0:
             mx.eval(h_last)
             ttft = time.perf_counter() - t0
             if session is not None:
                 session.publish(
-                    caches, mtp_cache, use_mtp, list(prompt_ids), h_last, checkpoints
+                    caches, mtp_cache, use_mtp, list(prompt_ids), h_last, checkpoints, tail
                 )
             return {
                 "prefill_reused": reused,
@@ -1116,6 +1167,7 @@ class SpecEngine:
                 prompt_ids + fed_gen,
                 h_last,
                 checkpoints,
+                tail,
             )
         return {
             "prefill_reused": reused,

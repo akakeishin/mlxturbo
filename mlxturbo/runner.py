@@ -217,6 +217,7 @@ class FlashSpecRunner:
         prompt_cache = None
         reused = 0
         checkpoints: list | None = None
+        resume = None
         if session is not None:
             checkpoints = session.checkpoints
             if session.cache is not None:
@@ -225,14 +226,30 @@ class FlashSpecRunner:
                 lcp = 0
                 while lcp < n and pl[lcp] == prompt_ids[lcp]:
                     lcp += 1
-                if lcp == len(pl) and lcp < len(prompt_ids):
+                if lcp == len(pl) and lcp <= len(prompt_ids):
                     prompt_cache = session.cache
                     reused = lcp
+                    tail = session.tail
                     # From here on this local variable owns session.cache. An
                     # exception during generation leaves the published
                     # session invalid from this point until publish() is
                     # reached (the same reason as FallbackRunner).
                     session.invalidate()
+                    if reused > 0 and reused == len(prompt_ids):
+                        # Diff-0 reuse: _select_session (mlxturbo/server.py)
+                        # only widens its cap to let `reused` reach
+                        # len(prompt_ids) exactly when it also found a
+                        # session.tail stamped at this same position, so this
+                        # should always resolve. If that invariant is ever
+                        # violated regardless, feeding generate_stream an
+                        # empty ``ids`` with no ``resume`` is not something it
+                        # supports -- fall back to leaving one token to
+                        # prefill, the cap this module used before the tail
+                        # mechanism existed.
+                        if tail is not None and tail[0] == reused:
+                            resume = tail[1]
+                        else:
+                            reused -= 1
             if prompt_cache is None:
                 prompt_cache = self.engine.model.make_cache()
                 checkpoints = []
@@ -244,6 +261,7 @@ class FlashSpecRunner:
         t0 = time.perf_counter()
         ttft = None
         accepted = rounds = 0
+        tail_out = None
         gen = self.engine.generate_stream(
             ids,
             max_tokens,
@@ -252,6 +270,7 @@ class FlashSpecRunner:
             eos_ids=eos_ids,
             checkpoints=checkpoints,
             base_pos=reused,
+            resume=resume,
             **extra,
         )
         try:
@@ -264,7 +283,7 @@ class FlashSpecRunner:
                     on_tokens(step_tokens)
         except StopIteration as stop:
             if stop.value is not None:
-                accepted, rounds = stop.value
+                accepted, rounds, tail_out = stop.value
         decode_time = time.perf_counter() - t0 - (ttft or 0.0)
         n_decode = max(len(tokens) - 1, 0)
         if session is not None:
@@ -276,9 +295,17 @@ class FlashSpecRunner:
             # (or reset to ``[]`` above when this call built a fresh cache) —
             # publish it alongside so the next turn's _select_session can
             # restore to it (the same shape as ChatSession.publish in
-            # mlxturbo/spec.py).
+            # mlxturbo/spec.py). ``tail_out`` (the logits/hyper pair at this
+            # call's prefill/decode boundary, from generate_stream) is stamped
+            # with the position it belongs to (this call's own full prompt
+            # length) so it doubles as the (position, payload) shape
+            # ChatSession.tail and _select_session's ``_reuse_cap_for``
+            # already use.
             session.publish(
-                prompt_cache, list(prompt_ids) + tokens[:-1], checkpoints=checkpoints
+                prompt_cache,
+                list(prompt_ids) + tokens[:-1],
+                checkpoints=checkpoints,
+                tail=(len(prompt_ids), tail_out) if tail_out is not None else None,
             )
         return {
             "tokens": tokens,
@@ -337,6 +364,12 @@ class FallbackSession:
         self.cache = None
         self.processed: list[int] = []
         self.checkpoints: list = []
+        # (position, (logits_last, hyper_prev)) -- see ChatSession.tail in
+        # mlxturbo/spec.py and FlashSpecEngine.generate_stream's ``resume``
+        # in mlxturbo/spec_flash.py. FallbackRunner never sets this (it has
+        # no notion of logits/hyper state to save), so for it this stays
+        # None forever, same as ``checkpoints`` for that path.
+        self.tail = None
 
     def invalidate(self):
         """Drop the published cache before it is aliased and mutated in place."""
@@ -344,11 +377,13 @@ class FallbackSession:
         self.cache = None
         self.processed = []
         self.checkpoints = []
+        self.tail = None
 
-    def publish(self, cache, processed, checkpoints=None):
+    def publish(self, cache, processed, checkpoints=None, tail=None):
         self.cache = cache
         self.processed = processed
         self.checkpoints = checkpoints if checkpoints is not None else []
+        self.tail = tail
 
 
 def _logprob_entry(resp, tokenizer, top_n: int) -> dict:

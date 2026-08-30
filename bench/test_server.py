@@ -1993,7 +1993,7 @@ class _ContractFlashEngine:
             previous_cur = token
             emitted += 1
             yield [token]
-        return 0, max(emitted - 1, 0)
+        return 0, max(emitted - 1, 0), None
 
 
 def test_flash_spec_runner_publishes_only_tokens_already_fed_to_cache():
@@ -3744,6 +3744,56 @@ def test_select_session_leaves_one_token_to_prefill_on_exact_repeat():
     assert got.caches[0].offset == 2
 
 
+def test_select_session_reuses_fully_when_tail_matches_exact_repeat():
+    """Diff-0 の TTFT 修正 (2026-08-30): 上の 2 テストはどちらも 1 トークン
+    残す (reuse_cap の既定)。session.tail が「新プロンプトの長さちょうど」の
+    位置にスタンプされていれば、そこまでフルに再利用してよい --
+    generate()/generate_stream() がそこから resume できるようになったため
+    (mlxturbo/spec.py, mlxturbo/spec_flash.py)。tail の中身自体は
+    _select_session にとって不透明 (位置だけ見る) なのでダミーでよい。"""
+
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    sess = ChatSession()
+    sess.processed = [1, 2, 3, 4, 5, 90, 91]  # プロンプト 5 + 生成 2
+    sess.caches = [_real_kv_cache(7), _real_kv_cache(7)]
+    sess.mtp_valid = False
+    sess.tail = (5, "dummy-resume-state")  # プロンプト長 (5) ちょうど
+    server.STATE.session_pool[0] = sess
+
+    got = server._select_session([1, 2, 3, 4, 5])
+
+    assert got is sess
+    assert got.processed == [1, 2, 3, 4, 5]  # 1 トークンも残さずフル再利用
+    assert got.caches[0].offset == 5
+    assert got.tail == (5, "dummy-resume-state")  # 位置が一致するので残る
+
+
+def test_select_session_leaves_one_token_when_tail_position_does_not_match():
+    """tail はあっても、その位置が新プロンプト長と一致しなければ従来どおり
+    1 トークン残す (無関係な tail に釣られて緩めてはいけない)。tail の位置
+    (6) は緩和の対象 (新プロンプト長 5) にも、結果として trim される位置
+    (4, reuse_cap どおり) にも一致しない値を選び、「一致しないので必ず捨て
+    られる」ことを区別して確認する。"""
+
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    sess = ChatSession()
+    sess.processed = [1, 2, 3, 4, 5, 90, 91]
+    sess.caches = [_real_kv_cache(7), _real_kv_cache(7)]
+    sess.mtp_valid = False
+    sess.tail = (6, "stale-resume-state")  # 新プロンプト長 (5) にも
+    # trim 後の位置 (4) にも一致しない
+    server.STATE.session_pool[0] = sess
+
+    got = server._select_session([1, 2, 3, 4, 5])
+
+    assert got is sess
+    assert got.processed == [1, 2, 3, 4]
+    assert got.caches[0].offset == 4
+    assert got.tail is None  # 一致しない tail は使えないので捨てる
+
+
 def test_select_session_falls_back_when_a_cache_layer_is_not_trimmable():
     """1 レイヤーでも巻き戻せなければ (実運用の GDN ハイブリッド構成:
     ArraysCache が線形層に混ざる)、部分一致は諦めて新規スロットへ倒す。
@@ -3895,6 +3945,40 @@ def test_checkpoint_restore_returns_none_without_checkpoints():
     assert server._try_checkpoint_restore_session_cache(sess, lcp=3) is None
 
 
+def test_restore_untrimmable_caches_does_not_alias_the_stored_snapshot():
+    """バグ修正 (2026-08-30、diff-0 の実機確認中に発見): restore_untrimmable_
+    caches は ``c.state = state`` で snapshot のリストをそのままライブの
+    ArraysCache に渡していたが、``ArraysCache.state`` のセッター (mlx_lm.
+    models.cache) は単なるエイリアス代入 (``self.cache = v``) で、
+    ``__setitem__`` はそのリストを in-place に書き換える (``self.cache[idx]
+    = value``)。つまり復元直後、ライブのキャッシュと checkpoints に積んで
+    ある snapshot は同じリストオブジェクトを指してしまう。その状態で 1 回
+    でも書き込む (次のデコードラウンドの ``cache[i] = ...``) と、アーカイブ
+    してあったはずの snapshot 自体まで書き換わり、同じチェックポイントから
+    の 2 回目以降の復元が壊れた値を返す (実機測定で「同じプロンプトの 3 回
+    目の投げ直しから出力が変わる」形で発覚した -- 1 回目の復元は snapshot
+    がまだ無傷なので気づけない)。"""
+
+    from mlx_lm.models.cache import ArraysCache
+
+    from mlxturbo.spec import restore_untrimmable_caches, snapshot_untrimmable_caches
+
+    c = ArraysCache(size=2)
+    c.cache = [mx.array([1.0]), mx.array([2.0])]
+    snapshot = snapshot_untrimmable_caches([c])
+
+    restore_untrimmable_caches([c], snapshot)
+    c[0] = mx.array([999.0])  # 次のデコードラウンドが書き込む想定
+
+    restore_untrimmable_caches([c], snapshot)
+
+    assert float(c[0].item()) == 1.0  # 直前の書き込みの影響を受けていない
+    # snapshot 自体もまだ元の値のまま (アーカイブが破壊されていない) --
+    # これが壊れていると、次にこの位置へ復元しようとした誰か (別スロットの
+    # 再利用など) も巻き添えになる。
+    assert float(snapshot[0][1][0].item()) == 1.0
+
+
 def test_select_session_reuses_via_checkpoint_when_trim_is_not_possible_even_with_mtp_valid():
     """ArraysCache が混ざっていて exact-trim が不可能でも、チェックポイント
     があればそこまで復元して同じスロットを再利用する。mtp_valid=True
@@ -4035,6 +4119,168 @@ def test_checkpoint_restore_end_to_end_matches_full_rebuild_with_mtp():
     )
 
     assert r2_reused["tokens"] == r2_fresh["tokens"]
+
+
+# ---------- 12d. バグ修正: 温まった prompt cache の diff-0 再利用 (TTFT) ----------
+#
+# 12/12b 節で checkpoint 経由の部分一致は直したが、reuse_cap =
+# len(prompt_ids) - 1 が全経路で無条件に効いていたため、同じプロンプトの
+# 投げ直し (regenerate) のような「差分 0 まで戻せる」最良のケースでも常に
+# 1 トークン分の prefill が残っていた (実測: 12k トークンで 2 回目以降も
+# 数秒かかる -- docs/VS-MLX-SERVE.md)。差分 0 では generate()/
+# generate_stream() が prefill のチャンクループに入らず、以前の逐次生成が
+# 依存していた hyper/logits (spec_flash) や h_last (spec) が計算されない
+# ため、単に上限を外すだけでは cap.hyper 参照などでクラッシュする。
+#
+# 直したのは: generate()/generate_stream() が prefill 終了時点の
+# logits[:, -1]/hyper_prev (spec_flash) または h_last (spec) を
+# ``session.tail`` として位置つきで保持し (ChatSession.tail /
+# FallbackSession.tail)、_select_session がその位置と新プロンプト長が
+# 完全に一致するときだけ上限を len(prompt_ids) まで緩め、
+# generate()/generate_stream() は差分 0 のとき prefill を飛ばして
+# session.tail から直接 decode を再開すること。
+
+
+def test_spec_engine_exact_repeat_reuses_prefill_fully_and_matches_fresh_run():
+    """SpecEngine/ChatSession 版の中核回帰テスト。同じプロンプトを 2 回
+    (session 経由で) 投げたとき、2 回目は 1 トークンも残さず全量再利用
+    (prefill_reused == len(prompt)) できること、かつ生成結果がまっさらな
+    再構築と完全一致すること。
+
+    修正前のコードでは SpecEngine.generate() 自身の再利用判定が
+    ``lcp < len(prompt_ids)`` を要求していたため、2 回目の呼び出しは
+    reused == len(prompt_ids) - 1 (1 トークン残す) にしかならず、この
+    テストの ``r2["prefill_reused"] == len(turn1_prompt)`` は必ず失敗して
+    いた (修正前のコードで確認済み)。"""
+
+    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+    from mlxturbo.mtp import MTPModule
+
+    mx.random.seed(6)
+    args = TextModelArgs(
+        model_type="qwen3_5",
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=6,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=48,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        full_attention_interval=3,
+        head_dim=8,
+        tie_word_embeddings=True,
+    )
+    text_model = TextModel(args)
+    mx.eval(text_model.parameters())
+    mtp = MTPModule(args)
+    mx.eval(mtp.parameters())
+    fake_model = SimpleNamespace(language_model=text_model)
+    engine = SpecEngine(fake_model, mtp=mtp, prefill_step_size=3)
+
+    turn1_prompt = list(range(12))  # step=3 で 4 チャンク: 境界 3,6,9,12
+
+    sess = ChatSession()
+    r1 = engine.generate(
+        turn1_prompt,
+        max_tokens=1,  # tokens が1個だけ -> processed == turn1_prompt そのもの
+        n_draft=2,
+        max_draft=2,
+        lookup_len=0,
+        temp=0.0,
+        eos_ids=set(),
+        session=sess,
+    )
+    assert sess.processed == turn1_prompt
+    assert sess.tail is not None
+    assert sess.tail[0] == len(turn1_prompt)
+
+    r2 = engine.generate(
+        turn1_prompt,
+        max_tokens=4,
+        n_draft=2,
+        max_draft=2,
+        lookup_len=0,
+        temp=0.0,
+        eos_ids=set(),
+        session=sess,
+    )
+    assert r2["prefill_reused"] == len(turn1_prompt)
+
+    r2_fresh = engine.generate(
+        turn1_prompt,
+        max_tokens=4,
+        n_draft=2,
+        max_draft=2,
+        lookup_len=0,
+        temp=0.0,
+        eos_ids=set(),
+        session=None,
+    )
+
+    assert r2["tokens"] == r2_fresh["tokens"]
+
+
+def test_flash_spec_exact_repeat_reuses_prefill_fully_and_matches_fresh_run(monkeypatch):
+    """FlashSpecEngine/FallbackSession 版 (flash_spec 経路、実運用の
+    qwen38fn-mlx-v-l がここを通る) の中核回帰テスト。上の SpecEngine 版と
+    同じ形: 同じプロンプトの投げ直しが全量再利用になり、まっさらな
+    再構築と生成が一致すること。
+
+    修正前のコードでは FlashSpecRunner.generate() 自身の再利用判定が
+    ``lcp < len(prompt_ids)`` を要求していたため、2 回目の呼び出しは
+    reused == len(turn1_prompt) - 1 にしかならず、この
+    ``r2["prefill_reused"] == len(turn1_prompt)`` は必ず失敗していた
+    (修正前のコードで確認済み)。"""
+
+    import mlxturbo.spec_flash as spec_flash_module
+
+    monkeypatch.setattr(spec_flash_module, "PREFILL_STEP_SIZE", 3)
+
+    mx.random.seed(7)
+    model, mtp = _build_tiny_qwen4_exp()
+    engine = spec_flash_module.FlashSpecEngine(model, mtp)
+    runner = FlashSpecRunner(engine)
+
+    turn1_prompt = list(range(1, 13))  # 12 トークン、step=3 で境界 3,6,9,12
+
+    session = FallbackSession()
+    r1 = runner.generate(
+        turn1_prompt,
+        max_tokens=1,  # tokens が1個だけ -> processed == turn1_prompt そのもの
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=session,
+    )
+    assert session.processed == turn1_prompt
+    assert session.tail is not None
+    assert session.tail[0] == len(turn1_prompt)
+
+    r2 = runner.generate(
+        turn1_prompt,
+        max_tokens=4,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=session,
+    )
+    assert r2["prefill_reused"] == len(turn1_prompt)
+
+    r2_fresh = runner.generate(
+        turn1_prompt,
+        max_tokens=4,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=None,
+    )
+
+    assert r2["tokens"] == r2_fresh["tokens"]
 
 
 # ---------- 12c. flash_spec 経路 (FallbackSession) のチェックポイント復元 ----------
