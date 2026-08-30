@@ -4424,15 +4424,40 @@ def _build_tiny_qwen4_exp():
     return model, mtp
 
 
+def test_flash_spec_depth_drops_to_one_past_the_context_limit():
+    """depth は文脈長で切り替わること。
+
+    深くすると検証フォワードの位置数が増え、その費用は文脈長に比例するので、
+    長文では利得を食い潰して逆に遅くなる (v-l 実測: 48k で depth 3 は
+    depth 1 の 17.6 対 30.8 tok/s)。DEPTH_CONTEXT_LIMIT の注記を参照。
+    """
+
+    import mlxturbo.spec_flash as spec_flash_module
+
+    model, mtp = _build_tiny_qwen4_exp()
+    engine = spec_flash_module.FlashSpecEngine(model, mtp, depth=3)
+    limit = spec_flash_module.DEPTH_CONTEXT_LIMIT
+
+    assert engine._effective_depth(0) == 3
+    assert engine._effective_depth(limit - 1) == 3
+    assert engine._effective_depth(limit) == 1
+    assert engine._effective_depth(limit * 8) == 1
+
+    # depth=1 で作ったエンジンは、短い文脈でも 1 のまま (上限が働くだけで、
+    # 指定より深くはしない)。
+    shallow = spec_flash_module.FlashSpecEngine(model, mtp, depth=1)
+    assert shallow._effective_depth(0) == 1
+
+
 def test_flash_spec_draft_reuses_primed_cache_across_rounds():
-    """MTP priming (2026-08-30): _draft() must no longer build a fresh,
-    empty _AttnCache() on every call -- it should keep using the one cache
-    that generate()/generate_stream() primed over the whole prompt, and that
-    cache's .offset should advance by exactly 1 every round instead of
-    resetting. This is a direct regression test for the bug the priming
-    change fixes: before it, every _draft() call re-created its own cache at
-    offset 0, so the MTP head never had any context beyond the single
-    current token."""
+    """MTP priming (2026-08-30): ドラフトは毎回空の _AttnCache() を作り直さず、
+    generate()/generate_stream() が priming したキャッシュを使い続けること。
+
+    priming はプロンプト位置 0..N-2 を覆う (N=5 トークン -> offset 4) ので、
+    最初のドラフトはそこから始まり、以後ラウンドごとにちょうど 1 ずつ伸びる
+    (連鎖で引いた分は _draft_chain が戻る前に刈るので、キャッシュには確定した
+    対しか入らない)。修正前は毎回 offset 0 の新しいキャッシュを作っていた。
+    """
 
     import mlxturbo.spec_flash as spec_flash_module
 
@@ -4443,26 +4468,21 @@ def test_flash_spec_draft_reuses_primed_cache_across_rounds():
     ids = mx.array([[1, 2, 3, 4, 5]])
     seen_caches = []
     offsets = []
-    orig_draft = spec_flash_module.FlashSpecEngine._draft
+    orig = spec_flash_module.FlashSpecEngine._draft_chain
 
-    def spy(self, cur, hyper_prev, cache):
+    def spy(self, cur, hyper_prev, cache, depth):
         seen_caches.append(cache)
         offsets.append(cache.offset)
-        return orig_draft(self, cur, hyper_prev, cache)
+        return orig(self, cur, hyper_prev, cache, depth)
 
-    spec_flash_module.FlashSpecEngine._draft = spy
+    spec_flash_module.FlashSpecEngine._draft_chain = spy
     try:
         engine.generate(ids, max_tokens=6)
     finally:
-        spec_flash_module.FlashSpecEngine._draft = orig_draft
+        spec_flash_module.FlashSpecEngine._draft_chain = orig
 
-    assert len(offsets) >= 2  # otherwise this test proves nothing
-    # every _draft() call in one generate() must reuse the identical cache
-    # object -- not a fresh one each time.
+    assert len(offsets) >= 2  # そうでないとこのテストは何も示さない
     assert all(c is seen_caches[0] for c in seen_caches)
-    # priming covers prompt positions 0..N-2 (N=5 tokens -> offset 4) before
-    # the first _draft() call, then the shared cache's offset must grow by
-    # exactly 1 every round (never reset to 0 or re-primed).
     assert offsets[0] == ids.shape[1] - 1
     assert offsets == list(range(offsets[0], offsets[0] + len(offsets)))
 

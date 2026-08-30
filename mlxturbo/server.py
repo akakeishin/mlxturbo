@@ -5789,6 +5789,14 @@ def main() -> None:
     )
     ap.add_argument("--mtp-bits", type=int, default=4)
     ap.add_argument(
+        "--mtp-depth",
+        type=int,
+        default=None,
+        help="1 ラウンドで引くドラフトの数 (既定は mlxturbo.spec_flash.MTP_DEPTH)。"
+        "2 以上ではヘッド自身の hyper 状態を次段に渡して連鎖させる。深くすると "
+        "1 ラウンドの採用数は増えるが、検証フォワードの位置数も増える",
+    )
+    ap.add_argument(
         "--no-mtp", action="store_true", help="MTP を読み込まず lookup (SAM) のみで投機する"
     )
     ap.add_argument(

@@ -68,6 +68,29 @@ PRIME_WINDOW = 2048
 # of PREFILL_STEP_SIZE always cover PRIME_WINDOW+1 positions.
 HYPER_KEEP_CHUNKS = 2
 
+# ドラフトを 1 ラウンドで何トークン引くか。1 = ヘッドを 1 回だけ回す。
+# 2 以上ではヘッド自身の hyper 状態を次段に渡して連鎖させる (_draft_chain)。
+# 受理率 r で depth d なら 1 ラウンドの期待トークン数は (1-r^(d+1))/(1-r) で、
+# d=1 は r=0.83 でも 1.83 が上限になる。
+MTP_DEPTH = 3
+
+# ここを越えたら depth を 1 に落とす。深くすると検証フォワードの位置数が増え、
+# その費用は文脈長に比例する (indexer のブロック選択が長いキャッシュ全体に
+# 対して位置ごとに走るため) ので、長文では利得を食い潰して逆に遅くなる。
+#
+# v-l / M3 Max のサーバー実測 (tok/s、温まった状態):
+#
+#   文脈    depth 1   depth 2   depth 3
+#    1k      45.4       —        51.5
+#    4k      37.0       —        45.5
+#    6k      36.3      39.7      45.7
+#    8k      38.1      36.6      35.4     <- ここで反転済み
+#   12k      37.3      29.8      33.3
+#   48k      30.8       —        17.6
+#
+# 反転は 6k と 8k の間。勝っている側の内側を採って 6144 (= 3 チャンク) に置く。
+DEPTH_CONTEXT_LIMIT = 6144
+
 
 def _arch():
     import mlx_lm.models.qwen4_exp as Q
@@ -253,6 +276,16 @@ def rollback(model, caches, cap: Capture, pre: dict, keep: int, total: int,
         c[3] = mx.concatenate([ctx, ids_kept], axis=1)[:, -ctx_len:]
 
 
+def trim_attn_cache(cache, keep: int) -> None:
+    """MTP のドラフトキャッシュを先頭 ``keep`` 件まで縮める。"""
+    drop = cache.offset - keep
+    if drop <= 0:
+        return
+    cache.trim(drop)
+    if cache.indexer.keys is not None:
+        cache.indexer.keys = cache.indexer.keys[:, :keep]
+
+
 def snapshot_mtp_cache(cache):
     """Copy the MTP draft cache so it can be handed to a later resumed call.
 
@@ -296,38 +329,78 @@ class FlashSpecEngine:
     produced `cur`.
     """
 
-    def __init__(self, model, mtp):
+    def __init__(self, model, mtp, depth: int = MTP_DEPTH):
         self.model = model
         self.mtp = mtp
         self.rope = model.model.rope
+        self.depth = max(1, int(depth))
 
-    def _draft(self, cur, hyper_prev, cache):
-        """Single-token draft. ``cache`` persists across the rounds of one
-        ``generate``/``generate_stream`` call (built by ``_prime_draft_cache``),
-        so the draft head attends to its own history instead of starting from
-        an empty cache every round. S=1 always, so the mask stays None.
+    def _effective_depth(self, pos: int) -> int:
+        """この位置で引くドラフト数。長い文脈では 1 に落とす
+        (DEPTH_CONTEXT_LIMIT の注記を参照)。"""
+        return 1 if pos >= DEPTH_CONTEXT_LIMIT else self.depth
+
+    def _draft_chain(self, cur, hyper_prev, cache, depth: int):
+        """``self.depth`` トークンをまとめて引く。
+
+        ヘッドは (embed(t), hyper) を受けて、mixer で潰す前に **hyper 形状の
+        状態を自分で作る**。それを次段に渡すことで、1 つのヘッドで t+2 より
+        先まで届く (DeepSeek-V3 と同じ形)。
+
+        確定した (トークン, hyper) の対は 1 段目だけなので、戻る前にキャッシュを
+        その 1 件まで縮める。**このキャッシュに投機的なものを入れない**という
+        不変条件が、ラウンドを跨いで持ち回れる根拠になっている。
         """
         Q = _arch()
-        emb = self.model.model.embed_tokens(cur)
-        mask = Q.create_attention_mask(emb, None)
-        out = self.mtp(emb, hyper_prev, self.rope, mask, cache, cache.indexer)
-        return mx.argmax(self.model.lm_head(out)[:, -1], axis=-1).reshape(1, 1)
+        keep = cache.offset + 1
+        drafts = []
+        tok, hyper = cur, hyper_prev
+        for _ in range(depth):
+            emb = self.model.model.embed_tokens(tok)
+            mask = Q.create_attention_mask(emb, None)
+            x = self.mtp.combine(emb, hyper)
+            x = self.mtp.layers[0](
+                x, self.rope, mask, None, cache, cache.indexer, None, None
+            )
+            out = self.mtp.hyper_connection_mixer(x)
+            tok = mx.argmax(self.model.lm_head(out)[:, -1], axis=-1).reshape(1, 1)
+            drafts.append(tok)
+            hyper = x
+        trim_attn_cache(cache, keep)
+        return drafts
+
+    def _verify(self, cap, lg, drafts, temp):
+        """検証フォワードの結果から、採用するトークンと hyper を取り出す。
+
+        ``pair`` は [cur, d1, ..., dk]。位置 j の logits は pair[j] の次の
+        トークンを与える。d1 から順に一致する限り採用し、外れたところで
+        打ち切ってその位置のトークンを代わりに出す。最後まで当たれば k+1 個出る。
+        """
+        toks, hypers, hit = [], [], 0
+        for j in range(len(drafts) + 1):
+            nxt = self._sample(lg[:, j], temp)
+            toks.append(nxt)
+            hypers.append(cap.hyper[:, j:j + 1])
+            if j == len(drafts) or int(nxt.item()) != int(drafts[j].item()):
+                break
+            hit += 1
+        return toks, hypers, hit
 
     def _prime_draft_cache(self, ids, hyper):
         """Run the tail of the prompt through the MTP head once ("priming"),
-        so the first ``_draft()`` of a generation already has real history.
+        so the first ``_draft_chain()`` of a generation already has real history.
 
         ``ids`` and ``hyper`` must cover the same trailing positions of the
         prompt. Only the last ``PRIME_WINDOW`` pairs are fed in: acceptance
         comes from recent context, and a window keeps the cost independent of
         prompt length (this model goes to 262144 tokens).
 
-        The pairing follows ``_draft()``: at position k the head takes
+        The pairing follows ``_draft_chain()``: at position k the head takes
         ``(embed(t_k), hyper_{k-1})``. The prompt supplies every such pair for
-        k = 1 .. N-1, and the first real ``_draft()`` continues at k = N, so
+        k = 1 .. N-1, and the first real draft continues at k = N, so
         there is no gap and no duplicate.
 
-        No rollback on a rejected round: every pair fed here or by ``_draft()``
+        No rollback on a rejected round: every pair fed here or by ``_draft_chain()``
         is built from values the target model's verification forward already
         confirmed. The rejected guess's embedding never enters this cache --
         only its argmax is compared. Nor can this cache change what is emitted:
@@ -374,25 +447,25 @@ class FlashSpecEngine:
         # generated token", so dropping it here shifts everything by one
         out, accepted, rounds = [int(cur.item())], 0, 0
         while len(out) < max_tokens:
-            draft = self._draft(cur, hyper_prev, mtp_cache)
-            pair = mx.concatenate([cur, draft], axis=1)
+            drafts = self._draft_chain(
+                cur, hyper_prev, mtp_cache,
+                self._effective_depth(ids.shape[1] + len(out)),
+            )
+            pair = mx.concatenate([cur] + drafts, axis=1)
+            total = pair.shape[1]
             pre = snapshot_pre(model, caches)
             with capture(model) as cap:
                 lg = model(pair, cache=caches)
                 mx.eval(lg)
-            nxt = mx.argmax(lg[:, 0], axis=-1).reshape(1, 1)
-            out.append(int(nxt.item()))
             rounds += 1
-            if int(nxt.item()) == int(draft.item()):
-                # the draft hit -> the logits at position 1 are the next token as-is
-                nxt2 = mx.argmax(lg[:, 1], axis=-1).reshape(1, 1)
-                out.append(int(nxt2.item()))
-                accepted += 1
-                cur, hyper_prev = nxt2, cap.hyper[:, 1:2]
-                # keep == total, so no rollback needed
-            else:
-                rollback(model, caches, cap, pre, keep=1, total=2, ids_kept=cur)
-                cur, hyper_prev = nxt, cap.hyper[:, 0:1]
+            toks, hypers, hit = self._verify(cap, lg, drafts, 0.0)
+            accepted += hit
+            keep = len(toks)
+            rollback(model, caches, cap, pre, keep=keep, total=total,
+                     ids_kept=pair[:, :keep])
+            vals = [int(t.item()) for t in toks][: max_tokens - len(out)]
+            out.extend(vals)
+            cur, hyper_prev = toks[-1], hypers[-1]
         return out[:max_tokens], accepted, rounds
 
     # ---------- mlxturbo-serve wiring (added 2026-08-29, additions only) ----------
@@ -615,22 +688,19 @@ class FlashSpecEngine:
             return accepted, rounds, (logits_tail, hyper_tail0, mtp_snap)
 
         while len(out) < max_tokens:
-            draft = self._draft(cur, hyper_prev, mtp_cache)
-            pair = mx.concatenate([cur, draft], axis=1)
+            drafts = self._draft_chain(
+                cur, hyper_prev, mtp_cache,
+                self._effective_depth(base_pos + n + len(out)),
+            )
+            pair = mx.concatenate([cur] + drafts, axis=1)
+            total = pair.shape[1]
             pre = snapshot_pre(model, caches)
             with capture(model) as cap:
                 lg = model(pair, cache=caches)
                 mx.eval(lg)
             rounds += 1
-            nxt = self._sample(lg[:, 0], temp)
-            if int(nxt.item()) == int(draft.item()):
-                accepted += 1
-                nxt2 = self._sample(lg[:, 1], temp)
-                toks = [nxt, nxt2]
-                hypers = [cap.hyper[:, 0:1], cap.hyper[:, 1:2]]
-            else:
-                toks = [nxt]
-                hypers = [cap.hyper[:, 0:1]]
+            toks, hypers, hit = self._verify(cap, lg, drafts, temp)
+            accepted += hit
 
             vals = [int(t.item()) for t in toks]
             cut = next((k for k, v in enumerate(vals) if v in eos), None)
@@ -642,7 +712,8 @@ class FlashSpecEngine:
 
             # When keep==total (an ordinary accept round with no truncation),
             # rollback() itself returns early, so it is fine to always call it.
-            rollback(model, caches, cap, pre, keep=len(vals), total=2, ids_kept=cur)
+            rollback(model, caches, cap, pre, keep=len(vals), total=total,
+                     ids_kept=pair[:, : len(vals)])
             out.extend(vals)
             yield vals
             cur, hyper_prev = toks[-1], hypers[-1]

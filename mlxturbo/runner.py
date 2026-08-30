@@ -1368,7 +1368,9 @@ def _build_base_runner(
             print(f"{log_prefix} {reason}; 通常生成にフォールバックします")
             return FallbackRunner(model, tokenizer, fallback_reason=reason)
 
-        engine = spec_flash.FlashSpecEngine(model, mtp)
+        # --mtp-depth の既定は None (未指定)。その場合はモジュールの既定を使う。
+        depth = getattr(args, "mtp_depth", None) or spec_flash.MTP_DEPTH
+        engine = spec_flash.FlashSpecEngine(model, mtp, depth=depth)
         bits_note = f"{mtp_bits}bit" if mtp_bits else "bf16"
         print(
             f"{log_prefix} Flash-Next 投機デコード有効 (FlashSpecEngine, MTP: あり"
