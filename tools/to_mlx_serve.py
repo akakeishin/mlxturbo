@@ -357,6 +357,51 @@ def _bits_of(wq, scales, group_size: int) -> int:
     return round(wq.shape[-1] * 32 / values)
 
 
+# このアーキの Qwen4ExpTextRMSNorm は x * (1 + w) を計算する。向こうのパックは
+# **+1 を畳み込んだ状態**で重みを持ち、エンジン側は素直に w を掛ける。
+# うちは HF の生の重み (ほぼ 0) をそのまま入れていたので、向こうで読むと
+# ほぼ 0 倍になり、生成が同じトークンの反復になる。形も値も一致して見えるのに
+# 出力だけが壊れるので、突き止めるのに時間がかかった。
+#
+# 一覧は向こうの tests/convert_qwen38_flash_next.py (MIT) の NORM_FOLD_SUFFIXES。
+# linear_attn.norm はゲート付きで素の重みなので触らない。
+NORM_FOLD_SUFFIXES = (
+    "hc_norm.weight", "q_norm.weight", "k_norm.weight",
+    "q_layernorm.weight", "k_layernorm.weight",
+    "ple.norm_key.weight", "ple.norm_query.weight", "ple.norm_conv.weight",
+    "pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight",
+)
+
+FOLD_MARK = ".norm_folded"
+
+
+def cmd_fold(args) -> None:
+    """RMSNorm の重みに +1 を畳み込む。**2 回かけてはいけない。**"""
+    import mlx.core as mx
+
+    pack = Path(args.pack).expanduser()
+    mark = pack / FOLD_MARK
+    if mark.exists() and not args.force:
+        sys.exit(f"すでに畳み込み済み ({mark})。やり直すならパックを作り直すこと")
+
+    n = 0
+    for sh in sorted(pack.glob("model-*.safetensors")):
+        if sh.name == "model-vision.safetensors":
+            continue
+        w = mx.load(str(sh))
+        hit = [k for k in w if k.endswith(NORM_FOLD_SUFFIXES)]
+        if not hit:
+            continue
+        for k in hit:
+            w[k] = (w[k].astype(mx.float32) + 1.0).astype(w[k].dtype)
+        mx.eval(list(w.values()))
+        mx.save_safetensors(str(sh), w)
+        n += len(hit)
+        print(f"  {sh.name}: {len(hit)} 本", flush=True)
+    mark.write_text("norm weights carry the +1\n")
+    print(f"{n} 本に +1 を畳み込んだ")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -375,6 +420,9 @@ def main() -> None:
     p.add_argument("--reference", required=True, help="mlx-serve ネイティブのパック")
     p.add_argument("--bits", type=int, default=4)
     p.add_argument("--group-size", type=int, default=64)
+    p = sub.add_parser("fold", help="RMSNorm の重みに +1 を畳み込む")
+    p.add_argument("--pack", required=True)
+    p.add_argument("--force", action="store_true", help="畳み込み済みの印を無視する")
     p = sub.add_parser("mtp", help="bf16 の MTP ヘッドを量子化して書き出す")
     p.add_argument("--src", required=True, help="mtp.safetensors")
     p.add_argument("--out", required=True, help="出力 safetensors")
@@ -391,6 +439,8 @@ def main() -> None:
         cmd_ngram(args)
     elif args.cmd == "align":
         cmd_align(args)
+    elif args.cmd == "fold":
+        cmd_fold(args)
     else:
         cmd_mtp(args)
 

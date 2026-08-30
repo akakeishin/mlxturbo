@@ -30,29 +30,46 @@ mlx-serve 26.8.11 (MLX 0.32.2)。うちの v-l を変換して読ませながら
 48 層ぶんで 192 群ずれる。`tools/to_mlx_serve.py align` が参照パックを見て
 揃える。揃えると decode が 27 -> 45 tok/s に上がった (速いカーネルに乗る)。
 
-## 未解決: 混在ビットのパックが壊れる
+## 犯人は RMSNorm の +1 だった (決着)
 
-v-l を変換して読ませると、**読み込みは通り、生成が同じトークンの反復になる。**
-`_coordinates_coordinates...` のような形で、崩れ方は決定的 (毎回同じ)。
+このアーキの `Qwen4ExpTextRMSNorm` は `x * (1 + w)` を計算する。向こうのパックは
+**+1 を畳み込んだ重み**を持ち、エンジンは素直に `w` を掛ける。うちは HF の生の
+重み (ほぼ 0) を入れていたので、向こうで読むとほぼ 0 倍になり、生成が同じ
+トークンの反復になっていた。
 
-潰した容疑者:
+形も dtype も 2762 群すべて一致し、値も bf16 の元と突き合わせて向こうと同じ
+量子化誤差だったので、突き止めるのに時間がかかった。潰した容疑者は全部無実:
+混在ビット (一律 5bit でも壊れた)、MTP、vision、n-gram 表、量子化する範囲、
+lm_head と embed のビット、config の形、融合カーネル。
 
-- n-gram 表 — 向こうの `ngram_table.bin` に差し替えても同じ。プレーナ変換は
-  バイト単位で照合済み (5 行を全ブロックで一致確認)
-- 量子化範囲のずれ — `align` で揃えた。速くはなったが崩れは同じ
-- 融合 MoE カーネル — `MLX_SERVE_MOE_*_FUSED=0` で外しても同じ
-- `lm_head` の 6bit — 8bit に焼き直しても同じ
-- `embed_tokens` / `hyper_connection_mixer` の 8bit — 4bit に焼き直しても同じ
-- config の per-tensor エントリの有無 — どちらでも同じ
+対象は向こうの `tests/convert_qwen38_flash_next.py` の `NORM_FOLD_SUFFIXES`:
 
-残っているのは、v-l が**参照と 1171 群中 606 群でビット数が違う**こと。
-6bit が 36 層の GDN 全体・12 層の self_attn 全体・末尾 8 層のエキスパート、
-8bit が hyper_connection 系の全層に散っている。どれか (あるいは複数) を
-向こうが決め打ちの幅で読んでいる。
+    hc_norm / q_norm / k_norm / q_layernorm / k_layernorm
+    ple.norm_key / ple.norm_query / ple.norm_conv
+    pre_fc_norm_embedding / pre_fc_norm_hidden
 
-Metal ソースの分岐は `BITS == 4` / `5` / `8` が各 213 箇所、`6` が 1 箇所、
-2 と 3 は 0 箇所。実行時メッセージは `this MLX runtime supports 2, 3, 4, 5, 6, 8`
-と言うので、読めはするが速い経路は 4/5/8 に限られる。
+`linear_attn.norm` はゲート付きで素の重みなので触らない。`tools/to_mlx_serve.py
+fold` がこれをやる。**2 回かけてはいけない**ので、済んだ印を `.norm_folded` に置く。
+
+うちの `tools/smoke_generate.py` の説明にも「RMSNorm の +1 欠落は生成が無意味な
+反復になったが活性の大きさはそれらしいままだった」と書いてある。同じ罠を
+逆向きに踏んだ。
+
+## 混在ビットは無実
+
++1 を直したら一律 5bit が通った (43.1 tok/s、一律 4bit は 51.5)。混在が読めるか
+どうかはこれとは別の問題で、まだ試していない。
+
+## 向こうの変換スクリプトから判ったその他の約束
+
+- bf16 のまま置くのは「1 次元」「2 次元だが行数 32 未満」「最終軸が 64 の倍数
+  でない」もの。行数 32 未満に当たるのは `shared_expert_gate`・
+  `block_inject_weight`・GDN の `in_proj_a/b`。router の `mlp.gate` は 512 行
+  あるので量子化される
+- `embed_tokens` は既定で 4bit gs64 固定
+- n-gram 表の 3/5/6bit は mlx-serve 26.9.1 以降でないと雑音として読まれる (#305)。
+  手元は 26.8.11 なので 4bit に留める
+- 深さ方向の conv1d は HF の `[C, 1, K]` のまま置く
 
 ## ここから言えること
 

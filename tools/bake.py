@@ -53,7 +53,28 @@ def _tier(experts: int, hi: int, layers: list[int]) -> dict:
     }
 
 
+# mlx-serve に読ませる段。**ビット幅を混ぜない。**混在パックは向こうで生成が
+# 壊れ、速い経路 (Metal ソースの分岐は 4/5/8 のみ) からも外れる
+# (docs/research/MLX-SERVE-PACK-FORMAT.md)。
+#
+# 既知で動くパック (ddalcu の一律 4bit) からの差をエキスパートだけに絞る。
+# パックの 93.7% がエキスパートなので、品質の取り分はここでほぼ全部取れる。
+# 動かなければ「このアーキでは 4bit しか読めない」と分かり、それはそれで決着。
+_SERVE_5 = {
+    "experts": {"bits": 5, "group_size": 64},
+    "router": {"bits": 4, "group_size": 64},  # 向こうは router を量子化する
+    "shared": {"bits": 4, "group_size": 64},
+    "gdn": {"bits": 4, "group_size": 64},
+    "attn": {"bits": 4, "group_size": 64},
+    "hc": {"bits": 4, "group_size": 64},
+    "head": {"bits": 8, "group_size": 64},  # 向こうと同じ
+    "ngram": False,
+    "ngram_disk": True,
+    "default": {"bits": 4, "group_size": 64},
+}
+
 TIERS = {
+    "serve-5": _SERVE_5,
     # 前 8 層だけ 4bit。v-fast6 (4bit が全域に散っている) の同容量改良版
     "v-xl": _tier(4, 6, list(range(8, N_LAYERS))),
     "v-l": _tier(4, 6, _last(8)),
@@ -63,6 +84,7 @@ TIERS = {
 
 # 予測 (tools/predict_recipe.py、rebit は悲観側)
 PREDICTED = {
+    "serve-5": (81.5, "未測定 (一律 4bit より良い側なのは確かだが、幅は未知)"),
     "v-xl": (97.5, "0.0033 前後 (推定。rebit では検証できない段)"),
     "v-l": (76.8, "0.00598"),
     "v-m": (64.8, "0.01257"),
@@ -95,11 +117,15 @@ def main():
     cf = _inject()
 
     if args.cmd == "list":
-        for name in ("v-xl", "v-l", "v-m", "v-s"):
+        for name in ("serve-5", "v-xl", "v-l", "v-m", "v-s"):
             gb, kld = PREDICTED[name]
             r = TIERS[name]
-            print(f"  {name:5s} experts {r['experts']['bits']}bit / "
-                  f"hi {r['experts_hi']['bits']}bit x {len(r['experts_hi_layers'])} 層"
+            if "experts_hi" in r:
+                mix = (f"hi {r['experts_hi']['bits']}bit x "
+                       f"{len(r['experts_hi_layers'])} 層")
+            else:
+                mix = "混在なし (mlx-serve 用)"
+            print(f"  {name:7s} experts {r['experts']['bits']}bit / {mix}"
                   f"  -> {gb:.1f}GB ({gb / 1.073741824:.1f}GiB)  予測 KLD {kld}")
         return
 
