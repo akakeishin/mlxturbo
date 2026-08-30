@@ -595,13 +595,22 @@ def _select_session(prompt_ids: list[int]):
     """
 
     pool = STATE.session_pool
+    # The generate paths need at least one token left to prefill: with a
+    # zero-length delta, generate_stream never enters its chunk loop and the
+    # hyper state it reads right after stays unset. So reuse is capped one
+    # token short of the prompt, the same thing llama.cpp does. Without the cap
+    # the best case of all -- the new prompt being a prefix of what this slot
+    # already processed (the same prompt sent again, a regenerate, a
+    # conversation stepped back a turn) -- was excluded by both passes below
+    # and fell through to a fresh slot and a full prefill.
+    reuse_cap = len(prompt_ids) - 1
 
     def _lcp(pl: list[int]) -> int:
         n = min(len(pl), len(prompt_ids))
         i = 0
         while i < n and pl[i] == prompt_ids[i]:
             i += 1
-        return i
+        return min(i, reuse_cap)
 
     # 1st pass: whole-sequence match (a pure append) — the existing safe path,
     # which does not touch the cache.
@@ -612,7 +621,7 @@ def _select_session(prompt_ids: list[int]):
         if not pl:
             continue
         lcp = _lcp(pl)
-        if lcp == len(pl) and lcp < len(prompt_ids) and lcp > best_lcp:
+        if lcp == len(pl) and lcp > best_lcp:
             best_lcp = lcp
             best_key = key
 
@@ -628,7 +637,7 @@ def _select_session(prompt_ids: list[int]):
         if not pl:
             continue
         lcp = _lcp(pl)
-        if 0 < lcp < len(pl) and lcp < len(prompt_ids):
+        if 0 < lcp < len(pl):
             partial.append((lcp, key, sess))
     partial.sort(key=lambda c: -c[0])
 

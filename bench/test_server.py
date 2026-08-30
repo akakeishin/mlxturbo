@@ -3698,6 +3698,52 @@ def test_select_session_reuses_via_trim_when_cache_is_fully_trimmable():
     assert got.h_last is None
 
 
+def test_select_session_reuses_when_prompt_is_a_prefix_of_processed():
+    """同じプロンプトの投げ直し (regenerate、会話を 1 往復戻す、エージェントが
+    毎ターン同じ前置きを送る) で再利用が効くこと。
+
+    processed は「プロンプト + 生成したトークン」なので、同じプロンプトが再び
+    来ると lcp == len(prompt_ids) になる。再利用できる量が最大の場合だが、
+    以前は両方の pass がこれを候補から外していて、まるごと prefill を
+    やり直していた (実測: 12k トークンで 2 回目も 39.6 秒)。
+    """
+
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    sess = ChatSession()
+    sess.processed = [1, 2, 3, 4, 5, 90, 91]  # プロンプト 5 + 生成 2
+    sess.caches = [_real_kv_cache(7), _real_kv_cache(7)]
+    sess.mtp_valid = False
+    server.STATE.session_pool[0] = sess
+
+    got = server._select_session([1, 2, 3, 4, 5])
+
+    assert got is sess, "同じプロンプトの投げ直しで別スロットに落ちてはいけない"
+    # 差分 0 では generate_stream がチャンクループに入らず hyper 状態が
+    # 未設定のままになるので、最後の 1 トークンは必ず prefill に残す。
+    assert got.processed == [1, 2, 3, 4]
+    assert got.caches[0].offset == 4
+
+
+def test_select_session_leaves_one_token_to_prefill_on_exact_repeat():
+    """processed がプロンプトそのものと完全一致していても、再利用は
+    プロンプト長 -1 で頭打ちにすること。"""
+
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    sess = ChatSession()
+    sess.processed = [1, 2, 3]
+    sess.caches = [_real_kv_cache(3)]
+    sess.mtp_valid = False
+    server.STATE.session_pool[0] = sess
+
+    got = server._select_session([1, 2, 3])
+
+    assert got is sess
+    assert got.processed == [1, 2]
+    assert got.caches[0].offset == 2
+
+
 def test_select_session_falls_back_when_a_cache_layer_is_not_trimmable():
     """1 レイヤーでも巻き戻せなければ (実運用の GDN ハイブリッド構成:
     ArraysCache が線形層に混ざる)、部分一致は諦めて新規スロットへ倒す。
