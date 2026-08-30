@@ -63,10 +63,11 @@ Connection methods, the full option list, API key auth, and connection examples 
 
 ## Constraints
 
+- **Text only. No images, audio or video.** The original checkpoint is a VLM, but this conversion carries no vision tower (zero vision tensors in the converted weights). Requests containing non-text blocks (`image_url`, `image`, `input_audio`, ...) are rejected with a 400. See §1 of [`docs/BACKLOG.md`](docs/BACKLOG.md) for what adding it would take
 - **One process, one model.** A model is loaded exactly once at startup and stays resident; switching models means starting a different process
-- **Requests are processed serially.** Continuous batching is not implemented; each request serializes to one generation at a time. If multiple clients connect at once, later requests wait for the earlier one to finish (once the queue exceeds `--max-queue`, new requests get a 503)
-- **`spec` / `flash_spec` routes return 400 for non-identity sampling parameters.** As noted above, this is because the speculative block-verification assumes exact distribution matching
-- **Token logprobs are not supported.** The response's `logprobs` field is always `null` or an empty array
+- **Requests are serialized by default.** `--max-batch N` enables continuous batching, but the default is 1 (serial). Even when enabled, speculative routes are excluded — only requests running on `FallbackRunner` get pooled. Once the queue exceeds `--max-queue`, new requests get a 503
+- **Non-identity sampling parameters downgrade that one request to non-speculative** on the `spec` / `flash_spec` routes, because speculative block-verification assumes exact distribution matching. The downgrade is reported in the response's `downgrade_reason` and in the server log
+- **logprobs only on non-speculative routes.** Requesting them on a speculative route downgrades the request the same way. Combining them with streaming returns a 400
 - For the full constraint list (the scope of determinism, context-length guards, etc.), see the "Constraints" section of [`docs/SERVER.md`](docs/SERVER.md)
 
 ## Measured numbers and how to reproduce them
