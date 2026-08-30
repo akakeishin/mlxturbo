@@ -8,3 +8,7 @@ models/
 tools/bridge/*.dylib
 tools/isa/build/
 bench/results/
+
+# Swift の中間物
+app/.build/
+app/build/
