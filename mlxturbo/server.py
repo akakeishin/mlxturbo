@@ -96,6 +96,7 @@ import json
 import os
 import queue
 import secrets
+import subprocess
 import threading
 import time
 import uuid
@@ -269,6 +270,9 @@ class ModelState:
     max_tokens_cap: int
     default_temp: float
     created_ts: int
+    # Raw --model value at startup, as opposed to model_name (the served
+    # name). Only GET /api/status reads it.
+    model_path: str = ""
     max_sessions: int = 8  # Limit on session_pool (LRU). It exists so that
     # per-conversation KV does not pile up without bound on top of a 91GB-class
     # model, and it can be changed with --max-sessions.
@@ -3070,6 +3074,53 @@ async def health():
     if fallback_reason is not None:
         body["fallback_reason"] = fallback_reason
     return body
+
+
+def _read_rss_bytes() -> int | None:
+    """Current (not peak) RSS of this process, in bytes.
+
+    ``getrusage`` only reports the high-water mark, so it can't answer "how
+    much is resident right now". macOS-only, so ``ps -o rss=`` (KiB there) is
+    enough. Best-effort: None rather than failing the request.
+    """
+
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        )
+        return int(out.stdout.strip()) * 1024
+    except Exception:
+        return None
+
+
+@app.get("/api/status")
+async def api_status():
+    """Polling target for the menu-bar app in app/.
+
+    Separate from /health so that endpoint's shape and callers stay untouched.
+    """
+
+    if STATE is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "loading", "loaded": False},
+        )
+    return {
+        "model_name": STATE.model_name,
+        "model_path": STATE.model_path,
+        "runner_kind": getattr(STATE.runner, "KIND", type(STATE.runner).__name__),
+        "fallback_reason": getattr(STATE.runner, "fallback_reason", None),
+        "rss_bytes": _read_rss_bytes(),
+        "peak_memory_bytes": mx.get_peak_memory(),
+        "uptime_s": time.time() - STATE.created_ts,
+        "n_sessions": len(STATE.session_pool),
+        "queue_depth": STATE.queue_depth,
+        "max_context_tokens": STATE.max_context_tokens,
+    }
 
 
 @app.get("/api/hello")
@@ -6087,6 +6138,7 @@ def main() -> None:
         lock=asyncio.Lock(),
         executor=executor,
         model_name=served_name,
+        model_path=args.model,
         eos_ids=set(tokenizer.eos_token_ids),
         max_tokens_cap=args.max_tokens,
         default_temp=args.temp,

@@ -6,6 +6,7 @@ uv run mlxturbo --prompt "..."        # one-shot
 
 import argparse
 import os
+import sys
 import time
 
 from ._mlx_compat import mlx_lm_load, resolve_local_model_path
@@ -72,6 +73,15 @@ def load_cli_mtp(
 
 
 def main() -> None:
+    # `mlxturbo hub ...` は app/ のメニューバーアプリ向けの JSON 専用の口で、
+    # 下の chat REPL の一モードではない。REPL の argparse より前で振り分けて、
+    # サブコマンドが --model や --temp と同居しないようにしている。
+    if len(sys.argv) > 1 and sys.argv[1] == "hub":
+        from .hub import main as hub_main
+
+        hub_main(sys.argv[2:])
+        return
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="lmstudio-community/Qwen3.8-27B-MLX-4bit")
     ap.add_argument("--original", default="Qwen/Qwen3.8-27B")

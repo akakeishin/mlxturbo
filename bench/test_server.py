@@ -362,6 +362,7 @@ def _install_state(runner, tokenizer=None, **overrides) -> server.ModelState:
         lock=asyncio.Lock(),
         executor=concurrent.futures.ThreadPoolExecutor(max_workers=1),
         model_name=overrides.get("model_name", "test-model"),
+        model_path=overrides.get("model_path", ""),
         eos_ids=overrides.get("eos_ids", {999}),
         max_tokens_cap=overrides.get("max_tokens_cap", 4096),
         default_temp=overrides.get("default_temp", 0.7),
@@ -966,6 +967,78 @@ def test_health_endpoint_omits_fallback_reason_for_spec_runner(client):
     _install_state(runner)
     resp = client.get("/health")
     assert "fallback_reason" not in resp.json()
+
+
+# ---------- 3a. /api/status (GUI 用ポーリング先) ----------
+
+
+def test_api_status_reports_model_and_runner(client):
+    runner = FakeRunner(tokens_to_emit=[])
+    _install_state(
+        runner,
+        model_name="my-model",
+        model_path="/Users/ht/models/my-model",
+        max_context_tokens=4096,
+    )
+    resp = client.get("/api/status")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["model_name"] == "my-model"
+    assert body["model_path"] == "/Users/ht/models/my-model"
+    assert body["runner_kind"] == "fallback"
+    assert body["fallback_reason"] is None
+    assert body["max_context_tokens"] == 4096
+    assert isinstance(body["rss_bytes"], int) or body["rss_bytes"] is None
+    assert isinstance(body["peak_memory_bytes"], int)
+    assert body["uptime_s"] >= 0
+    assert body["n_sessions"] == 0
+    assert body["queue_depth"] == 0
+
+
+def test_api_status_reports_fallback_reason_when_present(client):
+    runner = FakeRunner(tokens_to_emit=[])
+    runner.fallback_reason = "fake reason"
+    _install_state(runner)
+    resp = client.get("/api/status")
+    assert resp.json()["fallback_reason"] == "fake reason"
+
+
+def test_api_status_reports_n_sessions_and_queue_depth(client):
+    runner = FakeRunner(tokens_to_emit=[])
+    pool = OrderedDict()
+    pool[0] = object()
+    pool[1] = object()
+    _install_state(runner, session_pool=pool, queue_depth=2)
+    resp = client.get("/api/status")
+    body = resp.json()
+    assert body["n_sessions"] == 2
+    assert body["queue_depth"] == 2
+
+
+def test_api_status_before_load_returns_503():
+    server.STATE = None
+    with TestClient(server.app) as c:
+        resp = c.get("/api/status")
+    assert resp.status_code == 503
+
+
+def test_api_status_does_not_change_health_shape(client):
+    """/api/status を足しても /health の応答形は変わらない (別エンドポイント
+    として追加した、という要件そのものの検証)。"""
+
+    runner = FakeRunner(tokens_to_emit=[])
+    _install_state(runner, model_name="my-model")
+    resp = client.get("/health")
+    body = resp.json()
+    assert set(body.keys()) == {
+        "status",
+        "model",
+        "loaded",
+        "runner",
+        "busy",
+        "queue_depth",
+        "version",
+    }
 
 
 # ---------- 3b. バグ修正: GET/HEAD /api/hello が 404 だった ----------
