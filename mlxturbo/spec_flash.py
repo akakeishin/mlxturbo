@@ -253,6 +253,37 @@ def rollback(model, caches, cap: Capture, pre: dict, keep: int, total: int,
         c[3] = mx.concatenate([ctx, ids_kept], axis=1)[:, -ctx_len:]
 
 
+def snapshot_mtp_cache(cache):
+    """Copy the MTP draft cache so it can be handed to a later resumed call.
+
+    ``KVCache`` preallocates and writes into ``self.keys[..., i:i+n, :]`` in
+    place, so the live cache cannot simply be aliased -- the decode loop would
+    overwrite the copy. ``_IndexerCache`` concatenates instead (a fresh array
+    per update), so its keys are safe to share. About 5MB at PRIME_WINDOW with
+    this model's 2 KV heads.
+    """
+    if cache is None or cache.offset == 0:
+        return None
+    n = cache.offset
+    return (
+        mx.contiguous(cache.keys[..., :n, :]),
+        mx.contiguous(cache.values[..., :n, :]),
+        n,
+        cache.indexer.keys,
+    )
+
+
+def restore_mtp_cache(snap):
+    """Rebuild the cache saved by ``snapshot_mtp_cache`` (None -> empty)."""
+    cache = _arch()._AttnCache()
+    if snap is None:
+        return cache
+    keys, values, n, idx = snap
+    cache.keys, cache.values, cache.offset = keys, values, n
+    cache.indexer.keys = idx
+    return cache
+
+
 class FlashSpecEngine:
     """Depth-1 speculative decoding that uses the MTP as the draft.
 
@@ -496,8 +527,11 @@ class FlashSpecEngine:
         n = ids.shape[1]
         use_resume = resume is not None and n == 0
         if use_resume:
-            logits_tail, hyper_tail0 = resume
-            mtp_cache = _arch()._AttnCache()
+            logits_tail, hyper_tail0, mtp_snap = resume
+            # The primed draft cache is carried across too: without it a
+            # resumed call would draft from an empty cache and give back the
+            # acceptance that priming buys (measured: decode -7%).
+            mtp_cache = restore_mtp_cache(mtp_snap)
         else:
             step = PREFILL_STEP_SIZE
             i = 0
@@ -557,17 +591,18 @@ class FlashSpecEngine:
                 # Keep the successfully prefetched cache, but do not expose the
                 # first sampled ``cur``.  This mirrors SpecEngine.generate(0) and
                 # lets FlashSpecRunner publish exactly the prompt as processed.
-                return 0, 0, (logits_tail, hyper_tail0)
+                return 0, 0, (logits_tail, hyper_tail0, None)
             hyper_tail = (
                 hyper_chunks[0] if len(hyper_chunks) == 1
                 else mx.concatenate(hyper_chunks, axis=1)
             )
             mtp_cache = self._prime_draft_cache(ids[:, -hyper_tail.shape[1]:], hyper_tail)
+            mtp_snap = snapshot_mtp_cache(mtp_cache)
 
         if max_tokens == 0:
             # Only reachable via ``use_resume`` -- the normal path already
             # returned above.
-            return 0, 0, (logits_tail, hyper_tail0)
+            return 0, 0, (logits_tail, hyper_tail0, mtp_snap)
 
         hyper_prev = hyper_tail0
         cur = self._sample(logits_tail, temp)
@@ -577,7 +612,7 @@ class FlashSpecEngine:
         yield [first]
         accepted, rounds = 0, 0
         if first in eos:
-            return accepted, rounds, (logits_tail, hyper_tail0)
+            return accepted, rounds, (logits_tail, hyper_tail0, mtp_snap)
 
         while len(out) < max_tokens:
             draft = self._draft(cur, hyper_prev, mtp_cache)
@@ -614,7 +649,7 @@ class FlashSpecEngine:
             if cut is not None:
                 break
 
-        return accepted, rounds, (logits_tail, hyper_tail0)
+        return accepted, rounds, (logits_tail, hyper_tail0, mtp_snap)
 
 
 __all__ = ["Capture", "FlashSpecEngine", "capture", "rollback", "snapshot_pre"]
