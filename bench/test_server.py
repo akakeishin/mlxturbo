@@ -4132,6 +4132,49 @@ def _build_tiny_qwen4_exp():
     return model, mtp
 
 
+def test_flash_spec_draft_reuses_primed_cache_across_rounds():
+    """MTP priming (2026-08-30): _draft() must no longer build a fresh,
+    empty _AttnCache() on every call -- it should keep using the one cache
+    that generate()/generate_stream() primed over the whole prompt, and that
+    cache's .offset should advance by exactly 1 every round instead of
+    resetting. This is a direct regression test for the bug the priming
+    change fixes: before it, every _draft() call re-created its own cache at
+    offset 0, so the MTP head never had any context beyond the single
+    current token."""
+
+    import mlxturbo.spec_flash as spec_flash_module
+
+    mx.random.seed(2)
+    model, mtp = _build_tiny_qwen4_exp()
+    engine = spec_flash_module.FlashSpecEngine(model, mtp)
+
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    seen_caches = []
+    offsets = []
+    orig_draft = spec_flash_module.FlashSpecEngine._draft
+
+    def spy(self, cur, hyper_prev, cache):
+        seen_caches.append(cache)
+        offsets.append(cache.offset)
+        return orig_draft(self, cur, hyper_prev, cache)
+
+    spec_flash_module.FlashSpecEngine._draft = spy
+    try:
+        engine.generate(ids, max_tokens=6)
+    finally:
+        spec_flash_module.FlashSpecEngine._draft = orig_draft
+
+    assert len(offsets) >= 2  # otherwise this test proves nothing
+    # every _draft() call in one generate() must reuse the identical cache
+    # object -- not a fresh one each time.
+    assert all(c is seen_caches[0] for c in seen_caches)
+    # priming covers prompt positions 0..N-2 (N=5 tokens -> offset 4) before
+    # the first _draft() call, then the shared cache's offset must grow by
+    # exactly 1 every round (never reset to 0 or re-primed).
+    assert offsets[0] == ids.shape[1] - 1
+    assert offsets == list(range(offsets[0], offsets[0] + len(offsets)))
+
+
 def test_flash_spec_checkpoint_reuse_matches_full_rebuild_with_tail_mismatch(monkeypatch):
     """この節の合否基準そのもの: thinking マーカー再オープンと同じ形の不一致
     (処理済み列の末尾わずかだけが新プロンプトと食い違う、チェックポイント

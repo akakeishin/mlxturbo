@@ -57,6 +57,18 @@ import mlx.nn as nn
 from .spec import CHECKPOINT_RETENTION, PREFILL_STEP_SIZE, snapshot_untrimmable_caches
 
 
+# How many trailing prompt positions are fed to the MTP head before decoding
+# starts (see FlashSpecEngine._prime_draft_cache). Acceptance comes from recent
+# context, so a window buys most of the gain while keeping the cost independent
+# of prompt length -- this model's ceiling is 262144 tokens, where priming the
+# whole prompt would cost both minutes of TTFT and gigabytes of retained hyper
+# state. Measured at 2048: 32k prompt, acceptance 0.574 -> 0.827.
+PRIME_WINDOW = 2048
+# Trailing prefill chunks whose hyper state generate_stream retains. Two chunks
+# of PREFILL_STEP_SIZE always cover PRIME_WINDOW+1 positions.
+HYPER_KEEP_CHUNKS = 2
+
+
 def _arch():
     import mlx_lm.models.qwen4_exp as Q
 
@@ -258,13 +270,62 @@ class FlashSpecEngine:
         self.mtp = mtp
         self.rope = model.model.rope
 
-    def _draft(self, cur, hyper_prev):
+    def _draft(self, cur, hyper_prev, cache):
+        """Single-token draft. ``cache`` persists across the rounds of one
+        ``generate``/``generate_stream`` call (built by ``_prime_draft_cache``),
+        so the draft head attends to its own history instead of starting from
+        an empty cache every round. S=1 always, so the mask stays None.
+        """
         Q = _arch()
         emb = self.model.model.embed_tokens(cur)
-        cache = Q._AttnCache()
         mask = Q.create_attention_mask(emb, None)
         out = self.mtp(emb, hyper_prev, self.rope, mask, cache, cache.indexer)
         return mx.argmax(self.model.lm_head(out)[:, -1], axis=-1).reshape(1, 1)
+
+    def _prime_draft_cache(self, ids, hyper):
+        """Run the tail of the prompt through the MTP head once ("priming"),
+        so the first ``_draft()`` of a generation already has real history.
+
+        ``ids`` and ``hyper`` must cover the same trailing positions of the
+        prompt. Only the last ``PRIME_WINDOW`` pairs are fed in: acceptance
+        comes from recent context, and a window keeps the cost independent of
+        prompt length (this model goes to 262144 tokens).
+
+        The pairing follows ``_draft()``: at position k the head takes
+        ``(embed(t_k), hyper_{k-1})``. The prompt supplies every such pair for
+        k = 1 .. N-1, and the first real ``_draft()`` continues at k = N, so
+        there is no gap and no duplicate.
+
+        No rollback on a rejected round: every pair fed here or by ``_draft()``
+        is built from values the target model's verification forward already
+        confirmed. The rejected guess's embedding never enters this cache --
+        only its argmax is compared. Nor can this cache change what is emitted:
+        the output tokens come from the target model's own logits, which never
+        read it. It moves the acceptance rate, nothing else.
+        """
+        Q = _arch()
+        cache = Q._AttnCache()
+        n = min(ids.shape[1], hyper.shape[1])
+        if n > PRIME_WINDOW + 1:
+            n = PRIME_WINDOW + 1
+            ids, hyper = ids[:, -n:], hyper[:, -n:]
+        n_pairs = n - 1
+        if n_pairs < 1:
+            return cache
+        embeds = self.model.model.embed_tokens(ids[:, 1:])
+        hyper_ctx = hyper[:, :-1]
+        i = 0
+        while i < n_pairs:
+            j = min(i + PREFILL_STEP_SIZE, n_pairs)
+            chunk = embeds[:, i:j]
+            out = self.mtp(
+                chunk, hyper_ctx[:, i:j], self.rope,
+                Q.create_attention_mask(chunk, None), cache, cache.indexer,
+            )
+            mx.eval(out)
+            mx.clear_cache()
+            i = j
+        return cache
 
     def generate(self, ids, max_tokens: int, caches=None):
         """Greedy generation. Returns (token sequence, accepted count, round count)."""
@@ -274,6 +335,7 @@ class FlashSpecEngine:
             logits = model(ids, cache=caches)
             mx.eval(logits)
         hyper_prev = cap.hyper[:, -1:]
+        mtp_cache = self._prime_draft_cache(ids, cap.hyper)
         cur = mx.argmax(logits[:, -1], axis=-1).reshape(1, 1)
 
         # **Include the first token produced by prefill in the output too.**
@@ -281,7 +343,7 @@ class FlashSpecEngine:
         # generated token", so dropping it here shifts everything by one
         out, accepted, rounds = [int(cur.item())], 0, 0
         while len(out) < max_tokens:
-            draft = self._draft(cur, hyper_prev)
+            draft = self._draft(cur, hyper_prev, mtp_cache)
             pair = mx.concatenate([cur, draft], axis=1)
             pre = snapshot_pre(model, caches)
             with capture(model) as cap:
@@ -411,6 +473,13 @@ class FlashSpecEngine:
         i = 0
         logits = None
         cap = None
+        # The trailing prefill chunks' hyper state (B, chunk_len, hc*d), kept
+        # to prime the MTP's own cache below. Only the last HYPER_KEEP_CHUNKS
+        # are retained: priming reads at most PRIME_WINDOW+1 positions, and at
+        # this model's 262144-token ceiling holding all of them would be
+        # gigabytes. capture(light=True) records only GatedResidual's hyper, so
+        # this does not reintroduce the OOM that `light` exists to avoid.
+        hyper_chunks = []
         while i < n:
             j = min(i + step, n)
             chunk = ids[:, i:j]
@@ -426,13 +495,20 @@ class FlashSpecEngine:
                     logits = model(chunk, cache=caches)
                     mx.eval(logits)
             else:
-                h = model.model(chunk, cache=caches)
-                mx.eval(h)
+                # light=True (added for MTP priming): only the cheap
+                # GatedResidual hook runs, so this branch's computation and
+                # cache updates are unchanged -- we additionally record
+                # cap.hyper for this chunk.
+                with capture(model, light=True) as cap:
+                    h = model.model(chunk, cache=caches)
+                    mx.eval(h)
                 for c in caches:
                     state = getattr(c, "state", None)
                     if state is not None:
                         mx.eval(state)
                 mx.clear_cache()
+            hyper_chunks.append(cap.hyper)
+            del hyper_chunks[:-HYPER_KEEP_CHUNKS]
             i = j
             if checkpoints is not None:
                 checkpoints.append((base_pos + i, snapshot_untrimmable_caches(caches)))
@@ -443,6 +519,11 @@ class FlashSpecEngine:
             # first sampled ``cur``.  This mirrors SpecEngine.generate(0) and
             # lets FlashSpecRunner publish exactly the prompt as processed.
             return 0, 0
+        hyper_tail = (
+            hyper_chunks[0] if len(hyper_chunks) == 1
+            else mx.concatenate(hyper_chunks, axis=1)
+        )
+        mtp_cache = self._prime_draft_cache(ids[:, -hyper_tail.shape[1]:], hyper_tail)
         cur = self._sample(logits[:, -1], temp)
 
         first = int(cur.item())
@@ -453,7 +534,7 @@ class FlashSpecEngine:
             return accepted, rounds
 
         while len(out) < max_tokens:
-            draft = self._draft(cur, hyper_prev)
+            draft = self._draft(cur, hyper_prev, mtp_cache)
             pair = mx.concatenate([cur, draft], axis=1)
             pre = snapshot_pre(model, caches)
             with capture(model) as cap:
