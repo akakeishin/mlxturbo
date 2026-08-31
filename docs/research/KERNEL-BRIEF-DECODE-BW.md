@@ -103,6 +103,20 @@ indexer のプールブロックをラウンド間でキャッシュする案も
 値がずれており「差分プール = ビット同一」の主張が破れている)。差分 concat の
 連鎖はどのみち速くない。revert 済み。
 
+## prefill MoE の予算 (2026-09-01、カーネルレーンの第 2 の的)
+
+17k prefill 37.5s の最大部品は MoE 12.9s。mx.gather_qmm (sorted、実体は
+affine_gather_qmm_rhs = steel BlockMMA + セグメント切替) は**セグメントの
+太さに単調**: 行/expert 20/40/80/160/320 で 5.7/7.5/8.9/9.8/10.3 TFLOPS
+(密 qmm の上限 11.2)。チャンク幅を上げれば太くなるが、in-model では
+attention/indexer の一時増と相殺して -2% 止まり、8192 は wired 張り付き構成で
+Metal OOM。gate+up 融合バンク (N=1280) は効かない (7.63 = 分離と同値)。
+
+**書くべきカーネル**: gather_qmm_rhs のセグメント処理を 2 段タイル化し、
+細いセグメント (40 行/expert) でも BlockMMA の稼働率を保つ。到達目標は
+S=2048 で 10 TFLOPS (現 7.5)。当たれば prefill -3.5s (17k 454 -> 500+)。
+decode 側の共有タイル gather (関門は上記) と同じファイルの兄弟カーネル。
+
 ## 受け入れ基準 (BRIEF の規律)
 
 - in-model A/B (サーバー経由、同一プロンプト、複数プロンプト x 512 の平均 tok/step)

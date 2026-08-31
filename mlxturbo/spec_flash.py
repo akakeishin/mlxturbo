@@ -786,6 +786,15 @@ class FlashSpecEngine:
             mtp_cache = restore_mtp_cache(mtp_snap)
         else:
             step = PREFILL_STEP_SIZE
+            # 中間チャンク幅の knob。sorted gather_qmm の GEMM 効率は
+            # 1 エキスパートあたりの行数に単調 (S=2048: 7.5 TFLOPS ->
+            # S=8192: 9.8、密上限 11.2) だが、in-model では attention/indexer の
+            # 一時テンソル増と相殺して 17k TTFT -2% 止まり、しかもチャンク割りで
+            # 境界の丸めが動き出力が揺れる。既定は従来幅のまま。8192 は
+            # n-gram RAM 常駐 (wired 108GiB 張り付き) でサーバーが Metal OOM。
+            # prefill の本命は MoE gather の segment-aware GEMM カーネル
+            # (KERNEL-BRIEF-DECODE-BW.md)。
+            big = int(os.environ.get("MLXTURBO_PREFILL_CHUNK", "0") or 0) or step
             i = 0
             logits = None
             cap = None
@@ -798,7 +807,11 @@ class FlashSpecEngine:
             # does not reintroduce the OOM that `light` exists to avoid.
             hyper_chunks = []
             while i < n:
-                j = min(i + step, n)
+                remaining = n - i
+                if remaining > step:
+                    j = i + min(big, remaining - step)
+                else:
+                    j = n
                 chunk = ids[:, i:j]
                 if j == n:
                     # light=True: this chunk uses only cap.hyper[:, -1:]
