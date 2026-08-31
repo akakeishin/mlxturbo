@@ -578,15 +578,34 @@ def enable_moe_glu() -> None:
         # ソート + gather_qmm の方が強いので素のまま
         if indices.size >= 64 or not moe_glu.eligible(self.gate_proj, self.up_proj):
             return orig(self, x, indices)
-        B = indices.shape[:-1]
         topk = indices.shape[-1]
         K = x.shape[-1]
         H = self.gate_proj.scales.shape[-2]
-        x_tok = x.reshape(-1, K)                     # (B*T, K)
-        x_pairs = mx.repeat(x_tok[:, None, :], topk, axis=1).reshape(-1, K)
-        idx_flat = indices.reshape(-1)
+        # down 側の gather のために enable_gather_sort と同じソートを保つ
+        # (同一エキスパートを引く行を隣接させる。自作カーネル自身は順序不問)
+        do_sort = indices.size >= 16
+        xx = mx.expand_dims(x, (-2, -3))
+        idx = indices
+        inv_order = None
+        if do_sort:
+            import mlx_lm.models.switch_layers as SL2
+
+            xx, idx, inv_order = SL2._gather_sort(xx, indices)
+            x_pairs = xx.reshape(-1, K)              # ソート済み対ごとの x
+            idx_flat = idx
+        else:
+            x_tok = x.reshape(-1, K)
+            x_pairs = mx.repeat(x_tok[:, None, :], topk, axis=1).reshape(-1, K)
+            idx_flat = indices.reshape(-1)
         act = moe_glu.fused_glu(x_pairs, idx_flat, self.gate_proj, self.up_proj)
-        act = act.reshape(*B, topk, 1, H)
+        if do_sort:
+            act = act[:, None, :]                    # (P, 1, H)
+            out = self.down_proj(act, idx, sorted_indices=True)
+            import mlx_lm.models.switch_layers as SL2
+
+            out = SL2._scatter_unsort(out, inv_order, indices.shape)
+            return out.squeeze(-2)
+        act = act.reshape(*indices.shape, 1, H)
         out = self.down_proj(act, indices, sorted_indices=False)
         return out.squeeze(-2)
 

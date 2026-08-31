@@ -338,6 +338,54 @@ class FlashSpecEngine:
         self.mtp = mtp
         self.rope = model.model.rope
         self.depth = max(1, int(depth))
+        # draft-rerank (mlx-serve の設計の移植): trunk lm_head の 2bit 再量子化で
+        # 全語彙を粗く読み、正確な top-32 だけを trunk のヘッドの行で再採点する。
+        # 粗い top-32 に真の argmax が入っている限り draft は trunk と一致し、
+        # 検証は常に trunk ヘッドなので出力分布は無条件で無傷。
+        # MLXTURBO_DRAFT_RERANK=0 で無効。
+        self._rerank = None
+        if os.environ.get("MLXTURBO_DRAFT_RERANK", "1") != "0":
+            self._build_rerank()
+
+    RERANK_BITS = 2
+    RERANK_TOP = 32
+
+    def _build_rerank(self) -> None:
+        lm = self.model.lm_head
+        if not hasattr(lm, "scales"):
+            return
+        w = mx.dequantize(lm.weight, lm.scales, lm.biases,
+                          group_size=lm.group_size, bits=lm.bits)
+        cw, cs, cb = mx.quantize(w, group_size=64, bits=self.RERANK_BITS)
+        # 再採点用に trunk の行を bf16 で引けるよう、逆量子化した行列も保持
+        # ... はメモリを食い過ぎる (2.5GB)。行の gather は量子化のまま行い、
+        # その場で 32 行だけ逆量子化する。
+        mx.eval(cw, cs, cb)
+        self._rerank = (cw, cs, cb)
+        del w
+        mx.clear_cache()
+
+    def _draft_argmax(self, out) -> mx.array:
+        """draft 用の次トークン。(1, 1) を返す。
+
+        rerank あり: 2bit 粗ヘッドで全語彙 -> top-32 -> trunk の該当行を
+        逆量子化して再採点 -> argmax。無し: trunk ヘッドで argmax。
+        """
+        lm = self.model.lm_head
+        row = out[:, -1]
+        if self._rerank is None:
+            return mx.argmax(lm(out)[:, -1], axis=-1).reshape(1, 1)
+        cw, cs, cb = self._rerank
+        coarse = mx.quantized_matmul(
+            row, cw, scales=cs, biases=cb, transpose=True,
+            group_size=64, bits=self.RERANK_BITS)
+        top = mx.argpartition(-coarse, self.RERANK_TOP - 1, axis=-1)[..., : self.RERANK_TOP]
+        rows = mx.dequantize(
+            lm.weight[top[0]], lm.scales[top[0]], lm.biases[top[0]],
+            group_size=lm.group_size, bits=lm.bits)
+        scores = (row.astype(rows.dtype) @ rows.T)
+        best = mx.argmax(scores, axis=-1, keepdims=True)
+        return mx.take_along_axis(top, best, axis=-1)
 
     def _effective_depth(self, pos: int) -> int:
         """この位置で引くドラフト数。長い文脈では 1 に落とす
@@ -367,7 +415,7 @@ class FlashSpecEngine:
                 x, self.rope, mask, None, cache, cache.indexer, None, None
             )
             out = self.mtp.hyper_connection_mixer(x)
-            tok = mx.argmax(self.model.lm_head(out)[:, -1], axis=-1).reshape(1, 1)
+            tok = self._draft_argmax(out)
             drafts.append(tok)
             hyper = x
         trim_attn_cache(cache, keep)
