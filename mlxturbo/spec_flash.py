@@ -95,7 +95,11 @@ MTP_DEPTH = 2
 #   48k      30.8       —        17.6
 #
 # 反転は 6k と 8k の間。勝っている側の内側を採って 6144 (= 3 チャンク) に置く。
-DEPTH_CONTEXT_LIMIT = 6144
+# 2026-09-01 再較正: 6144 は sdpa の 32 行の壁 (qL>=3 が未融合経路に落ちる)
+# を避けるための遺物だった。壁は 2 行分割で解消済みで、17k 実測は depth2 が
+# depth1 を 14% 上回り受理率も 2.27 を維持 (docs/DECODE-ANATOMY)。既定は
+# 実質無効 (モデルの文脈上限)。env で戻せる。
+DEPTH_CONTEXT_LIMIT = int(os.environ.get("MLXTURBO_DEPTH_CTX_LIMIT", "262144"))
 
 
 def _arch():

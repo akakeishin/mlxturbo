@@ -14,7 +14,12 @@ mlx-serve --mtp と mlxturbo を同じクライアント・同じプロンプト
 2. **サーバー経路の per-round 消費** (SSE/detok/on_tokens が round 間に同期
    挿入される構造)。server の chunk_gap p95 = standalone のラウンド周期
    (どちらも 35.7ms) で間接確認 — 差は挿入されていない
-3. **4271 超の文脈** (8-17k)。xlong (~17k) の実測を本文に追加
+3. **4271 超の文脈** (8-17k)。xlong (~17k) を測ったら**当たりが出た**:
+   DEPTH_CONTEXT_LIMIT=6144 (sdpa 壁時代の遺物) が 17k で depth1 を強制し
+   41.9 tok/s (tok/step 1.61) に沈んでいた。壁は分割済みなので depth2 を
+   通すと **47.7 (tok/step 2.27) で mlx-serve の 46.2 を逆転**。既定を
+   実質無効 (262144) に再較正した。temp=0.7 の短文も 59.1 vs 54.4 で勝ち。
+   17k の prefill は 487 vs 366 tok/s (TTFT 35.0s vs 46.4s)
 
 ## 追記 (2026-09-01 朝): 泡の第 2 ラウンドと床
 
