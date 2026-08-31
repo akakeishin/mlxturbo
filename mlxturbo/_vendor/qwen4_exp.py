@@ -344,18 +344,27 @@ class Attention(nn.Module):
         # 独立なので、壁に収まる幅で切って繋いでも数値は同一。列を切れない
         # 文字列マスク ("causal") のときは触らない。
         gqa = self.n_heads // self.n_kv_heads
-        if (
-            S * gqa > 32
-            and S <= 8
-            and isinstance(mask, mx.array)
-            and k.shape[2] >= 2048
-        ):
+        split_mask = None
+        if S * gqa > 32 and S <= 8:
+            if isinstance(mask, mx.array):
+                split_mask = mask
+            elif mask == "causal" and k.shape[2] >= 512:
+                # 文字列のままでは列を切れないので、同じ意味のブールマスクを組む
+                # (q は絶対位置 offset..offset+S-1、k は 0..kv-1)。文字列 causal は
+                # sdpa の最速経路なので、壁の代償が小さい短い kv では触らない
+                # (kv=200 で壁 0.7ms < マスク実体化の代償、kv=1024 で壁 6.2ms)
+                kv_len = k.shape[2]
+                split_mask = (
+                    mx.arange(kv_len)[None, :]
+                    <= (offset + mx.arange(S))[:, None]
+                )[None, None]
+        if split_mask is not None:
             step = max(1, 32 // gqa)
             out = mx.concatenate(
                 [
                     scaled_dot_product_attention(
                         q[:, :, i : i + step], k, v, cache=cache,
-                        scale=self.scale, mask=mask[..., i : i + step, :],
+                        scale=self.scale, mask=split_mask[..., i : i + step, :],
                     )
                     for i in range(0, S, step)
                 ],

@@ -6071,6 +6071,17 @@ def main() -> None:
             # wiring things up without editing the caller.
             os.environ[MTP_PATH_ENV] = args.mtp
         model, tokenizer, config = mlx_lm_load(args.model, return_config=True)
+        # 重みを GPU に wire する。mlx_lm の stream_generate は生成のたびに
+        # wired_limit() で巻くが、FlashSpecEngine/SpecEngine の経路はそれを
+        # 通らないので、ここで一度だけ恒久的に設定する。wire しないと macOS が
+        # ページを退避・圧縮でき、読み出しが劣化する (docs/research/
+        # KERNEL-BRIEF-MOE-GDN.md: lm_head 常駐 109GB/s vs 非常駐 315GB/s)。
+        try:
+            rec = mx.metal.device_info()["max_recommended_working_set_size"]
+            mx.set_wired_limit(rec)
+            print(f"[mlxturbo-serve] wired limit を {rec / 2**30:.0f}GiB に設定")
+        except Exception as e:  # noqa: BLE001  wire できない環境でも起動は続ける
+            print(f"[mlxturbo-serve] wired limit 設定失敗 (続行): {e}")
         if args.ngram:
             from .ngram_stream import install
 

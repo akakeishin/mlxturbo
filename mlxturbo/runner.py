@@ -1274,10 +1274,23 @@ def _build_base_runner(
             wide = fused.enable_wide_projections(model)
             print(f"{log_prefix} 連結射影有効: gdn={wide['gdn']} attn={wide['attn']}"
                   f" shared={wide['shared']} experts={wide['experts']} 層")
-        sort_min = os.environ.get("MLXTURBO_SORT_MIN")
+        # gather のソート閾値は既定 16 (値は不変で、検証幅 22..44 の添字が
+        # ソートされて同じエキスパートの読みが隣接する)。0 で無効化。
+        sort_min = int(os.environ.get("MLXTURBO_SORT_MIN", "16"))
         if sort_min:
-            fused.enable_gather_sort(int(sort_min))
-            print(f"{log_prefix} gather のソート閾値を {sort_min} に変更 (値は不変)")
+            fused.enable_gather_sort(sort_min)
+            print(f"{log_prefix} gather のソート閾値 {sort_min} (既定 16、値は不変)")
+        if os.environ.get("MLXTURBO_FAST_QMM") == "1":
+            # 検証フォワード (M=3..8) の密 qmm を 8x8 MMA タイルに通す。
+            # stock qmv は M にほぼ比例して重みを読み直すが、MMA タイルは
+            # 1 回で済む (Flash-Next 形状の実測: M=3 で qkv -22% / lm_head -33%)。
+            # M=2 は stock が勝つので窓の下限は 3。M=1 (draft) と prefill は
+            # fast_qmm 自身の窓判定で素通り。
+            from . import fast_qmm
+
+            fast_qmm.M_MIN = int(os.environ.get("MLXTURBO_QMM_M_MIN", "3"))
+            fast_qmm.enable()
+            print(f"{log_prefix} fast_qmm 有効 (M={fast_qmm.M_MIN}..8 を MMA タイルへ)")
 
     # Qwen3.8-Flash-Next (qwen4_exp) + MTP (explicit or auto-discovered) ->
     # the FlashSpecEngine path (docs/MTP-FLASH.md). The 27B (qwen3_5) has a
