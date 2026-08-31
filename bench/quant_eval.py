@@ -58,6 +58,10 @@ def _load(model_ref: str, ngram: str | None = None, rebit_spec: str | None = Non
         import os
 
         os.environ["FASTMLX_NGRAM_DISK"] = "1"
+    # qwen4_exp のクラス解決は mlxturbo._arch_registry が sys.meta_path 経由で
+    # 面倒を見る。import しないと mlx_lm が "Model type qwen4_exp not supported"
+    # で落ちる
+    import mlxturbo  # noqa: F401
     from mlx_lm import load
 
     model, tok = load(model_ref)
@@ -97,7 +101,7 @@ def _teacher_logits(model, full_ids):
 def cmd_continuations(args):
     import mlx.core as mx
 
-    model, tokenizer = _load(args.model)
+    model, tokenizer = _load(args.model, getattr(args, "ngram", None))
     eos = {tokenizer.eos_token_id}
     out = {"model": args.model, "gen_tokens": args.gen_tokens, "prompts": {}}
     for key, text in CALIB_PROMPTS.items():
@@ -119,7 +123,7 @@ def cmd_continuations(args):
 def cmd_dump(args):
     import mlx.core as mx
 
-    model, _ = _load(args.model)
+    model, _ = _load(args.model, getattr(args, "ngram", None))
     cont = json.loads(Path(args.continuations).read_text())
     arrays = {}
     meta = {"model": args.model, "topk": args.topk, "prompts": {}}
@@ -457,6 +461,7 @@ def main():
     p = sub.add_parser("continuations")
     p.add_argument("--model", required=True)
     p.add_argument("--gen-tokens", type=int, default=128)
+    p.add_argument("--ngram", help="n-gram サイドカーのディレクトリ")
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_continuations)
 
@@ -464,6 +469,7 @@ def main():
     p.add_argument("--model", required=True)
     p.add_argument("--continuations", required=True)
     p.add_argument("--topk", type=int, default=256)
+    p.add_argument("--ngram", help="n-gram サイドカーのディレクトリ")
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_dump)
 

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -151,6 +152,93 @@ class Runner:
         return out
 
 
+class HttpRunner:
+    """OpenAI 互換の口ごしに測る。Runner と同じ 3 つのメソッドを持つ。
+
+    mlx-serve を相手にするために足した。うちのエンジンと同じ土俵で比べるには、
+    同じサーバー越しに同じ課題を通す必要がある。ついでに、外の API (FP8 で
+    出しているところ) も `--endpoint` を変えるだけで同じ課題にかけられる。
+
+    in-process 版との違いが 1 つある。チャットテンプレートを当てるのが
+    サーバー側になるので、思考出力を止める指示を JSON で送る
+    (`enable_thinking: false`)。受け取らないサーバーだと思考が混ざり、
+    gsm8k の答え抽出が末尾の数字を拾い損ねる。結果に効くので、
+    **結果 JSON に endpoint と served_model を必ず残す。**
+    """
+
+    def __init__(self, endpoint: str, model: str, api_key: str | None = None,
+                 timeout: float = 600.0):
+        self.endpoint = endpoint.rstrip("/")
+        self.model = model
+        self.timeout = timeout
+        self.headers = {"Content-Type": "application/json"}
+        if api_key:
+            self.headers["Authorization"] = f"Bearer {api_key}"
+
+    def _post(self, body: dict) -> dict:
+        import urllib.error
+        import urllib.request
+
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(
+            f"{self.endpoint}/v1/chat/completions", data=data, headers=self.headers)
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    return json.loads(r.read())
+            except (urllib.error.URLError, TimeoutError) as e:
+                if attempt == 2:
+                    raise SystemExit(f"{self.endpoint} が応答しない: {e}")
+                time.sleep(2 * (attempt + 1))
+        raise AssertionError("unreachable")
+
+    def chat_ids(self, text: str):
+        raise NotImplementedError("HTTP 越しにはトークン列を触れない")
+
+    def greedy(self, text: str, max_tokens: int, stop: tuple[str, ...] = ()) -> str:
+        body = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": text}],
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "enable_thinking": False,
+        }
+        if stop:
+            body["stop"] = list(stop)
+        r = self._post(body)
+        return r["choices"][0]["message"].get("content") or ""
+
+    def choice_logprobs(self, text: str, choices: tuple[str, ...]) -> list[float]:
+        """先頭 1 トークンの上位 logprob から選択肢を拾う。
+
+        OpenAI の口では分布そのものは取れないので上位 20 件で代用する。
+        選択肢が 20 件に入らなければ、その選択肢は選ばれなかったものとして
+        FLOOR を返す。A-D の 4 択なら、まず外れない。
+        """
+        FLOOR = -30.0
+        r = self._post({
+            "model": self.model,
+            "messages": [{"role": "user", "content": text}],
+            "max_tokens": 1,
+            "temperature": 0.0,
+            "enable_thinking": False,
+            "logprobs": True,
+            "top_logprobs": 20,
+        })
+        content = (r["choices"][0].get("logprobs") or {}).get("content") or []
+        if not content:
+            raise SystemExit(
+                f"{self.endpoint} が logprobs を返さない。"
+                "mmlu は --tasks から外すか、in-process で測ること")
+        top = {t["token"]: t["logprob"] for t in content[0].get("top_logprobs", [])}
+        out = []
+        for c in choices:
+            out.append(max(
+                (lp for tok, lp in top.items() if tok.strip() == c.strip()),
+                default=FLOOR))
+        return out
+
+
 # ---------------------------------------------------------------- 課題
 
 
@@ -271,15 +359,24 @@ def cmd_run(args):
             raise SystemExit(f"未知の課題 {t}。選べるのは {', '.join(TASKS)}")
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"モデル読み込み: {args.model}")
-    t0 = time.time()
-    run = Runner(args.model, args.ngram)
-    print(f"  {time.time() - t0:.0f} 秒")
+    if args.endpoint:
+        if not args.served_model:
+            raise SystemExit("--endpoint には --served-model も要る")
+        print(f"接続先: {args.endpoint} ({args.served_model})")
+        run = HttpRunner(args.endpoint, args.served_model,
+                         os.environ.get("TASK_EVAL_API_KEY"))
+    else:
+        print(f"モデル読み込み: {args.model}")
+        t0 = time.time()
+        run = Runner(args.model, args.ngram)
+        print(f"  {time.time() - t0:.0f} 秒")
 
     result = {
         "tag": args.tag,
         "ngram_sidecar": args.ngram,
         "model": args.model,
+        "endpoint": args.endpoint,
+        "served_model": args.served_model,
         "at": datetime.now(timezone.utc).isoformat(),
         "tasks": {},
     }
@@ -324,7 +421,12 @@ def main():
     p.set_defaults(fn=cmd_fetch)
 
     p = sub.add_parser("run")
-    p.add_argument("--model", required=True)
+    p.add_argument("--model", default="", help="in-process で測るときのパス")
+    p.add_argument("--endpoint", default=None,
+                   help="OpenAI 互換の口 (例 http://127.0.0.1:11234)。"
+                        "指定すると --model ではなくこちら越しに測る")
+    p.add_argument("--served-model", default=None,
+                   help="--endpoint 側でのモデル名")
     p.add_argument("--tag", required=True)
     p.add_argument("--ngram", default=None, help="n-gram サイドカー")
     p.add_argument("--tasks", default="gsm8k,humaneval,mmlu")

@@ -73,8 +73,44 @@ _SERVE_5 = {
     "default": {"bits": 4, "group_size": 64},
 }
 
+# 一律 4bit より速い側。MoE の融合カーネルは 2/4/8 を受けるので、2 と 4 は
+# どちらも速い経路の上にある。感度は深さに対して単調に増えるので、前を 2bit に
+# 落として後ろ 16 層を 4bit で残す。エキスパートは 63.3 -> 44.6 GiB (-30%)。
+_SERVE_B = {
+    **{k: v for k, v in _SERVE_5.items() if k != "experts"},
+    "experts": {"bits": 2, "group_size": 64},
+    "experts_hi": {"bits": 4, "group_size": 64},
+    "experts_hi_layers": _last(16),
+}
+
+# 品質レーン。エキスパートの重み誤差は 48 層でほぼ一定 (最大/最小 1.02-1.07 倍)
+# なので、層を選ぶ根拠は深さの感度しかない。末尾から N 層を 8bit にする形だけ試す。
+# 4bit と 8bit の重み誤差の比は 16.9 倍。MoE の速いカーネルは 2/4/8 を受けるので
+# 8bit は経路に残る (5/6 は落ちる)。
+_SERVE_Q4 = {
+    **{k: v for k, v in _SERVE_5.items() if k != "experts"},
+    "experts": {"bits": 4, "group_size": 64},
+}
+_SERVE_Q48 = {
+    **_SERVE_Q4,
+    "experts_hi": {"bits": 8, "group_size": 64},
+    "experts_hi_layers": _last(8),
+}
+
+# 128GB 機の上限側。Metal の上限が 107.5GB なので常駐 95GB あたりが実用の天井。
+# 全層 8bit だとエキスパートだけで 119.6 GiB になり載らない。
+_SERVE_Q24 = {
+    **_SERVE_Q4,
+    "experts_hi": {"bits": 8, "group_size": 64},
+    "experts_hi_layers": _last(24),
+}
+
 TIERS = {
     "serve-5": _SERVE_5,
+    "serve-q4": _SERVE_Q4,
+    "serve-q24": _SERVE_Q24,
+    "serve-q48": _SERVE_Q48,
+    "serve-b": _SERVE_B,
     # 前 8 層だけ 4bit。v-fast6 (4bit が全域に散っている) の同容量改良版
     "v-xl": _tier(4, 6, list(range(8, N_LAYERS))),
     "v-l": _tier(4, 6, _last(8)),
@@ -85,6 +121,10 @@ TIERS = {
 # 予測 (tools/predict_recipe.py、rebit は悲観側)
 PREDICTED = {
     "serve-5": (81.5, "未測定 (一律 4bit より良い側なのは確かだが、幅は未知)"),
+    "serve-q4": (66.0, "未測定 (ddalcu と同じ配分。基準線)"),
+    "serve-q24": (95.0, "未測定 (末尾 24 層。128GB 機の上限側)"),
+    "serve-q48": (76.0, "未測定 (末尾 8 層のエキスパートを 8bit に)"),
+    "serve-b": (48.0, "未測定 (2bit は素の affine だと荒い。imatrix が要るかもしれない)"),
     "v-xl": (97.5, "0.0033 前後 (推定。rebit では検証できない段)"),
     "v-l": (76.8, "0.00598"),
     "v-m": (64.8, "0.01257"),
@@ -117,7 +157,7 @@ def main():
     cf = _inject()
 
     if args.cmd == "list":
-        for name in ("serve-5", "v-xl", "v-l", "v-m", "v-s"):
+        for name in ("serve-5", "serve-q4", "serve-q48", "serve-q24", "serve-b", "v-xl", "v-l", "v-m", "v-s"):
             gb, kld = PREDICTED[name]
             r = TIERS[name]
             if "experts_hi" in r:
