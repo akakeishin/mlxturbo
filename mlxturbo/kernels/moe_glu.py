@@ -24,81 +24,85 @@ _KERNELS: dict[tuple, Any] = {}
 GROUP_SIZE = 64
 BITS = 4
 NSIMD = 4          # 1 スレッドグループのsimdgroup 数 (128 スレッド)
-ROWS_PER_TG = 32   # 1 スレッドグループが受け持つ出力行数
+ROWS_PER_TG = NSIMD * 4   # qmv_fast と同じく simdgroup あたり 4 行
 
 
 def _source(K: int, H: int) -> str:
-    words = K // 8          # 4bit: u32 1 語に 8 値
-    groups = K // GROUP_SIZE
+    """mlx の qmv_fast_impl (quantized.h) と同じ構造:
+    simdgroup あたり 4 行、スレッドあたり 16 値 (2 パック) をレジスタに置き、
+    4 行 x 2 行列 (gate/up) の 8 本の dot で使い回す。バイアス項は
+    qdot と同じく sum(x) に畳む。"""
+    assert K % 512 == 0, "block=512 の等分が前提"
+    n_iters = K // 512
     return f"""
+    constexpr int VPT = 16;                 // 4bit x 2 words
+    constexpr int NSG = {NSIMD};
+    constexpr int ROWS = 4;
     const uint lane = thread_index_in_simdgroup;
     const uint sg   = simdgroup_index_in_threadgroup;
     const uint pair = threadgroup_position_in_grid.z;
-    const uint row0 = threadgroup_position_in_grid.y * {ROWS_PER_TG};
+    const uint row0 = threadgroup_position_in_grid.y * (NSG * ROWS) + sg * ROWS;
+    if (row0 >= {H}) return;
 
     const uint e = idx[pair];
-
-    // 対の入力 x を fp32 で TG メモリへ (全 simdgroup 共有)
-    threadgroup float tx[{K}];
-    threadgroup float gxsum[{groups}];
-    const size_t xoff = (size_t)pair * {K};
-    for (uint i = sg * 32 + lane; i < {K}; i += {NSIMD} * 32) {{
-        tx[i] = (float)x[xoff + i];
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    // グループごとの Sigma x (バイアス項用)
-    for (uint g = sg * 32 + lane; g < {groups}; g += {NSIMD} * 32) {{
-        float s = 0.0f;
-        for (uint i = 0; i < {GROUP_SIZE}; i++) s += tx[g * {GROUP_SIZE} + i];
-        gxsum[g] = s;
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
+    const size_t wrow = (size_t)({K} / 8);         // u32 words / 行
+    const size_t grow = (size_t)({K} / 64);        // グループ / 行
     const size_t ebase = (size_t)e * {H};
-    for (uint r = row0 + sg; r < row0 + {ROWS_PER_TG} && r < {H}; r += {NSIMD}) {{
-        const size_t woff = (ebase + r) * {words};
-        const size_t goff = (ebase + r) * {groups};
 
-        float accg = 0.0f;
-        float accu = 0.0f;
-        // uint4 で 4 語 = 32 値をまとめて読む。{words} 語 = {words} / 4 本の uint4。
-        // 1 本の uint4 (32 値) は 64 値グループの半分なので g = j4 >> 1
-        const device uint4* gw4 = (const device uint4*)(gate_w + woff);
-        const device uint4* uw4 = (const device uint4*)(up_w + woff);
-        for (uint j4 = lane; j4 < {words} / 4; j4 += 32) {{
-            const uint g = j4 >> 1;
-            const float sgc = (float)gate_s[goff + g];
-            const float suc = (float)up_s[goff + g];
-            const uint4 wg = gw4[j4];
-            const uint4 wu = uw4[j4];
-            float pg = 0.0f;
-            float pu = 0.0f;
-            const uint base = j4 * 32;
+    const device uint8_t* gws = (const device uint8_t*)(gate_w + (ebase + row0) * wrow);
+    const device uint8_t* uws = (const device uint8_t*)(up_w + (ebase + row0) * wrow);
+    const device T* gsl = gate_s + (ebase + row0) * grow;
+    const device T* gbl = gate_b + (ebase + row0) * grow;
+    const device T* usl = up_s + (ebase + row0) * grow;
+    const device T* ubl = up_b + (ebase + row0) * grow;
+    const device T* xp = x + (size_t)pair * {K};
+
+    // スレッドの担当: 連続 16 値。group64 = 4 スレッドぶんなので
+    // グループ添字はイテレーション内で一定
+    gws += lane * 8;                                // 16 値 = 8 バイト
+    uws += lane * 8;
+    const uint gofs = lane / 4;                     // ブロック内グループ
+    xp  += lane * VPT;
+
+    float rg[ROWS] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    float ru[ROWS] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    float xt[VPT];
+
+    for (int it = 0; it < {n_iters}; it++) {{
+        float xsum = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < VPT; i++) {{
+            xt[i] = (float)xp[i];
+            xsum += xt[i];
+        }}
+        const uint gbase = it * 8 + gofs;           // 1 イテレーション = 8 グループ
+        #pragma unroll
+        for (int r = 0; r < ROWS; r++) {{
+            const device uint8_t* wl = gws + (size_t)r * ({K} / 2);
+            const device uint8_t* wu = uws + (size_t)r * ({K} / 2);
+            float ag = 0.0f;
+            float au = 0.0f;
             #pragma unroll
-            for (uint w = 0; w < 4; w++) {{
-                const uint bg = wg[w];
-                const uint bu = wu[w];
-                const uint b2 = base + w * 8;
-                #pragma unroll
-                for (uint i = 0; i < 8; i++) {{
-                    const float xv = tx[b2 + i];
-                    pg += (float)((bg >> (4 * i)) & 0xF) * xv;
-                    pu += (float)((bu >> (4 * i)) & 0xF) * xv;
-                }}
+            for (int i = 0; i < 8; i++) {{
+                ag += xt[2 * i] * (float)(wl[i] & 0x0F)
+                    + xt[2 * i + 1] * (float)(wl[i] >> 4);
+                au += xt[2 * i] * (float)(wu[i] & 0x0F)
+                    + xt[2 * i + 1] * (float)(wu[i] >> 4);
             }}
-            accg += sgc * pg;
-            accu += suc * pu;
+            rg[r] += (float)gsl[r * grow + gbase] * ag + (float)gbl[r * grow + gbase] * xsum;
+            ru[r] += (float)usl[r * grow + gbase] * au + (float)ubl[r * grow + gbase] * xsum;
         }}
-        // バイアス項: Sigma_g b_g * (Sigma_{{i in g}} x_i)
-        for (uint g = lane; g < {groups}; g += 32) {{
-            accg += (float)gate_b[goff + g] * gxsum[g];
-            accu += (float)up_b[goff + g] * gxsum[g];
-        }}
-        accg = simd_sum(accg);
-        accu = simd_sum(accu);
-        if (lane == 0) {{
-            const float sig = 1.0f / (1.0f + metal::exp(-accg));
-            out[(size_t)pair * {H} + r] = (T)(accg * sig * accu);
+        gws += 256;                                  // 512 値 = 256 バイト
+        uws += 256;
+        xp += 512;
+    }}
+    #pragma unroll
+    for (int r = 0; r < ROWS; r++) {{
+        float g = simd_sum(rg[r]);
+        float u = simd_sum(ru[r]);
+        if (lane == 0 && row0 + r < {H}) {{
+            const float sig = 1.0f / (1.0f + metal::exp(-g));
+            out[(size_t)pair * {H} + row0 + r] = (T)(g * sig * u);
         }}
     }}
 """
@@ -129,7 +133,7 @@ def eligible(gate_proj, up_proj) -> bool:
         if getattr(l, "mode", "affine") != "affine":
             return False
     K = gate_proj.weight.shape[-1] * 8
-    if K % GROUP_SIZE:
+    if K % 512:
         return False
     return mx.default_device() == mx.gpu and mx.metal.is_available()
 

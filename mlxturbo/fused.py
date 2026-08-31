@@ -550,8 +550,51 @@ def enable_gather_sort(min_size: int = 16) -> None:
 
     SL.SwitchGLU.__call__ = patched
 
+
+_ORIG_SWITCH_GLU_FULL = None
+
+
+def enable_moe_glu() -> None:
+    """SwitchGLU の gate+up+silu*mul を自作 1 ディスパッチカーネルに差し替える。
+
+    kernels/moe_glu.py (qmv_fast 構造)。down_proj はそのまま gather_qmm。
+    適格でない層・経路 (量子化が 4bit/gs64 でない、prefill のソート済み大バッチ
+    など) は素の実装へ落ちる。数値は gather_qmm x2 + swiglu とビット一致しない
+    (積和順と bf16 sigmoid)。判定は in-model の複数プロンプト平均で。
+    """
+    global _ORIG_SWITCH_GLU_FULL
+    import mlx.core as mx
+    import mlx_lm.models.switch_layers as SL
+
+    from .kernels import moe_glu
+
+    if _ORIG_SWITCH_GLU_FULL is not None:
+        return
+    _ORIG_SWITCH_GLU_FULL = SL.SwitchGLU.__call__
+    orig = _ORIG_SWITCH_GLU_FULL
+
+    def patched(self, x, indices):
+        # デコードの小さい添字だけを対象にする。大きいバッチ (prefill) は
+        # ソート + gather_qmm の方が強いので素のまま
+        if indices.size >= 64 or not moe_glu.eligible(self.gate_proj, self.up_proj):
+            return orig(self, x, indices)
+        B = indices.shape[:-1]
+        topk = indices.shape[-1]
+        K = x.shape[-1]
+        H = self.gate_proj.scales.shape[-2]
+        x_tok = x.reshape(-1, K)                     # (B*T, K)
+        x_pairs = mx.repeat(x_tok[:, None, :], topk, axis=1).reshape(-1, K)
+        idx_flat = indices.reshape(-1)
+        act = moe_glu.fused_glu(x_pairs, idx_flat, self.gate_proj, self.up_proj)
+        act = act.reshape(*B, topk, 1, H)
+        out = self.down_proj(act, indices, sorted_indices=False)
+        return out.squeeze(-2)
+
+    SL.SwitchGLU.__call__ = patched
+
 __all__ = [
     "enable_gather_sort",
+    "enable_moe_glu",
     "enable_moe_shared_fold",
     "enable_wide_projections",
     "disable_hyper_connection",

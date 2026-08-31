@@ -1280,6 +1280,9 @@ def _build_base_runner(
         if sort_min:
             fused.enable_gather_sort(sort_min)
             print(f"{log_prefix} gather のソート閾値 {sort_min} (既定 16、値は不変)")
+        if os.environ.get("MLXTURBO_MOE_GLU") == "1":
+            fused.enable_moe_glu()
+            print(f"{log_prefix} moe_glu カーネル有効 (gate+up+silu*mul を 1 ディスパッチ)")
         if os.environ.get("MLXTURBO_FAST_QMM") == "1":
             # 検証フォワード (M=3..8) の密 qmm を 8x8 MMA タイルに通す。
             # stock qmv は M にほぼ比例して重みを読み直すが、MMA タイルは
