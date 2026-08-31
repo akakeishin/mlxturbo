@@ -224,6 +224,58 @@ def capture(model, light: bool = False):
         Q.GatedResidual.__call__ = orig_hc
 
 
+
+
+# 段階投入の間隔 (層数)。0 で無効 = 一括構築。2026-08-31 の掃引: 16/12/8/6/4/3/2
+# で 53.9/55.0/57.6/57.8/58.3/58.7 tok/s (probe 実測、出力は全て一致)。既定 2。
+_STAGE_EVERY = int(os.environ.get("MLXTURBO_STAGE_EVERY", "2") or 0)
+
+
+def _staged_forward(model, ids, caches):
+    """Model.__call__ と同じ計算を、途中の hidden を async_eval しながら組む。
+
+    グラフを 48 層ぶん組み切ってから投げると、構築中 (~4ms) GPU が遊ぶ
+    (xctrace 実測の泡)。12 層ごとに投入すれば GPU は先頭から走り出し、
+    CPU は残りを組み続けられる。計算内容は Qwen4ExpModel.__call__ +
+    lm_head と完全に同一 (このファイルの capture と同様、写しであることが
+    正しさの根拠。本家を変えるときはここも変えること)。
+    """
+    Q = _arch()
+    m = model.model
+    h = m.embed_tokens(ids)
+    cache = caches
+
+    full_idx = [i for i, l in enumerate(m.layers) if l.layer_type == "full_attention"]
+    attn_cache = cache[full_idx[0]] if full_idx else None
+    mask = Q.create_attention_mask(h, [attn_cache] if attn_cache is not None else None)
+    conv_mask = None
+
+    prev_ctx = None
+    if m.ple_layers:
+        ctx_len = m.args.ngram_size - 1
+        eos_id = m.args.eos_token_id
+        eos_id = eos_id[0] if isinstance(eos_id, list) else eos_id
+        pc = cache[m.ple_layers[0]]
+        prev = pc[3] if pc is not None else None
+        prev_ctx = (prev if prev is not None
+                    else mx.full((ids.shape[0], ctx_len), eos_id, ids.dtype))
+        if pc is not None:
+            tail = mx.concatenate([prev_ctx, ids], axis=1)[:, -ctx_len:]
+            pc[3] = tail
+
+    h = mx.tile(h, (1, 1, m.hc))
+    step = _STAGE_EVERY
+    for i, (layer, c) in enumerate(zip(m.layers, cache)):
+        idx_c = c.indexer if (c is not None and hasattr(c, "indexer")) else None
+        h = layer(h, m.rope, mask, conv_mask, c, idx_c, ids, prev_ctx)
+        if step and (i + 1) % step == 0 and i < len(m.layers) - 1:
+            mx.async_eval(h)
+    out = m.hyper_connection_mixer(h)
+    if model.args.text.tie_word_embeddings:
+        return m.embed_tokens.as_linear(out)
+    return model.lm_head(out)
+
+
 def _pipeline_snapshot(model, caches, mtp_cache):
     """楽観先組み (次ラウンドのグラフを結果を知らずに組む) 用の浅い退避。
 
@@ -452,7 +504,7 @@ class FlashSpecEngine:
         trim_attn_cache(cache, keep)
         return drafts
 
-    def _verify(self, cap, lg, drafts, temp):
+    def _verify(self, cap, lg, drafts, temp, precomputed=None):
         """検証フォワードの結果から、採用するトークンと hyper を取り出す。
 
         ``pair`` は [cur, d1, ..., dk]。位置 j の logits は pair[j] の次の
@@ -471,11 +523,16 @@ class FlashSpecEngine:
             return toks, hypers, hit
 
         # greedy はドラフト位置ごとに .item() で同期せず、argmax と一致判定を
-        # まとめて 1 回の同期で取る (1 ラウンドあたり最大 depth+1 回 -> 1 回)
+        # まとめて 1 回の同期で取る (1 ラウンドあたり最大 depth+1 回 -> 1 回)。
+        # 呼び出し側が verify 本体と同じ eval で評価済みなら precomputed で
+        # 受け取り、この同期も消える
         k = len(drafts)
-        nxt_all = mx.argmax(lg, axis=-1)          # (1, k+1)
-        dv = mx.concatenate(drafts, axis=1)       # (1, k)
-        mx.eval(nxt_all, dv)
+        if precomputed is not None and precomputed[0] is not None:
+            nxt_all, dv = precomputed
+        else:
+            nxt_all = mx.argmax(lg, axis=-1)          # (1, k+1)
+            dv = mx.concatenate(drafts, axis=1)       # (1, k)
+            mx.eval(nxt_all, dv)
         vals = nxt_all[0].tolist()
         dvals = dv[0].tolist()
         hit = 0
@@ -798,6 +855,7 @@ class FlashSpecEngine:
         # GPU トレース実測でラウンド毎に ~7ms の泡 (グラフ構築中の GPU アイドル)
         # があり、全採用率 ~0.7 との積で泡の大半が消える。greedy のみ。
         pending = None
+        next_drafts = None
         # 1=通常の楽観パイプライン, 2=組むが毎回捨てる (切り分け用), 0=無効
         pipeline = int(os.environ.get("MLXTURBO_PIPELINE", "0") or 0)
         while len(out) < max_tokens:
@@ -808,15 +866,22 @@ class FlashSpecEngine:
                 pending = None
                 pipe_snap = None
             else:
-                drafts = self._draft_chain(
-                    cur, hyper_prev, mtp_cache,
-                    self._effective_depth(base_pos + n + len(out)),
-                )
+                if next_drafts is not None:
+                    drafts = next_drafts        # 前ラウンド末尾で構築・投機済み
+                    next_drafts = None
+                else:
+                    drafts = self._draft_chain(
+                        cur, hyper_prev, mtp_cache,
+                        self._effective_depth(base_pos + n + len(out)),
+                    )
+                    # draft は必ず使うので先に投げる。GPU が draft チェーンを
+                    # 回している間に、CPU は下の検証フォワードのグラフを組む
+                    mx.async_eval(drafts)
                 pair = mx.concatenate([cur] + drafts, axis=1)
                 total = pair.shape[1]
                 pre = snapshot_pre(model, caches)
                 with capture(model) as cap:
-                    lg = model(pair, cache=caches)
+                    lg = _staged_forward(model, pair, caches)
             if timers:
                 mx.eval(drafts)
                 phase["draft"] += time.perf_counter() - ts
@@ -837,12 +902,19 @@ class FlashSpecEngine:
                     lg2 = model(pair2, cache=caches)
                 next_pending = (drafts2, pair2, pair2.shape[1], pre2, cap2,
                                 lg2, snap2)
-            mx.eval(lg)
+            if temp <= 0 and drafts:
+                nxt_all = mx.argmax(lg, axis=-1)
+                dv = mx.concatenate(drafts, axis=1)
+                mx.eval(lg, nxt_all, dv)
+            else:
+                nxt_all = dv = None
+                mx.eval(lg)
             rounds += 1
             if timers:
                 phase["verify"] += time.perf_counter() - ts
                 ts = time.perf_counter()
-            toks, hypers, hit = self._verify(cap, lg, drafts, temp)
+            toks, hypers, hit = self._verify(cap, lg, drafts, temp,
+                                             precomputed=(nxt_all, dv))
             accepted += hit
 
             vals = [int(t.item()) for t in toks]
@@ -864,6 +936,20 @@ class FlashSpecEngine:
                     pending = next_pending
                 else:
                     _pipeline_restore(model, caches, mtp_cache, next_pending[6])
+            cur, hyper_prev = toks[-1], hypers[-1]
+            # 次ラウンドの draft をここで組んで投げる (rollback / yield などの
+            # CPU 後処理を draft の GPU 実行に隠す)。draft はトランクの
+            # キャッシュに触れず、rollback は MTP のキャッシュに触れないので
+            # 順序を入れ替えても意味は変わらない。最終ラウンドでは無駄になるが
+            # 1 リクエスト 1 回きり。
+            next_drafts = None
+            if (pending is None and cut is None
+                    and len(out) + len(vals) < max_tokens):
+                next_drafts = self._draft_chain(
+                    cur, hyper_prev, mtp_cache,
+                    self._effective_depth(base_pos + n + len(out) + len(vals)),
+                )
+                mx.async_eval(next_drafts)
             rollback(model, caches, cap, pre, keep=len(vals), total=total,
                      ids_kept=pair[:, : len(vals)])
             if timers:
@@ -871,7 +957,6 @@ class FlashSpecEngine:
                 phase["rollback"] += time.perf_counter() - ts
             out.extend(vals)
             yield vals
-            cur, hyper_prev = toks[-1], hypers[-1]
             if cut is not None:
                 break
 
