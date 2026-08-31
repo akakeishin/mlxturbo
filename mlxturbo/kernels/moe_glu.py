@@ -23,81 +23,78 @@ _KERNELS: dict[tuple, Any] = {}
 
 GROUP_SIZE = 64
 BITS = 4
-NSIMD = 4          # 1 スレッドグループのsimdgroup 数 (128 スレッド)
+NSIMD = 2          # qmv_fast と同じ simdgroup 2 本 (64 スレッド)
 ROWS_PER_TG = NSIMD * 4   # qmv_fast と同じく simdgroup あたり 4 行
 
 
 def _source(K: int, H: int) -> str:
-    """mlx の qmv_fast_impl (quantized.h) と同じ構造:
-    simdgroup あたり 4 行、スレッドあたり 16 値 (2 パック) をレジスタに置き、
-    4 行 x 2 行列 (gate/up) の 8 本の dot で使い回す。バイアス項は
-    qdot と同じく sum(x) に畳む。"""
+    """qmv_fast_impl (mlx quantized.h) 準拠の v4:
+    simdgroup 2 本 x 4 行、スレッドあたり 16 値。x は vec4、重みは uint2 で
+    ロードし、バイアスは sum(x) に畳む。gate/up の 2 行列を同じ x レジスタで
+    続けて処理する。"""
     assert K % 512 == 0, "block=512 の等分が前提"
     n_iters = K // 512
     return f"""
-    constexpr int VPT = 16;                 // 4bit x 2 words
-    constexpr int NSG = {NSIMD};
-    constexpr int ROWS = 4;
+    constexpr int VPT = 16;
     const uint lane = thread_index_in_simdgroup;
     const uint sg   = simdgroup_index_in_threadgroup;
     const uint pair = threadgroup_position_in_grid.z;
-    const uint row0 = threadgroup_position_in_grid.y * (NSG * ROWS) + sg * ROWS;
+    const uint row0 = threadgroup_position_in_grid.y * ({NSIMD} * 4) + sg * 4;
     if (row0 >= {H}) return;
 
     const uint e = idx[pair];
-    const size_t wrow = (size_t)({K} / 8);         // u32 words / 行
-    const size_t grow = (size_t)({K} / 64);        // グループ / 行
+    const size_t wrow2 = (size_t)({K} / 16);       // uint2 / 行
+    const size_t grow = (size_t)({K} / 64);
     const size_t ebase = (size_t)e * {H};
 
-    const device uint8_t* gws = (const device uint8_t*)(gate_w + (ebase + row0) * wrow);
-    const device uint8_t* uws = (const device uint8_t*)(up_w + (ebase + row0) * wrow);
+    const device uint2* gw2 = (const device uint2*)gate_w + (ebase + row0) * wrow2 + lane;
+    const device uint2* uw2 = (const device uint2*)up_w + (ebase + row0) * wrow2 + lane;
     const device T* gsl = gate_s + (ebase + row0) * grow;
     const device T* gbl = gate_b + (ebase + row0) * grow;
     const device T* usl = up_s + (ebase + row0) * grow;
     const device T* ubl = up_b + (ebase + row0) * grow;
-    const device T* xp = x + (size_t)pair * {K};
+    const device vec<T, 4>* xv =
+        (const device vec<T, 4>*)(x + (size_t)pair * {K}) + lane * 4;
 
-    // スレッドの担当: 連続 16 値。group64 = 4 スレッドぶんなので
-    // グループ添字はイテレーション内で一定
-    gws += lane * 8;                                // 16 値 = 8 バイト
-    uws += lane * 8;
-    const uint gofs = lane / 4;                     // ブロック内グループ
-    xp  += lane * VPT;
-
-    float rg[ROWS] = {{0.0f, 0.0f, 0.0f, 0.0f}};
-    float ru[ROWS] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    const uint gofs = lane / 4;
+    float rg[4] = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    float ru[4] = {{0.0f, 0.0f, 0.0f, 0.0f}};
     float xt[VPT];
 
     for (int it = 0; it < {n_iters}; it++) {{
         float xsum = 0.0f;
         #pragma unroll
-        for (int i = 0; i < VPT; i++) {{
-            xt[i] = (float)xp[i];
-            xsum += xt[i];
+        for (int v = 0; v < 4; v++) {{
+            const vec<T, 4> xx = xv[v];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {{
+                xt[v * 4 + i] = (float)xx[i];
+                xsum += xt[v * 4 + i];
+            }}
         }}
-        const uint gbase = it * 8 + gofs;           // 1 イテレーション = 8 グループ
+        const uint gbase = it * 8 + gofs;
         #pragma unroll
-        for (int r = 0; r < ROWS; r++) {{
-            const device uint8_t* wl = gws + (size_t)r * ({K} / 2);
-            const device uint8_t* wu = uws + (size_t)r * ({K} / 2);
+        for (int r = 0; r < 4; r++) {{
+            const uint2 wg = gw2[(size_t)r * wrow2];
+            const uint2 wu = uw2[(size_t)r * wrow2];
             float ag = 0.0f;
             float au = 0.0f;
             #pragma unroll
             for (int i = 0; i < 8; i++) {{
-                ag += xt[2 * i] * (float)(wl[i] & 0x0F)
-                    + xt[2 * i + 1] * (float)(wl[i] >> 4);
-                au += xt[2 * i] * (float)(wu[i] & 0x0F)
-                    + xt[2 * i + 1] * (float)(wu[i] >> 4);
+                ag += xt[i] * (float)((wg.x >> (4 * i)) & 0xF)
+                    + xt[8 + i] * (float)((wg.y >> (4 * i)) & 0xF);
+                au += xt[i] * (float)((wu.x >> (4 * i)) & 0xF)
+                    + xt[8 + i] * (float)((wu.y >> (4 * i)) & 0xF);
             }}
             rg[r] += (float)gsl[r * grow + gbase] * ag + (float)gbl[r * grow + gbase] * xsum;
             ru[r] += (float)usl[r * grow + gbase] * au + (float)ubl[r * grow + gbase] * xsum;
         }}
-        gws += 256;                                  // 512 値 = 256 バイト
-        uws += 256;
-        xp += 512;
+        gw2 += 32;
+        uw2 += 32;
+        xv += 128;
     }}
     #pragma unroll
-    for (int r = 0; r < ROWS; r++) {{
+    for (int r = 0; r < 4; r++) {{
         float g = simd_sum(rg[r]);
         float u = simd_sum(ru[r]);
         if (lane == 0 && row0 + r < {H}) {{

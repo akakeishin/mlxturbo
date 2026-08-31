@@ -61,8 +61,15 @@ zpad をカーネル内へ、読み順を行連続に。
 | 融合 v1 (スカラー nibble 展開) | 7.4 |
 | 融合 v2 (uint4 + unroll) | 6.7 |
 
-v3 で qmv_fast_impl (mlx quantized.h) の構造 (simdgroup 4 行、スレッド 16 値
-レジスタ常駐、バイアスは sum(x) に畳む) を写した。温キャッシュの単体では
+v4 まで進めた。v3 = qmv_fast_impl (mlx quantized.h) の構造 (simdgroup 4 行、
+スレッド 16 値レジスタ常駐、バイアスは sum(x) に畳む)。v4 = さらに x を
+vec<T,4>、重みを uint2 でロードし simdgroup 2 本に (qmv_fast と同一構成)。
+単体 (温キャッシュ): T=1 は素の gather+swiglu に 26% 勝つ (2.07 vs 2.80ms/48層)
+が **T=3 で 1.4 倍負けたまま** (7.06 vs 4.98)。スケーリングが線形 (対数) で、
+素の gather は T=3 で 1.78 倍にしか伸びない。ランダム添字の温キャッシュでも
+この差が出るので、dedup ではなく占有率かタイル形の差。**次の一手は推測でなく
+Xcode の Metal capture で素の gather の実行形 (行/対の割り付け、simdgroup 数、
+read 幅) を見ること。**盲目の反復は禁止 (measurement-discipline)。温キャッシュの単体では
 T=1 で素に勝つ (2.21 vs 2.78ms) が T=3 で負け、**in-model では短 +3% 遅 /
 長 -5%** (verify 43.9 vs 42.6ms)。負けの構造は明確: このカーネルは対ごとに
 エキスパート行を独立に読むが、MLX の gather (+ソート) は同一エキスパートを
