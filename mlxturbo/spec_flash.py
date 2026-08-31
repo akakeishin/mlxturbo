@@ -523,15 +523,26 @@ class FlashSpecEngine:
         トークンを与える。d1 から順に一致する限り採用し、外れたところで
         打ち切ってその位置のトークンを代わりに出す。最後まで当たれば k+1 個出る。
         """
-        if temp > 0 or not drafts:
-            toks, hypers, hit = [], [], 0
-            for j in range(len(drafts) + 1):
-                nxt = self._sample(lg[:, j], temp)
-                toks.append(nxt)
-                hypers.append(cap.hyper[:, j:j + 1])
-                if j == len(drafts) or int(nxt.item()) != int(drafts[j].item()):
-                    break
+        if not drafts:
+            toks = [self._sample(lg[:, 0], temp)]
+            return toks, [cap.hyper[:, 0:1]], 0
+        if temp > 0:
+            # 位置 j のサンプルは lg[:, j] にしか依存しない (j-1 の採否は
+            # 「どこで打ち切るか」を決めるだけ) ので、全位置を先に引いて
+            # 一致プレフィックスだけ採用しても分布は逐次版と同一。
+            # 同期が位置ごと (最大 depth+1 回) から 1 回になる
+            k = len(drafts)
+            samp = mx.random.categorical(
+                lg.astype(mx.float32) / temp).reshape(1, k + 1)
+            dv = mx.concatenate(drafts, axis=1)
+            mx.eval(samp, dv)
+            vals = samp[0].tolist()
+            dvals = dv[0].tolist()
+            hit = 0
+            while hit < k and vals[hit] == dvals[hit]:
                 hit += 1
+            toks = [samp[:, j:j + 1] for j in range(hit + 1)]
+            hypers = [cap.hyper[:, j:j + 1] for j in range(hit + 1)]
             return toks, hypers, hit
 
         # greedy はドラフト位置ごとに .item() で同期せず、argmax と一致判定を
