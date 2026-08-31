@@ -230,6 +230,9 @@ def capture(model, light: bool = False):
 # で 53.9/55.0/57.6/57.8/58.3/58.7 tok/s (probe 実測、出力は全て一致)。既定 2。
 _STAGE_EVERY = int(os.environ.get("MLXTURBO_STAGE_EVERY", "2") or 0)
 
+# MLXTURBO_ROUND_TRACE=1: ラウンド内の CPU 側区間を ms で刻む (調査用)
+_ROUND_TRACE = os.environ.get("MLXTURBO_ROUND_TRACE") == "1"
+
 
 def _staged_forward(model, ids, caches):
     """Model.__call__ と同じ計算を、途中の hidden を async_eval しながら組む。
@@ -490,7 +493,7 @@ class FlashSpecEngine:
         keep = cache.offset + 1
         drafts = []
         tok, hyper = cur, hyper_prev
-        for _ in range(depth):
+        for step in range(depth):
             emb = self.model.model.embed_tokens(tok)
             mask = Q.create_attention_mask(emb, None)
             x = self.mtp.combine(emb, hyper)
@@ -501,6 +504,11 @@ class FlashSpecEngine:
             tok = self._draft_argmax(out)
             drafts.append(tok)
             hyper = x
+            if step < depth - 1:
+                # 段を組み終えるごとに投入する。GPU がこの段を回している間に
+                # CPU は次の段 (と rerank) を組む。呼び出し側は末尾で全体を
+                # async_eval するので、廃棄されるグラフは無い
+                mx.async_eval(tok)
         trim_attn_cache(cache, keep)
         return drafts
 
@@ -902,6 +910,8 @@ class FlashSpecEngine:
                     lg2 = model(pair2, cache=caches)
                 next_pending = (drafts2, pair2, pair2.shape[1], pre2, cap2,
                                 lg2, snap2)
+            if _ROUND_TRACE:
+                _rt = [("built", time.perf_counter())]
             if temp <= 0 and drafts:
                 nxt_all = mx.argmax(lg, axis=-1)
                 dv = mx.concatenate(drafts, axis=1)
@@ -909,6 +919,8 @@ class FlashSpecEngine:
             else:
                 nxt_all = dv = None
                 mx.eval(lg)
+            if _ROUND_TRACE:
+                _rt.append(("eval_done", time.perf_counter()))
             rounds += 1
             if timers:
                 phase["verify"] += time.perf_counter() - ts
@@ -942,6 +954,8 @@ class FlashSpecEngine:
             # キャッシュに触れず、rollback は MTP のキャッシュに触れないので
             # 順序を入れ替えても意味は変わらない。最終ラウンドでは無駄になるが
             # 1 リクエスト 1 回きり。
+            if _ROUND_TRACE:
+                _rt.append(("verify_done", time.perf_counter()))
             next_drafts = None
             if (pending is None and cut is None
                     and len(out) + len(vals) < max_tokens):
@@ -950,12 +964,19 @@ class FlashSpecEngine:
                     self._effective_depth(base_pos + n + len(out) + len(vals)),
                 )
                 mx.async_eval(next_drafts)
+            if _ROUND_TRACE:
+                _rt.append(("drafts_submitted", time.perf_counter()))
             rollback(model, caches, cap, pre, keep=len(vals), total=total,
                      ids_kept=pair[:, : len(vals)])
             if timers:
                 mx.eval([c.state for c in caches if getattr(c, "state", None) is not None])
                 phase["rollback"] += time.perf_counter() - ts
             out.extend(vals)
+            if _ROUND_TRACE:
+                _rt.append(("rollback_done", time.perf_counter()))
+                base_t = _rt[0][1]
+                print(f"[round] t={base_t * 1e3:.2f}", " ".join(
+                    f"{k}={(t - base_t) * 1e3:.2f}" for k, t in _rt[1:]), flush=True)
             yield vals
             if cut is not None:
                 break
