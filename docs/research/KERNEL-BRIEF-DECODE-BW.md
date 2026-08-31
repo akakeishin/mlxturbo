@@ -79,6 +79,25 @@ T=1 で素に勝つ (2.21 vs 2.78ms) が T=3 で負け、**in-model では短 +3
 関門。v1-v3 は mlxturbo/kernels/moe_glu.py に残してある (MLXTURBO_MOE_GLU=1
 で配線されるが既定 off)。
 
+## ラウンド間の泡 7.3ms: 実在するが、楽観先組みでは取れない (2026-08-31)
+
+xctrace (Metal System Trace は CLI で取れる。`xcrun xctrace record --template
+'Metal System Trace' --attach <pid>`、export は schema=metal-gpu-intervals) で
+decode 中の GPU タイムラインを取ると、**5ms 超のアイドルがフォワード回数と
+同数 (223 回/8 秒)、平均 7.3ms** — ラウンド間で CPU が次のグラフを組む間、
+GPU が止まっている。ラウンドの ~16%。
+
+これを「全採用を仮定した次ラウンドのグラフを verify の GPU 実行中に先組み」
+(cur を argmax の遅延配列のまま使う) で取ろうとしたが、**逆に -28〜40%**。
+切り分け (組んで毎回捨てるモードが最遅) により、毒は使い方でなく**組むこと
+自体**: 捨てたはずの遅延サブグラフが評価される (MLX はグラフが深くなると
+暗黙の全評価を走らせる)。トークン列は全モードで一致しており正しさは無傷。
+コードは MLXTURBO_PIPELINE=1/2 で残してある (既定 0)。
+
+泡を取る残りの道: (a) グラフ構築自体を軽くする (mx.compile の shapeless 化、
+offset を配列入力に変える改修が前提)、(b) MLX 側の暗黙 eval 閾値の制御。
+どちらも MLX 内部仕様の調査が先。
+
 ## 受け入れ基準 (BRIEF の規律)
 
 - in-model A/B (サーバー経由、同一プロンプト、複数プロンプト x 512 の平均 tok/step)

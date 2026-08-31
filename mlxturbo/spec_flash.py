@@ -224,6 +224,37 @@ def capture(model, light: bool = False):
         Q.GatedResidual.__call__ = orig_hc
 
 
+def _pipeline_snapshot(model, caches, mtp_cache):
+    """楽観先組み (次ラウンドのグラフを結果を知らずに組む) 用の浅い退避。
+
+    MLX の配列は不変ノードで、キャッシュの「更新」は Python 参照の付け替え
+    (KVCache の setitem もオブジェクトを新ノードへ束縛し直すだけ) なので、
+    参照とオフセットを控えておけば付け替えで完全に戻せる。飛行中のグラフは
+    古いノードを掴んでいるため影響を受けない。"""
+    st = []
+    for layer, c in zip(model.model.layers, caches):
+        if layer.layer_type == "full_attention":
+            st.append(("a", c.keys, c.values, c.offset, c.indexer.keys))
+        else:
+            # ArraysCache は 4 スロットの参照だけ (offset を持たない。
+            # advance() は lengths/left_padding 用で decode では両方 None)
+            st.append(("l", c[0], c[1], c[2], c[3]))
+    st.append(("m", mtp_cache.keys, mtp_cache.values, mtp_cache.offset,
+               mtp_cache.indexer.keys))
+    return st
+
+
+def _pipeline_restore(model, caches, mtp_cache, st) -> None:
+    for (layer, c), rec in zip(zip(model.model.layers, caches), st[:-1]):
+        if rec[0] == "a":
+            _, c.keys, c.values, c.offset, c.indexer.keys = rec
+        else:
+            _, c0, c1, c2, c3 = rec
+            c[0], c[1], c[2], c[3] = c0, c1, c2, c3
+    rec = st[-1]
+    _, mtp_cache.keys, mtp_cache.values, mtp_cache.offset, mtp_cache.indexer.keys = rec
+
+
 def snapshot_pre(model, caches) -> dict:
     """**Before** the forward, note down what capture cannot restore."""
     pre = {"kv": [], "ctx": []}
@@ -761,23 +792,52 @@ class FlashSpecEngine:
         timers = os.environ.get("MLXTURBO_PHASE_TIMERS") == "1"
         phase = {"draft": 0.0, "verify": 0.0, "post": 0.0, "rollback": 0.0}
         self.last_phase = phase if timers else None
+        # 楽観パイプライン: verify の GPU 実行中に「全採用だった場合の次ラウンド」
+        # のグラフを CPU で先に組む。全採用なら rollback は no-op なので先組みが
+        # そのまま正しく、外れたら _pipeline_restore で参照を戻して組み直す。
+        # GPU トレース実測でラウンド毎に ~7ms の泡 (グラフ構築中の GPU アイドル)
+        # があり、全採用率 ~0.7 との積で泡の大半が消える。greedy のみ。
+        pending = None
+        # 1=通常の楽観パイプライン, 2=組むが毎回捨てる (切り分け用), 0=無効
+        pipeline = int(os.environ.get("MLXTURBO_PIPELINE", "0") or 0)
         while len(out) < max_tokens:
             if timers:
                 ts = time.perf_counter()
-            drafts = self._draft_chain(
-                cur, hyper_prev, mtp_cache,
-                self._effective_depth(base_pos + n + len(out)),
-            )
+            if pending is not None:
+                drafts, pair, total, pre, cap, lg, pipe_snap = pending
+                pending = None
+                pipe_snap = None
+            else:
+                drafts = self._draft_chain(
+                    cur, hyper_prev, mtp_cache,
+                    self._effective_depth(base_pos + n + len(out)),
+                )
+                pair = mx.concatenate([cur] + drafts, axis=1)
+                total = pair.shape[1]
+                pre = snapshot_pre(model, caches)
+                with capture(model) as cap:
+                    lg = model(pair, cache=caches)
             if timers:
                 mx.eval(drafts)
                 phase["draft"] += time.perf_counter() - ts
                 ts = time.perf_counter()
-            pair = mx.concatenate([cur] + drafts, axis=1)
-            total = pair.shape[1]
-            pre = snapshot_pre(model, caches)
-            with capture(model) as cap:
-                lg = model(pair, cache=caches)
-                mx.eval(lg)
+            next_pending = None
+            if pipeline > 0 and temp <= 0 and len(out) + total < max_tokens:
+                mx.async_eval(lg)
+                snap2 = _pipeline_snapshot(model, caches, mtp_cache)
+                cur2 = mx.argmax(lg[:, total - 1], axis=-1).reshape(1, 1)
+                hyper2 = cap.hyper[:, total - 1: total]
+                drafts2 = self._draft_chain(
+                    cur2, hyper2, mtp_cache,
+                    self._effective_depth(base_pos + n + len(out) + total),
+                )
+                pair2 = mx.concatenate([cur2] + drafts2, axis=1)
+                pre2 = snapshot_pre(model, caches)
+                with capture(model) as cap2:
+                    lg2 = model(pair2, cache=caches)
+                next_pending = (drafts2, pair2, pair2.shape[1], pre2, cap2,
+                                lg2, snap2)
+            mx.eval(lg)
             rounds += 1
             if timers:
                 phase["verify"] += time.perf_counter() - ts
@@ -798,6 +858,12 @@ class FlashSpecEngine:
             if timers:
                 phase["post"] += time.perf_counter() - ts
                 ts = time.perf_counter()
+            full_accept = (len(vals) == total and cut is None)
+            if next_pending is not None:
+                if full_accept and pipeline == 1:
+                    pending = next_pending
+                else:
+                    _pipeline_restore(model, caches, mtp_cache, next_pending[6])
             rollback(model, caches, cap, pre, keep=len(vals), total=total,
                      ids_kept=pair[:, : len(vals)])
             if timers:
