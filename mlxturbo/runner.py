@@ -307,7 +307,7 @@ class FlashSpecRunner:
                 checkpoints=checkpoints,
                 tail=(len(prompt_ids), tail_out) if tail_out is not None else None,
             )
-        return {
+        result = {
             "tokens": tokens,
             "ttft_s": ttft or 0.0,
             "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
@@ -320,6 +320,10 @@ class FlashSpecRunner:
             # report 0.0, the same as SpecEngine.
             "tokens_per_step": (n_decode / rounds) if rounds else 0.0,
         }
+        # MLXTURBO_PHASE_TIMERS=1 のときだけ engine が埋める (spec_flash.py)。
+        if getattr(self.engine, "last_phase", None):
+            result["phase"] = {**self.engine.last_phase, "rounds": rounds}
+        return result
 
 
 class FallbackSession:

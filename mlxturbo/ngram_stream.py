@@ -276,7 +276,15 @@ def install(model, sidecar: str | Path) -> None:
     At quantization/conversion time `_ShardedEmbedding` was made an empty
     parameter-free implementation, so the checkpoint contains no n-gram tensors.
     This is where the actual data gets supplied.
+
+    サイドカーの manifest が layout=separate なら RAM 常駐 (RamNGram) に
+    振り分ける。interleaved はディスク参照 (StreamNGram)。どちらを使うかは
+    サイドカーを焼いた時点で決まっている、という一点に寄せる。
     """
+
+    manifest = json.loads((Path(sidecar) / "manifest.json").read_text())
+    if manifest.get("layout") == "separate":
+        return install_ram(model, sidecar)
 
     stream = StreamNGram(Path(sidecar))
     n = 0

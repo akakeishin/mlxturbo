@@ -35,6 +35,8 @@ somewhere, without fail).
 
 from __future__ import annotations
 
+import os
+import time
 from contextlib import contextmanager
 
 import mlx.core as mx
@@ -687,11 +689,23 @@ class FlashSpecEngine:
         if first in eos:
             return accepted, rounds, (logits_tail, hyper_tail0, mtp_snap)
 
+        # 計測モード (MLXTURBO_PHASE_TIMERS=1): フェーズ境界で強制 eval して
+        # draft / verify / post の実時間を分ける。強制 eval 自体が同期を増やす
+        # ので、絶対値は少し膨らむ。比率を見るためのもの。既定では完全に素通り。
+        timers = os.environ.get("MLXTURBO_PHASE_TIMERS") == "1"
+        phase = {"draft": 0.0, "verify": 0.0, "post": 0.0, "rollback": 0.0}
+        self.last_phase = phase if timers else None
         while len(out) < max_tokens:
+            if timers:
+                ts = time.perf_counter()
             drafts = self._draft_chain(
                 cur, hyper_prev, mtp_cache,
                 self._effective_depth(base_pos + n + len(out)),
             )
+            if timers:
+                mx.eval(drafts)
+                phase["draft"] += time.perf_counter() - ts
+                ts = time.perf_counter()
             pair = mx.concatenate([cur] + drafts, axis=1)
             total = pair.shape[1]
             pre = snapshot_pre(model, caches)
@@ -699,6 +713,9 @@ class FlashSpecEngine:
                 lg = model(pair, cache=caches)
                 mx.eval(lg)
             rounds += 1
+            if timers:
+                phase["verify"] += time.perf_counter() - ts
+                ts = time.perf_counter()
             toks, hypers, hit = self._verify(cap, lg, drafts, temp)
             accepted += hit
 
@@ -712,8 +729,14 @@ class FlashSpecEngine:
 
             # When keep==total (an ordinary accept round with no truncation),
             # rollback() itself returns early, so it is fine to always call it.
+            if timers:
+                phase["post"] += time.perf_counter() - ts
+                ts = time.perf_counter()
             rollback(model, caches, cap, pre, keep=len(vals), total=total,
                      ids_kept=pair[:, : len(vals)])
+            if timers:
+                mx.eval([c.state for c in caches if getattr(c, "state", None) is not None])
+                phase["rollback"] += time.perf_counter() - ts
             out.extend(vals)
             yield vals
             cur, hyper_prev = toks[-1], hypers[-1]

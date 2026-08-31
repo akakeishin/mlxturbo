@@ -33,8 +33,13 @@ def _targets(model, cls: str):
     """Enumerate (parent module, attribute name, quantized linear)."""
 
     def q(mod, attr):
+        # 量子化済み (scales あり) と bf16 の素の Linear の両方を拾う。
+        # 後者は mlx-serve 由来のパック (inject / shared_expert_gate を生で持つ)
+        # をビットだけ揃え直すのに要る。
         child = getattr(mod, attr, None)
-        if child is not None and hasattr(child, "scales"):
+        if child is not None and (
+            hasattr(child, "scales") or getattr(child, "weight", None) is not None
+        ):
             yield mod, attr, child
 
     if cls == "head":
@@ -77,10 +82,14 @@ def _requantize(lin, bits: int, group_size: int):
     import mlx.core as mx
     import mlx.nn as nn
 
-    w = mx.dequantize(
-        lin.weight, lin.scales, lin.biases,
-        group_size=lin.group_size, bits=lin.bits,
-    )
+    if hasattr(lin, "scales"):
+        w = mx.dequantize(
+            lin.weight, lin.scales, lin.biases,
+            group_size=lin.group_size, bits=lin.bits,
+        )
+    else:
+        # 素の Linear。こちらは二重量子化ではなく、初めての量子化
+        w = lin.weight
     out_dims, in_dims = w.shape
     # If head_dim is not divisible by group_size, mlx silently skips the
     # quantization. That is the same trap we hit with 7.942 bpw, so fail here.
@@ -123,9 +132,10 @@ def apply(model, spec: str, verbose: bool = True) -> None:
         n = 0
         saved = 0
         for parent, attr, lin in list(_targets(model, cls)):
-            if lin.bits == bits and lin.group_size == gs:
+            quantized = hasattr(lin, "scales")
+            if quantized and lin.bits == bits and lin.group_size == gs:
                 continue
-            before = lin.weight.nbytes + lin.scales.nbytes
+            before = lin.weight.nbytes + (lin.scales.nbytes if quantized else 0)
             setattr(parent, attr, _requantize(lin, bits, gs))
             new = getattr(parent, attr)
             saved += before - (new.weight.nbytes + new.scales.nbytes)

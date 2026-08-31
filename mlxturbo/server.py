@@ -2431,10 +2431,21 @@ def _log_gen_stats(res: dict) -> None:
     OpenAI/Anthropic response formats, so the same content as cli.py's display
     line is written to a one-line log for the operator."""
 
-    print(
+    line = (
         f"[mlxturbo-serve] prefill reused={res.get('prefill_reused', 0)} "
         f"new={res.get('prefill_new', 0)} decode={res.get('decode_tps', 0.0):.1f}tok/s"
+        f" tok/step={res.get('tokens_per_step', 0.0):.2f}"
+        f" ttft={res.get('ttft_s', 0.0):.2f}s"
     )
+    ph = res.get("phase")
+    if ph:
+        rounds = ph.get("rounds") or 1
+        parts = " ".join(
+            f"{k}={ph[k] * 1000 / rounds:.1f}ms"
+            for k in ("draft", "verify", "post", "rollback") if k in ph
+        )
+        line += f" | phase/round: {parts} (rounds={rounds})"
+    print(line)
 
 
 # ---------- generation plumbing ----------
@@ -5903,6 +5914,13 @@ def main() -> None:
         " (mlxturbo/ngram_stream.py)。cli.py の --ngram と同じ",
     )
     ap.add_argument(
+        "--rebit",
+        default=None,
+        help="読み込み後にクラス単位でビットを打ち直す (例 hc=4,router=4)。"
+        " mlxturbo/rebit.py の spec と同じ。パックを焼き直さずに"
+        " ビット配分やカーネル適格性を A/B するための道具",
+    )
+    ap.add_argument(
         "--no-fused",
         action="store_true",
         help="hyper-connections 融合カーネルを無効化する (既定は有効)。"
@@ -6057,6 +6075,10 @@ def main() -> None:
             from .ngram_stream import install
 
             install(model, args.ngram)
+        if args.rebit:
+            from . import rebit
+
+            rebit.apply(model, args.rebit)
         print(f"[mlxturbo-serve] loaded in {time.perf_counter() - t0:.1f}s: {args.model}")
         runner = build_runner(model, tokenizer, config, args, log_prefix="[mlxturbo-serve]")
         _enforce_required_runner(runner, args.require_runner)

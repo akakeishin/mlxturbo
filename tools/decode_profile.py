@@ -94,6 +94,8 @@ def main():
     if args.ngram:
         os.environ["FASTMLX_NGRAM_DISK"] = "1"
     import mlx.core as mx
+
+    import mlxturbo  # noqa: F401  qwen4_exp のアーキ登録
     from mlx_lm import load
 
     model, tok = load(args.model)
