@@ -49,6 +49,25 @@ wide-proj は Python 連結だと qmv 変種が変わるだけだったが、専
 in-model で負けた — zpad の concat 起動と split-K の読み順が原因候補。
 zpad をカーネル内へ、読み順を行連続に。
 
+## 着手済み: moe_glu の足場と初期実測 (2026-08-31)
+
+`mlxturbo/kernels/moe_glu.py` に gate+up+silu*mul の 1 ディスパッチ版を置いた
+(未配線、どこからも呼ばれない)。検算は通る (相対 1e-2、bf16 の丸め相当)。
+速度は温キャッシュの 48 層直列 (T=3、30 対) で:
+
+| 版 | ms |
+|---|---|
+| 素 (gather_qmm x2 + swiglu) | 4.7-4.9 |
+| 融合 v1 (スカラー nibble 展開) | 7.4 |
+| 融合 v2 (uint4 + unroll) | 6.7 |
+
+**MLX の gather に並ぶだけで、あと 1.4 倍の最適化が要る。**候補は x の
+threadgroup ステージングをやめて device から bfloat4 直読み、1 simdgroup
+2 行持ち、行あたりの simd_sum 2 回を 1 回に畳む、など。融合の構造利得
+(ディスパッチ -2/層) は ~0.2-0.4ms/48 層しかないので、**カーネル単体で
+gather に勝てない限りこの路線は成立しない**。次のカーネルセッションは
+まずこの 1 点 (単体で gather 超え) を関門にすること。
+
 ## 受け入れ基準 (BRIEF の規律)
 
 - in-model A/B (サーバー経由、同一プロンプト、複数プロンプト x 512 の平均 tok/step)
