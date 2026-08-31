@@ -117,6 +117,31 @@ Metal OOM。gate+up 融合バンク (N=1280) は効かない (7.63 = 分離と�
 S=2048 で 10 TFLOPS (現 7.5)。当たれば prefill -3.5s (17k 454 -> 500+)。
 decode 側の共有タイル gather (関門は上記) と同じファイルの兄弟カーネル。
 
+**保留 (2026-09-01、advisor 判断)**: 上のカーネルは書かずに保留。同じ的を
+Python だけで撃てる layer-major prefill (レイヤー主導で G チャンクの MoE を
+concat して1回で流し、attention/indexer は 2048 のまま) を先にやる。
+r=40->40G で標準カーネルのまま効率曲線を登る。根拠: (1) 律速はタイル内
+expert 境界のフル GEMM やり直し (quantized.h の affine_gather_qmm_rhs、
+BM=32) で、eff ≈ 1/(1+32/r) が実測曲線と整合、(2) gather_qmm は行独立で、
+BM=32/64 をまたいだ分割でもビット一致を micro で確認済み → A/B が
+テキスト運と無縁、(3) mx.fast.metal_kernel は steel ヘッダを include
+できない (ヘッダ平坦化の下ごしらえが必要) と判明し、カーネル案の初期費用が
+想定より高い。**反転条件**: chunk 4096 の in-model MoE 部分時間が
+12.9s から予測 (~10.9s) の半分も落ちない / G=2 で wired 構成が OOM /
+17k 実プロンプトのビット一致が破れて検証戦略が KLD に落ちる — いずれかで
+カーネル案に戻る。layer-major が入って r=160+ に達したら、この
+カーネルの上積みは ≤8% に縮むので、その時点で本節のカーネルは棚上げ確定。
+
+**決着 (2026-09-01)**: layer-major は入った (spec_flash._group_prefill_forward、
+MLXTURBO_PREFILL_GROUP 既定 4)。反転条件はどれも発火せず: in-model の
+MoE 部分時間 18.4→14.9s (chunk 4096 の観測)、17k 実プロンプトで
+logits/hyper/全キャッシュ 110 配列ビット一致、wired+ngramRAM のサーバーで
+OOM なし。17k TTFT はサーバー実測 34.49→32.40s (493→524 tok/s)、
+in-process では 41.5→37.0s。4k 以下と decode は不変 (グループ条件が
+効かない長さ)。**prefill 面の segment-aware GEMM カーネルは棚上げ確定**
+(r=160 で eff 87%、カーネル天井までの残りは ≤8%)。decode 面の共有タイル
+gather (verify の MoE 13.8ms) は別問題として残る。
+
 ## 受け入れ基準 (BRIEF の規律)
 
 - in-model A/B (サーバー経由、同一プロンプト、複数プロンプト x 512 の平均 tok/step)

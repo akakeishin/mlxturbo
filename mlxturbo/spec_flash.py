@@ -283,6 +283,93 @@ def _staged_forward(model, ids, caches):
     return model.lm_head(out)
 
 
+# prefill の中間チャンクを何個まとめてレイヤー主導で流すか。attention/indexer は
+# チャンク幅 (2048) のまま、MoE だけグループぶんの行を concat して 1 回で流す。
+# gather_qmm (affine_gather_qmm_rhs) は BM 行タイル内の expert 境界ごとに
+# フル GEMM をやり直すため、効率は行数/expert に単調 (r=40/80/160 で
+# 7.5/8.9/9.8 TFLOPS、密上限 11.2)。チャンク幅そのものを上げる案 (下の
+# MLXTURBO_PREFILL_CHUNK) は attention/indexer の一時増と相殺したが、
+# こちらは MoE の行だけ太らせるので相殺しない (in-model 実測: chunk 4096 で
+# MoE 部分時間 18.4 -> 14.9s)。gather_qmm は行独立で、BM=32/64 をまたぐ
+# 分割でもビット一致 (micro 確認済み) — 出力はトークン列まで不変が要件。
+_PREFILL_GROUP = int(os.environ.get("MLXTURBO_PREFILL_GROUP", "4") or 0)
+
+
+def _group_prefill_forward(model, chunks, caches):
+    """中間 prefill チャンクのグループをレイヤー主導で流す。
+
+    計算内容は「各チャンクを順に Qwen4ExpModel.__call__ に通す」のと完全に
+    同一で、違いは MoE (layer.mlp) だけグループ内チャンクの行を concat して
+    1 回で呼ぶこと (行独立なのでビット一致)。mixer は通さない — chunk-major
+    でも中間チャンクの mixer 出力は捨てられており、呼び手が使う cap.hyper は
+    mixer の入力 (= 最終レイヤー出力) だから、それをチャンクごとに返す。
+    _staged_forward と同じく本家の写しであることが正しさの根拠。本家を
+    変えるときはここも変えること。
+
+    キャッシュ整合性: レイヤー主導でも「レイヤー i がチャンク c を処理する
+    時点のキャッシュ i の中身」は chunk-major と一致する (レイヤー i の
+    キャッシュを進めるのはレイヤー i 自身だけなので、処理順の入れ替えは
+    各キャッシュから見ると無関係)。mask も同じ理由で per-chunk に 1 個。
+    """
+    Q = _arch()
+    m = model.model
+    G = len(chunks)
+    hs = [mx.tile(m.embed_tokens(ch), (1, 1, m.hc)) for ch in chunks]
+    conv_mask = None
+
+    full_idx = [i for i, l in enumerate(m.layers) if l.layer_type == "full_attention"]
+    masks = [None] * G  # レイヤー 0 の走査中に、正しいオフセットで生成する
+
+    # per-chunk の prev_ctx: 本家はモデル呼び出しごとに pc[3] を進めるので、
+    # チャンク列に対して同じ更新を先に畳んでおく
+    prev_ctxs = [None] * G
+    if m.ple_layers:
+        ctx_len = m.args.ngram_size - 1
+        eos_id = m.args.eos_token_id
+        eos_id = eos_id[0] if isinstance(eos_id, list) else eos_id
+        pc = caches[m.ple_layers[0]]
+        prev = pc[3] if pc is not None else None
+        if prev is None:
+            prev = mx.full((chunks[0].shape[0], ctx_len), eos_id, chunks[0].dtype)
+        for ci, ch in enumerate(chunks):
+            prev_ctxs[ci] = prev
+            prev = mx.concatenate([prev, ch], axis=1)[:, -ctx_len:]
+        if pc is not None:
+            pc[3] = prev
+
+    step = _STAGE_EVERY
+    for li, (layer, c) in enumerate(zip(m.layers, caches)):
+        idx_c = c.indexer if (c is not None and hasattr(c, "indexer")) else None
+        posts = []
+        for ci in range(G):
+            h = hs[ci]
+            if layer.ple is not None:
+                h = h + layer.ple(h, chunks[ci], prev_ctxs[ci], c)
+            x, hyper, inject = layer.attn_hyper_connection(h)
+            if layer.layer_type == "linear_attention":
+                x = layer.linear_attn(x, conv_mask, c)
+            else:
+                if masks[ci] is None:
+                    masks[ci] = Q.create_attention_mask(x, [c])
+                x = layer.self_attn(x, m.rope, masks[ci], c, idx_c)
+            h = hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
+            posts.append(layer.mlp_hyper_connection(h))
+        xcat = mx.concatenate([p[0] for p in posts], axis=1)
+        ycat = layer.mlp(xcat)
+        offs, acc = [], 0
+        for p in posts[:-1]:
+            acc += p[0].shape[1]
+            offs.append(acc)
+        ys = mx.split(ycat, offs, axis=1)
+        for ci in range(G):
+            _, hyper, inject = posts[ci]
+            y = ys[ci]
+            hs[ci] = hyper + (y[..., None, :] * inject[..., None]).reshape(*y.shape[:-1], -1)
+        if step and (li + 1) % step == 0 and li < len(m.layers) - 1:
+            mx.async_eval(*hs)
+    return hs
+
+
 def _pipeline_snapshot(model, caches, mtp_cache):
     """楽観先組み (次ラウンドのグラフを結果を知らずに組む) 用の浅い退避。
 
@@ -808,6 +895,33 @@ class FlashSpecEngine:
             hyper_chunks = []
             while i < n:
                 remaining = n - i
+                # 前方の等長 2048 チャンクだけレイヤー主導でグループ処理する
+                # (チャンク境界は従来と同一 grid なので出力はビット一致)。
+                # 末尾側 (端数チャンクと最終チャンク) は従来経路のまま —
+                # checkpoint の粒度が要るのは分岐が起きやすい末尾だから。
+                # MLXTURBO_PREFILL_CHUNK 指定時は旧 knob を優先して無効化。
+                if _PREFILL_GROUP > 1 and big == step and remaining - step >= 2 * step:
+                    g = min(_PREFILL_GROUP, (remaining - step) // step)
+                    group_chunks = [
+                        ids[:, i + k * step : i + (k + 1) * step] for k in range(g)
+                    ]
+                    hys = _group_prefill_forward(model, group_chunks, caches)
+                    hys = hys[-HYPER_KEEP_CHUNKS:]
+                    mx.eval(*hys)
+                    for c in caches:
+                        state = getattr(c, "state", None)
+                        if state is not None:
+                            mx.eval(state)
+                    mx.clear_cache()
+                    hyper_chunks.extend(hys)
+                    del hyper_chunks[:-HYPER_KEEP_CHUNKS]
+                    i += g * step
+                    if checkpoints is not None:
+                        checkpoints.append(
+                            (base_pos + i, snapshot_untrimmable_caches(caches))
+                        )
+                        del checkpoints[:-CHECKPOINT_RETENTION]
+                    continue
                 if remaining > step:
                     j = i + min(big, remaining - step)
                 else:
