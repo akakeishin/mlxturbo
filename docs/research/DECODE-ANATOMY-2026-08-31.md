@@ -19,6 +19,18 @@ shim で除去、lib/mlx・ds4・llama は既存クローンから流用)。
 
 長 4k の再逆転 (-0.25ms/round) と prefill 17k が新しい戦線。
 
+prefill 17k の解剖 (37.5s、in-process): **MoE 12.9s (34%、FLOP 効率 ~29%)**、
+GDN 7.6s、attention 7.2s、PLE 1.3s、残り 8.6s。MoE は gather_qmm が prefill
+幅でも GEMM タイルに乗らないのが原因で、Python 層に打つ手は無い (彼らは
+融合カーネル)。チャンク幅 2048->4096 は +3% 弱 (熱ドリフト内)。clear_cache
+は毎チャンクでも無害。**prefill 差もカーネルレーンの仕事**。
+
+彼らのコミット記録から回収した情報: verify S=1/2/4 = 16.0/22.4/30.6ms
+(こちらの 28/33/42.5 に対し全幅で ~1.4 倍速い = やはり基礎カーネル)、
+彼らも sdpa 分割済み (splitMaskedSdpa256)、per-index 受理率は prose
+0.65/0.37/0.25 とこちら (0.76 / 条件付き 0.89) が大差で上、QSA gather は
+kv<=8k で mask arm 維持 (4-8k は構造的に gather が損)。
+
 ## 全セル決着 (2026-09-01、advisor 監査 + 基準最新化の後: 対 release 26.8.11)
 
 基準は最新リリース v26.8.11 (2026-08-29、main の先行コミットに decode 性能は
