@@ -34,6 +34,7 @@ former is +0.34ms slower; see tools/ablate_moe.py), so they are not enabled.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Protocol
@@ -1249,11 +1250,34 @@ def _build_base_runner(
     warn_if_not_installed(model)
 
     if args.no_fused:
-        print(f"{log_prefix} --no-fused: hyper-connections 融合カーネルを無効化")
+        print(f"{log_prefix} --no-fused: hyper-connections 融合カーネルと連結射影を無効化")
     else:
-        fused.enable_hyper_connection_kernel()
-        print(f"{log_prefix} hyper-connections 融合カーネル有効 (moe_route/rms_norm_gated は実測で"
-              " 空振りのため無効のまま)")
+        # HC の実装は MLXTURBO_HC で選ぶ: kernel (既定) / compiled / off。
+        # kernel は 2 ディスパッチだが sigmoid が bf16 とビット一致しない
+        # (kernels/hyper_connection.py の精度の節)。compiled は op 単位で
+        # 素と同じ計算の記録なのでビット同一のまま起動回数だけ減る。
+        hc_mode = os.environ.get("MLXTURBO_HC", "kernel")
+        if hc_mode == "compiled":
+            fused.enable_hyper_connection()
+            print(f"{log_prefix} hyper-connections: mx.compile 版 (ビット同一)")
+        elif hc_mode == "off":
+            print(f"{log_prefix} hyper-connections: 素の実装 (MLXTURBO_HC=off)")
+        else:
+            fused.enable_hyper_connection_kernel()
+            print(f"{log_prefix} hyper-connections 融合カーネル有効 (moe_route/rms_norm_gated は実測で"
+                  " 空振りのため無効のまま)")
+        # enable_moe_shared_fold は実測で逆効果 (verify +1.8ms) につき呼ばない。
+        # 連結射影も既定 OFF: 連結で N が変わると qmv のカーネル変種が変わり、
+        # 加算順の違いが最終 ulp を動かす疑いがある (tok/step 2.44 -> 2.23 の
+        # 低下と時期が一致)。MLXTURBO_WIDE=1 で実験的に有効化。
+        if os.environ.get("MLXTURBO_WIDE") == "1":
+            wide = fused.enable_wide_projections(model)
+            print(f"{log_prefix} 連結射影有効: gdn={wide['gdn']} attn={wide['attn']}"
+                  f" shared={wide['shared']} experts={wide['experts']} 層")
+        sort_min = os.environ.get("MLXTURBO_SORT_MIN")
+        if sort_min:
+            fused.enable_gather_sort(int(sort_min))
+            print(f"{log_prefix} gather のソート閾値を {sort_min} に変更 (値は不変)")
 
     # Qwen3.8-Flash-Next (qwen4_exp) + MTP (explicit or auto-discovered) ->
     # the FlashSpecEngine path (docs/MTP-FLASH.md). The 27B (qwen3_5) has a

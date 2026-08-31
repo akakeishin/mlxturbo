@@ -154,10 +154,8 @@ def capture(model, light: bool = False):
         # Transcribe the main GatedDeltaNet.__call__ as-is, replacing only the
         # kernel with the one that returns states. Do not change the logic
         B, S, _ = x.shape
-        mixed_qkv = self.in_proj_qkv(x)
-        z = self.in_proj_z(x).reshape(B, S, self.n_v, self.dv)
-        b = self.in_proj_b(x)
-        a = self.in_proj_a(x)
+        mixed_qkv, z, b, a = self._project_in(x)
+        z = z.reshape(B, S, self.n_v, self.dv)
 
         conv_state = (
             cache[0]
@@ -378,14 +376,30 @@ class FlashSpecEngine:
         トークンを与える。d1 から順に一致する限り採用し、外れたところで
         打ち切ってその位置のトークンを代わりに出す。最後まで当たれば k+1 個出る。
         """
-        toks, hypers, hit = [], [], 0
-        for j in range(len(drafts) + 1):
-            nxt = self._sample(lg[:, j], temp)
-            toks.append(nxt)
-            hypers.append(cap.hyper[:, j:j + 1])
-            if j == len(drafts) or int(nxt.item()) != int(drafts[j].item()):
-                break
+        if temp > 0 or not drafts:
+            toks, hypers, hit = [], [], 0
+            for j in range(len(drafts) + 1):
+                nxt = self._sample(lg[:, j], temp)
+                toks.append(nxt)
+                hypers.append(cap.hyper[:, j:j + 1])
+                if j == len(drafts) or int(nxt.item()) != int(drafts[j].item()):
+                    break
+                hit += 1
+            return toks, hypers, hit
+
+        # greedy はドラフト位置ごとに .item() で同期せず、argmax と一致判定を
+        # まとめて 1 回の同期で取る (1 ラウンドあたり最大 depth+1 回 -> 1 回)
+        k = len(drafts)
+        nxt_all = mx.argmax(lg, axis=-1)          # (1, k+1)
+        dv = mx.concatenate(drafts, axis=1)       # (1, k)
+        mx.eval(nxt_all, dv)
+        vals = nxt_all[0].tolist()
+        dvals = dv[0].tolist()
+        hit = 0
+        while hit < k and vals[hit] == dvals[hit]:
             hit += 1
+        toks = [nxt_all[:, j:j + 1] for j in range(hit + 1)]
+        hypers = [cap.hyper[:, j:j + 1] for j in range(hit + 1)]
         return toks, hypers, hit
 
     def _prime_draft_cache(self, ids, hyper):

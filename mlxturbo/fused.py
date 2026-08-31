@@ -297,7 +297,263 @@ def disable_hyper_connection() -> None:
     _ORIG_HC = None
 
 
+
+# ------------------------------------------------------------ wide projections
+#
+# 同じ入力に掛かる量子化行列を出力次元で連結し、qmm のカーネル起動回数を減らす。
+# 各出力行の量子化パラメータは行単位なので、連結しても数値はビット単位で不変。
+# 特に効くのは行数が極端に少ない qmm (GDN の in_proj_a/b は 48 行、
+# shared_expert_gate は 1 行) で、単独ではレイテンシしか買えない。
+#
+#   GDN:       in_proj_qkv / z / b / a   4 本 -> 1 本 (36 層)
+#   Attention: q_proj / k_proj / v_proj  3 本 -> 1 本 (12 層)
+#   MoE 共有:  shared gate / up / shared_expert_gate  3 本 -> 1 本 (48 層)
+#   エキスパート: switch_mlp の gate / up  gather 2 回 -> 1 回 (48 層)
+#
+# ビット幅か group_size が揃っていないモジュールはその場で素通し (連結しない)。
+# 元のモジュールは残す (rebit や保存経路が触るため)。増えるメモリは連結分。
+
+
+def _cat_quantized(lins):
+    """QuantizedLinear の列を出力次元で連結。(w, scales, biases, gs, bits) か、
+    揃っていなければ None。"""
+    import mlx.core as mx
+
+    if any(not hasattr(l, "scales") for l in lins):
+        return None
+    gs, bits = lins[0].group_size, lins[0].bits
+    if any(l.group_size != gs or l.bits != bits for l in lins[1:]):
+        return None
+    w = mx.concatenate([l.weight for l in lins], axis=0)
+    sc = mx.concatenate([l.scales for l in lins], axis=0)
+    bi = mx.concatenate([l.biases for l in lins], axis=0)
+    mx.eval(w, sc, bi)
+    return w, sc, bi, gs, bits
+
+
+def enable_wide_projections(model, mtp=None) -> dict:
+    """読み込み済みモデルに連結射影を仕込む。戻り値は種類別の適用層数。"""
+    import mlx.core as mx
+
+    counts = {"gdn": 0, "attn": 0, "shared": 0, "experts": 0}
+
+    def each_layer():
+        for layer in model.model.layers:
+            yield layer
+        if mtp is not None:
+            for layer in mtp.layers:
+                yield layer
+
+    for layer in each_layer():
+        la = getattr(layer, "linear_attn", None)
+        if la is not None:
+            cat = _cat_quantized(
+                [la.in_proj_qkv, la.in_proj_z, la.in_proj_b, la.in_proj_a])
+            if cat is not None:
+                w, sc, bi, gs, bits = cat
+                c1 = la.conv_dim
+                c2 = c1 + la.value_dim
+                c3 = c2 + la.n_v
+                la._wide_in = (w, sc, bi, gs, bits, (c1, c2, c3))
+                counts["gdn"] += 1
+        sa = getattr(layer, "self_attn", None)
+        if sa is not None and hasattr(sa, "q_proj"):
+            cat = _cat_quantized([sa.q_proj, sa.k_proj, sa.v_proj])
+            if cat is not None:
+                w, sc, bi, gs, bits = cat
+                c1 = sa.n_heads * sa.head_dim * 2
+                c2 = c1 + sa.n_kv_heads * sa.head_dim
+                sa._wide_qkv = (w, sc, bi, gs, bits, (c1, c2))
+                counts["attn"] += 1
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None and getattr(mlp, "_router513", None) is not None:
+            continue          # shared 畳み込み済み: shared/experts はそちらが持つ
+        se = getattr(mlp, "shared_expert", None) if mlp is not None else None
+        if se is not None:
+            cat = _cat_quantized(
+                [se.gate_proj, se.up_proj, mlp.shared_expert_gate])
+            if cat is not None:
+                w, sc, bi, gs, bits = cat
+                h = _rows(se.gate_proj)
+                mlp._wide_shared = (w, sc, bi, gs, bits, h)
+                counts["shared"] += 1
+        sw = getattr(mlp, "switch_mlp", None) if mlp is not None else None
+        if sw is not None and hasattr(sw.gate_proj, "scales"):
+            g, u = sw.gate_proj, sw.up_proj
+            if g.group_size == u.group_size and g.bits == u.bits:
+                w = mx.concatenate([g.weight, u.weight], axis=1)
+                sc = mx.concatenate([g.scales, u.scales], axis=1)
+                bi = mx.concatenate([g.biases, u.biases], axis=1)
+                mx.eval(w, sc, bi)
+                sw._fused_w, sw._fused_s, sw._fused_b = w, sc, bi
+                sw._fused_h = _rows(g)
+                counts["experts"] += 1
+    if counts["experts"]:
+        _patch_switch_glu()
+    return counts
+
+
+def _rows(lin) -> int:
+    """量子化済み Linear/SwitchLinear の出力行数 (パック前)。"""
+    return lin.scales.shape[-2]
+
+
+_ORIG_SWITCH_GLU = None
+
+
+def _patch_switch_glu() -> None:
+    """SwitchGLU の gate/up gather を、_fused_* があれば 1 回にまとめる。"""
+    global _ORIG_SWITCH_GLU
+    import mlx.core as mx
+    import mlx_lm.models.switch_layers as SL
+
+    if _ORIG_SWITCH_GLU is not None:
+        return
+    _ORIG_SWITCH_GLU = SL.SwitchGLU.__call__
+    orig = _ORIG_SWITCH_GLU
+
+    import os
+
+    # 検証フォワード (T=2..4 -> 添字 22..44) は既定の 64 に届かずソートされない。
+    # ソートすると同じエキスパートを引く行が隣接し、重みタイルの再利用が効く。
+    # 値は並べ替えて戻すだけなので不変。閾値は MLXTURBO_SORT_MIN で変えられる。
+    sort_min = int(os.environ.get("MLXTURBO_SORT_MIN", "64"))
+
+    def patched(self, x, indices):
+        if not hasattr(self, "_fused_w"):
+            return orig(self, x, indices)
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= sort_min
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = SL._gather_sort(x, indices)
+        gp = self.gate_proj
+        both = mx.gather_qmm(
+            x, self._fused_w, self._fused_s, self._fused_b,
+            rhs_indices=idx, transpose=True,
+            group_size=gp.group_size, bits=gp.bits, mode=gp.mode,
+            sorted_indices=do_sort,
+        )
+        h = self._fused_h
+        x_gate, x_up = both[..., :h], both[..., h:]
+        x = self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices=do_sort)
+        if do_sort:
+            x = SL._scatter_unsort(x, inv_order, indices.shape)
+        return x.squeeze(-2)
+
+    SL.SwitchGLU.__call__ = patched
+
+
+def enable_moe_shared_fold(model) -> int:
+    """shared expert を「常に選ばれる 513 番目のエキスパート」に畳み込む。
+
+    shared_expert_intermediate_size (640) はエキスパートと同一なので、
+    gate/up/down の各バンクに shared の行を 1 枚足し、毎トークンの添字に
+    512 を固定で追加すれば、shared の qmm 3 本 + gate 1 本が直列経路から消える
+    (gather はエキスパート方向に並列なので、1 本増えても直列時間は伸びない)。
+
+    sigmoid(shared_expert_gate(x)) は router に行を足して同じ行列積から取る。
+    router は逆量子化して fp32 の密行列にする (513 行 x 2560、5MB。読み出しは
+    誤差の内で、量子化 router の qmm と密 fp32 の行列積は同じ値を出す)。
+
+    重み和の足し込み順が変わるぶんだけ bf16 の丸めが動く (moe_route カーネルと
+    同じ種類の差)。ビット/gs が揃っていない層は素通し。
+    """
+    import mlx.core as mx
+
+    def deq(lin):
+        if hasattr(lin, "scales"):
+            return mx.dequantize(
+                lin.weight, lin.scales, lin.biases,
+                group_size=lin.group_size, bits=lin.bits)
+        return lin.weight
+
+    n = 0
+    for layer in model.model.layers:
+        mlp = getattr(layer, "mlp", None)
+        se = getattr(mlp, "shared_expert", None) if mlp is not None else None
+        sw = getattr(mlp, "switch_mlp", None) if mlp is not None else None
+        if se is None or sw is None:
+            continue
+        parts = [sw.gate_proj, sw.up_proj, sw.down_proj,
+                 se.gate_proj, se.up_proj, se.down_proj]
+        if any(not hasattr(x, "scales") for x in parts):
+            continue
+        gs, bits = sw.gate_proj.group_size, sw.gate_proj.bits
+        if any(x.group_size != gs or x.bits != bits for x in parts):
+            continue
+
+        def bank(swl, lin, attr):
+            return mx.concatenate(
+                [getattr(swl, attr), getattr(lin, attr)[None]], axis=0)
+
+        g, u, d = sw.gate_proj, sw.up_proj, sw.down_proj
+        fw = mx.concatenate(
+            [bank(g, se.gate_proj, "weight"), bank(u, se.up_proj, "weight")], axis=1)
+        fs = mx.concatenate(
+            [bank(g, se.gate_proj, "scales"), bank(u, se.up_proj, "scales")], axis=1)
+        fb = mx.concatenate(
+            [bank(g, se.gate_proj, "biases"), bank(u, se.up_proj, "biases")], axis=1)
+        dw = bank(d, se.down_proj, "weight")
+        ds = bank(d, se.down_proj, "scales")
+        db = bank(d, se.down_proj, "biases")
+        router = mx.concatenate(
+            [deq(mlp.gate), deq(mlp.shared_expert_gate)], axis=0
+        ).astype(mx.float32)
+        mx.eval(fw, fs, fb, dw, ds, db, router)
+
+        sw._fused_w, sw._fused_s, sw._fused_b = fw, fs, fb
+        sw._fused_h = _rows(g)
+        d.weight, d.scales, d.biases = dw, ds, db
+        mlp._router513 = router
+        n += 1
+    if n:
+        _patch_switch_glu()
+    return n
+
+
+_ORIG_SWITCH_SORT = None
+
+
+def enable_gather_sort(min_size: int = 16) -> None:
+    """SwitchGLU のソート閾値だけを下げる (構造は素の 3 gather のまま)。
+
+    既定の閾値 64 は検証フォワード (T=2..4 -> 添字 22..44) に届かず、同じ
+    エキスパートを引く行が散らばったまま読まれる。ソートすれば重みタイルの
+    再利用が効く。並べ替えて戻すだけなので出力の値は不変。
+    """
+    global _ORIG_SWITCH_SORT
+    import mlx_lm.models.switch_layers as SL
+
+    if _ORIG_SWITCH_SORT is not None:
+        return
+    _ORIG_SWITCH_SORT = SL.SwitchGLU.__call__
+
+    import mlx.core as mx
+
+    def patched(self, x, indices):
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= min_size
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = SL._gather_sort(x, indices)
+        if self.training:
+            idx = mx.stop_gradient(idx)
+        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        x = self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices=do_sort)
+        if do_sort:
+            x = SL._scatter_unsort(x, inv_order, indices.shape)
+        return x.squeeze(-2)
+
+    SL.SwitchGLU.__call__ = patched
+
 __all__ = [
+    "enable_gather_sort",
+    "enable_moe_shared_fold",
+    "enable_wide_projections",
     "disable_hyper_connection",
     "disable_hyper_connection_kernel",
     "disable_moe_route",

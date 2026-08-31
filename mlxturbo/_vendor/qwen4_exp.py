@@ -306,13 +306,21 @@ class Attention(nn.Module):
 
         sparse = self.indexer(x, rope, idx_cache, offset)
 
-        q, gate = mx.split(self.q_proj(x).reshape(B, S, self.n_heads, -1), 2, axis=-1)
+        wide = getattr(self, "_wide_qkv", None)
+        if wide is None:
+            qg, kk, vv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        else:
+            w, sc, bi, gs, bits, (c1, c2) = wide
+            out = mx.quantized_matmul(
+                x, w, sc, bi, transpose=True, group_size=gs, bits=bits)
+            qg, kk, vv = out[..., :c1], out[..., c1:c2], out[..., c2:]
+        q, gate = mx.split(qg.reshape(B, S, self.n_heads, -1), 2, axis=-1)
         gate = gate.reshape(B, S, -1)
         q = self.q_norm(q).transpose(0, 2, 1, 3)
-        k = self.k_norm(self.k_proj(x).reshape(B, S, self.n_kv_heads, -1)).transpose(
+        k = self.k_norm(kk.reshape(B, S, self.n_kv_heads, -1)).transpose(
             0, 2, 1, 3
         )
-        v = self.v_proj(x).reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        v = vv.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
         cos, sin = rope(mx.arange(offset, offset + S)[None])
         cos, sin = cos[:, None], sin[:, None]
@@ -330,9 +338,33 @@ class Attention(nn.Module):
                 else (mask + add if not isinstance(mask, str) else add)
             )
 
-        out = scaled_dot_product_attention(
-            q, k, v, cache=cache, scale=self.scale, mask=mask
-        )
+        # MLX sdpa の速い vector カーネルは q 行数 (S * n_heads) 32 まで。
+        # 越えると全 KV にスコアを実体化する経路に落ち、長い文脈で跳ねる
+        # (docs/research/SDPA-WIDTH-WALL.md)。マスク付きの注意は q の行どうしが
+        # 独立なので、壁に収まる幅で切って繋いでも数値は同一。列を切れない
+        # 文字列マスク ("causal") のときは触らない。
+        gqa = self.n_heads // self.n_kv_heads
+        if (
+            S * gqa > 32
+            and S <= 8
+            and isinstance(mask, mx.array)
+            and k.shape[2] >= 2048
+        ):
+            step = max(1, 32 // gqa)
+            out = mx.concatenate(
+                [
+                    scaled_dot_product_attention(
+                        q[:, :, i : i + step], k, v, cache=cache,
+                        scale=self.scale, mask=mask[..., i : i + step, :],
+                    )
+                    for i in range(0, S, step)
+                ],
+                axis=2,
+            )
+        else:
+            out = scaled_dot_product_attention(
+                q, k, v, cache=cache, scale=self.scale, mask=mask
+            )
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
 
@@ -373,12 +405,23 @@ class GatedDeltaNet(nn.Module):
         )
         self.out_proj = nn.Linear(self.value_dim, d, bias=False)
 
+    def _project_in(self, x):
+        """4 本の入力射影。mlxturbo.fused.enable_wide_projections が
+        ``_wide_in`` を置くと 1 本の qmm に連結される (数値は不変)。
+        spec_flash.capture の GDN 差し替えもここを通る。"""
+        wide = getattr(self, "_wide_in", None)
+        if wide is None:
+            return (self.in_proj_qkv(x), self.in_proj_z(x),
+                    self.in_proj_b(x), self.in_proj_a(x))
+        w, sc, bi, gs, bits, (c1, c2, c3) = wide
+        out = mx.quantized_matmul(
+            x, w, sc, bi, transpose=True, group_size=gs, bits=bits)
+        return out[..., :c1], out[..., c1:c2], out[..., c2:c3], out[..., c3:]
+
     def __call__(self, x, mask, cache) -> mx.array:
         B, S, _ = x.shape
-        mixed_qkv = self.in_proj_qkv(x)
-        z = self.in_proj_z(x).reshape(B, S, self.n_v, self.dv)
-        b = self.in_proj_b(x)
-        a = self.in_proj_a(x)
+        mixed_qkv, z, b, a = self._project_in(x)
+        z = z.reshape(B, S, self.n_v, self.dv)
 
         conv_state = (
             cache[0]
@@ -435,11 +478,33 @@ class SparseMoeBlock(nn.Module):
         self.shared_expert_gate = nn.Linear(args.hidden_size, 1, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
+        r513 = getattr(self, "_router513", None)
+        if r513 is not None:
+            # mlxturbo.fused.enable_moe_shared_fold: shared expert は
+            # バンクの 513 番目。router の行列積 1 本から選択重みと
+            # shared のゲートの両方を取る
+            logits = x.astype(mx.float32) @ r513.T
+            lr = logits[..., :512]
+            sg = mx.sigmoid(logits[..., 512:])
+            idx = mx.argpartition(-lr, self.top_k - 1, axis=-1)[..., : self.top_k]
+            w = mx.softmax(mx.take_along_axis(lr, idx, axis=-1), axis=-1, precise=True)
+            idx = mx.concatenate(
+                [idx, mx.full((*idx.shape[:-1], 1), 512, dtype=idx.dtype)], axis=-1)
+            w = mx.concatenate([w, sg], axis=-1)
+            return (self.switch_mlp(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
         logits = self.gate(x.astype(mx.float32))
         idx = mx.argpartition(-logits, self.top_k - 1, axis=-1)[..., : self.top_k]
         w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
         out = (self.switch_mlp(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
-        return out + mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+        wide = getattr(self, "_wide_shared", None)
+        if wide is None:
+            return out + mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
+        wq, sc, bi, gs, bits, h = wide
+        gus = mx.quantized_matmul(
+            x, wq, sc, bi, transpose=True, group_size=gs, bits=bits)
+        g, u, sg = gus[..., :h], gus[..., h : 2 * h], gus[..., 2 * h :]
+        shared = self.shared_expert.down_proj(nn.silu(g) * u)
+        return out + mx.sigmoid(sg) * shared
 
 
 class MLP(nn.Module):
