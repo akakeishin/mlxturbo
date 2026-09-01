@@ -166,7 +166,7 @@ Flash-Next 独自として扱わないこと** — 線形注意/再帰系は Qwe
 | 2 | `mlxturbo/spec_flash.py:296` `_group_prefill_forward` | 同上 | layer-major prefill。層主導 x G チャンクの二重ループで、MoE 行を concat して 1 回の GEMM にまとめる | 段 5 (保留)。pre_mlp/post_mlp 分解を検討中だが効果対リスク比が最悪、二重ループ自体は最適化の本体なので残す |
 | 3 | `mlxturbo/batch.py:584` `model_call` | 同上 `Qwen4ExpModel.__call__` | mask 生成・conv_mask 構築・n-gram prev_ctx 更新の 3 箇所がバッチ (左パディング) 対応版 | 段 3 で `_make_masks`/`_update_ngram_ctx` を vendor 側シームとして切り出し解消予定 |
 | 4 | `mlxturbo/spec_flash.py:158` `capture()` 内 `gdn`/`ple_conv` | `mlxturbo/_vendor/qwen4_exp.py` `GatedDeltaNet.__call__` / `PLELayer._short_conv` | rollback 用に `states_all` 等を保持するための転記 (カーネル差し替えのみ、ロジック不変) | 対象外。「本家と一字一句同じ」が `tools/verify_prefill_bitident.py` のビット一致ゲートの根拠なので抽象化しない (本文の番号ラベルが唯一無い項目 -- 除外 3 項目リストの 3 番目 `capture の GDN 転記` が写し 1/2 と同じ並びで対応する、という消去法での再構成) |
-| 5 | `mlxturbo/batch.py:516` `gdn_call` + `:564` `ple_short_conv` | `GatedDeltaNet.__call__` / `PLELayer._short_conv` | conv 状態の取り出しを `cache.lengths` (右パディング下の実長) 基準にする差分のみ | 段 1 で `_store_conv_state` 系のシームを vendor に切って解消予定 |
+| 5 | ~~`mlxturbo/batch.py` `gdn_call` + `ple_short_conv`~~ | `GatedDeltaNet.__call__` / `PLELayer._short_conv` | conv 状態の取り出しを `cache.lengths` (右パディング下の実長) 基準にする差分のみ | **解消済み (段 1)**。vendor に `_store_conv_state` / `_store_short_conv_state` を切り、batch はその 2 つだけ差し替える |
 | 6 | `mlxturbo/spec.py:432` `_linear_capture` | site-packages `mlx_lm/models/qwen3_5.py` の `GatedDeltaNet` (27B/qwen3_5 側) | qwen3_5 用の GDN 捕捉版 | 対象外。上流が site-packages で vendor していない (関数 1 つのために qwen3_5 を vendor するのは割に合わない) |
 | 7 | `mlxturbo/batch.py:456` `attention_call` | `mlxturbo/_vendor/qwen4_exp.py` `Attention.__call__` | rope 位置導出のみが左パディング対応の差分 | 段 2 で `_positions`/`_final_mask` を vendor 側シームとして切り出し解消予定 |
 | 8 | `mlxturbo/batch_spec.py:248` `ragged_attention()` 内 `call` | 同上 `Attention.__call__` | rope 位置と最終 mask 構成 (`cache.ledger.next_round_mask`) の 2 点が dead-slot 台帳対応の差分 | 段 2 で解消予定 (写し 7 と同じシーム) |
@@ -217,13 +217,18 @@ decode が退行したら縮小 / PR #1788 が上流に入って vendor を捨�
 前節の方針を作業単位に落とす。**着手はアーキ能力レイヤ (arch.py) の完了後。**
 各段は独立していて、途中で止めても壊れない。段ごとにコミットする。
 
-**段 1: 写し 5 の解消 (batch.py の GDN/PLE)**
+**段 1: 写し 5 の解消 (batch.py の GDN/PLE)** — **完了 (2026-09-01)**
 vendor に `GatedDeltaNet._store_conv_state(cache, conv_input)` と
 `PLELayer._store_short_conv_state` 相当のシームを切り、batch.py はそのメソッド
 だけ差し替える。写し本体 (~37 行) が消える。副次効果として batch 経路が
 vendor の `_wide_qkv` 融合と sdpa 壁分割を自動で獲得する (現在は写しに
 伝播しておらず黙って遅い)。検査: tools/verify_batch_cache.py、
 tools/verify_batch_real.py、compat_smoke。
+
+結果: 写し 76 行が override 2 個 (+ 共通ヘルパ 1) になった。
+`verify_batch_cache` の出力は変更前後でバイト一致、`verify_batch_spec` も
+全ケース一致。オーバーライドは 1 呼び手 (クラス) あたり 1 個で、反転条件
+(3 個超) には遠い。batch 経路は `_project_in` (wide 融合) を自動で獲得した。
 
 **段 2: 写し 7 と 8 の解消 (Attention 2 種)**
 vendor の `Attention.__call__` に `_positions(cache, S)` と

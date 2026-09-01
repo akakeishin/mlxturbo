@@ -512,73 +512,38 @@ def _install_model_patches(BatchAttnCache):
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
 
-    # ---- GatedDeltaNet: slice the conv state at the real length -------
-    def gdn_call(self, x, mask, cache):
-        B, S, _ = x.shape
-        mixed_qkv = self.in_proj_qkv(x)
-        z = self.in_proj_z(x).reshape(B, S, self.n_v, self.dv)
-        b = self.in_proj_b(x)
-        a = self.in_proj_a(x)
+    # ---- conv state: keep the columns that follow the real length ----
+    #
+    # Prefill runs with right padding, so the tail of a row is padding. The
+    # stock seams (`GatedDeltaNet._store_conv_state` /
+    # `PLELayer._store_short_conv_state`) take the last n columns, which under
+    # right padding are padding. Only the extraction differs; the forward pass
+    # itself stays in the vendored module, so batch keeps whatever fusions
+    # land there (`_project_in` / `_wide_qkv`).
+    def _tail_positions(cache, n_keep: int, span: int):
+        """Index of the n_keep columns to carry over, per row. `None` means
+        the stock tail (no batch cache, i.e. no per-row length)."""
+        lengths = getattr(cache, "lengths", None)
+        if lengths is None:
+            return None
+        ends = mx.clip(lengths, 0, span)
+        return (ends[:, None] + mx.arange(n_keep))[..., None]
 
-        conv_state = (
-            cache[0]
-            if (cache is not None and cache[0] is not None)
-            else mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=x.dtype)
-        )
-        if mask is not None:
-            mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
-        conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
-        if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            lengths = getattr(cache, "lengths", None)
-            if lengths is None:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
-            else:
-                # Under right padding the tail is padding. Point at the n_keep
-                # columns immediately following the real length
-                ends = mx.clip(lengths, 0, S)
-                pos = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, pos, axis=1)
-        conv_out = nn.silu(self.conv1d(conv_input))
+    def store_conv_state(self, cache, conv_input):
+        n_keep = self.conv_kernel_size - 1
+        pos = _tail_positions(cache, n_keep, conv_input.shape[1] - n_keep)
+        if pos is None:
+            _ORIG["GatedDeltaNet"](self, cache, conv_input)
+        else:
+            cache[0] = mx.take_along_axis(conv_input, pos, axis=1)
 
-        q, k, v = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
-        q = q.reshape(B, S, self.n_k, self.dk)
-        k = k.reshape(B, S, self.n_k, self.dk)
-        v = v.reshape(B, S, self.n_v, self.dv)
-
-        inv_scale = self.dk**-0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-
-        state = cache[1] if cache is not None else None
-        out, state = Q.gated_delta_update(
-            q, k, v, a, b, self.A_log, self.dt_bias, state, mask,
-            use_kernel=not self.training,
-        )
-        if cache is not None:
-            cache[1] = state
-            cache.advance(S)
-        return self.out_proj(self.norm(out, z).reshape(B, S, -1))
-
-    # ---- PLELayer: slice the short-conv state at the real length too --
-    def ple_short_conv(self, x, cache):
-        S = x.shape[1]
+    def store_short_conv_state(self, cache, full):
         n = self.short_conv_state_len
-        state = (
-            cache[2]
-            if (cache is not None and cache[2] is not None)
-            else mx.zeros((x.shape[0], n, x.shape[-1]), dtype=x.dtype)
-        )
-        full = mx.concatenate([state, x], axis=1)
-        if cache is not None:
-            lengths = getattr(cache, "lengths", None)
-            if lengths is None:
-                cache[2] = mx.contiguous(full[:, -n:, :])
-            else:
-                ends = mx.clip(lengths, 0, S)
-                pos = (ends[:, None] + mx.arange(n))[..., None]
-                cache[2] = mx.take_along_axis(full, pos, axis=1)
-        return nn.silu(self.conv1d(full[:, -(n + S) :, :]))
+        pos = _tail_positions(cache, n, full.shape[1] - n)
+        if pos is None:
+            _ORIG["PLELayer"](self, cache, full)
+        else:
+            cache[2] = mx.take_along_axis(full, pos, axis=1)
 
     # ---- Qwen4ExpModel: actually distribute the mask ------------------
     def model_call(self, ids, cache=None, input_embeddings=None):
@@ -641,14 +606,14 @@ def _install_model_patches(BatchAttnCache):
 
     _ORIG["QSAIndexer"] = Q.QSAIndexer.__call__
     _ORIG["Attention"] = Q.Attention.__call__
-    _ORIG["GatedDeltaNet"] = Q.GatedDeltaNet.__call__
-    _ORIG["PLELayer"] = Q.PLELayer._short_conv
+    _ORIG["GatedDeltaNet"] = Q.GatedDeltaNet._store_conv_state
+    _ORIG["PLELayer"] = Q.PLELayer._store_short_conv_state
     _ORIG["Qwen4ExpModel"] = Q.Qwen4ExpModel.__call__
 
     Q.QSAIndexer.__call__ = indexer_call
     Q.Attention.__call__ = attention_call
-    Q.GatedDeltaNet.__call__ = gdn_call
-    Q.PLELayer._short_conv = ple_short_conv
+    Q.GatedDeltaNet._store_conv_state = store_conv_state
+    Q.PLELayer._store_short_conv_state = store_short_conv_state
     Q.Qwen4ExpModel.__call__ = model_call
 
 
@@ -680,8 +645,8 @@ def disable_batch_cache() -> None:
 
     Q.QSAIndexer.__call__ = _ORIG["QSAIndexer"]
     Q.Attention.__call__ = _ORIG["Attention"]
-    Q.GatedDeltaNet.__call__ = _ORIG["GatedDeltaNet"]
-    Q.PLELayer._short_conv = _ORIG["PLELayer"]
+    Q.GatedDeltaNet._store_conv_state = _ORIG["GatedDeltaNet"]
+    Q.PLELayer._store_short_conv_state = _ORIG["PLELayer"]
     Q.Qwen4ExpModel.__call__ = _ORIG["Qwen4ExpModel"]
     # Leaving `merge` in place would mean building indexer-carrying batch
     # caches while the forward pass has been restored to stock. Fall back to

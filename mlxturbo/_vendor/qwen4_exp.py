@@ -427,6 +427,15 @@ class GatedDeltaNet(nn.Module):
             x, w, sc, bi, transpose=True, group_size=gs, bits=bits)
         return out[..., :c1], out[..., c1:c2], out[..., c2:c3], out[..., c3:]
 
+    def _store_conv_state(self, cache, conv_input) -> None:
+        """次ステップに持ち越す conv 状態 (末尾 K-1 列) を書く。
+
+        バッチ経路 (`mlxturbo/batch.py`) は右パディングで走るので末尾が
+        パディングになり、実長の直後 K-1 列を取る必要がある。そちらは
+        このメソッドだけを差し替える (`__call__` 本体は共有する)。
+        """
+        cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
+
     def __call__(self, x, mask, cache) -> mx.array:
         B, S, _ = x.shape
         mixed_qkv, z, b, a = self._project_in(x)
@@ -441,7 +450,7 @@ class GatedDeltaNet(nn.Module):
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
-            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
+            self._store_conv_state(cache, conv_input)
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
@@ -748,6 +757,11 @@ class PLELayer(nn.Module):
             bias=False,
         )
 
+    def _store_short_conv_state(self, cache, full) -> None:
+        """PLE の short conv 状態を書く。GatedDeltaNet._store_conv_state と
+        同じ理由で切ってあるシーム (バッチ経路が差し替える)。"""
+        cache[2] = mx.contiguous(full[:, -self.short_conv_state_len :, :])
+
     def _short_conv(self, x: mx.array, cache) -> mx.array:
         S = x.shape[1]
         n = self.short_conv_state_len
@@ -758,7 +772,7 @@ class PLELayer(nn.Module):
         )
         full = mx.concatenate([state, x], axis=1)
         if cache is not None:
-            cache[2] = mx.contiguous(full[:, -n:, :])
+            self._store_short_conv_state(cache, full)
         return nn.silu(self.conv1d(full[:, -(n + S) :, :]))
 
     def __call__(
