@@ -301,6 +301,27 @@ def _knob_bool_mask(ctx):
     return apply
 
 
+def _knob_gather_attn(ctx):
+    """A = gather 経路 (段 3(b)) / B = 現行の加算マスク。
+
+    選ばれたブロックの和集合だけ KV を集めてから dense sdpa に渡す。
+    **注意する集合は同じなので品質は変わらない** (加算順が変わるだけ、
+    合成モデルで max|diff|=1.8e-7)。合格条件: 17k / 50k の ms/token が
+    改善すること。改善したら既定 on にする。
+    """
+    from mlxturbo.gather_attn import disable_gather_attn, enable_gather_attn
+
+    model = ctx["eng"].model
+
+    def apply(variant):
+        if variant == "A":
+            enable_gather_attn(model)
+        else:
+            disable_gather_attn(model)
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
@@ -311,6 +332,7 @@ KNOBS = {
     "prefill-group": (_knob_prefill_group, ["2", "4", "8"], True, "4"),
     "qsa": (_knob_qsa, ["A", "B"], False, "A"),
     "bool-mask": (_knob_bool_mask, ["A", "B"], False, "B"),
+    "gather-attn": (_knob_gather_attn, ["A", "B"], False, "B"),
     "wide": (_knob_wide, ["A", "B"], False, "B"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
 }
@@ -554,6 +576,10 @@ def main() -> int:
                 vals = [r[metric] for r in sub if r["variant"] == v]
                 means[v] = sum(vals) / len(vals)
             base = means[baseline]
+            if base == 0:
+                # --prefill-once のとき prefill_s は全条件 0 になる (prefill は
+                # 1 回しか流していない)。比を取る意味が無いので飛ばす
+                continue
             cells = "  ".join(
                 f"{v}={means[v]:8.3f}({(means[v] - base) / base * 100:+5.1f}%)"
                 for v in variants
