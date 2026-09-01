@@ -554,8 +554,12 @@ def main() -> int:
                     eos_ids=eos_ids)
             ms = td / max(len(out), 1) * 1000
             tpr = len(out) / max(rounds, 1)
+            # ms/token は ms/round と tok/round の比なので、**費用と受理が
+            # 混ざる**。出力が変わりうる knob では ms/round を見ないと、
+            # テキスト運による受理の増減を実装の速さと取り違える
             rows.append(dict(kind=kind, ctx=n, variant=v, n_out=len(out),
                              prefill_s=tp, decode_s=td, ms_per_tok=ms,
+                             ms_per_round=td / max(rounds, 1) * 1000,
                              accepted=acc, rounds=rounds, tok_per_round=tpr,
                              head=out[:24]))
             print(f"  {v}: prefill {tp:6.2f}s  decode {td:6.2f}s  "
@@ -570,7 +574,8 @@ def main() -> int:
         sub = [r for r in rows if r["kind"] == kind]
         if not sub:
             continue
-        for metric in ("ms_per_tok", "tok_per_round", "prefill_s"):
+        for metric in ("ms_per_tok", "ms_per_round", "tok_per_round",
+                       "prefill_s"):
             means = {}
             for v in variants:
                 vals = [r[metric] for r in sub if r["variant"] == v]
