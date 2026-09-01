@@ -989,14 +989,50 @@ class Qwen4ExpModel(nn.Module):
 
 
 class _IndexerCache(_BaseCache):
-    """Holds the indexer raw keys (one per token, not pooled)."""
+    """Holds the indexer raw keys (one per token, not pooled).
+
+    KVCache と同じくブロック単位で確保して埋める。以前は毎更新
+    ``mx.concatenate`` で、ラウンドごとに全長を読み書きし直していた
+    (17k で 1 層 4.3MB x 12 層 = 52MB/フォワード)。値はビット不変。
+
+    ``keys`` は**論理配列** (offset までの view) を返す。呼び手
+    (``spec_flash.trim_attn_cache``、``batch.py`` の ``_trim_indexer``、
+    ``batch_spec`` の compaction、検証ツール) はどれも「今ある鍵そのもの」を
+    期待していて、確保済みバッファの尻を見せると静かに 0 を掴む。KVCache は
+    ``keys`` が生バッファで ``state`` が view という逆の約束なので、そちらの
+    書き方をそのまま持ってこないこと。
+    """
+
+    step = 256
 
     def __init__(self):
-        self.keys = None
+        self._buf = None
+        self.offset = 0
+
+    @property
+    def keys(self):
+        return None if self._buf is None else self._buf[:, : self.offset]
+
+    @keys.setter
+    def keys(self, v):
+        # 外から論理配列を差し込まれたら、それをそのままバッファにする
+        # (確保の余裕は失うが、次の update で取り直す)
+        self._buf = v
+        self.offset = 0 if v is None else v.shape[1]
 
     def update(self, k: mx.array) -> mx.array:
-        self.keys = k if self.keys is None else mx.concatenate([self.keys, k], axis=1)
-        return self.keys
+        prev = self.offset
+        if self._buf is None or prev + k.shape[1] > self._buf.shape[1]:
+            B, S, D = k.shape
+            n_steps = (self.step + S - 1) // self.step
+            new = mx.zeros((B, n_steps * self.step, D), k.dtype)
+            if self._buf is None:
+                self._buf = new
+            else:
+                self._buf = mx.concatenate([self._buf[:, :prev], new], axis=1)
+        self.offset = prev + k.shape[1]
+        self._buf[:, prev : self.offset] = k
+        return self._buf[:, : self.offset]
 
     @property
     def state(self):
