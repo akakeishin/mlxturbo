@@ -92,7 +92,7 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT / "bench"))
 
 from vs_mlx_serve import (  # noqa: E402
-    QUESTIONS, SHORT, Server, model_id, stream_once,
+    QUESTIONS, SHORT, Server, install_term_handler, model_id, stream_once,
 )
 
 # vs_mlx_serve.py の QUESTIONS (2本) だけでは N=8 で使い回しが多すぎるので、
@@ -165,6 +165,7 @@ def summarize_round(results: list[tuple], wall: float) -> dict:
 
 
 def main() -> int:
+    install_term_handler()
     ap = argparse.ArgumentParser()
     ap.add_argument("--serve-bin", required=True)
     ap.add_argument("--serve-model", required=True)

@@ -147,6 +147,27 @@ def stream_once(port: int, messages: list, n_tokens: int, model: str = "x"):
     return ttft, time.perf_counter() - t_dec, n, "".join(parts)
 
 
+def install_term_handler() -> None:
+    """SIGTERM/SIGINT で `with` を巻き戻して、起動したサーバーを道連れにする。
+
+    `Server` は `start_new_session=True` で別セッションに切り離す (ハーネスが
+    Ctrl-C を受けてもサーバーが即死しないように)。その代わり、**親が外から
+    殺されると `__exit__` が走らず、91GB を抱えたサーバーだけが残る。**
+    2026-09-01 に実際に起きた: 比較を止めたら mlx-serve が 69.5GB を抱えたまま
+    15 分居座り、biglock が「ロック無しのプロセスが走っている」と正しく検出して
+    後続の測定が全部待たされた。
+
+    SystemExit を投げれば `with` の `__exit__` が走るので、殺し方が SIGKILL で
+    ない限り後始末が付く。
+    """
+
+    def _bye(signum, frame):
+        raise SystemExit(f"signal {signum} を受けたので終了する")
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _bye)
+
+
 class Server:
     def __init__(self, name: str, argv: list[str], port: int):
         self.name, self.argv, self.port = name, argv, port
@@ -173,6 +194,7 @@ class Server:
 
 
 def main() -> int:
+    install_term_handler()
     ap = argparse.ArgumentParser()
     ap.add_argument("--serve-bin", required=True)
     ap.add_argument("--serve-model", required=True)
