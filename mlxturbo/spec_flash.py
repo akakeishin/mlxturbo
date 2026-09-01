@@ -369,6 +369,10 @@ _PREFILL_GROUP = int(os.environ.get("MLXTURBO_PREFILL_GROUP", "4") or 0)
 # (docs/research/IMPROVEMENT-QUEUE.md B2)。
 _PREFILL_TAIL_CHUNKS = int(os.environ.get("MLXTURBO_PREFILL_TAIL_CHUNKS", "1"))
 
+# group prefill のグループ境界を非同期投入にする (既定 off)。詳細は使用箇所の
+# コメント。取り分は小さく、メモリ側の危険は実在するので、測ってから決める。
+_PREFILL_PIPELINE = os.environ.get("MLXTURBO_PREFILL_PIPELINE") == "1"
+
 if _PREFILL_GROUP > 1 and os.environ.get("MLXTURBO_PREFILL_CHUNK"):
     # MLXTURBO_PREFILL_CHUNK を立てると big != step になり、下の group 経路の
     # 条件が外れて layer-major prefill が**黙って無効化**される。チャンク幅の
@@ -1029,12 +1033,29 @@ class FlashSpecEngine:
                     ]
                     hys = _group_prefill_forward(model, group_chunks, caches)
                     hys = hys[-HYPER_KEEP_CHUNKS:]
-                    mx.eval(*hys)
-                    for c in caches:
-                        state = getattr(c, "state", None)
-                        if state is not None:
-                            mx.eval(state)
-                    mx.clear_cache()
+                    states = [
+                        st for c in caches
+                        if (st := getattr(c, "state", None)) is not None
+                    ]
+                    if _PREFILL_PIPELINE:
+                        # グループ境界の完全同期をやめ、非同期投入にして次の
+                        # グループのグラフ構築を先に始める。全部使うグラフ
+                        # なので「作って捨てる」禁則には当たらない。
+                        #
+                        # **既定 off。**2 グループぶんの中間が同時に生きるので、
+                        # wired limit + n-gram RAM 32GB で張り付いた構成では
+                        # OOM 側に倒れうる (128GB に 91GB のモデルが載っている)。
+                        # clear_cache も打てない (飛行中のバッファを掴んでいる)。
+                        # 取り分の見積もりは 17k で 0.5-1s (1.5-3%) と小さく、
+                        # レップのばらつき (±3%) に埋もれる可能性がある。
+                        # 有効にする前に in-model で測ること
+                        # (docs/research/IMPROVEMENT-QUEUE.md D5)。
+                        mx.async_eval(*hys, *states)
+                    else:
+                        mx.eval(*hys)
+                        for st in states:
+                            mx.eval(st)
+                        mx.clear_cache()
                     hyper_chunks.extend(hys)
                     del hyper_chunks[:-HYPER_KEEP_CHUNKS]
                     i += g * step
