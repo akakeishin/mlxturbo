@@ -47,6 +47,7 @@ _ORIG_RNG = None
 _ORIG_MOE = None
 _COMPILED = {}
 _COMBINE_COMPILED = {}
+_COMBINE_PLAIN: dict = {}
 
 
 def _build(hc: int, d: int, eps: float, use_combine: bool):
@@ -426,6 +427,58 @@ def enable_hc_write() -> None:
         return fn(hyper, x, inject)
 
     Q.DecoderLayer._combine = staticmethod(patched)
+
+
+def enable_hc_write_nofuse() -> None:
+    """`enable_hc_write` と**同じ差し替えの機構だけ**を入れる対照。融合はしない。
+
+    2026-09-01 の A/B で、hc-write が長文脈で +5.2%、gdn-prework が +5.3%
+    遅くなった。gdn-prework は**一度も発火していない**のに遅く、原因は
+    `eligible()` の評価そのものだった (層ごと・フォワードごとに 20 個の条件)。
+    つまり **knob を有効にする機構自体に費用がある。**
+
+    そうなると「融合が効かなかった」と畳んだ過去の判定が、実は
+    「融合の取り分 < 機構の費用」だった可能性が出る (`moe_route` の +0.34ms、
+    `rms_norm_gated` の空振りはどれもその桁)。
+
+    この対照は `_combine` を同じ形で差し替え、同じ per-call の Python の
+    仕事 (形の読み出し、辞書引き、関数呼び出し 1 段) をしたうえで、
+    **compile を通さない素の式**を呼ぶ。A (融合) と C (この対照) の差が
+    融合の取り分、C と B (素) の差が差し替えの費用。
+    """
+
+    global _ORIG_HC_COMBINE
+    import mlx_lm.models.qwen4_exp as Q
+
+    if _ORIG_HC_COMBINE is not None:
+        return
+    _ORIG_HC_COMBINE = Q.DecoderLayer._combine
+
+    def patched(hyper, x, inject):
+        hc = inject.shape[-1]
+        d = x.shape[-1]
+        fn = _build_combine_plain(hc, d)
+        return fn(hyper, x, inject)
+
+    Q.DecoderLayer._combine = staticmethod(patched)
+
+
+def _build_combine_plain(hc: int, d: int):
+    """`_build_combine` と同じ引き当てをして、compile していない式を返す。"""
+
+    key = (hc, d)
+    fn = _COMBINE_PLAIN.get(key)
+    if fn is not None:
+        return fn
+
+    def core(hyper, x, inject):
+        lead = x.shape[:-1]
+        hyper_r = hyper.reshape(*lead, hc, d)
+        mixed = hyper_r + x[..., None, :] * inject[..., None]
+        return mixed.reshape(*lead, hc * d)
+
+    _COMBINE_PLAIN[key] = core
+    return core
 
 
 def disable_hc_write() -> None:
@@ -909,6 +962,7 @@ __all__ = [
     "disable_moe_verify_gather",
     "disable_rms_norm_gated",
     "enable_hc_write",
+    "enable_hc_write_nofuse",
     "enable_hyper_connection",
     "enable_hyper_connection_kernel",
     "enable_moe_route",

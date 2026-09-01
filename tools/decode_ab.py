@@ -187,21 +187,27 @@ def _knob_gdn_prework(ctx):
 
 
 def _knob_hc_write(ctx):
-    """A = hyper-connection の書き戻し (_combine) を mx.compile で融合 / B = off (既定)。
+    """A = 融合 (mx.compile) / C = 差し替えの機構だけ (融合なし) / B = 素 (既定)。
 
-    `DecoderLayer._combine` (`hyper + (x を inject で配ったもの)`) は素の
-    まま層あたり 2 回、48 層で計 96 回呼ばれる (読み側の
-    `enable_hyper_connection_kernel` とは別のディスパッチ)。融合は
-    multiply→add をまとめるだけで演算順を変えないのでビット同一になる。
+    `DecoderLayer._combine` は素のまま層あたり 2 回、48 層で 96 回呼ばれる。
+    融合は multiply→add をまとめるだけで演算順を変えないのでビット同一。
+
+    **C は対照。**2026-09-01 の A/B で、この knob が長文脈で +5.2%、
+    gdn-prework が +5.3% 遅くなった。後者は**一度も発火していない**のに遅く、
+    原因は `eligible()` の評価そのものだった。つまり knob を有効にする機構に
+    費用がある。C は同じ差し替えをして同じ per-call の Python の仕事をし、
+    compile を通さない素の式を呼ぶ。**A-C が融合の取り分、C-B が機構の費用。**
+
     合格条件: 出力一致 (対照)。
     """
     from mlxturbo import fused
 
     def apply(variant):
+        fused.disable_hc_write()
         if variant == "A":
             fused.enable_hc_write()
-        else:
-            fused.disable_hc_write()
+        elif variant == "C":
+            fused.enable_hc_write_nofuse()
 
     return apply
 
@@ -486,7 +492,7 @@ KNOBS = {
     "qsa-tail": (_knob_qsa_tail, ["A", "B"], True, "B"),
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
     "gdn-prework": (_knob_gdn_prework, ["A", "B"], False, "B"),
-    "hc-write": (_knob_hc_write, ["A", "B"], True, "B"),
+    "hc-write": (_knob_hc_write, ["A", "C", "B"], True, "B"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),
