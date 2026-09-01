@@ -37,6 +37,10 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              出力一致) がそのまま効く。合格条件: 長文脈で ms/token が改善する
              こと (17k で 52MB/フォワードの読み書きが消える見込み)。
 
+`stage-every` 段階投入の間隔 (既定 2)。1/2/4 を回文順で。値は変わらず
+             スケジューリングだけが変わるので、対照 (出力一致) が効く。
+             合格条件: 短・長の両方で ms/token が改善すること。
+
 `moe-verify` 共有タイル gather v2 (MLXTURBO_MOE_VERIFY、既定 off)。
              verify 幅の MoE だけを差し替える。
              合格条件: **ms/token が短・長の両方で改善すること。**
@@ -167,12 +171,28 @@ def _knob_indexer_cache(ctx):
     return apply
 
 
+def _knob_stage_every(ctx):
+    """段階投入の間隔 (`spec_flash._STAGE_EVERY`)。既定 2。
+
+    掃引が 16→2 で単調改善のまま端点で打ち切られていて **1 が未測**。しかも
+    短 decode の probe でしか測っておらず 17k は未測 (fable-advisor 指摘)。
+    0 は無効化 (層ループ中に async_eval を挟まない)。
+    """
+    import mlxturbo.spec_flash as SF
+
+    def apply(variant):
+        SF._STAGE_EVERY = int(variant)
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
     "qsa-tail": (_knob_qsa_tail, ["A", "B"], True, "B"),
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
+    "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
 }
 
