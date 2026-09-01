@@ -26,6 +26,7 @@ docs/STATUS.md, "Phase D general-purpose pack").
 """
 
 import math
+import os
 import time
 from collections import Counter
 from contextlib import nullcontext
@@ -45,7 +46,9 @@ from .kernels.dispatch import (
     enable as enable_quantized_dispatch,
     quantized_matmul as dispatched_quantized_matmul,
 )
+from .prefill_common import split_and_checkpoint_tail
 from .sam import SuffixAutomaton
+from .staged import staged_forward
 
 # ---------- D1: confidence-gated chaining ----------
 #
@@ -159,6 +162,16 @@ PREFILL_STEP_SIZE = 2048
 # have been pushed out), no matching checkpoint is simply found and we fall over
 # to a fresh slot (the safe side).
 CHECKPOINT_RETENTION = 8
+
+
+# ---------- staged submission (段階投入) ----------
+#
+# spec_flash.py の _staged_forward (Flash-Next 型) と同じ手法の dense 側移植:
+# 検証フォワードの層ループを every 層ごとに mx.async_eval し、グラフ構築中の
+# GPU 遊休を刈る (実装は mlxturbo/staged.py、qwen3_5 型モデル向けの汎用版)。
+# 値は spec_flash.py 側の既定に揃えている -- こちらでの掃引は未実施 (27B
+# 実モデルが手元にない。docstring 参照)。
+_STAGE_EVERY = int(os.environ.get("MLXTURBO_STAGE_EVERY", "2") or 0)
 
 
 def snapshot_untrimmable_caches(caches) -> list[tuple[int, object, object, object]]:
@@ -374,7 +387,35 @@ class SpecEngine:
         i = 0
         while i < n:
             j = min(i + step, n)
-            h_chunk, _ = self._hidden_forward(tokens[i:j], caches, capture=False)
+            chunk = tokens[i:j]
+            if j == n:
+                # BPE 境界 checkpoint (spec_flash.py の同名修正の移植、共有
+                # ヘルパー: prefill_common.py の split_and_checkpoint_tail)。
+                # checkpoints が有効かつ chunk が 2 トークン以上のときだけ、
+                # 最終チャンクの直前 1 トークンを切り離して手前 (head) にも
+                # checkpoint を積む。会話 2 ターン目の retemplate では末尾
+                # トークンが BPE マージで化け、LCP が checkpoint のちょうど
+                # 1 トークン手前に落ちてセッション全体が使い捨てになる
+                # (spec_flash.py 側の実測で確認済みの現象。こちらは同じ層
+                # ループ構造 -- _hidden_forward の capture=False 分岐 --
+                # なので同じ理由で同じ症状が起きる)。head の forward 結果
+                # (h_chunk 相当) は chunks に含めておかないと h_all の長さが
+                # 合わなくなる。no-op 時 (checkpoints=None または chunk 長 1
+                # 以下、generate() 呼び出し側で session が無いときがこちら)
+                # は head_result が空 tuple で、chunk は変わらず従来どおり
+                # 1 回で forward される。
+                chunk, head_result = split_and_checkpoint_tail(
+                    chunk,
+                    checkpoints,
+                    base_pos + i,
+                    caches,
+                    CHECKPOINT_RETENTION,
+                    snapshot_untrimmable_caches,
+                    lambda head: self._hidden_forward(head, caches, capture=False)[0],
+                )
+                if head_result:
+                    chunks.append(head_result[0])
+            h_chunk, _ = self._hidden_forward(chunk, caches, capture=False)
             chunks.append(h_chunk)
             mx.eval(h_chunk)
             for c in caches:
@@ -1001,9 +1042,22 @@ class SpecEngine:
             ts = time.perf_counter()
             # A one-token window cannot require rollback.  Use the native path
             # so n_draft=0 + lookup_len=0 is a true non-speculative baseline.
-            hs, sink = self._hidden_forward(
-                window, caches, capture=window.shape[0] > 1
-            )
+            if window.shape[0] > 1:
+                hs, sink = self._hidden_forward(window, caches, capture=True)
+            else:
+                # 段階投入 (staged submission, mlxturbo/staged.py 参照;
+                # spec_flash.py の _staged_forward の dense 版移植)。1
+                # トークンの検証はロールバック用 capture が要らない (capture
+                # は複数トークン投機を破棄するときだけ要る) ので、
+                # _hidden_forward の capture=False 分岐と完全に同じ層ループ
+                # (qwen3_5 型: is_linear で ssm_mask/fa_mask を使い分け、各層
+                # を layer(h, mask=mask, cache=c) で呼ぶ) を、グラフ構築中の
+                # GPU 遊休を刈る汎用ヘルパーに置き換えるだけ。async_eval は
+                # 値を変えずスケジューリングだけを変えるので計算内容は
+                # _hidden_forward(capture=False) と同一 -- sink は capture=False
+                # のときこれまでも常に空だったので [] のままで変わらない。
+                hs = staged_forward(self.inner, window[None], caches, every=_STAGE_EVERY)
+                sink = []
             logits = self._head(hs, self.inner.norm)
             accepted_eos = None
             ent_l = None

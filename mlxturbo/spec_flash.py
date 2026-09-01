@@ -57,6 +57,7 @@ import mlx.nn as nn
 # (they look only at caches' is_trimmable()/state) -- we reuse them as they are.
 # spec.py is only read, never modified.
 from .spec import CHECKPOINT_RETENTION, PREFILL_STEP_SIZE, snapshot_untrimmable_caches
+from .prefill_common import split_and_checkpoint_tail
 
 
 # How many trailing prompt positions are fed to the MTP head before decoding
@@ -928,38 +929,35 @@ class FlashSpecEngine:
                     j = n
                 chunk = ids[:, i:j]
                 if j == n:
-                    # 直前 1 トークンを切り離し、その手前にも checkpoint を
-                    # 1 つ追加で残す (checkpoints が有効なときだけ)。次ターンの
-                    # 会話は末尾がここで retemplate される (例: 直前ターンの
-                    # thinking 内容がプレースホルダに畳まれる) ため、この
-                    # プロンプト末尾の最終トークン自体が周辺文字とのマージで
-                    # 別トークンに化けることがある (BPE は末尾かどうかで
-                    # マージ結果が変わりうる)。その場合 LCP はここでちょうど
-                    # 1 トークン手前に留まり、末尾ぴったりの checkpoint だけでは
-                    # 拾えず、セッション全体が使い捨てになる (実測: 診断で
-                    # 確認)。手前にもう 1 点残しておけば、この 1 トークンの
-                    # ズレだけは確実に吸収できる。注意: 分割は正しい計算だが
-                    # 一括処理とビット一致とは限らない (チャンク割りが変わると
-                    # 丸めが動くのは既知の性質)。checkpoints 有効時 = サーバー
-                    # 経路だけの挙動で、generate() や検証プローブは通らない。
-                    # 副次効果として最終チャンクの lm_head が 1 トークン分に
-                    # 縮む (従来はチャンク全幅の logits を作って末尾だけ使っていた)。
-                    tail_split = checkpoints is not None and chunk.shape[1] > 1
-                    if tail_split:
-                        head = chunk[:, :-1]
+                    # BPE 境界 checkpoint (共有ヘルパー: prefill_common.py の
+                    # split_and_checkpoint_tail、詳しい背景はそちらの
+                    # docstring 参照)。checkpoints が有効かつ chunk が 2
+                    # トークン以上のときだけ、直前 1 トークンを切り離して
+                    # 手前 (head) にも checkpoint を積む -- そうしないと
+                    # 会話 2 ターン目の retemplate で末尾トークンが BPE
+                    # マージにより化け、LCP が checkpoint のちょうど 1
+                    # トークン手前に落ちてセッション全体が使い捨てになる
+                    # (実測: 診断で確認)。no-op 時 (checkpoints=None または
+                    # chunk 長 1 以下、generate()/検証プローブがこちら) は
+                    # head_result が空 tuple で返り、tail_split は False の
+                    # まま従来の分岐に合流する。副次効果として分割時は最終
+                    # チャンクの lm_head が 1 トークン分に縮む (従来は
+                    # チャンク全幅の logits を作って末尾だけ使っていた)。
+                    def _forward_head(head):
                         with capture(model, light=True) as cap0:
                             h0 = model.model(head, cache=caches)
-                            mx.eval(h0)
-                        for c in caches:
-                            state = getattr(c, "state", None)
-                            if state is not None:
-                                mx.eval(state)
-                        mx.clear_cache()
-                        checkpoints.append(
-                            (base_pos + i + head.shape[1], snapshot_untrimmable_caches(caches))
-                        )
-                        del checkpoints[:-CHECKPOINT_RETENTION]
-                        chunk = chunk[:, -1:]
+                        return h0, cap0.hyper
+
+                    chunk, head_result = split_and_checkpoint_tail(
+                        chunk,
+                        checkpoints,
+                        base_pos + i,
+                        caches,
+                        CHECKPOINT_RETENTION,
+                        snapshot_untrimmable_caches,
+                        _forward_head,
+                    )
+                    tail_split = bool(head_result)
                     # light=True: this chunk uses only cap.hyper[:, -1:]
                     # (referenced right below). Full capture (cap.gdn/cap.ple)
                     # unconditionally allocated memory proportional to T (this
@@ -972,7 +970,7 @@ class FlashSpecEngine:
                         logits = model(chunk, cache=caches)
                         mx.eval(logits)
                     if tail_split:
-                        cap.hyper = mx.concatenate([cap0.hyper, cap.hyper], axis=1)
+                        cap.hyper = mx.concatenate([head_result[1], cap.hyper], axis=1)
                 else:
                     # light=True (added for MTP priming): only the cheap
                     # GatedResidual hook runs, so this branch's computation and
