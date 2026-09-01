@@ -195,3 +195,55 @@ decode が退行したら縮小 / PR #1788 が上流に入って vendor を捨�
 
 **ついでの発見**: batch.py:437-453 の QSA tail 因果性の修正は「本家のバグ
 修正が写しにだけ住んでいる」例。vendor を所有するなら本体へ移すのが筋。
+
+### 写しの整理: 実行順と各段の受け入れ検査 (2026-09-01 確定、ユーザー承認)
+
+前節の方針を作業単位に落とす。**着手はアーキ能力レイヤ (arch.py) の完了後。**
+各段は独立していて、途中で止めても壊れない。段ごとにコミットする。
+
+**段 1: 写し 5 の解消 (batch.py の GDN/PLE)**
+vendor に `GatedDeltaNet._store_conv_state(cache, conv_input)` と
+`PLELayer._store_short_conv_state` 相当のシームを切り、batch.py はそのメソッド
+だけ差し替える。写し本体 (~37 行) が消える。副次効果として batch 経路が
+vendor の `_wide_qkv` 融合と sdpa 壁分割を自動で獲得する (現在は写しに
+伝播しておらず黙って遅い)。検査: tools/verify_batch_cache.py、
+tools/verify_batch_real.py、compat_smoke。
+
+**段 2: 写し 7 と 8 の解消 (Attention 2 種)**
+vendor の `Attention.__call__` に `_positions(cache, S)` と
+`_final_mask(mask, sparse, dtype)` を切る。batch.py (左パディング) と
+batch_spec.py (dead-slot 台帳) はこの 2 つのオーバーライドだけになり、
+qkv/rope/sdpa/gate の本体は vendor に 1 つだけ残る。検査: 段 1 と同じ +
+tools/verify_batch_spec.py。
+
+**段 3: 写し 3 の解消 (batch.py の model_call)**
+vendor `__call__` を `_make_masks` / `_update_ngram_ctx` + 層ループに分解。
+batch はこの 2 つを差し替える。検査: 段 1 と同じ。
+
+**段 4: 写し 1 の前段共有 (低リスク、単独でも価値がある)**
+`_staged_forward` の前段 ~25 行 (mask 生成・PLE prev_ctx 更新) は本家と
+完全に同一。`_prelude` として括り出せば消え、残るのは「層ループ +
+async_eval 差し込み」という本物の差分だけになる。**ループ骨格自体は残す** —
+2 層ごとの async_eval は本家に無い制御フローで、これが +15% の実体
+(グラフ構築中の GPU 泡 7.3ms の刈り取り)。検査: ビット一致ゲート
+tools/verify_prefill_bitident.py + probe の出力一致。
+
+**段 5 (保留、B/C 群の手応えを見てから判断): 写し 2 の分解**
+`_group_prefill_forward` の二重ループ (レイヤー主導 x G チャンク) は
+layer-major prefill の本体そのもので、消すことは最適化を捨てることと同義。
+ただし `DecoderLayer` を `pre_mlp` / `post_mlp` に分解すれば
+hyper-connection 合成式の重複が消えて写しが半減する。advisor 評価では
+効果対リスク比が最も悪い。**判断材料**: 段 1-3 で「シームのオーバーライドが
+1 呼び手あたり 3 個を超えない」が実地で確かめられたら、同じ基準を段 5 に
+当てて可否を決める。超えたなら段 5 はやらない。
+さらに踏み込む案として「vendor の `__call__` にレイヤー主導モードを持たせ、
+写し 2 を丸ごと消す」もあるが、本家が 2 つの走行モードを抱える複雑さと
+引き換えなので、段 1-3 の後に改めて判断する。
+
+**残すと決めたもの**: 写し 6 (spec.py の qwen3_5 版 `_linear_capture`)。
+上流が site-packages の mlx_lm 本体で vendor していないため対象外。
+関数 1 つのために qwen3_5 を vendor するのは割に合わない。
+
+**ついでに片付ける**: batch.py:437-453 の QSA tail 因果性の修正は
+「本家のバグ修正が写しにだけ住んでいる」状態。vendor を所有する立場なので
+本体へ移す (段 1 か 2 のついでに)。
