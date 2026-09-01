@@ -48,8 +48,9 @@
   in-model 実測で負けたから off にしてある。有効化する前に棄却時の記録
   (`docs/research/DECODE-ANATOMY-2026-08-31.md`、
   `docs/research/KERNEL-BRIEF-DECODE-BW.md:283`) を読むこと。一方
-  `MLXTURBO_MOE_VERIFY` (`mlxturbo/kernels/moe_verify_gather.py`) はまだ
-  in-model A/B で決着していないだけで、負けたわけではない。逆に
+  `MLXTURBO_MOE_VERIFY` (`mlxturbo/kernels/moe_verify_gather.py`) も
+  2026-09-01 の in-model A/B で決着 (短 decode 3 本とも +46〜52% 遅い)。
+  これも「有効化しない」側。逆に
   `MLXTURBO_PREFILL_GROUP=4` / `MLXTURBO_STAGE_EVERY=2` /
   `MLXTURBO_DRAFT_RERANK=1` / `MLXTURBO_HC=kernel` / `MLXTURBO_SORT_MIN=16`
   は本番の既定値そのもので、値を変えると本番の挙動が変わる。
