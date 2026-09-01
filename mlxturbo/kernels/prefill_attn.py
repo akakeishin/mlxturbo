@@ -69,6 +69,9 @@ import mlx.core as mx
 
 from . import _fire
 
+# prefill と decode/verify を分ける S の下限。上の `eligible` の注記を参照。
+MIN_S = 64
+
 # 1 threadgroup が使う threadgroup メモリの上限 (Apple GPU は 32KB)。
 # K/V タイル + 選択ブロックの添字列 + simdgroup ごとの本数がここに載る。
 MAX_TG_BYTES = 30 * 1024
@@ -317,6 +320,17 @@ def eligible(
 ) -> bool:
     """このカーネルで扱える形か。外れたら呼び出し側は既存の gather 経路へ。"""
 
+    # decode/verify 幅には入れない。このカーネルは online softmax で加算順が
+    # 変わるためビット一致しない。prefill では出力が下流の一致で吸収されるが、
+    # verify 幅で使うと argmax がまれに割れて受理率が動く。2026-09-01 の A/B が
+    # まさにそれで、prefill -1.4% に対し tok/round -0.7%、合計 ms/tok は +0.9%
+    # の悪化になった (bench/results/prefill-attn-ab.json)。**prefill だけに効かせて
+    # 測り直すための下限。**MIN_S は本番の verify 幅 (depth+1、最大でも 16) より
+    # 十分大きく、prefill のチャンク幅 (PREFILL_STEP_SIZE=2048、group 分割後も
+    # 数百以上) より十分小さい値。
+    if q.shape[2] < MIN_S:
+        _warn_once("min_s", f"S={q.shape[2]} は decode/verify 幅なので使わない")
+        return False
     if mx.default_device() != mx.gpu or not mx.metal.is_available():
         _warn_once("gpu", "GPU が既定デバイスでないので使わない")
         return False
