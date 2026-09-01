@@ -1015,6 +1015,76 @@ RUNNER_KINDS = frozenset(
 )
 
 
+def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) -> None:
+    """出荷経路で有効になる融合・置き換えを全部当てる。
+
+    `build_runner` が起動時に通す設定そのもの。**ベンチや A/B ハーネスは
+    必ずここを通すこと** -- 以前 `tools/decode_ab.py` が
+    `enable_hyper_connection_kernel()` だけを呼んでいて、gather のソート
+    (既定 16) が入らないまま測っていた。同一ハーネス内の相対比較なら符号は
+    生き残るが、閾値や交差点は構成で動く。
+
+    env で切り替わるもの (MLXTURBO_HC / _WIDE / _SORT_MIN / _MOE_GLU /
+    _MOE_VERIFY / _FAST_QMM) の既定はここが唯一の出どころ。
+    """
+    from . import fused
+
+    if no_fused:
+        print(f"{log_prefix} --no-fused: hyper-connections 融合カーネルと連結射影を無効化")
+    else:
+        # HC の実装は MLXTURBO_HC で選ぶ: kernel (既定) / compiled / off。
+        # kernel は 2 ディスパッチだが sigmoid が bf16 とビット一致しない
+        # (kernels/hyper_connection.py の精度の節)。compiled は op 単位で
+        # 素と同じ計算の記録なのでビット同一のまま起動回数だけ減る。
+        hc_mode = os.environ.get("MLXTURBO_HC", "kernel")
+        if hc_mode == "compiled":
+            fused.enable_hyper_connection()
+            print(f"{log_prefix} hyper-connections: mx.compile 版 (ビット同一)")
+        elif hc_mode == "off":
+            print(f"{log_prefix} hyper-connections: 素の実装 (MLXTURBO_HC=off)")
+        else:
+            fused.enable_hyper_connection_kernel()
+            print(f"{log_prefix} hyper-connections 融合カーネル有効 (moe_route/rms_norm_gated は実測で"
+                  " 空振りのため無効のまま)")
+        # enable_moe_shared_fold は実測で逆効果 (verify +1.8ms) につき呼ばない。
+        # 連結射影も既定 OFF: 連結で N が変わると qmv のカーネル変種が変わり、
+        # 加算順の違いが最終 ulp を動かす疑いがある (tok/step 2.44 -> 2.23 の
+        # 低下と時期が一致)。MLXTURBO_WIDE=1 で実験的に有効化。
+        if os.environ.get("MLXTURBO_WIDE") == "1":
+            wide = fused.enable_wide_projections(model)
+            print(f"{log_prefix} 連結射影有効: gdn={wide['gdn']} attn={wide['attn']}"
+                  f" shared={wide['shared']} experts={wide['experts']} 層")
+        # gather のソート閾値は既定 16 (値は不変で、検証幅 22..44 の添字が
+        # ソートされて同じエキスパートの読みが隣接する)。0 で無効化。
+        sort_min = int(os.environ.get("MLXTURBO_SORT_MIN", "16"))
+        if sort_min:
+            fused.enable_gather_sort(sort_min)
+            print(f"{log_prefix} gather のソート閾値 {sort_min} (既定 16、値は不変)")
+        if os.environ.get("MLXTURBO_MOE_GLU") == "1":
+            fused.enable_moe_glu()
+            print(f"{log_prefix} moe_glu カーネル有効 (gate+up+silu*mul を 1 ディスパッチ)")
+        # enable_moe_verify_gather 自身が MLXTURBO_MOE_VERIFY=1 をゲートに
+        # 持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
+        # 以前はこの呼び出し自体が無く、環境変数を立ててもサーバーでは
+        # 何も起きなかった (B1、Opus 設計レビュー指摘。統合ディスパッチ
+        # (C1) 済みなので、他の 3 経路と掛け順で衝突する心配は無い)。
+        fused.enable_moe_verify_gather()
+        if os.environ.get("MLXTURBO_MOE_VERIFY") == "1":
+            print(f"{log_prefix} moe_verify_gather カーネル有効 (verify 幅の gate+up 融合 + down)")
+        if os.environ.get("MLXTURBO_FAST_QMM") == "1":
+            # 検証フォワード (M=3..8) の密 qmm を 8x8 MMA タイルに通す。
+            # stock qmv は M にほぼ比例して重みを読み直すが、MMA タイルは
+            # 1 回で済む (Flash-Next 形状の実測: M=3 で qkv -22% / lm_head -33%)。
+            # M=2 は stock が勝つので窓の下限は 3。M=1 (draft) と prefill は
+            # fast_qmm 自身の窓判定で素通り。
+            from . import fast_qmm
+
+            fast_qmm.M_MIN = int(os.environ.get("MLXTURBO_QMM_M_MIN", "3"))
+            fast_qmm.enable()
+            print(f"{log_prefix} fast_qmm 有効 (M={fast_qmm.M_MIN}..8 を MMA タイルへ)")
+
+
+
 def build_runner(
     model,
     tokenizer,
@@ -1271,7 +1341,6 @@ def _build_base_runner(
     ``fallback_reason`` is always None (see the Runner Protocol).
     """
 
-    from . import fused
     from .cli import load_cli_mtp
     from .ngram_stream import warn_if_not_installed
 
@@ -1280,59 +1349,7 @@ def _build_base_runner(
     # so unless the alarm is sounded here nobody notices
     warn_if_not_installed(model)
 
-    if args.no_fused:
-        print(f"{log_prefix} --no-fused: hyper-connections 融合カーネルと連結射影を無効化")
-    else:
-        # HC の実装は MLXTURBO_HC で選ぶ: kernel (既定) / compiled / off。
-        # kernel は 2 ディスパッチだが sigmoid が bf16 とビット一致しない
-        # (kernels/hyper_connection.py の精度の節)。compiled は op 単位で
-        # 素と同じ計算の記録なのでビット同一のまま起動回数だけ減る。
-        hc_mode = os.environ.get("MLXTURBO_HC", "kernel")
-        if hc_mode == "compiled":
-            fused.enable_hyper_connection()
-            print(f"{log_prefix} hyper-connections: mx.compile 版 (ビット同一)")
-        elif hc_mode == "off":
-            print(f"{log_prefix} hyper-connections: 素の実装 (MLXTURBO_HC=off)")
-        else:
-            fused.enable_hyper_connection_kernel()
-            print(f"{log_prefix} hyper-connections 融合カーネル有効 (moe_route/rms_norm_gated は実測で"
-                  " 空振りのため無効のまま)")
-        # enable_moe_shared_fold は実測で逆効果 (verify +1.8ms) につき呼ばない。
-        # 連結射影も既定 OFF: 連結で N が変わると qmv のカーネル変種が変わり、
-        # 加算順の違いが最終 ulp を動かす疑いがある (tok/step 2.44 -> 2.23 の
-        # 低下と時期が一致)。MLXTURBO_WIDE=1 で実験的に有効化。
-        if os.environ.get("MLXTURBO_WIDE") == "1":
-            wide = fused.enable_wide_projections(model)
-            print(f"{log_prefix} 連結射影有効: gdn={wide['gdn']} attn={wide['attn']}"
-                  f" shared={wide['shared']} experts={wide['experts']} 層")
-        # gather のソート閾値は既定 16 (値は不変で、検証幅 22..44 の添字が
-        # ソートされて同じエキスパートの読みが隣接する)。0 で無効化。
-        sort_min = int(os.environ.get("MLXTURBO_SORT_MIN", "16"))
-        if sort_min:
-            fused.enable_gather_sort(sort_min)
-            print(f"{log_prefix} gather のソート閾値 {sort_min} (既定 16、値は不変)")
-        if os.environ.get("MLXTURBO_MOE_GLU") == "1":
-            fused.enable_moe_glu()
-            print(f"{log_prefix} moe_glu カーネル有効 (gate+up+silu*mul を 1 ディスパッチ)")
-        # enable_moe_verify_gather 自身が MLXTURBO_MOE_VERIFY=1 をゲートに
-        # 持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
-        # 以前はこの呼び出し自体が無く、環境変数を立ててもサーバーでは
-        # 何も起きなかった (B1、Opus 設計レビュー指摘。統合ディスパッチ
-        # (C1) 済みなので、他の 3 経路と掛け順で衝突する心配は無い)。
-        fused.enable_moe_verify_gather()
-        if os.environ.get("MLXTURBO_MOE_VERIFY") == "1":
-            print(f"{log_prefix} moe_verify_gather カーネル有効 (verify 幅の gate+up 融合 + down)")
-        if os.environ.get("MLXTURBO_FAST_QMM") == "1":
-            # 検証フォワード (M=3..8) の密 qmm を 8x8 MMA タイルに通す。
-            # stock qmv は M にほぼ比例して重みを読み直すが、MMA タイルは
-            # 1 回で済む (Flash-Next 形状の実測: M=3 で qkv -22% / lm_head -33%)。
-            # M=2 は stock が勝つので窓の下限は 3。M=1 (draft) と prefill は
-            # fast_qmm 自身の窓判定で素通り。
-            from . import fast_qmm
-
-            fast_qmm.M_MIN = int(os.environ.get("MLXTURBO_QMM_M_MIN", "3"))
-            fast_qmm.enable()
-            print(f"{log_prefix} fast_qmm 有効 (M={fast_qmm.M_MIN}..8 を MMA タイルへ)")
+    enable_default_fusions(model, log_prefix, args.no_fused)
 
     # Qwen3.8-Flash-Next (qwen4_exp) + MTP (explicit or auto-discovered) ->
     # the FlashSpecEngine path (docs/MTP-FLASH.md). The 27B (qwen3_5) has a

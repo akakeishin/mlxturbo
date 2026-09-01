@@ -187,7 +187,7 @@ def main() -> int:
     from mlx_lm import load
 
     import mlxturbo  # noqa: F401
-    from mlxturbo import fused, mtp_flash, spec_flash
+    from mlxturbo import mtp_flash, spec_flash
 
     model_path = os.path.expanduser(args.model)
     model, tok = load(model_path)
@@ -195,7 +195,13 @@ def main() -> int:
         from mlxturbo.ngram_stream import install
 
         install(model, os.path.expanduser(args.ngram))
-    fused.enable_hyper_connection_kernel()
+    # 出荷経路と同じ融合を当てる。以前ここが
+    # enable_hyper_connection_kernel() だけで、gather のソート (既定 16) が
+    # 入らないまま測っていた (fable-advisor 指摘)。同一ハーネス内の相対比較
+    # なら符号は生き残るが、閾値や交差点は構成で動く。
+    from mlxturbo.runner import enable_default_fusions
+
+    enable_default_fusions(model, log_prefix="[decode_ab]")
     mtp_path = args.mtp or os.path.join(model_path, "mtp.safetensors")
     q = {"group_size": 64, "bits": args.mtp_bits} if args.mtp_bits else None
     mtp = mtp_flash.load_flash_mtp(os.path.expanduser(mtp_path),
