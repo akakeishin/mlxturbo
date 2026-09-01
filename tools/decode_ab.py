@@ -32,6 +32,11 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              いることを確かめてから既定を動かす。片方だけなら文脈長で
              切り替える話になるので、その場で決めない。
 
+`indexer-cache` QSA の生鍵キャッシュを確保方式にした件 (2026-09-01)。
+             B は毎更新 concat の旧実装。値はビット不変なので、対照 (短文脈で
+             出力一致) がそのまま効く。合格条件: 長文脈で ms/token が改善する
+             こと (17k で 52MB/フォワードの読み書きが消える見込み)。
+
 `moe-verify` 共有タイル gather v2 (MLXTURBO_MOE_VERIFY、既定 off)。
              verify 幅の MoE だけを差し替える。
              合格条件: **ms/token が短・長の両方で改善すること。**
@@ -140,11 +145,34 @@ def _knob_depth(ctx):
     return apply
 
 
+def _knob_indexer_cache(ctx):
+    """A = 確保方式 (現行) / B = 毎更新 concat (2026-09-01 以前)。
+
+    B は `_IndexerCache.update` を旧実装に戻すだけ。`keys` はプロパティなので、
+    代入すればバッファごと置き換わり、当時と同じ「毎回全長を読み書きし直す」
+    挙動になる。
+    """
+    import mlx.core as mx
+    import mlx_lm.models.qwen4_exp as Q
+
+    new_update = Q._IndexerCache.update
+
+    def old_update(self, k):
+        self.keys = k if self.keys is None else mx.concatenate([self.keys, k], axis=1)
+        return self.keys
+
+    def apply(variant):
+        Q._IndexerCache.update = new_update if variant == "A" else old_update
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
     "qsa-tail": (_knob_qsa_tail, ["A", "B"], True, "B"),
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
+    "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
 }
 
