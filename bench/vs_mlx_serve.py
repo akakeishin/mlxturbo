@@ -75,7 +75,25 @@ def wait_ready(port: int, timeout: float = 900.0) -> bool:
     return False
 
 
-def stream_once(port: int, messages: list, n_tokens: int):
+def model_id(port: int) -> str:
+    """/v1/models が名乗っている id を取る。
+
+    **プレースホルダを送らないこと。**以前ここは `"model": "x"` を送っていて、
+    mlx-serve が 404 を返して比較が丸ごと落ちた (2026-09-01)。うちのサーバーは
+    model を見ないので気づかなかった。両者に同じ扱いをさせるには、それぞれが
+    名乗っている id をそのまま送り返すのが正しい。
+    """
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/v1/models", timeout=10
+    ) as r:
+        data = json.loads(r.read().decode())
+    items = data.get("data") or []
+    if not items:
+        raise RuntimeError(f"port {port} の /v1/models が空")
+    return items[0]["id"]
+
+
+def stream_once(port: int, messages: list, n_tokens: int, model: str = "x"):
     """SSE で 1 本流し、(TTFT 秒, decode 秒, チャンク数, 本文) を返す。
 
     本文を返すのは**追記ターン (warm TTFT) を作るため**。実クライアントは
@@ -86,7 +104,7 @@ def stream_once(port: int, messages: list, n_tokens: int):
     その仕事が 1 ミリも見えない。**
     """
     body = json.dumps({
-        "model": "x",
+        "model": model,
         "messages": messages,
         "max_tokens": n_tokens,
         "temperature": 0,
@@ -196,17 +214,18 @@ def main() -> int:
     for name in ("mlx-serve", "mlxturbo", "mlxturbo", "mlx-serve"):
         cls, argv, port = sides[name]
         with cls(name, argv, port):
+            mid = model_id(port)
             for c in ctxs:
                 msgs = [{"role": "user", "content": prompts[c]}]
-                stream_once(port, msgs, 8)  # 温め (捨てる)
-                ttft, dec, n, reply = stream_once(port, msgs, args.tokens)
+                stream_once(port, msgs, 8, mid)  # 温め (捨てる)
+                ttft, dec, n, reply = stream_once(port, msgs, args.tokens, mid)
                 tps = (n - 1) / dec if dec > 0 and n > 1 else 0.0
                 # 追記ターン: 実クライアントと同じく履歴をまるごと送り直す。
                 # 前ターンのプロンプトが接頭辞になるので、再利用が効けば
                 # TTFT が落ちる
                 msgs2 = msgs + [{"role": "assistant", "content": reply},
                                 {"role": "user", "content": "続けてください。"}]
-                w_ttft, _, _, _ = stream_once(port, msgs2, 8)
+                w_ttft, _, _, _ = stream_once(port, msgs2, 8, mid)
                 rows.append(dict(engine=name, ctx=c, ttft_s=ttft,
                                  warm_ttft_s=w_ttft, decode_tps=tps, tokens=n))
                 print(f"  {name:10s} ctx={c:6d}  冷 TTFT {ttft:7.2f}s  "

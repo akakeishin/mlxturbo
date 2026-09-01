@@ -91,7 +91,9 @@ if str(REPO_ROOT) not in sys.path:
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 sys.path.insert(0, str(REPO_ROOT / "bench"))
 
-from vs_mlx_serve import QUESTIONS, SHORT, Server, stream_once  # noqa: E402
+from vs_mlx_serve import (  # noqa: E402
+    QUESTIONS, SHORT, Server, model_id, stream_once,
+)
 
 # vs_mlx_serve.py の QUESTIONS (2本) だけでは N=8 で使い回しが多すぎるので、
 # 窓を増やすための追加の設問。窓の中身 (文書プールの非重複スライス) は
@@ -123,7 +125,7 @@ def build_prompt_pool(tok, need: int, long_prompts) -> list[str]:
     return pool
 
 
-def run_batch(port: int, prompts: list[str], n_tokens: int):
+def run_batch(port: int, prompts: list[str], n_tokens: int, model: str = "x"):
     """prompts を同時に流し、(各要求の (ttft, decode_s, n_chunks, reply) のリスト, 壁時計秒) を返す。
 
     ThreadPoolExecutor で全要求を同時に投げる (SSE 読み取りはブロッキング I/O
@@ -134,7 +136,8 @@ def run_batch(port: int, prompts: list[str], n_tokens: int):
     msgs_list = [[{"role": "user", "content": p}] for p in prompts]
     t0 = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(prompts)) as ex:
-        futs = [ex.submit(stream_once, port, m, n_tokens) for m in msgs_list]
+        futs = [ex.submit(stream_once, port, m, n_tokens, model)
+                for m in msgs_list]
         results = [f.result() for f in futs]
     wall = time.perf_counter() - t0
     return results, wall
@@ -223,16 +226,17 @@ def main() -> int:
         with cls(name, argv, port):
             cursor = 0
             # 起動直後の 1 本は必ず冷えているので捨てる (vs_mlx_serve.py と同じ約束)
-            stream_once(port, [{"role": "user", "content": SHORT}], 8)
+            mid = model_id(port)
+            stream_once(port, [{"role": "user", "content": SHORT}], 8, mid)
             for n in ns:
                 for round_idx in range(args.rounds):
                     warm_prompts = pool[cursor:cursor + n]
                     cursor += n
-                    run_batch(port, warm_prompts, 8)  # ウォームアップ、捨てる
+                    run_batch(port, warm_prompts, 8, mid)  # ウォームアップ、捨てる
 
                     meas_prompts = pool[cursor:cursor + n]
                     cursor += n
-                    results, wall = run_batch(port, meas_prompts, args.tokens)
+                    results, wall = run_batch(port, meas_prompts, args.tokens, mid)
                     summary = summarize_round(results, wall)
                     row = dict(engine=name, n=n, round=round_idx, **summary)
                     rows.append(row)
