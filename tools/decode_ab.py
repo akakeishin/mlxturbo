@@ -176,6 +176,8 @@ def main() -> int:
     ap.add_argument("--tokens", type=int, default=512)
     ap.add_argument("--ctx", type=int, default=17000)
     ap.add_argument("--out", default=None, help="結果 JSON の書き出し先")
+    ap.add_argument("--only", choices=("both", "short", "long"), default="both",
+                    help="長さの片方だけ回す (交差点探しで短文脈を省くため)")
     args = ap.parse_args()
 
     if args.ngram:
@@ -210,7 +212,7 @@ def main() -> int:
     pool_ids = tok.encode(pool)
     win = args.ctx - 200  # 質問文とテンプレートのぶんを空ける
     longs = []
-    for i, qtext in enumerate(LONG_QUESTIONS):
+    for i, qtext in enumerate(LONG_QUESTIONS if args.only != "short" else []):
         lo = i * win
         if lo + win > len(pool_ids):
             print(f"素材が足りない (必要 {(i + 1) * win} tok, 手元 {len(pool_ids)})")
@@ -222,8 +224,11 @@ def main() -> int:
         return mx.array(tok.apply_chat_template(
             [{"role": "user", "content": text}], add_generation_prompt=True))[None]
 
-    cases = [("short", to_ids(p)) for p in SHORT_PROMPTS]
-    cases += [("long", to_ids(p)) for p in longs]
+    cases = []
+    if args.only in ("both", "short"):
+        cases += [("short", to_ids(p)) for p in SHORT_PROMPTS]
+    if args.only in ("both", "long"):
+        cases += [("long", to_ids(p)) for p in longs]
 
     setup, variants, control_identical, baseline = KNOBS[args.knob]
     set_variant = setup({"eng": eng})
@@ -260,7 +265,7 @@ def main() -> int:
             print(f"  {v}: prefill {tp:6.2f}s  decode {td:6.2f}s  "
                   f"{ms:6.2f} ms/tok  tok/round {tpr:.3f}  "
                   f"({acc}/{rounds})", flush=True)
-    set_variant("A")
+    set_variant(baseline)
 
     # ---- まとめ -------------------------------------------------------
     print("\n=== まとめ ===")
