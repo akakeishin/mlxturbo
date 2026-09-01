@@ -96,6 +96,10 @@ class RaggedLedger:
         self.L = 0
         self._alive: list[list[bool]] = [[] for _ in range(batch_size)]
         self._valid_len: list[int] = [0] * batch_size
+        # prefill の 1 回だけ立てる。右パディングで流すので、そのラウンドの
+        # マスクは「因果 かつ 実長より手前」であって、通常ラウンドの
+        # 「生きている過去 + 因果」とは別物 (round_mask 参照)
+        self.prefill_lengths: list[int] | None = None
 
     def valid_len_array(self) -> mx.array:
         """行ごとの論理長 (B,)。RoPE の位置 (= このラウンドの新規列の
@@ -121,6 +125,21 @@ class RaggedLedger:
         causal = mx.arange(T)[None, :] <= mx.arange(T)[:, None]  # (T, T)
         new = mx.broadcast_to(causal[None], (B, T, T))
         return mx.concatenate([prev, new], axis=-1)[:, None]
+
+    def round_mask(self, T: int) -> mx.array:
+        """このラウンドのフォワードに渡す bool マスク (B, 1, T, L+T)。
+
+        prefill 中 (``prefill_lengths`` が立っている) は、まだ過去が無く、
+        右パディングを隠す必要があるので「因果 かつ 実長より手前」。
+        それ以外は ``next_round_mask``。
+        """
+        if self.prefill_lengths is None:
+            return self.next_round_mask(T)
+        lens = mx.array(self.prefill_lengths)
+        cols = mx.arange(T)
+        causal = cols[None, :] <= cols[:, None]  # (T, T)
+        valid = cols[None, :] < lens[:, None]  # (B, T)
+        return (causal[None] & valid[:, None, :])[:, None]
 
     def commit_round(self, keeps: list[int], total: int) -> None:
         """検証後、行 b は先頭 ``keeps[b]`` 列 (1..total) を alive として
@@ -213,6 +232,12 @@ class RaggedAttnCache:
     def size(self) -> int:
         return 0 if self.keys is None else self.keys.shape[2]
 
+    def round_mask(self, T: int) -> mx.array:
+        """このラウンドの mask。``ragged_attention`` の ``_final_mask`` から
+        呼ばれる (MTP のドラフトキャッシュも同じ名前を持つので、Attention 側は
+        キャッシュの種類を知らなくてよい)。"""
+        return self.ledger.round_mask(T)
+
     @property
     def offset(self) -> mx.array:
         """(B,) の論理位置。帳簿から毎回引く (手で同期する箇所を作らない)。"""
@@ -284,7 +309,7 @@ def ragged_attention():
                 "QSA (indexer) はこのモジュールの対象外 -- indexer_budget を "
                 "kv 長が超えない構成でのみ使うこと (モジュール docstring参照)"
             )
-        return cache.ledger.next_round_mask(S)
+        return cache.round_mask(S)
 
     Q.Attention._positions = positions
     Q.Attention._final_mask = final_mask
