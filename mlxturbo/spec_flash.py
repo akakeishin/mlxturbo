@@ -126,6 +126,10 @@ DEPTH_CONTEXT_LIMIT = int(os.environ.get("MLXTURBO_DEPTH_CTX_LIMIT", "0")) or No
 _DEPTH_CTX_LIMIT_FALLBACK = 262144
 
 
+# バッチの負荷連動 depth。既定 off (未測)。choose_depth の注記を参照。
+_BATCH_DEPTH_ADAPT = os.environ.get("MLXTURBO_BATCH_DEPTH_ADAPT") == "1"
+
+
 def _logsoftmax_rows(logits: mx.array, n: int) -> list:
     """``logits`` の先頭 n 位置を log 確率にして 1 行ずつ返す。
 
@@ -169,6 +173,13 @@ def choose_depth(
     """
     if pos >= ctx_limit:
         return 1
+    if batch_size > 1 and _BATCH_DEPTH_ADAPT:
+        # B 行同期ラウンドでは、検証フォワードに 1 位置足す費用が B にほぼ
+        # 比例して上がる (行数ぶんの列が増える) 一方、受理が増える利得は
+        # 行ごとに独立なので B に比例しない。よって B が増えたら浅くする、
+        # が紙モデルの符号。**未測なので既定 off。**スループットを測って
+        # から段数と閾値を決める (docs/research/IMPROVEMENT-QUEUE.md B5)。
+        return max(1, depth - (batch_size - 1) // 4)
     return depth
 
 

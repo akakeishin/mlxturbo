@@ -473,6 +473,42 @@ def batched_rollback(model, caches, cap, keeps: list[int], pre_ctx=None, pair=No
     )
 
 
+# ------------------------------------------------------------ admission
+
+
+def bucket_batches(
+    lengths: list[int], max_batch: int, max_ratio: float = 1.5
+) -> list[list[int]]:
+    """待っているリクエストを、長さの近いものだけでバッチにまとめる。
+
+    右パディングの無駄は行ごとに ``max_len - len`` 列で、そこは dead slot と
+    同じく**計算はするが使わない**。長さ比が開くほど無駄が増えるので、
+    バッチ内の最長/最短が ``max_ratio`` を超えるものは別バッチに割る。
+
+    引数は長さのリスト、返り値は元の添字のリストのリスト (入力順は保つ)。
+    長さでソートしてから詰めるので、隣り合う長さが同じバッチに入る。
+
+    ``max_ratio`` の既定 1.5 は**未測**。無駄列の割合の上限がおよそ
+    1 - 1/1.5 = 33% になる値として置いた。スループットを測ってから詰める。
+    """
+    if max_batch < 1:
+        raise ValueError("max_batch は 1 以上")
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    out: list[list[int]] = []
+    cur: list[int] = []
+    for i in order:
+        if cur and (
+            len(cur) >= max_batch
+            or lengths[i] > lengths[cur[0]] * max_ratio
+        ):
+            out.append(cur)
+            cur = []
+        cur.append(i)
+    if cur:
+        out.append(cur)
+    return out
+
+
 # ------------------------------------------------------------ generator
 
 
@@ -657,4 +693,5 @@ __all__ = [
     "snapshot_pre_ctx",
     "batched_rollback",
     "BatchSpecGenerator",
+    "bucket_batches",
 ]
