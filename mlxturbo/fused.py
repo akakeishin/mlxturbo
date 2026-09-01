@@ -233,9 +233,14 @@ def enable_rms_norm_gated() -> None:
     called once in each of the 36 layers that have GDN. Measured at 2.37ms/token
     (tools/ablate_gdn.py).
 
-    This kernel is bit-exact with the reference (it does not read quantized weights,
-    and the gate path stays in fp32, so the 1 ulp problem with bf16 sigmoid that was
-    an issue in hyper-connections does not arise).
+    **ビット一致という上の主張は成り立っていない (2026-09-02 実測)。**
+    in-model A/B (--knob rms-norm-gated、下駄を取った後) で ms/round は
+    短 -0.6% / 長 -0.4% と下がるが、**tok/round が短 -2.0% / 長 -1.7% 落ちる。**
+    受理率が動くということは数値が変わっているということで、ビット一致なら
+    起きない。差し引きで負けるので既定 off のまま。
+
+    A/B の対照チェックが通っていたのは、**先頭 24 トークンしか比べていない**
+    ため (`head=out[:24]`)。それ以降で分岐している。
     """
 
     global _ORIG_RNG
