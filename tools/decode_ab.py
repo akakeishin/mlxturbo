@@ -636,6 +636,7 @@ def main() -> int:
     # enable_hyper_connection_kernel() だけで、gather のソート (既定 16) が
     # 入らないまま測っていた (fable-advisor 指摘)。同一ハーネス内の相対比較
     # なら符号は生き残るが、閾値や交差点は構成で動く。
+    from mlxturbo.kernels import _fire
     from mlxturbo.runner import enable_default_fusions
 
     enable_default_fusions(model, log_prefix="[decode_ab]")
@@ -711,6 +712,10 @@ def main() -> int:
                   " 以降はここから decode のみ", flush=True)
         for v in order:
             set_variant(v)
+            # カーネルの発火回数を条件ごとに数え直す。適格判定は条件を外すと
+            # 黙って False を返すので、「効果ゼロ」が遅いのか届いていないのかを
+            # 区別する手が要る (2026-09-01 に GDN 前処理で実際に空振りした)。
+            _fire.reset()
             if shared is None:
                 out, tp, td, acc, rounds = run_once(eng, ids, args.tokens, eos_ids)
             else:
@@ -727,9 +732,13 @@ def main() -> int:
                              ms_per_round=td / max(rounds, 1) * 1000,
                              accepted=acc, rounds=rounds, tok_per_round=tpr,
                              head=out[:24]))
+            fired = _fire.snapshot()
+            rows[-1]["fired"] = fired
+            fired_s = ("  発火 " + " ".join(f"{k}={n}" for k, n in
+                                            sorted(fired.items()))) if fired else ""
             print(f"  {v}: prefill {tp:6.2f}s  decode {td:6.2f}s  "
                   f"{ms:6.2f} ms/tok  tok/round {tpr:.3f}  "
-                  f"({acc}/{rounds})", flush=True)
+                  f"({acc}/{rounds}){fired_s}", flush=True)
     set_variant(baseline)
 
     # ---- まとめ -------------------------------------------------------

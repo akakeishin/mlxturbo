@@ -67,6 +67,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from . import _fire
+
 # 1 threadgroup が使う threadgroup メモリの上限 (Apple GPU は 32KB)。
 # K/V タイル + 選択ブロックの添字列 + simdgroup ごとの本数がここに載る。
 MAX_TG_BYTES = 30 * 1024
@@ -388,6 +390,7 @@ def prefill_attn(
     そのまま `reshape(B, S, -1)` できる (カーネルがこの並びで書く)。
     """
 
+    _fire.bump("prefill_attn")
     B, n_heads, S, head_dim = q.shape
     n_kv = k.shape[1]
     gqa = n_heads // n_kv

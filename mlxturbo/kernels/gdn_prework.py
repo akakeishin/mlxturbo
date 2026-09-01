@@ -56,6 +56,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from . import _fire
+
 _KERNELS: dict[tuple, Any] = {}
 
 # 1 threadgroup = 32 simdgroup x 32 lane。q の 16 head + k の 16 head をちょうど
@@ -308,6 +310,7 @@ def fused_gdn_prework(
     `(B, K-1, conv_dim)` (次段の `cache[0]` にそのまま入る形)。
     """
 
+    _fire.bump("gdn_prework")
     B, S, conv_dim = mixed_qkv.shape
     K = conv_w.shape[1]
     inv_scale = dk**-0.5
