@@ -43,6 +43,14 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              出力一致) がそのまま効く。合格条件: 長文脈で ms/token が改善する
              こと (17k で 52MB/フォワードの読み書きが消える見込み)。
 
+`pooled-cache` QSA の pooled キー (段 X1、`docs/research/KERNEL-PROGRAM.md`)。
+             A は増分キャッシュ (既定)、B は毎回全ブロック作り直し (旧経路)。
+             値はビット不変 (mean・k_layernorm・rope はどれもブロック内で
+             閉じているので、増分で作っても全部作り直しても同じ)。対照
+             (出力一致) がそのまま効く。合格条件: 長文脈で ms/token が
+             改善すること (`tools/micro_indexer.py` の内訳で pooled 再構築 +
+             rope が indexer の 45.5% を占めていた)。
+
 `stage-every` 段階投入の間隔 (既定 2)。1/2/4 を回文順で。値は変わらず
              スケジューリングだけが変わるので、対照 (出力一致) が効く。
              合格条件: 短・長の両方で ms/token が改善すること。
@@ -180,6 +188,27 @@ def _knob_indexer_cache(ctx):
 
     def apply(variant):
         Q._IndexerCache.update = new_update if variant == "A" else old_update
+
+    return apply
+
+
+def _knob_pooled_cache(ctx):
+    """A = pooled キーの増分キャッシュ (段 X1、既定) / B = 毎回全ブロック作り直し。
+
+    `_IndexerCache.pooled` / `QSAIndexer._pooled_and_top` (`mlxturbo/pooled_cache.py`
+    の `enable_pooled_cache` / `disable_pooled_cache` を素通しするだけ)。値は
+    ビット不変 (mean・k_layernorm・rope はどれもブロック内で閉じている) なので
+    対照 (出力一致) がそのまま効く。
+    """
+    from mlxturbo.pooled_cache import disable_pooled_cache, enable_pooled_cache
+
+    model = ctx["eng"].model
+
+    def apply(variant):
+        if variant == "A":
+            enable_pooled_cache(model)
+        else:
+            disable_pooled_cache(model)
 
     return apply
 
@@ -351,6 +380,7 @@ KNOBS = {
     "qsa-tail": (_knob_qsa_tail, ["A", "B"], True, "B"),
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
+    "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),
     "prefill-group": (_knob_prefill_group, ["2", "4", "8"], True, "4"),
     "qsa": (_knob_qsa, ["A", "B"], False, "A"),

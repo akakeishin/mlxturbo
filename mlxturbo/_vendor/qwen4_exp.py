@@ -238,6 +238,9 @@ class QSAIndexer(nn.Module):
         )
         self.q_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        # 段 X1 (docs/research/KERNEL-PROGRAM.md): pooled キーの増分キャッシュ。
+        # 既定 on (ビット不変なので)。A/B 用の口は mlxturbo/pooled_cache.py。
+        self._pooled_cache = True
 
     def _pooled_and_top(self, x, rope, cache, offset: int, positions=None):
         """pooled key の作成からブロック top-k 選択まで。``__call__`` と
@@ -264,16 +267,37 @@ class QSAIndexer(nn.Module):
             return None
 
         n_blocks = kv_len // self.compress_ratio
-        pooled = raw_k[:, : n_blocks * self.compress_ratio].reshape(
-            B, n_blocks, self.compress_ratio, self.head_dim
-        )
-        pooled = self.k_layernorm(
-            pooled.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
-        )
-
         block_starts = mx.arange(n_blocks) * self.compress_ratio
-        cos_k, sin_k = rope(block_starts[None, :])
-        pooled = _rope_partial(pooled, cos_k, sin_k)
+
+        # 段 X1: ブロックは compress_ratio トークン分が揃った時点で内容が
+        # 確定し (mean・k_layernorm はブロック内で閉じている)、rope の角度も
+        # block_starts だけで決まって以後変わらない。よって新しく完成した
+        # ブロックぶんだけ計算して cache に積み増せば、毎回全ブロックを
+        # 作り直すのとビット一致する (`docs/research/KERNEL-PROGRAM.md` 段 X1、
+        # `tools/micro_indexer.py` の実測で pooled 関連が indexer の 45.5%)。
+        if cache is not None and getattr(self, "_pooled_cache", True):
+
+            def _new_pooled_blocks(start: int, end: int):
+                seg = raw_k[
+                    :, start * self.compress_ratio : end * self.compress_ratio
+                ].reshape(B, end - start, self.compress_ratio, self.head_dim)
+                seg = self.k_layernorm(
+                    seg.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
+                )
+                starts = block_starts[start:end]
+                cos_seg, sin_seg = rope(starts[None, :])
+                return _rope_partial(seg, cos_seg, sin_seg)
+
+            pooled = cache.pooled(n_blocks, _new_pooled_blocks)
+        else:
+            pooled = raw_k[:, : n_blocks * self.compress_ratio].reshape(
+                B, n_blocks, self.compress_ratio, self.head_dim
+            )
+            pooled = self.k_layernorm(
+                pooled.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
+            )
+            cos_k, sin_k = rope(block_starts[None, :])
+            pooled = _rope_partial(pooled, cos_k, sin_k)
 
         q_col = mx.arange(offset, offset + S)
         cos_q, sin_q = rope(q_col[None, :] if positions is None else positions)
@@ -1262,6 +1286,14 @@ class _IndexerCache(_BaseCache):
     期待していて、確保済みバッファの尻を見せると静かに 0 を掴む。KVCache は
     ``keys`` が生バッファで ``state`` が view という逆の約束なので、そちらの
     書き方をそのまま持ってこないこと。
+
+    段 X1 (``docs/research/KERNEL-PROGRAM.md``): rope 済み pooled キーも
+    ここで持ち回る (``_pooled``、確定済みブロック数は ``_pooled_n``)。
+    ``update`` (通常の追記) だけが増分で伸ばす。``keys`` の setter は
+    trim / rollback / batch の filter・extend・extract・merge・state 復元の
+    どれもが通る「外から論理配列を差し込む」経路で、縮み・並べ替えの
+    どちらもあり得るので、そこでは無条件に pooled を捨てて作り直す
+    (古いブロックを静かに使い回すよりは、作り直しの分だけ遅い方がまし)。
     """
 
     step = 256
@@ -1269,6 +1301,8 @@ class _IndexerCache(_BaseCache):
     def __init__(self):
         self._buf = None
         self.offset = 0
+        self._pooled = None
+        self._pooled_n = 0
 
     @property
     def keys(self):
@@ -1280,6 +1314,33 @@ class _IndexerCache(_BaseCache):
         # (確保の余裕は失うが、次の update で取り直す)
         self._buf = v
         self.offset = 0 if v is None else v.shape[1]
+        # 縮み・並べ替えの可能性がある経路 (この setter しかない)。
+        # pooled はブロック分割に対応しているので、古いものを引きずるくらい
+        # なら丸ごと捨てて次回に作り直す。
+        self._pooled = None
+        self._pooled_n = 0
+
+    def pooled(self, n_blocks: int, make_new) -> mx.array:
+        """rope 済み pooled キーを、確定済みブロックは使い回して返す。
+
+        ``make_new(start, end)`` は新規に確定したブロック範囲
+        ``[start, end)`` の rope 済み pooled (``(B, end-start, head_dim)``) を
+        計算するコールバック。``n_blocks`` が既知より減っていたら
+        (``keys`` の setter を経由しない縮みは無いはずだが、念のため)
+        捨てて作り直す。
+        """
+        if self._pooled is not None and self._pooled_n > n_blocks:
+            self._pooled = None
+            self._pooled_n = 0
+        if self._pooled_n < n_blocks:
+            new = make_new(self._pooled_n, n_blocks)
+            self._pooled = (
+                new
+                if self._pooled is None
+                else mx.concatenate([self._pooled, new], axis=1)
+            )
+            self._pooled_n = n_blocks
+        return self._pooled
 
     def update(self, k: mx.array) -> mx.array:
         prev = self.offset
