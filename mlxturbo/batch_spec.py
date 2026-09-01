@@ -246,16 +246,16 @@ def make_ragged_cache(model, batch_size: int):
 
 @contextmanager
 def ragged_attention():
-    """このラウンドの検証フォワード限定で ``Attention.__call__`` を差し替える。
+    """このラウンドの検証フォワード限定で ``Attention`` の 2 つのシームを
+    差し替える。フォワード本体は本家 (``mlxturbo/_vendor/qwen4_exp.py``) の
+    ままで、違うのは次の 2 点だけ。
 
-    本家 (``mlxturbo/_vendor/qwen4_exp.py`` の ``Attention.__call__``) の写しで、
-    異なるのは 2 点だけ:
-
-    1. RoPE の位置: ``cache.offset`` を (B,) の論理位置として扱う (本家は
-       python int の物理列位置)。``RaggedAttnCache.offset`` が
-       ``RaggedLedger.valid_len_array()`` を返すので、ここで区別は要らない --
-       ``rope(offset[:, None] + arange(S))`` を常に使うだけでよい。
-    2. mask: ``Qwen4ExpModel.__call__`` が渡す ``mask`` 引数は
+    1. RoPE の位置 (``_positions``): ``cache.offset`` を (B,) の論理位置として
+       扱う (本家は python int の物理列位置)。``RaggedAttnCache.offset`` が
+       ``RaggedLedger.valid_len_array()`` を返すので、ここでは
+       ``offset[:, None] + arange(S)`` を常に使うだけでよい。QSA に渡す列位置は
+       ``cache.size()`` (物理列数) のまま。
+    2. mask (``_final_mask``): ``Qwen4ExpModel.__call__`` が渡す ``mask`` 引数は
        ``create_attention_mask(h, [attn_cache])`` の結果で、単一キャッシュで
        はなくリストを渡すため必ず "causal"/None に潰れる
        (mlxturbo/batch.py の docstring 項目 4 と同じ理由)。dead slot を
@@ -272,47 +272,27 @@ def ragged_attention():
     """
 
     Q = _arch()
-    orig = Q.Attention.__call__
+    orig_positions = Q.Attention._positions
+    orig_final_mask = Q.Attention._final_mask
 
-    def call(self, x, rope, mask, cache, idx_cache):
-        B, S, _ = x.shape
-        offset = cache.offset  # (B,) 論理位置
-        sparse = self.indexer(x, rope, idx_cache, cache.size())
+    def positions(self, cache, S):
+        return cache.size(), cache.offset[:, None] + mx.arange(S)[None, :]
+
+    def final_mask(self, mask, sparse, cache, S, dtype):
         if sparse is not None:
             raise NotImplementedError(
                 "QSA (indexer) はこのモジュールの対象外 -- indexer_budget を "
                 "kv 長が超えない構成でのみ使うこと (モジュール docstring参照)"
             )
+        return cache.ledger.next_round_mask(S)
 
-        qg = self.q_proj(x)
-        q, gate = mx.split(qg.reshape(B, S, self.n_heads, -1), 2, axis=-1)
-        gate = gate.reshape(B, S, -1)
-        q = self.q_norm(q).transpose(0, 2, 1, 3)
-        k = self.k_norm(self.k_proj(x).reshape(B, S, self.n_kv_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
-        v = self.v_proj(x).reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-
-        positions = offset[:, None] + mx.arange(S)[None, :]  # (B, S)
-        cos, sin = rope(positions)
-        cos, sin = cos[:, None], sin[:, None]
-        q, k = Q._rope_partial(q, cos, sin), Q._rope_partial(k, cos, sin)
-
-        if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
-
-        ledger_mask = cache.ledger.next_round_mask(S)
-        out = Q.scaled_dot_product_attention(
-            q, k, v, cache=cache, scale=self.scale, mask=ledger_mask
-        )
-        out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-        return self.o_proj(out * mx.sigmoid(gate))
-
-    Q.Attention.__call__ = call
+    Q.Attention._positions = positions
+    Q.Attention._final_mask = final_mask
     try:
         yield
     finally:
-        Q.Attention.__call__ = orig
+        Q.Attention._positions = orig_positions
+        Q.Attention._final_mask = orig_final_mask
 
 
 @contextmanager

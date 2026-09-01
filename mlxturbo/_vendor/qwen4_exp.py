@@ -220,7 +220,12 @@ class QSAIndexer(nn.Module):
         self.q_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
-    def __call__(self, x, rope, cache, offset: int) -> Optional[mx.array]:
+    def __call__(
+        self, x, rope, cache, offset: int, positions=None
+    ) -> Optional[mx.array]:
+        """``offset`` はキャッシュの列位置 (ブロック格子と可視判定に使う)、
+        ``positions`` はその系列の先頭から数えた真の位置 (rope の角度に使う)。
+        パディングが無ければ両者は一致するので ``positions`` は省略できる。"""
         B, S, _ = x.shape
         qk = self.index_qk_proj(x)
         split = self.n_heads * self.head_dim
@@ -248,8 +253,8 @@ class QSAIndexer(nn.Module):
         cos_k, sin_k = rope(block_starts[None, :])
         pooled = _rope_partial(pooled, cos_k, sin_k)
 
-        q_pos = mx.arange(offset, offset + S)
-        cos_q, sin_q = rope(q_pos[None, :])
+        q_col = mx.arange(offset, offset + S)
+        cos_q, sin_q = rope(q_col[None, :] if positions is None else positions)
         q = self.q_layernorm(q)
         q = _rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
 
@@ -261,7 +266,7 @@ class QSAIndexer(nn.Module):
 
         # a block is only a candidate if it lies entirely in the query's past
         block_end = block_starts + self.compress_ratio - 1
-        visible = block_end[None, None, :] <= q_pos[None, :, None]
+        visible = block_end[None, None, :] <= q_col[None, :, None]
         scores = mx.where(visible, scores, -mx.inf)
 
         k = min(self.block_topk, n_blocks)
@@ -300,11 +305,38 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.indexer = QSAIndexer(args)
 
+    def _positions(self, cache, S: int):
+        """``(offset, positions)`` を返すシーム。
+
+        ``offset`` はキャッシュの列位置 (QSA のブロック格子・可視判定、および
+        sdpa 壁分割の causal マスク組みに使う)、``positions`` は系列の先頭から
+        数えた真の位置 (rope の角度に使う)。パディングの無い単一系列では
+        両者は一致する。バッチ経路 (`mlxturbo/batch.py` の左パディング、
+        `mlxturbo/batch_spec.py` の dead slot 台帳) はここだけを差し替える。
+        """
+        offset = cache.offset if cache is not None else 0
+        return offset, mx.arange(offset, offset + S)[None]
+
+    def _final_mask(self, mask, sparse, cache, S: int, dtype):
+        """sdpa に渡す最終的な mask を組むシーム。
+
+        既定は「sparse があれば causal を捨てて sparse だけを見る」という
+        本家の規約。バッチ経路は左パディングとの連言を取ったり、dead slot
+        台帳から組み直したりするためにここを差し替える。
+        """
+        if sparse is None:
+            return mask
+        neg = mx.finfo(dtype).min if hasattr(mx, "finfo") else -1e9
+        add = mx.where(sparse, mx.array(0, dtype), mx.array(neg, dtype))
+        if mask is None or isinstance(mask, str):
+            return add
+        return mask + add
+
     def __call__(self, x, rope, mask, cache, idx_cache) -> mx.array:
         B, S, _ = x.shape
-        offset = cache.offset if cache is not None else 0
+        offset, positions = self._positions(cache, S)
 
-        sparse = self.indexer(x, rope, idx_cache, offset)
+        sparse = self.indexer(x, rope, idx_cache, offset, positions)
 
         wide = getattr(self, "_wide_qkv", None)
         if wide is None:
@@ -322,21 +354,14 @@ class Attention(nn.Module):
         )
         v = vv.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        cos, sin = rope(mx.arange(offset, offset + S)[None])
+        cos, sin = rope(positions)
         cos, sin = cos[:, None], sin[:, None]
         q, k = _rope_partial(q, cos, sin), _rope_partial(k, cos, sin)
 
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
 
-        if sparse is not None:
-            neg = mx.finfo(q.dtype).min if hasattr(mx, "finfo") else -1e9
-            add = mx.where(sparse, mx.array(0, q.dtype), mx.array(neg, q.dtype))
-            mask = (
-                add
-                if mask is None
-                else (mask + add if not isinstance(mask, str) else add)
-            )
+        mask = self._final_mask(mask, sparse, cache, S, q.dtype)
 
         # MLX sdpa の速い vector カーネルは q 行数 (S * n_heads) 32 まで。
         # 越えると全 KV にスコアを実体化する経路に落ち、長い文脈で跳ねる

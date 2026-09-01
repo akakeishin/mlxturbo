@@ -168,8 +168,8 @@ Flash-Next 独自として扱わないこと** — 線形注意/再帰系は Qwe
 | 4 | `mlxturbo/spec_flash.py:158` `capture()` 内 `gdn`/`ple_conv` | `mlxturbo/_vendor/qwen4_exp.py` `GatedDeltaNet.__call__` / `PLELayer._short_conv` | rollback 用に `states_all` 等を保持するための転記 (カーネル差し替えのみ、ロジック不変) | 対象外。「本家と一字一句同じ」が `tools/verify_prefill_bitident.py` のビット一致ゲートの根拠なので抽象化しない (本文の番号ラベルが唯一無い項目 -- 除外 3 項目リストの 3 番目 `capture の GDN 転記` が写し 1/2 と同じ並びで対応する、という消去法での再構成) |
 | 5 | ~~`mlxturbo/batch.py` `gdn_call` + `ple_short_conv`~~ | `GatedDeltaNet.__call__` / `PLELayer._short_conv` | conv 状態の取り出しを `cache.lengths` (右パディング下の実長) 基準にする差分のみ | **解消済み (段 1)**。vendor に `_store_conv_state` / `_store_short_conv_state` を切り、batch はその 2 つだけ差し替える |
 | 6 | `mlxturbo/spec.py:432` `_linear_capture` | site-packages `mlx_lm/models/qwen3_5.py` の `GatedDeltaNet` (27B/qwen3_5 側) | qwen3_5 用の GDN 捕捉版 | 対象外。上流が site-packages で vendor していない (関数 1 つのために qwen3_5 を vendor するのは割に合わない) |
-| 7 | `mlxturbo/batch.py:456` `attention_call` | `mlxturbo/_vendor/qwen4_exp.py` `Attention.__call__` | rope 位置導出のみが左パディング対応の差分 | 段 2 で `_positions`/`_final_mask` を vendor 側シームとして切り出し解消予定 |
-| 8 | `mlxturbo/batch_spec.py:248` `ragged_attention()` 内 `call` | 同上 `Attention.__call__` | rope 位置と最終 mask 構成 (`cache.ledger.next_round_mask`) の 2 点が dead-slot 台帳対応の差分 | 段 2 で解消予定 (写し 7 と同じシーム) |
+| 7 | ~~`mlxturbo/batch.py:456` `attention_call`~~ | `mlxturbo/_vendor/qwen4_exp.py` `Attention.__call__` | rope 位置導出のみが左パディング対応の差分 | **解消済み (段 2)**。vendor に `_positions` / `_final_mask` を切り、batch はその 2 つだけ差し替える |
+| 8 | ~~`mlxturbo/batch_spec.py:248` `ragged_attention()` 内 `call`~~ | 同上 `Attention.__call__` | rope 位置と最終 mask 構成 (`cache.ledger.next_round_mask`) の 2 点が dead-slot 台帳対応の差分 | **解消済み (段 2)**。写し 7 と同じシームで消えた |
 | 9 | `mlxturbo/staged.py:35` `staged_forward` | site-packages `mlx_lm/models/qwen3_5.py` の `Qwen3_5TextModel.__call__` | 写し 1 と同じ段階投入手法を qwen3_5 (27B/dense) 側へアーキ非依存に一般化移植したもの | 対象外。写し 6 と同じ理由 (上流が site-packages)。今日追加 |
 
 **前提の変更 (ユーザー方針)**: 上流 mlx-lm PR #1788 への追随は気にしない。
@@ -230,12 +230,20 @@ tools/verify_batch_real.py、compat_smoke。
 全ケース一致。オーバーライドは 1 呼び手 (クラス) あたり 1 個で、反転条件
 (3 個超) には遠い。batch 経路は `_project_in` (wide 融合) を自動で獲得した。
 
-**段 2: 写し 7 と 8 の解消 (Attention 2 種)**
+**段 2: 写し 7 と 8 の解消 (Attention 2 種)** — **完了 (2026-09-01)**
 vendor の `Attention.__call__` に `_positions(cache, S)` と
 `_final_mask(mask, sparse, dtype)` を切る。batch.py (左パディング) と
 batch_spec.py (dead-slot 台帳) はこの 2 つのオーバーライドだけになり、
 qkv/rope/sdpa/gate の本体は vendor に 1 つだけ残る。検査: 段 1 と同じ +
 tools/verify_batch_spec.py。
+
+結果: 写し 2 つ (batch.py 88 行 + batch_spec.py 36 行) が override 2 個ずつに
+なった。QSA には「列位置と真の位置」の区別 (`positions` 引数) が入り、
+batch の左パディング対応が本家の規約として表に出た。副次効果として両経路が
+`_wide_qkv` 融合と sdpa 壁分割を獲得する。検査は verify_batch_cache がバイト
+一致、verify_batch_spec 全ケース一致、加えて**単一系列の指紋**
+(`tools/vendor_fingerprint.py`、QSA 活性/不活性 x chunk 割り 4 通りの logits と
+全キャッシュ配列の md5) が変更前後で一致。オーバーライドはクラスあたり 2 個。
 
 **段 3: 写し 3 の解消 (batch.py の model_call)**
 vendor `__call__` を `_make_masks` / `_update_ngram_ctx` + 層ループに分解。

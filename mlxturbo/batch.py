@@ -346,9 +346,8 @@ def _install_model_patches(BatchAttnCache):
     import math
 
     import mlx.core as mx
-    import mlx.nn as nn
     import mlx_lm.models.qwen4_exp as Q
-    from mlx_lm.models.base import create_attention_mask, scaled_dot_product_attention
+    from mlx_lm.models.base import create_attention_mask
 
     # ---- _AttnCache.merge --------------------------------------------
     # `KVCache.merge` returns a `BatchKVCache`. That is a different class with
@@ -452,65 +451,42 @@ def _install_model_patches(BatchAttnCache):
             )
         return keep[:, None]
 
-    # ---- Attention ---------------------------------------------------
-    def attention_call(self, x, rope, mask, cache, idx_cache):
-        B, S, _ = x.shape
-        # Separate the column position from the true position; with left
-        # padding the two diverge.
-        #   - column position (`size()`): which column of the cache this is.
-        #     QSA's block boundaries and visibility test use this one
-        #   - true position (`offset`): the number of tokens counted from the
-        #     start of that sequence. The rope angle uses this one.
-        #     `BatchKVCache.offset` is a (B,) array and is exactly the
-        #     per-sequence true position
-        #
-        # Keys written during prefill are rotated by "the position within that
-        # sequence" (prefill runs with right padding, and finalize only
-        # rearranges the layout). Rotating the decode queries by column position
-        # would shift the origin by the amount of padding and break rope's
-        # relative property
-        offset = cache.size() if cache is not None else 0
+    # ---- Attention: positions and mask only --------------------------
+    #
+    # The forward pass itself stays in the vendored module; only these two
+    # seams differ. That way batch keeps whatever lands there (the `_wide_qkv`
+    # fusion, the sdpa width-wall split).
+    def attn_positions(self, cache, S):
+        """Separate the column position from the true position; with left
+        padding the two diverge.
+
+          - column position (`size()`): which column of the cache this is.
+            QSA's block boundaries and visibility test use this one
+          - true position (`offset`): the number of tokens counted from the
+            start of that sequence. The rope angle uses this one.
+            `BatchKVCache.offset` is a (B,) array and is exactly the
+            per-sequence true position
+
+        Keys written during prefill are rotated by "the position within that
+        sequence" (prefill runs with right padding, and finalize only
+        rearranges the layout). Rotating the decode queries by column position
+        would shift the origin by the amount of padding and break rope's
+        relative property.
+        """
         if cache is None:
-            positions = mx.arange(S)[None]
-        elif isinstance(cache.offset, mx.array):
-            positions = cache.offset[:, None] + mx.arange(S)
-        else:
-            positions = mx.arange(cache.offset, cache.offset + S)[None]
+            return 0, mx.arange(S)[None]
+        if isinstance(cache.offset, mx.array):
+            return cache.size(), cache.offset[:, None] + mx.arange(S)
+        return cache.size(), mx.arange(cache.offset, cache.offset + S)[None]
 
-        sparse = self.indexer(x, rope, idx_cache, offset, positions)
-
-        q, gate = mx.split(self.q_proj(x).reshape(B, S, self.n_heads, -1), 2, axis=-1)
-        gate = gate.reshape(B, S, -1)
-        q = self.q_norm(q).transpose(0, 2, 1, 3)
-        k = self.k_norm(self.k_proj(x).reshape(B, S, self.n_kv_heads, -1)).transpose(
-            0, 2, 1, 3
-        )
-        v = self.v_proj(x).reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
-
-        cos, sin = rope(positions)
-        cos, sin = cos[:, None], sin[:, None]
-        q, k = Q._rope_partial(q, cos, sin), Q._rope_partial(k, cos, sin)
-
-        if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
-
-        if sparse is not None:
-            neg = mx.finfo(q.dtype).min if hasattr(mx, "finfo") else -1e9
-            zero, negv = mx.array(0, q.dtype), mx.array(neg, q.dtype)
-            if mask is None or isinstance(mask, str):
-                # Same as the stock implementation: when sparse is present,
-                # throw away causal
-                mask = mx.where(sparse, zero, negv)
-            else:
-                # A bool mask that carries left padding; take the conjunction
-                # here
-                mask = mx.where(mask & sparse, zero, negv)
-
-        out = scaled_dot_product_attention(
-            q, k, v, cache=cache, scale=self.scale, mask=mask
-        )
-        out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
-        return self.o_proj(out * mx.sigmoid(gate))
+    def attn_final_mask(self, mask, sparse, cache, S, dtype):
+        if sparse is None or mask is None or isinstance(mask, str):
+            # Nothing to combine: fall back to the stock rule (when sparse is
+            # present, causal is thrown away)
+            return _ORIG["Attention._final_mask"](self, mask, sparse, cache, S, dtype)
+        # A bool mask that carries left padding; take the conjunction here
+        neg = mx.finfo(dtype).min if hasattr(mx, "finfo") else -1e9
+        return mx.where(mask & sparse, mx.array(0, dtype), mx.array(neg, dtype))
 
     # ---- conv state: keep the columns that follow the real length ----
     #
@@ -533,7 +509,7 @@ def _install_model_patches(BatchAttnCache):
         n_keep = self.conv_kernel_size - 1
         pos = _tail_positions(cache, n_keep, conv_input.shape[1] - n_keep)
         if pos is None:
-            _ORIG["GatedDeltaNet"](self, cache, conv_input)
+            _ORIG["GatedDeltaNet._store_conv_state"](self, cache, conv_input)
         else:
             cache[0] = mx.take_along_axis(conv_input, pos, axis=1)
 
@@ -541,7 +517,7 @@ def _install_model_patches(BatchAttnCache):
         n = self.short_conv_state_len
         pos = _tail_positions(cache, n, full.shape[1] - n)
         if pos is None:
-            _ORIG["PLELayer"](self, cache, full)
+            _ORIG["PLELayer._store_short_conv_state"](self, cache, full)
         else:
             cache[2] = mx.take_along_axis(full, pos, axis=1)
 
@@ -605,13 +581,15 @@ def _install_model_patches(BatchAttnCache):
         return self.hyper_connection_mixer(h)
 
     _ORIG["QSAIndexer"] = Q.QSAIndexer.__call__
-    _ORIG["Attention"] = Q.Attention.__call__
-    _ORIG["GatedDeltaNet"] = Q.GatedDeltaNet._store_conv_state
-    _ORIG["PLELayer"] = Q.PLELayer._store_short_conv_state
+    _ORIG["Attention._final_mask"] = Q.Attention._final_mask
+    _ORIG["Attention._positions"] = Q.Attention._positions
+    _ORIG["GatedDeltaNet._store_conv_state"] = Q.GatedDeltaNet._store_conv_state
+    _ORIG["PLELayer._store_short_conv_state"] = Q.PLELayer._store_short_conv_state
     _ORIG["Qwen4ExpModel"] = Q.Qwen4ExpModel.__call__
 
     Q.QSAIndexer.__call__ = indexer_call
-    Q.Attention.__call__ = attention_call
+    Q.Attention._positions = attn_positions
+    Q.Attention._final_mask = attn_final_mask
     Q.GatedDeltaNet._store_conv_state = store_conv_state
     Q.PLELayer._store_short_conv_state = store_short_conv_state
     Q.Qwen4ExpModel.__call__ = model_call
@@ -644,9 +622,10 @@ def disable_batch_cache() -> None:
     import mlx_lm.models.qwen4_exp as Q
 
     Q.QSAIndexer.__call__ = _ORIG["QSAIndexer"]
-    Q.Attention.__call__ = _ORIG["Attention"]
-    Q.GatedDeltaNet._store_conv_state = _ORIG["GatedDeltaNet"]
-    Q.PLELayer._store_short_conv_state = _ORIG["PLELayer"]
+    Q.Attention._positions = _ORIG["Attention._positions"]
+    Q.Attention._final_mask = _ORIG["Attention._final_mask"]
+    Q.GatedDeltaNet._store_conv_state = _ORIG["GatedDeltaNet._store_conv_state"]
+    Q.PLELayer._store_short_conv_state = _ORIG["PLELayer._store_short_conv_state"]
     Q.Qwen4ExpModel.__call__ = _ORIG["Qwen4ExpModel"]
     # Leaving `merge` in place would mean building indexer-carrying batch
     # caches while the forward pass has been restored to stock. Fall back to
