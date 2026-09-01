@@ -8219,6 +8219,48 @@ def test_spec_batchable_length_condition():
     assert not spec_batchable(model, 10, 0, depth=2)
 
 
+def test_spec_batch_route_skips_coordinator_when_nothing_to_batch():
+    """まとめる相手がいない要求はコーディネータに入れないこと。
+
+    入れると、その要求は得るものが無いまま**セッション (プロンプトキャッシュ
+    の再利用) だけを失う**。実測 (2026-09-02、67 トークンのプロンプト x 12):
+    通常経路 TTFT 0.35s / 15.51ms/tok (cached_tokens=67) に対し、
+    コーディネータ経由は TTFT 0.67s / 16.16ms/tok (cached_tokens=0)。
+    毎回ちがうプロンプトでそろえると 15.85 vs 15.84 ms/tok で一致するので、
+    差の全部が再利用の有無だった (mlxturbo/server.py の
+    ``_spec_batch_would_be_alone``)。
+    """
+
+    from mlxturbo.batch_spec import BatchSpecCoordinator
+
+    coord = BatchSpecCoordinator.__new__(BatchSpecCoordinator)
+    coord._guard = threading.Lock()
+    coord._active = False
+    coord._inbox = SimpleNamespace(empty=lambda: True)
+
+    _install_state(FakeSpecRunner([10]))
+    server.STATE.queue_depth = 1  # 自分の 1 本だけ
+    # 誰も走っていない -> 1 本きりになる -> 通常経路へ
+    assert coord.is_idle()
+    assert server._spec_batch_would_be_alone(coord)
+    # コーディネータが動いている -> join できる相手がいる
+    coord._active = True
+    assert not coord.is_idle()
+    assert not server._spec_batch_would_be_alone(coord)
+    # 待ち行列に届いているだけでも相手がいる
+    coord._active = False
+    coord._inbox = SimpleNamespace(empty=lambda: False)
+    assert not server._spec_batch_would_be_alone(coord)
+    # 他の要求が在庫にある (queue_depth >= 2) -> 相手がいる。
+    # **錠 (STATE.lock) では駄目**: ルート判定は錠を取りに行く手前で走るので、
+    # 同時到着は全部「空いている」と見えてバッチが一度も噛まなかった (実測)
+    coord._inbox = SimpleNamespace(empty=lambda: True)
+    assert coord.is_idle()
+    server.STATE.queue_depth = 2
+    assert not server._spec_batch_would_be_alone(coord)
+    assert not server.STATE.lock.locked()  # 錠は空いているのに、相手はいる
+
+
 def test_spec_round_depth_respects_rectangle_and_budget():
     """1 ラウンドのドラフト数 k は、矩形 B*(1+k) <= 8 と残りのトークン予算の
     両方に収める。どちらにも収まらなければ 0 (素の decode) -- 小さい予算を

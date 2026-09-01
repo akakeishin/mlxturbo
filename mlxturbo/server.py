@@ -2529,9 +2529,58 @@ def _resolve_batch_route(
         return coordinator, _runner_batch_tier(coordinator, prompt_ids, max_tokens)
     spec = STATE.spec_batch_coordinator
     if spec is not None and can_batch_spec(gen_runner):
-        if spec_batch_eligible(spec, prompt_ids, max_tokens, sampling_kwargs or {}):
+        if spec_batch_eligible(spec, prompt_ids, max_tokens, sampling_kwargs or {}) and not _spec_batch_would_be_alone(spec):
             return spec, "spec"
     return None
+
+
+def _spec_batch_would_be_alone(spec) -> bool:
+    """いまこの要求を --max-batch-spec に投げても 1 本きりになるか。
+
+    True なら通常経路 (STATE.lock + セッション) に落とす。**まとめる相手が
+    いないのにコーディネータへ入れると、得るものが無いままセッション
+    (プロンプトキャッシュの再利用) だけを失う。**バッチ経路がセッションを
+    持たないのは B>1 では必然だが (1 本の会話が KV を占有する仕組みと、
+    複数行が 1 つの KV を共有する仕組みは同居しない)、B=1 では丸損になる。
+
+    実測 (2026-09-02、67 トークンのプロンプトを 12 回、bench/batch_b1_gate.py):
+
+        通常経路           TTFT 0.35s / 15.51 ms/tok  (cached_tokens=67)
+        コーディネータ経由  TTFT 0.67s / 16.16 ms/tok  (cached_tokens=0)
+
+    差の全部がプロンプトキャッシュの再利用の有無だった。毎回ちがうプロンプト
+    (どちらも再利用不可) でそろえると 15.85 / 15.84 ms/tok、TTFT 0.685s /
+    0.682s で一致する -- コーディネータの単独経路そのものには費用が無い。
+    `--batch-spec-wait-ms 0` にしても TTFT は 0.645s までしか下がらないので、
+    相方待ちの 15ms でもない。
+
+    判定は 2 つ。どちらかが立っていれば「相手がいる」:
+
+    - コーディネータが動いている (走行中のバッチ・prefill 車線・待ち行列)。
+      新しい要求はそこに join できる。
+    - ``STATE.queue_depth`` が 2 以上 = 自分以外の要求が処理中/待機中。この
+      要求は待つしかないので、コーディネータに入れて後続とバッチを組む方が
+      得 (走行中の通常経路の要求に join することはできない -- 単独経路は
+      走り切るまで executor を占有する)。
+
+    どちらも空なら、この要求は自分ひとりで走る。そのときはセッションを持って
+    通常経路を通る方が速い。
+
+    **``STATE.lock.locked()`` では駄目**だった (2026-09-02 実測)。ルートの
+    判定 (`_openai_stream` の中) は錠を取りに行く**手前**で走るので、同時に
+    来た 4 本は全部「錠は空いている」と見て全部が通常経路に行き、バッチ機構が
+    一度も噛まなかった (同時 4 本で joins=0、壁時計 8.81s = 直列とほぼ同じ)。
+    ``queue_depth`` はエンドポイントの入口 (`_try_reserve_queue_slot`、
+    StreamingResponse を組む前) で増えるので、ルート判定の時点で自分と他の
+    在庫の両方が数えられている。
+
+    競合について: ``queue_depth`` はスナップショットなので、2 本が同時に
+    「自分だけ」と見て両方が通常経路に行くことはある。その 2 本は STATE.lock
+    で直列化するだけで、これは --max-batch-spec を付けなかったときの挙動
+    そのもの。黙って壊れる形は無い。
+    """
+
+    return spec.is_idle() and STATE.queue_depth <= 1
 
 
 async def _run_generate_batched(
@@ -3143,6 +3192,21 @@ async def health():
     fallback_reason = getattr(STATE.runner, "fallback_reason", None)
     if fallback_reason is not None:
         body["fallback_reason"] = fallback_reason
+    spec = STATE.spec_batch_coordinator
+    if spec is not None:
+        # --max-batch-spec が実際にどう振る舞ったかを外から見るための計数。
+        # 特に `solo_runs` は「待ち行列に 1 本のときは単独経路をそのまま使う」
+        # という B=1 無劣化の構造が効いているかを確かめる唯一の口で、
+        # bench/batch_b1_gate.py と併せて読む (joins が 0 で solo_runs が
+        # リクエスト数と一致していれば、構造としては効いている)
+        body["spec_batch"] = {
+            "solo_runs": spec.solo_runs,
+            "joins": spec.joins,
+            "preemptions": spec.preemptions,
+            "wait_ms": spec.wait_ms,
+            "token_budget": spec.token_budget,
+            "prefill_chunk": spec.prefill_chunk,
+        }
     return body
 
 
@@ -6111,9 +6175,10 @@ def main() -> None:
         " 従来どおり直列に流れる。スケジューラは chunked prefill 方式で、新しい"
         " 要求の prefill を刻んで走行中の decode と同じステップに混ぜるので、"
         " 走行中のバッチに後から入れる (次のバッチを待たない)。ただし単独経路で"
-        " 走り出した要求には後から入れられない。待ち行列に 1 本しか無いときは"
-        " 単独経路をそのまま使うので、単独リクエストの decode は"
-        " 変わらない (bench/batch_b1_gate.py)",
+        " 走り出した要求には後から入れられない。**まとめる相手がいない要求は"
+        " そもそもこの機構に入れず、従来どおりセッション付きの経路を通す**ので、"
+        " 同時実行が無いワークロードでは指定してもしなくても挙動が変わらない"
+        " (bench/batch_b1_gate.py で実測: 15.51 vs 15.55 ms/tok)",
     )
     ap.add_argument(
         "--batch-spec-wait-ms",

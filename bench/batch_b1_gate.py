@@ -169,7 +169,7 @@ def main() -> None:
     parser.add_argument("--max-tokens", type=int, default=64, help="1回あたりの生成トークン上限 (既定: %(default)s)")
     parser.add_argument("--base-url", default="http://127.0.0.1:8765/v1", help="サーバーのAPI base URL (既定: %(default)s)")
     parser.add_argument("--model", default=None, help="'model' フィールドに載せる値。省略時はフィールド自体を送らない")
-    parser.add_argument("--baseline", type=float, default=14.6, help="比較対象の基準 ms/token (既定: %(default)s、KERNEL-BRIEF-DECODE-BW.md の short decode 実測値)")
+    parser.add_argument("--baseline", type=float, default=15.55, help="比較対象の基準 ms/token (既定: %(default)s)。**2026-09-02 に 14.6 から更新。**14.6 は古く、バッチ機構を切った状態でも 15.5 前後だったのでゲートが常に赤で、誰も見ない状態になっていた。**基準が現実から離れたゲートは、落ちていること自体が情報にならない。**確実なのは同じ手順で off 側を測って比べること")
     parser.add_argument("--tolerance", type=float, default=0.05, help="許容比率 (既定: %(default)s = ±5%%)")
     parser.add_argument("--timeout", type=float, default=120.0, help="1リクエストあたりのタイムアウト秒 (既定: %(default)s)")
     parser.add_argument("--dry-run", action="store_true", help="ネットワークを叩かず、実行内容だけ表示する")

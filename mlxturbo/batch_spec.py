@@ -1300,9 +1300,18 @@ class SpecPrefillLane:
 #    残り max_tokens は同じだけ減るので、`spec_batchable` の条件
 #    (`prompt + max_tokens <= indexer_budget`) は退避の前後で動かない。
 #
-# ## B=1 は既存の単独経路のまま
+# ## B=1 は既存の単独経路のまま (二重に守る)
 #
-# 走行中のバッチも車線も空で、待ち行列に 1 本しか無いときは
+# **入口で守る (1 段目)。**まとめる相手がいない要求は、そもそもこの機構に
+# 入れない -- `server._resolve_batch_route` が `is_idle()` を見て通常経路
+# (STATE.lock + セッション) に落とす。ここを守らないと、単独の要求が
+# **セッション (プロンプトキャッシュの再利用) だけを失う**。バッチ経路が
+# セッションを持たないのは B>1 では必然だが、B=1 では丸損で、実測で
+# TTFT +0.32s / decode +4% として出た (2026-09-02、`is_idle` の docstring)。
+#
+# **駆動ループでも守る (2 段目)。**1 段目をすり抜けた場合 (入口の判定と
+# 駆動の間に他の要求が終わった等) でも、走行中のバッチも車線も空で
+# 待ち行列に 1 本しか無いときは
 # `BatchSpecGenerator` を使わず、`FlashSpecRunner.generate`
 # (= `FlashSpecEngine.generate_stream`) をそのまま呼ぶ。単独経路には楽観
 # パイプライン・次ラウンドの draft 先行投入・適応的 depth が乗っていて、
@@ -1659,6 +1668,33 @@ class BatchSpecCoordinator:
                     if not self._active:
                         self._active = True
                         self.executor.submit(self._drive)
+
+    def is_idle(self) -> bool:
+        """駆動ループが動いていないか (別スレッドから読んでよい)。
+
+        True = 「いま投げても相方がいない」。サーバー側の入口
+        (`server._resolve_batch_route`) がこれを見て、**まとめる相手がいない
+        要求はコーディネータに入れない**ようにする。
+
+        入れてしまうと、その要求はセッション (プロンプトキャッシュ) を失う。
+        バッチ経路はセッションを持たない割り切りで、それは B>1 では必然
+        (1 本の会話が KV を占有する仕組みと、複数行が 1 つの KV を共有する
+        仕組みは同居しない) だが、**B=1 では丸損**になる。実測 (2026-09-02、
+        67 トークンのプロンプトを 12 回):
+
+            off          TTFT 0.35s / 15.51 ms/tok  (cached_tokens=67)
+            コーディネータ TTFT 0.67s / 16.16 ms/tok  (cached_tokens=0)
+
+        差の全部がこれで、単独経路そのものは無罪だった -- 毎回ちがう
+        プロンプト (どちらも再利用不可) でそろえると
+        off 15.85 / on 15.84 ms/tok、TTFT 0.685s / 0.682s で一致する。
+
+        ``_active`` は駆動ループの生存そのもの (走行中のバッチ・prefill 車線・
+        待ち行列のどれかがある間は True) なので、これ 1 つで足りる。
+        """
+        with self._guard:
+            active = self._active
+        return not active and self._inbox.empty()
 
     def _live_admissions(self) -> list:
         out = list(self._rows) + list(self._waiting)
