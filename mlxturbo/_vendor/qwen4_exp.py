@@ -838,7 +838,22 @@ class DecoderLayer(nn.Module):
         self.attn_hyper_connection = GatedResidual(args)
         self.mlp_hyper_connection = GatedResidual(args)
 
-    def __call__(self, h, rope, mask, conv_mask, cache, idx_cache, ids, prev_ctx):
+    @staticmethod
+    def _combine(hyper, x, inject):
+        """hyper-connection の合成。分岐出力 x を inject で hc 本に配り、
+        持ち越した hyper に足す。"""
+        return hyper + (x[..., None, :] * inject[..., None]).reshape(
+            *x.shape[:-1], -1
+        )
+
+    def pre_mlp(self, h, rope, mask, conv_mask, cache, idx_cache, ids, prev_ctx):
+        """PLE と attention までを進め、MoE の入力 ``(x, hyper, inject)`` を返す。
+
+        `mlxturbo/spec_flash.py` の `_group_prefill_forward` (layer-major
+        prefill) が、G チャンクぶんの x を concat して MoE を 1 回で呼ぶために
+        ここで切る。あちらの本物の差分は「MoE の呼び出し粒度」だけで、層の
+        中身は本家のこれを使う。
+        """
         if self.ple is not None:
             h = h + self.ple(h, ids, prev_ctx, cache)
 
@@ -847,11 +862,14 @@ class DecoderLayer(nn.Module):
             x = self.linear_attn(x, conv_mask, cache)
         else:
             x = self.self_attn(x, rope, mask, cache, idx_cache)
-        h = hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
+        h = self._combine(hyper, x, inject)
+        return self.mlp_hyper_connection(h)
 
-        x, hyper, inject = self.mlp_hyper_connection(h)
-        x = self.mlp(x)
-        return hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
+    def __call__(self, h, rope, mask, conv_mask, cache, idx_cache, ids, prev_ctx):
+        x, hyper, inject = self.pre_mlp(
+            h, rope, mask, conv_mask, cache, idx_cache, ids, prev_ctx
+        )
+        return self._combine(hyper, self.mlp(x), inject)
 
 
 class Qwen4ExpModel(nn.Module):

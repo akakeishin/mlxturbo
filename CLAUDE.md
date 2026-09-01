@@ -21,10 +21,20 @@
 
 ## 触ると壊れるもの
 
+- `_vendor/qwen4_exp.py` のシーム (`Attention._positions` / `_final_mask`、
+  `GatedDeltaNet._store_conv_state`、`PLELayer._store_short_conv_state`、
+  `Qwen4ExpModel._make_masks` / `_store_ngram_ctx` / `_prelude`、
+  `DecoderLayer.pre_mlp` / `_combine`) は `mlxturbo/batch.py`、
+  `mlxturbo/batch_spec.py`、`mlxturbo/spec_flash.py` の呼び出し口。
+  **引数や返り値を変えるときは 3 つの呼び手を全部見ること。**
+  差し替え側は 1 クラスあたり 2 個までに保つ。超えたらフックが内部構造を
+  漏らし始めた合図で、そのときは写しに戻すほうが正しい (`docs/BACKLOG.md`)。
 - `mlxturbo/spec_flash.py` の `_staged_forward` / `_group_prefill_forward` /
-  `capture()` は `_vendor/qwen4_exp.py` の Model.__call__ の写し。
-  **本家を変えたら写しも全部変える。**変更後は
-  `tools/verify_prefill_bitident.py` で旧経路とのビット一致を確認する
+  `capture()` には、本家の制御フローの写しが残っている (段階投入のループ骨格、
+  レイヤー主導の二重ループ、rollback 用の GDN 転記)。**本家の層まわりを
+  変えたらここも見る。**変更後は `tools/vendor_fingerprint.py` (合成モデル、
+  CPU、数秒) で一次検査し、prefill を触ったなら
+  `tools/verify_prefill_bitident.py` (実モデル、4 分) までやる
   (詳しい対応表は `docs/BACKLOG.md` の「本家フォワードの写し 9 種の整理」)。
 - `mlxturbo/staged.py` の `staged_forward` は site-packages の
   `mlx_lm.models.qwen3_5.Qwen3_5TextModel.__call__` の写し (27B/qwen3_5 側)。

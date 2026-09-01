@@ -163,7 +163,7 @@ Flash-Next 独自として扱わないこと** — 線形注意/再帰系は Qwe
 | # | 写し (file:line) | 複製元 (file:line) | 内容 | 扱い |
 |---|---|---|---|---|
 | 1 | `mlxturbo/spec_flash.py:238` `_staged_forward` | `mlxturbo/_vendor/qwen4_exp.py` `Qwen4ExpModel.__call__` + lm_head | 段階投入。既定 2 層ごとに `mx.async_eval(h)` を挟み、グラフ構築中の GPU 泡 (7.3ms) を刈る | **段 4 済み**。前段 (mask 生成・PLE prev_ctx 更新) は本家の `_prelude` を呼ぶ形になり、写しはループ骨格だけになった。骨格は本家に無い制御フローなので残す |
-| 2 | `mlxturbo/spec_flash.py:296` `_group_prefill_forward` | 同上 | layer-major prefill。層主導 x G チャンクの二重ループで、MoE 行を concat して 1 回の GEMM にまとめる | 段 5 (保留)。pre_mlp/post_mlp 分解を検討中だが効果対リスク比が最悪、二重ループ自体は最適化の本体なので残す |
+| 2 | `mlxturbo/spec_flash.py:296` `_group_prefill_forward` | 同上 | layer-major prefill。層主導 x G チャンクの二重ループで、MoE 行を concat して 1 回の GEMM にまとめる | **段 5 済み**。層の中身は本家の `pre_mlp` / `_combine` を呼ぶ形になり、残るのは二重ループと MoE の呼び出し粒度 (= 最適化の本体) だけ |
 | 3 | ~~`mlxturbo/batch.py:584` `model_call`~~ | 同上 `Qwen4ExpModel.__call__` | mask 生成・conv_mask 構築・n-gram prev_ctx 更新の 3 箇所がバッチ (左パディング) 対応版 | **解消済み (段 3)**。vendor に `_make_masks` / `_store_ngram_ctx` を切って解消 |
 | 4 | `mlxturbo/spec_flash.py:158` `capture()` 内 `gdn`/`ple_conv` | `mlxturbo/_vendor/qwen4_exp.py` `GatedDeltaNet.__call__` / `PLELayer._short_conv` | rollback 用に `states_all` 等を保持するための転記 (カーネル差し替えのみ、ロジック不変) | 対象外。「本家と一字一句同じ」が `tools/verify_prefill_bitident.py` のビット一致ゲートの根拠なので抽象化しない (本文の番号ラベルが唯一無い項目 -- 除外 3 項目リストの 3 番目 `capture の GDN 転記` が写し 1/2 と同じ並びで対応する、という消去法での再構成) |
 | 5 | ~~`mlxturbo/batch.py` `gdn_call` + `ple_short_conv`~~ | `GatedDeltaNet.__call__` / `PLELayer._short_conv` | conv 状態の取り出しを `cache.lengths` (右パディング下の実長) 基準にする差分のみ | **解消済み (段 1)**。vendor に `_store_conv_state` / `_store_short_conv_state` を切り、batch はその 2 つだけ差し替える |
@@ -277,7 +277,7 @@ tools/verify_prefill_bitident.py + probe の出力一致。
 concat する以上 CPU 非量子化では累積順が動くため。実測 8.3e-7、実モデルでの
 ビット一致は verify_prefill_bitident が見る)。
 
-**段 5 (保留、B/C 群の手応えを見てから判断): 写し 2 の分解**
+**段 5: 写し 2 の分解** — **実施 (2026-09-01)**
 `_group_prefill_forward` の二重ループ (レイヤー主導 x G チャンク) は
 layer-major prefill の本体そのもので、消すことは最適化を捨てることと同義。
 ただし `DecoderLayer` を `pre_mlp` / `post_mlp` に分解すれば
@@ -288,6 +288,21 @@ hyper-connection 合成式の重複が消えて写しが半減する。advisor �
 さらに踏み込む案として「vendor の `__call__` にレイヤー主導モードを持たせ、
 写し 2 を丸ごと消す」もあるが、本家が 2 つの走行モードを抱える複雑さと
 引き換えなので、段 1-3 の後に改めて判断する。
+
+**判断と結果**: 段 1-3 の実地でオーバーライドは 1 クラスあたり最大 2 個に
+収まり、基準を満たしたので実施した。`DecoderLayer` に `pre_mlp` (PLE +
+attention まで進めて MoE の入力を返す) と `_combine` (hyper-connection の
+合成) を切り、`__call__` は `pre_mlp` → `mlp` → `_combine` の 3 行になった。
+`_group_prefill_forward` の内側ループも同じ部品を呼ぶだけになり、層の中身の
+重複が消えた。**残した二重ループが layer-major prefill の本体**で、これを
+消すことは最適化を捨てることと同義 (17k TTFT 34.5→32.4s の実体)。
+「本家に走行モードを 2 つ持たせる」案は採らない。本家が誰の都合で分岐して
+いるか読めなくなるほうが高くつく。
+
+副産物として、prefill の mask 生成が `x` (attention 分岐の入力) ではなく
+`hs[ci]` (層の入力) から作る形になった。値は同じ (mask はチャンク幅と
+キャッシュのオフセットだけで決まる) が、`pre_mlp` を呼ぶ前に決まっている
+必要があるため。
 
 **残すと決めたもの**: 写し 6 (spec.py の qwen3_5 版 `_linear_capture`)。
 上流が site-packages の mlx_lm 本体で vendor していないため対象外。

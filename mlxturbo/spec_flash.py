@@ -287,8 +287,10 @@ def _group_prefill_forward(model, chunks, caches):
     1 回で呼ぶこと (行独立なのでビット一致)。mixer は通さない — chunk-major
     でも中間チャンクの mixer 出力は捨てられており、呼び手が使う cap.hyper は
     mixer の入力 (= 最終レイヤー出力) だから、それをチャンクごとに返す。
-    _staged_forward と同じく本家の写しであることが正しさの根拠。本家を
-    変えるときはここも変えること。
+
+    層の中身は本家の `DecoderLayer.pre_mlp` と `_combine` を呼ぶので写しでは
+    ない。ここに残る差分は「二重ループ (レイヤー主導 x G チャンク) と MoE の
+    呼び出し粒度」だけで、それが layer-major prefill の本体。
 
     キャッシュ整合性: レイヤー主導でも「レイヤー i がチャンク c を処理する
     時点のキャッシュ i の中身」は chunk-major と一致する (レイヤー i の
@@ -301,8 +303,7 @@ def _group_prefill_forward(model, chunks, caches):
     hs = [mx.tile(m.embed_tokens(ch), (1, 1, m.hc)) for ch in chunks]
     conv_mask = None
 
-    full_idx = [i for i, l in enumerate(m.layers) if l.layer_type == "full_attention"]
-    masks = [None] * G  # レイヤー 0 の走査中に、正しいオフセットで生成する
+    masks = [None] * G  # 最初の full attention 層の走査中に生成する
 
     # per-chunk の prev_ctx: 本家はモデル呼び出しごとに pc[3] を進めるので、
     # チャンク列に対して同じ更新を先に畳んでおく
@@ -326,18 +327,15 @@ def _group_prefill_forward(model, chunks, caches):
         idx_c = c.indexer if (c is not None and hasattr(c, "indexer")) else None
         posts = []
         for ci in range(G):
-            h = hs[ci]
-            if layer.ple is not None:
-                h = h + layer.ple(h, chunks[ci], prev_ctxs[ci], c)
-            x, hyper, inject = layer.attn_hyper_connection(h)
-            if layer.layer_type == "linear_attention":
-                x = layer.linear_attn(x, conv_mask, c)
-            else:
-                if masks[ci] is None:
-                    masks[ci] = Q.create_attention_mask(x, [c])
-                x = layer.self_attn(x, m.rope, masks[ci], c, idx_c)
-            h = hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
-            posts.append(layer.mlp_hyper_connection(h))
+            if layer.layer_type != "linear_attention" and masks[ci] is None:
+                # 本家は層ごとに作るが、同じチャンクなら層をまたいで同一
+                # (mask はチャンク幅とそのキャッシュのオフセットだけで決まり、
+                # レイヤー i のキャッシュを進めるのはレイヤー i 自身だけ)。
+                masks[ci] = Q.create_attention_mask(hs[ci], [c])
+            posts.append(layer.pre_mlp(
+                hs[ci], m.rope, masks[ci], conv_mask, c, idx_c,
+                chunks[ci], prev_ctxs[ci],
+            ))
         xcat = mx.concatenate([p[0] for p in posts], axis=1)
         ycat = layer.mlp(xcat)
         offs, acc = [], 0
@@ -347,8 +345,7 @@ def _group_prefill_forward(model, chunks, caches):
         ys = mx.split(ycat, offs, axis=1)
         for ci in range(G):
             _, hyper, inject = posts[ci]
-            y = ys[ci]
-            hs[ci] = hyper + (y[..., None, :] * inject[..., None]).reshape(*y.shape[:-1], -1)
+            hs[ci] = layer._combine(hyper, ys[ci], inject)
         if step and (li + 1) % step == 0 and li < len(m.layers) - 1:
             mx.async_eval(*hs)
     return hs

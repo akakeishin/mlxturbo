@@ -14,10 +14,10 @@ QSA (indexer) の活性/不活性と prefill の割り方を変えた 4 通り�
 `mlxturbo/spec_flash.py` の写し 2 つ (`_staged_forward` / `_group_prefill_forward`)
 が本家と一致することも見る (写しを触ったときの一次検査。実モデルでの本番
 ゲートは `tools/verify_prefill_bitident.py`)。
-budget=8 の chunk=4 と chunk=19 は**わざと食い違う**構成で、QSA の端数
-ブロックが未来を見せる件 (docs/BACKLOG.md「QSA tail の因果性」) が直ると
-一致に変わる。挙動を変えない変更の検査に使うぶんには、食い違ったままで
-よい (前後で同じ値が出ることだけを見る)。
+budget=8 の chunk=4 と chunk=19 は**互いに食い違う**構成。QSA のブロック
+格子は kv 長で決まるので、prefill の割り方が変われば選ばれるブロックも
+変わる (端数ブロックの因果性を直しても、これは残る)。この道具が見るのは
+「変更の前後で同じ値が出るか」だけなので、食い違ったままでよい。
 """
 
 from __future__ import annotations
