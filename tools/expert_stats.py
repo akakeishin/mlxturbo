@@ -41,8 +41,13 @@ def main():
         os.environ["FASTMLX_NGRAM_DISK"] = "1"
 
     import mlx.core as mx
-    import mlx_lm.models.qwen4_exp as Q
     import numpy as np
+
+    # qwen4_exp は mlxturbo が sys.meta_path に差す解決器で初めて import
+    # できるようになる (mlxturbo/_arch_registry.py)。**mlxturbo を先に
+    # import すること** -- 順番を逆にすると ModuleNotFoundError で落ちる。
+    import mlxturbo  # noqa: F401
+    import mlx_lm.models.qwen4_exp as Q
     from mlx_lm import load
 
     model, _ = load(args.model)
