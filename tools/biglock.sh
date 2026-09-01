@@ -32,8 +32,21 @@ while true; do
     fi
   fi
 
-  # 2. ロックを持たない相手 (まだこの仕組みを使っていない側) も見る
-  OTHER=$(pgrep -f "\.venv/bin/python3? (tools|bench)/" | head -1)
+  # 2. ロックを持たない相手 (まだこの仕組みを使っていない側) も見る。
+  #
+  # **待っている biglock.sh 自身を数えないこと。**待機中の wrapper の
+  # コマンドラインには引数として `.venv/bin/python tools/...` が丸ごと入って
+  # いるので、素の pgrep だと待ち合わせている者どうしが互いを「ロック無しで
+  # 走っている python」と見なして永久に待つ (実際に 4 本並べて 47 分空転した)。
+  OTHER=""
+  for _pid in $(pgrep -f "\.venv/bin/python3? (tools|bench)/"); do
+    [ "$_pid" = "$$" ] && continue
+    case "$(ps -o command= -p "$_pid" 2>/dev/null)" in
+      *biglock.sh*) continue ;;
+    esac
+    OTHER=$_pid
+    break
+  done
   if [ -n "$OTHER" ]; then
     [ "$WAITED" -eq 0 ] && \
       echo "biglock: ロック無しの pid=$OTHER が走っている。空くまで待つ" >&2
