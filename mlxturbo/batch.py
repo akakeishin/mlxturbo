@@ -52,6 +52,24 @@ venv.
    Flash-Next's GDN layers use 2 of the 4 slots (PLE / n-gram) only in PLE
    layers, so every time a single sequence finishes you get a `TypeError`.
 
+## How it is patched (seams, not copies)
+
+Everything above used to be fixed by copying the forward passes of
+`Attention` / `GatedDeltaNet` / `PLELayer` / `Qwen4ExpModel` into this module
+and editing a few lines. The copies drifted: fusions that landed in the
+vendored module (`_wide_qkv`, `_project_in`) never reached the batch path, and
+nothing said so out loud. The vendored module now carries the hooks instead
+(`Attention._positions` / `_final_mask`, `GatedDeltaNet._store_conv_state`,
+`PLELayer._store_short_conv_state`, `Qwen4ExpModel._make_masks` /
+`_store_ngram_ctx`), and this module replaces only those. The forward passes
+themselves live in one place. `QSAIndexer.__call__` is still replaced whole:
+its left-padding differences run through the middle of the block-grid
+computation, so a hook would have to expose the internals.
+
+The rule of thumb (docs/BACKLOG.md): if the overrides for one class go past 3,
+the hooks have started leaking internal structure and copying is the better
+trade again.
+
 ## What was left alone
 
 When there is no padding (B=1, or a batch of equal lengths) the same graph runs
@@ -347,7 +365,6 @@ def _install_model_patches(BatchAttnCache):
 
     import mlx.core as mx
     import mlx_lm.models.qwen4_exp as Q
-    from mlx_lm.models.base import create_attention_mask
 
     # ---- _AttnCache.merge --------------------------------------------
     # `KVCache.merge` returns a `BatchKVCache`. That is a different class with
@@ -497,13 +514,14 @@ def _install_model_patches(BatchAttnCache):
     # itself stays in the vendored module, so batch keeps whatever fusions
     # land there (`_project_in` / `_wide_qkv`).
     def _tail_positions(cache, n_keep: int, span: int):
-        """Index of the n_keep columns to carry over, per row. `None` means
-        the stock tail (no batch cache, i.e. no per-row length)."""
+        """(B, n_keep) index of the columns to carry over, per row. `None`
+        means the stock tail (no batch cache, i.e. no per-row length).
+        Callers indexing a 3-D array append a trailing axis."""
         lengths = getattr(cache, "lengths", None)
         if lengths is None:
             return None
         ends = mx.clip(lengths, 0, span)
-        return (ends[:, None] + mx.arange(n_keep))[..., None]
+        return ends[:, None] + mx.arange(n_keep)
 
     def store_conv_state(self, cache, conv_input):
         n_keep = self.conv_kernel_size - 1
@@ -511,7 +529,7 @@ def _install_model_patches(BatchAttnCache):
         if pos is None:
             _ORIG["GatedDeltaNet._store_conv_state"](self, cache, conv_input)
         else:
-            cache[0] = mx.take_along_axis(conv_input, pos, axis=1)
+            cache[0] = mx.take_along_axis(conv_input, pos[..., None], axis=1)
 
     def store_short_conv_state(self, cache, full):
         n = self.short_conv_state_len
@@ -519,14 +537,10 @@ def _install_model_patches(BatchAttnCache):
         if pos is None:
             _ORIG["PLELayer._store_short_conv_state"](self, cache, full)
         else:
-            cache[2] = mx.take_along_axis(full, pos, axis=1)
+            cache[2] = mx.take_along_axis(full, pos[..., None], axis=1)
 
     # ---- Qwen4ExpModel: actually distribute the mask ------------------
-    def model_call(self, ids, cache=None, input_embeddings=None):
-        h = self.embed_tokens(ids) if input_embeddings is None else input_embeddings
-        if cache is None:
-            cache = [None] * len(self.layers)
-
+    def make_masks(self, h, cache):
         full_idx = [
             i for i, l in enumerate(self.layers) if l.layer_type == "full_attention"
         ]
@@ -537,9 +551,7 @@ def _install_model_patches(BatchAttnCache):
             # None)
             mask = attn_cache.make_mask(h.shape[1])
         else:
-            mask = create_attention_mask(
-                h, [attn_cache] if attn_cache is not None else None
-            )
+            mask, _ = _ORIG["Qwen4ExpModel._make_masks"](self, h, cache)
 
         lin_idx = [
             i for i, l in enumerate(self.layers) if l.layer_type == "linear_attention"
@@ -551,48 +563,30 @@ def _install_model_patches(BatchAttnCache):
             # Prefill under right padding. Keep padding columns out of the
             # recurrent state
             conv_mask = mx.arange(h.shape[1])[None] < lengths[:, None]
+        return mask, conv_mask
 
-        prev_ctx = None
-        if self.ple_layers:
-            ctx_len = self.args.ngram_size - 1
-            eos = self.args.eos_token_id
-            eos = eos[0] if isinstance(eos, list) else eos
-            pc = cache[self.ple_layers[0]]
-            prev = pc[3] if pc is not None else None
-            prev_ctx = (
-                prev
-                if prev is not None
-                else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
-            )
-            if pc is not None:
-                cat = mx.concatenate([prev_ctx, ids], axis=1)
-                pc_lengths = getattr(pc, "lengths", None)
-                if pc_lengths is None:
-                    pc[3] = cat[:, -ctx_len:]
-                else:
-                    ends = mx.clip(pc_lengths, 0, ids.shape[1])
-                    pos = ends[:, None] + mx.arange(ctx_len)
-                    pc[3] = mx.take_along_axis(cat, pos, axis=1)
-
-        h = mx.tile(h, (1, 1, self.hc))
-        for layer, c in zip(self.layers, cache):
-            idx_c = c.indexer if (c is not None and hasattr(c, "indexer")) else None
-            h = layer(h, self.rope, mask, conv_mask, c, idx_c, ids, prev_ctx)
-        return self.hyper_connection_mixer(h)
+    def store_ngram_ctx(self, pc, cat, ctx_len):
+        pos = _tail_positions(pc, ctx_len, cat.shape[1] - ctx_len)
+        if pos is None:
+            _ORIG["Qwen4ExpModel._store_ngram_ctx"](self, pc, cat, ctx_len)
+        else:
+            pc[3] = mx.take_along_axis(cat, pos, axis=1)
 
     _ORIG["QSAIndexer"] = Q.QSAIndexer.__call__
     _ORIG["Attention._final_mask"] = Q.Attention._final_mask
     _ORIG["Attention._positions"] = Q.Attention._positions
     _ORIG["GatedDeltaNet._store_conv_state"] = Q.GatedDeltaNet._store_conv_state
     _ORIG["PLELayer._store_short_conv_state"] = Q.PLELayer._store_short_conv_state
-    _ORIG["Qwen4ExpModel"] = Q.Qwen4ExpModel.__call__
+    _ORIG["Qwen4ExpModel._make_masks"] = Q.Qwen4ExpModel._make_masks
+    _ORIG["Qwen4ExpModel._store_ngram_ctx"] = Q.Qwen4ExpModel._store_ngram_ctx
 
     Q.QSAIndexer.__call__ = indexer_call
     Q.Attention._positions = attn_positions
     Q.Attention._final_mask = attn_final_mask
     Q.GatedDeltaNet._store_conv_state = store_conv_state
     Q.PLELayer._store_short_conv_state = store_short_conv_state
-    Q.Qwen4ExpModel.__call__ = model_call
+    Q.Qwen4ExpModel._make_masks = make_masks
+    Q.Qwen4ExpModel._store_ngram_ctx = store_ngram_ctx
 
 
 # ------------------------------------------------------------------ activation
@@ -626,7 +620,8 @@ def disable_batch_cache() -> None:
     Q.Attention._final_mask = _ORIG["Attention._final_mask"]
     Q.GatedDeltaNet._store_conv_state = _ORIG["GatedDeltaNet._store_conv_state"]
     Q.PLELayer._store_short_conv_state = _ORIG["PLELayer._store_short_conv_state"]
-    Q.Qwen4ExpModel.__call__ = _ORIG["Qwen4ExpModel"]
+    Q.Qwen4ExpModel._make_masks = _ORIG["Qwen4ExpModel._make_masks"]
+    Q.Qwen4ExpModel._store_ngram_ctx = _ORIG["Qwen4ExpModel._store_ngram_ctx"]
     # Leaving `merge` in place would mean building indexer-carrying batch
     # caches while the forward pass has been restored to stock. Fall back to
     # the inherited one (KVCache.merge)

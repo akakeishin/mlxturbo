@@ -869,11 +869,14 @@ class Qwen4ExpModel(nn.Module):
             i for i in range(args.num_hidden_layers) if (i + 1) in args.ple_layer_ids
         ]
 
-    def __call__(self, ids: mx.array, cache=None, input_embeddings=None):
-        h = self.embed_tokens(ids) if input_embeddings is None else input_embeddings
-        if cache is None:
-            cache = [None] * len(self.layers)
+    def _make_masks(self, h, cache):
+        """``(mask, conv_mask)`` を返すシーム。
 
+        ``mask`` は full attention 用、``conv_mask`` は再帰系 (GDN) の入力から
+        列を落とすためのもので、単一系列では要らない (None)。バッチ経路
+        (`mlxturbo/batch.py`) は左パディングの配列マスクと、右パディングを
+        再帰状態から外す conv_mask を返すためにここを差し替える。
+        """
         full_idx = [
             i for i, l in enumerate(self.layers) if l.layer_type == "full_attention"
         ]
@@ -881,7 +884,19 @@ class Qwen4ExpModel(nn.Module):
         mask = create_attention_mask(
             h, [attn_cache] if attn_cache is not None else None
         )
-        conv_mask = None
+        return mask, None
+
+    def _store_ngram_ctx(self, pc, cat, ctx_len: int) -> None:
+        """n-gram の直前文脈 (末尾 ctx_len トークン) を書くシーム。
+        `GatedDeltaNet._store_conv_state` と同じ理由で切ってある。"""
+        pc[3] = cat[:, -ctx_len:]
+
+    def __call__(self, ids: mx.array, cache=None, input_embeddings=None):
+        h = self.embed_tokens(ids) if input_embeddings is None else input_embeddings
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        mask, conv_mask = self._make_masks(h, cache)
 
         prev_ctx = None
         if self.ple_layers:
@@ -896,8 +911,9 @@ class Qwen4ExpModel(nn.Module):
                 else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
             )
             if pc is not None:
-                tail = mx.concatenate([prev_ctx, ids], axis=1)[:, -ctx_len:]
-                pc[3] = tail
+                self._store_ngram_ctx(
+                    pc, mx.concatenate([prev_ctx, ids], axis=1), ctx_len
+                )
 
         h = mx.tile(h, (1, 1, self.hc))
         for layer, c in zip(self.layers, cache):

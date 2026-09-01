@@ -164,7 +164,7 @@ Flash-Next 独自として扱わないこと** — 線形注意/再帰系は Qwe
 |---|---|---|---|---|
 | 1 | `mlxturbo/spec_flash.py:238` `_staged_forward` | `mlxturbo/_vendor/qwen4_exp.py` `Qwen4ExpModel.__call__` + lm_head | 段階投入。既定 2 層ごとに `mx.async_eval(h)` を挟み、グラフ構築中の GPU 泡 (7.3ms) を刈る | 段 4 で前段 (mask 生成・PLE prev_ctx 更新) を共有化予定。ループ骨格自体 (本家に無い制御フロー) は残す |
 | 2 | `mlxturbo/spec_flash.py:296` `_group_prefill_forward` | 同上 | layer-major prefill。層主導 x G チャンクの二重ループで、MoE 行を concat して 1 回の GEMM にまとめる | 段 5 (保留)。pre_mlp/post_mlp 分解を検討中だが効果対リスク比が最悪、二重ループ自体は最適化の本体なので残す |
-| 3 | `mlxturbo/batch.py:584` `model_call` | 同上 `Qwen4ExpModel.__call__` | mask 生成・conv_mask 構築・n-gram prev_ctx 更新の 3 箇所がバッチ (左パディング) 対応版 | 段 3 で `_make_masks`/`_update_ngram_ctx` を vendor 側シームとして切り出し解消予定 |
+| 3 | ~~`mlxturbo/batch.py:584` `model_call`~~ | 同上 `Qwen4ExpModel.__call__` | mask 生成・conv_mask 構築・n-gram prev_ctx 更新の 3 箇所がバッチ (左パディング) 対応版 | **解消済み (段 3)**。vendor に `_make_masks` / `_store_ngram_ctx` を切って解消 |
 | 4 | `mlxturbo/spec_flash.py:158` `capture()` 内 `gdn`/`ple_conv` | `mlxturbo/_vendor/qwen4_exp.py` `GatedDeltaNet.__call__` / `PLELayer._short_conv` | rollback 用に `states_all` 等を保持するための転記 (カーネル差し替えのみ、ロジック不変) | 対象外。「本家と一字一句同じ」が `tools/verify_prefill_bitident.py` のビット一致ゲートの根拠なので抽象化しない (本文の番号ラベルが唯一無い項目 -- 除外 3 項目リストの 3 番目 `capture の GDN 転記` が写し 1/2 と同じ並びで対応する、という消去法での再構成) |
 | 5 | ~~`mlxturbo/batch.py` `gdn_call` + `ple_short_conv`~~ | `GatedDeltaNet.__call__` / `PLELayer._short_conv` | conv 状態の取り出しを `cache.lengths` (右パディング下の実長) 基準にする差分のみ | **解消済み (段 1)**。vendor に `_store_conv_state` / `_store_short_conv_state` を切り、batch はその 2 つだけ差し替える |
 | 6 | `mlxturbo/spec.py:432` `_linear_capture` | site-packages `mlx_lm/models/qwen3_5.py` の `GatedDeltaNet` (27B/qwen3_5 側) | qwen3_5 用の GDN 捕捉版 | 対象外。上流が site-packages で vendor していない (関数 1 つのために qwen3_5 を vendor するのは割に合わない) |
@@ -245,9 +245,21 @@ batch の左パディング対応が本家の規約として表に出た。副�
 (`tools/vendor_fingerprint.py`、QSA 活性/不活性 x chunk 割り 4 通りの logits と
 全キャッシュ配列の md5) が変更前後で一致。オーバーライドはクラスあたり 2 個。
 
-**段 3: 写し 3 の解消 (batch.py の model_call)**
+**段 3: 写し 3 の解消 (batch.py の model_call)** — **完了 (2026-09-01)**
 vendor `__call__` を `_make_masks` / `_update_ngram_ctx` + 層ループに分解。
 batch はこの 2 つを差し替える。検査: 段 1 と同じ。
+
+結果: `_update_ngram_ctx` は当初案より狭い `_store_ngram_ctx` (末尾文脈の
+書き込みだけ) にした。prev_ctx の組み立ては本家と同一なので、共有できる分は
+共有したほうが写しが減る。写し 57 行が override 2 個になった。検査は 3 つ
+(verify_batch_cache バイト一致 / verify_batch_spec 全ケース一致 /
+vendor_fingerprint 一致) とも通過。
+
+**段 1-3 の集計**: 写し 5 つ (257 行) が override 8 個になった。1 クラス
+あたり最大 2 個で、反転条件 (3 個超) には触れていない。オーバーライドが
+必要な差分は「位置の意味 (列 vs 真の位置)」「マスクの出どころ」「状態を
+どの列から取るか」の 3 種類に収まっており、フック仕様が内部構造に依存する
+兆候は出ていない。
 
 **段 4: 写し 1 の前段共有 (低リスク、単独でも価値がある)**
 `_staged_forward` の前段 ~25 行 (mask 生成・PLE prev_ctx 更新) は本家と
