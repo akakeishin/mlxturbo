@@ -198,6 +198,11 @@ class RotaryEmbedding:
 # ------------------------------------------------------------------------ QSA
 
 
+# 集めた列が kv 長のこの割合を超えるなら gather しない (上の判定を参照)。
+# M3 Max の実測から 0.20。機種が変わったら測り直すこと。
+_GATHER_MAX_RATIO = float(os.environ.get("MLXTURBO_GATHER_MAX_RATIO", "0.20"))
+
+
 @dataclass
 class QSABlockSelection:
     """段 3(b) の gather 経路 (``mlxturbo/gather_attn.py``) 向け: ブロック選択を
@@ -625,6 +630,35 @@ class Attention(nn.Module):
         cr = self.indexer.compress_ratio
         S = x.shape[1]
         if offset + S <= self.indexer.token_budget or offset < cr - 1:
+            return None
+
+        # 集めるだけの価値があるかを**ホスト側の算数だけ**で判定する。
+        #
+        # タイルごとの union はクエリ行数 T と block_topk の積で上に抑えられる
+        # ので、集める列数の上限は `T * block_topk * compress_ratio`
+        # = `T * token_budget`。これを kv_len で割った比が、この呼び出しで
+        # 読む列の割合の上限になる。**選択を計算しなくても分かる**ので、
+        # 判定に GPU の仕事は要らない。
+        #
+        # 比が大きいと gather は割に合わない -- 集める読み (飛び飛びなので
+        # 帯域効率が悪い) + 書き + sdpa の読み、で密の 1 回読みに近づく。
+        # M3 Max の実測 (17k/25k/50k、幅 2):
+        #
+        #   比 24% -> +1.1%   比 16% -> -6.7%   比 8% -> -15.4%
+        #
+        # ほぼ直線で、0 と交わるのが比 ~23%。安全側に倒して 0.20 を既定にする
+        # (少し保守的だと長文で取り分を少し落とすだけだが、逆に攻めすぎると
+        # 数の多い中尺のリクエストで損をする)。
+        #
+        # **この値はマシン依存。**分子側 (飛び飛びの読みとカーネル起動) と
+        # 分母側 (連続読み) のスケールの仕方が機種で違う。別のマシンでは
+        # `MLXTURBO_GATHER_MAX_RATIO` で上書きし、
+        # `tools/decode_ab.py --knob gather-attn` を文脈長を振って掃引して
+        # 直線が 0 と交わる比を取り直すこと (実測は M3 Max のみ)。
+        tile = getattr(self, "_gather_attn_tile", 0)
+        rows = tile if 0 < tile < S else S
+        kv_len = offset + S
+        if rows * self.indexer.token_budget > _GATHER_MAX_RATIO * kv_len:
             return None
 
         blocks = self.indexer.select_blocks(x, rope, idx_cache, offset, positions)
