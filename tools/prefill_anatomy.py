@@ -30,6 +30,25 @@ offset を控えておけば付け替えで完全に戻せる。
     ple       PLE 1 層 (n-gram の行読みを含む)
     embed     embed_tokens + hc 本への tile
 
+MoE は prefill の半分を占めるので、さらに中を割って別表で出す。切り方は
+`SparseMoeBlock.__call__` と `SwitchGLU` の gather_sort 経路
+(`fused.enable_gather_sort`、既定 SORT_MIN=16) の呼び出し順そのまま。
+
+    router    gate の行列積 (x を fp32 にしてから)
+    topk      argpartition + take_along_axis + softmax
+    sort      expand_dims + _gather_sort (argsort 2 回 + 行の take)
+    up/gate   gather_qmm 2 本 (2560 -> 640)
+    swiglu    silu(gate) * up
+    down      gather_qmm 1 本 (640 -> 2560)
+    unsort    _scatter_unsort + squeeze
+    combine   ルータ重みの適用 + top-K の縮約
+    shared    shared_expert_gate + shared_expert + 加算
+
+内訳は**層ごとに**測る。前提 (logits、添字、並べ替え済みの活性) は計測区間の
+外で作って確定させ、部品にはその実物を渡す。並べ替え済みの活性だけで 1 層
+105MB あり、48 層ぶん抱えられないため。層ごとに同期が入るぶん、48 層まとめて
+測った MoE 全体とは重なりの有無が違う -- その差も出す。
+
 ## 下限と効率
 
 各部品に**下限 (帯域または FLOP から出した卓上値) と効率 (下限/実測)**を
@@ -239,6 +258,201 @@ def bounds(a, S: int, offset: int, ngram_rec: float):
     return out, scan, n_blocks
 
 
+# MoE の中の部品。SparseMoeBlock.__call__ の呼び出し順そのまま。
+MOE_ORDER = ["router", "topk", "sort", "up", "gate", "swiglu", "down",
+             "unsort", "combine", "shared"]
+MOE_LABEL = {
+    "router": "  router の行列積 (fp32)",
+    "topk": "  top-k 選択 + softmax",
+    "sort": "  並べ替え (argsort x2 + take)",
+    "up": "  up 行列積 (2560 -> 640)",
+    "gate": "  gate 行列積 (2560 -> 640)",
+    "swiglu": "  SwiGLU",
+    "down": "  down 行列積 (640 -> 2560)",
+    "unsort": "  書き戻し (scatter unsort)",
+    "combine": "  ルータ重み + top-K 縮約",
+    "shared": "  共有専門家 (ゲート込み)",
+}
+
+
+def moe_bounds(a, mod, S: int):
+    """MoE 48 層ぶんの、部品ごとの FLOP とバイトを数える。
+
+    バイトは**2 通り**数える。
+
+    - **最小バイト**: `bounds` と同じ規約 (重みは 1 回、活性は入出力を
+      1 回ずつ)。中間の実体化は数えない。
+    - **動いたバイト**: コードが実際に作る配列を、op ごとに読み書きで数える。
+      `x.astype(mx.float32)` の写し、`argpartition` の全幅の出力、
+      `us * w[..., None]` が bf16 x fp32 で fp32 に昇格して 210MB を書くこと
+      など、**FLOP がゼロのまま DRAM を往復する量**はここにしか出ない。
+
+    どちらも下限は `max(FLOP/11.2T, バイト/393GB/s)` で出す (ルーフライン)。
+    重なりゼロの側の括弧として `FLOP + バイト` も呼び出し側で出す。
+
+    エキスパートの重みは 512 個を全部読む前提 -- S=2048 x top_k=10 の
+    20480 行なら 1 個あたり平均 40 行で、まず全部触られる。部品の FLOP の
+    合計は `bounds` の moe 行と一致する。
+    """
+    d, L = a.hidden_size, a.num_hidden_layers
+    ne, tk = a.num_experts, a.num_experts_per_tok
+    mi, sh = a.moe_intermediate_size, a.shared_expert_intermediate_size
+    P = S * tk
+    sw, se = mod.switch_mlp, mod.shared_expert
+    out = {}
+
+    def put(key, flop, byt, act):
+        flop, byt, act = L * flop, L * byt, L * act
+        f = flop / PEAK_FLOPS * 1000
+        out[key] = (flop, byt, max(f, byt / BW * 1000), act,
+                    max(f, act / BW * 1000), f + act / BW * 1000,
+                    "計算" if f >= act / BW * 1000 else "帯域")
+
+    def wb(lin, n):
+        """重み n 個を 1 回読むバイト数 (量子化なら 4bit + scales/biases)。"""
+        return n * (QBYTE if hasattr(lin, "scales") else 2)
+
+    # router: astype が fp32 の写しを 1 枚作り、qmm はそれを読む
+    put("router", 2 * S * d * ne,
+        wb(mod.gate, ne * d) + S * d * 2 + S * ne * 4,
+        S * d * 2 + S * d * 4 + S * d * 4 + wb(mod.gate, ne * d) + S * ne * 4)
+    # topk: -logits / argpartition の出力はどちらも ne 幅 (tk 幅ではない)
+    put("topk", 0.0, S * ne * 4 + 2 * S * tk * 4, 5 * S * ne * 4 + 6 * S * tk * 4)
+    # sort: argsort 2 回 + order//M + indices[order] で添字を 4 枚作り、
+    #       行の take は P 行を集めて P 行書く
+    put("sort", 0.0, S * d * 2 + P * d * 2 + 3 * S * tk * 4,
+        8 * P * 4 + 2 * P * d * 2)
+    # up/gate/down: gather_qmm は中間を作らないので最小 = 動いたバイト
+    for key, lin in (("up", sw.up_proj), ("gate", sw.gate_proj)):
+        b = wb(lin, ne * mi * d) + P * d * 2 + P * mi * 2
+        put(key, 2 * P * d * mi, b, b)
+    # swiglu: mx.compile 済みの融合 op 1 つ (silu と mul が分かれない)
+    put("swiglu", 0.0, 3 * P * mi * 2, 3 * P * mi * 2)
+    b = wb(sw.down_proj, ne * mi * d) + P * mi * 2 + P * d * 2
+    put("down", 2 * P * mi * d, b, b)
+    put("unsort", 0.0, 2 * P * d * 2, 2 * P * d * 2)
+    # combine: us(bf16) * w(fp32) は fp32 に昇格する。P x d の fp32 が
+    #          1 枚 (2048 x 10 x 2560 x 4 = 210MB) 実体化して sum が読み直す
+    put("combine", 0.0, P * d * 2 + S * d * 2,
+        P * d * 2 + S * tk * 4 + 2 * P * d * 4 + 2 * S * d * 4 + S * d * 2)
+    # shared: MLP は silu と mul が別 op (SwitchGLU 側と違い融合されない)
+    swb = (wb(se.gate_proj, d * sh) + wb(se.up_proj, d * sh)
+           + wb(se.down_proj, d * sh) + wb(mod.shared_expert_gate, d))
+    put("shared", 2 * S * d * (3 * sh + 1),
+        swb + S * (3 * d * 2 + 3 * sh * 2),
+        swb + S * (2 * d * 2 + 2 * sh * 2)          # gate/up 射影
+        + S * (2 * sh * 2 + 3 * sh * 2)             # silu と mul (別 op)
+        + S * (sh * 2 + d * 2)                      # down 射影
+        + S * (2 * d * 2) + S * (3 * d * 2))        # sigmoid の掛けと加算
+    return out
+
+
+def moe_parts(grabbed, reps):
+    """捕まえた MoE 48 層を、層ごとに部品へ割って ms を積む。
+
+    **無効化の差分ではなく、部品そのものを実物の入力で走らせた実測。**
+    前提は計測区間の外で eval して確定させる。1 層ぶん作っては測って捨てる
+    (並べ替え済みの活性が 1 層 105MB なので 48 層は抱えられない)。
+
+    同じ層で `SparseMoeBlock.__call__` そのものも測って `_layer` に積む。
+    部品和の突き合わせ先はこちら -- 48 層を 1 回の eval にまとめて測った
+    「MoE 全体」とは、同時に生きる中間の量が 48 倍違う。2 つの差自体が
+    読みどころなので両方出す。
+
+    `_pad32` / `_pad64` はエキスパートあたりの行数から出したタイルの水増し率
+    (sum(ceil(c/T)*T) / sum(c))。gather_qmm はソート済みの添字を
+    エキスパートごとの区間に切って走るので、区間が短いほどタイルが余る。
+
+    `#` で始まる鍵は**積み上げの段**。qmm 3 本だけの graph から始めて、
+    SwiGLU・並べ替え・書き戻し・router 一式を 1 段ずつ足す。段の増分と、
+    個別に測った部品を突き合わせると、「部品の時間」なのか「投入の間の
+    空白」なのかが分かれる。無効化の引き算ではなく、毎段が実物の graph。
+    """
+    import mlx.core as mx
+    import mlx_lm.models.switch_layers as SL
+    import numpy as np
+
+    def topk(logits, tk):
+        i = mx.argpartition(-logits, tk - 1, axis=-1)[..., :tk]
+        return i, mx.softmax(mx.take_along_axis(logits, i, axis=-1),
+                             axis=-1, precise=True)
+
+    acc = {k: 0.0 for k in MOE_ORDER}
+    acc.update({k: 0.0 for k in ("_layer", "#qmm", "#silu", "#sort", "#glu")})
+    pad32, pad64 = [], []
+    for mod, x in grabbed:
+        sw, tk = mod.switch_mlp, mod.top_k
+        acc["_layer"] += med_ms(lambda: mod(x), reps)
+        logits = mod.gate(x.astype(mx.float32))
+        mx.eval(logits)
+        idx, w = topk(logits, tk)
+        mx.eval(idx, w)
+        c = np.bincount(np.array(idx).ravel(), minlength=logits.shape[-1])
+        for T, dst in ((32, pad32), (64, pad64)):
+            dst.append(float(-(-c // T).sum() * T / c.sum()))
+        xs, idxs, inv = SL._gather_sort(mx.expand_dims(x, (-2, -3)), idx)
+        mx.eval(xs, idxs, inv)
+        x_up = sw.up_proj(xs, idxs, sorted_indices=True)
+        x_gate = sw.gate_proj(xs, idxs, sorted_indices=True)
+        mx.eval(x_up, x_gate)
+        act = sw.activation(x_up, x_gate)
+        mx.eval(act)
+        dn = sw.down_proj(act, idxs, sorted_indices=True)
+        mx.eval(dn)
+        us = SL._scatter_unsort(dn, inv, idx.shape).squeeze(-2)
+        mx.eval(us)
+        comb = (us * w[..., None]).sum(axis=-2).astype(x.dtype)
+        mx.eval(comb)
+
+        acc["router"] += med_ms(lambda: mod.gate(x.astype(mx.float32)), reps)
+        acc["topk"] += med_ms(lambda: topk(logits, tk), reps)
+        acc["sort"] += med_ms(
+            lambda: SL._gather_sort(mx.expand_dims(x, (-2, -3)), idx), reps)
+        acc["up"] += med_ms(
+            lambda: sw.up_proj(xs, idxs, sorted_indices=True), reps)
+        acc["gate"] += med_ms(
+            lambda: sw.gate_proj(xs, idxs, sorted_indices=True), reps)
+        acc["swiglu"] += med_ms(lambda: sw.activation(x_up, x_gate), reps)
+        acc["down"] += med_ms(
+            lambda: sw.down_proj(act, idxs, sorted_indices=True), reps)
+        acc["unsort"] += med_ms(
+            lambda: SL._scatter_unsort(dn, inv, idx.shape).squeeze(-2), reps)
+        acc["combine"] += med_ms(
+            lambda: (us * w[..., None]).sum(axis=-2).astype(x.dtype), reps)
+        acc["shared"] += med_ms(
+            lambda: comb + mx.sigmoid(mod.shared_expert_gate(x))
+            * mod.shared_expert(x), reps)
+
+        # -- 積み上げ。段ごとに 1 つの graph で、間に eval を入れない
+        def qmm3():
+            """qmm 3 本だけ。down は確定済みの act を読む (鎖にしない)。"""
+            return (sw.up_proj(xs, idxs, sorted_indices=True),
+                    sw.gate_proj(xs, idxs, sorted_indices=True),
+                    sw.down_proj(act, idxs, sorted_indices=True))
+
+        def with_silu():
+            u = sw.up_proj(xs, idxs, sorted_indices=True)
+            g = sw.gate_proj(xs, idxs, sorted_indices=True)
+            return sw.down_proj(sw.activation(u, g), idxs, sorted_indices=True)
+
+        def with_sort():
+            xx, ii, _ = SL._gather_sort(mx.expand_dims(x, (-2, -3)), idx)
+            u = sw.up_proj(xx, ii, sorted_indices=True)
+            g = sw.gate_proj(xx, ii, sorted_indices=True)
+            return sw.down_proj(sw.activation(u, g), ii, sorted_indices=True)
+
+        acc["#qmm"] += med_ms(qmm3, reps)
+        acc["#silu"] += med_ms(with_silu, reps)
+        acc["#sort"] += med_ms(with_sort, reps)
+        acc["#glu"] += med_ms(lambda: sw(x, idx), reps)  # + 書き戻し
+
+        del logits, idx, w, xs, idxs, inv, x_up, x_gate, act, dn, us, comb
+        mx.clear_cache()
+    acc["_pad32"] = statistics.median(pad32)
+    acc["_pad64"] = statistics.median(pad64)
+    return acc
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -373,6 +587,8 @@ def main() -> int:
         emb = model.model.embed_tokens
         res["embed"] = med_ms(
             lambda: mx.tile(emb(chunk), (1, 1, model.model.hc)), args.reps)
+        mp = moe_parts(grabbed["moe"], args.reps) if grabbed["moe"] else None
+        mlb = moe_bounds(ta, grabbed["moe"][0][0], step) if grabbed["moe"] else None
         grabbed.clear()
         mx.clear_cache()
 
@@ -427,6 +643,58 @@ def main() -> int:
                   "単体計測が重なりを再現できていない **")
         print(f"  (参考) GDN の再帰スキャン {scan / 1e12:.2f} T / n_blocks={n_blocks}",
               flush=True)
+
+        if mp is None:
+            return
+        print(f"\n  {'MoE 48 層の内訳':30s}{'実測 ms':>9s}{'FLOP T':>8s}"
+              f"{'最小GB':>8s}{'下限':>8s}{'効率':>7s}"
+              f"{'動GB':>8s}{'下限2':>8s}{'効率2':>7s}  律速")
+        for k in MOE_ORDER:
+            flop, byt, low, act, low2, nolap, kind = mlb[k]
+            ms = mp[k]
+            print(f"  {MOE_LABEL[k]:30s}{ms:9.1f}{flop / 1e12:8.2f}"
+                  f"{byt / 1e9:8.1f}{low:8.1f}{low / ms * 100 if ms else 0:6.1f}%"
+                  f"{act / 1e9:8.1f}{low2:8.1f}"
+                  f"{low2 / ms * 100 if ms else 0:6.1f}%  {kind}")
+        msum = sum(mp[k] for k in MOE_ORDER)
+        mlow = sum(v[2] for v in mlb.values())
+        mlow2 = sum(v[4] for v in mlb.values())
+        print(f"  {'  MoE 部品和':30s}{msum:9.1f}"
+              f"{sum(v[0] for v in mlb.values()) / 1e12:8.2f}"
+              f"{sum(v[1] for v in mlb.values()) / 1e9:8.1f}{mlow:8.1f}"
+              f"{mlow / msum * 100:6.1f}%"
+              f"{sum(v[3] for v in mlb.values()) / 1e9:8.1f}{mlow2:8.1f}"
+              f"{mlow2 / msum * 100:6.1f}%")
+        print(f"  下限2 は max(FLOP, 動バイト)。重なりゼロ側の括弧 (FLOP+動バイト)"
+              f" は {sum(v[5] for v in mlb.values()):.0f} ms"
+              f" (部品和の {sum(v[5] for v in mlb.values()) / msum * 100:.0f}%)")
+        lay = mp["_layer"]
+        print(f"  {'  MoE 全体 (層ごとに測って合計)':30s}{lay:9.1f}")
+        print(f"  {'  MoE 全体 (48 層を 1 eval で)':30s}{res['moe']:9.1f}")
+        print(f"  MoE 部品和 - 層ごと合計 = {msum - lay:+.1f} ms"
+              f" ({(msum - lay) / lay * 100:+.1f}%)")
+        print(f"  層ごと合計 - 48 層まとめ = {lay - res['moe']:+.1f} ms"
+              f" ({(lay - res['moe']) / res['moe'] * 100:+.1f}%)")
+        print(f"  (参考) タイルの水増し率 中央値: T=32 {mp['_pad32']:.2f} 倍"
+              f" / T=64 {mp['_pad64']:.2f} 倍")
+
+        print(f"\n  {'積み上げ (48 層合計)':30s}{'壁時計 ms':>10s}{'増分':>9s}"
+              f"{'個別の部品':>11s}{'差':>9s}")
+        prev, ladder = 0.0, [
+            ("qmm 3 本のみ", "#qmm", ("up", "gate", "down")),
+            ("+ SwiGLU", "#silu", ("swiglu",)),
+            ("+ 並べ替え", "#sort", ("sort",)),
+            ("+ 書き戻し (= SwitchGLU)", "#glu", ("unsort",)),
+            ("+ router/top-k/縮約/共有", "_layer",
+             ("router", "topk", "combine", "shared")),
+        ]
+        for name, key, parts in ladder:
+            inc = mp[key] - prev
+            ind = sum(mp[p] for p in parts)
+            print(f"  {name:30s}{mp[key]:10.1f}{inc:9.1f}{ind:11.1f}"
+                  f"{inc - ind:9.1f}")
+            prev = mp[key]
+        print(flush=True)
 
     for ci in range(n_full):
         if ci in points:
