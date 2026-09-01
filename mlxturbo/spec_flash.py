@@ -238,7 +238,10 @@ def capture(model, light: bool = False):
     """
 
     Q = _arch()
-    from .kernels.gated_delta_states import gated_delta_update_with_states
+    from .kernels.gated_delta_states import (
+        gated_delta_update_with_states,
+        gated_delta_update_with_states_gb,
+    )
 
     cap = Capture()
     orig_gdn = Q.GatedDeltaNet.__call__
@@ -258,6 +261,43 @@ def capture(model, light: bool = False):
             if (cache is not None and cache[0] is not None)
             else mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=x.dtype)
         )
+
+        # GDN 前処理の融合カーネル経路 (mlxturbo/kernels/gdn_prework.py)。
+        # _vendor/qwen4_exp.py:965-997 の適格判定と完全に同じ条件
+        # (同じ条件でないと A/B の解釈が壊れる)。検証フォワードは rollback 用に
+        # states_all (位置ごとの再帰状態) も要るので、mlx_lm 版
+        # gated_delta_kernel (最終状態だけ返す) の代わりに
+        # gated_delta_update_with_states_gb を呼ぶ。conv_input (rollback で
+        # conv 窓を切り出すのに使う) は前処理カーネルが返さないので、ここで
+        # 組み直す (concat だけで、融合の対象である conv1d/silu/rms_norm の
+        # 再計算ではない)。
+        if (
+            getattr(self, "_gdn_prework", False)
+            and mask is None
+            and cache is not None
+            and not self.training
+            and getattr(cache, "lengths", None) is None
+        ):
+            from .kernels import gdn_prework as gp
+
+            if gp.eligible(mixed_qkv, conv_state, self.conv1d.weight, a, b,
+                            self.A_log, self.dt_bias, self.n_k, self.n_v,
+                            self.dk, self.key_dim, self.value_dim):
+                q, k, v, g, beta, new_conv_state = gp.fused_gdn_prework(
+                    mixed_qkv, conv_state, self.conv1d.weight, a, b,
+                    self.A_log, self.dt_bias, self.n_k, self.n_v,
+                    self.dk, self.dv, self.key_dim, self.value_dim,
+                )
+                conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
+                out, states_all = gated_delta_update_with_states_gb(
+                    q, k, v, g, beta, cache[1], mask
+                )
+                cap.gdn[id(self)] = (conv_input, states_all)
+                cache[0] = new_conv_state
+                cache[1] = states_all[:, -1]
+                cache.advance(S)
+                return self.out_proj(self.norm(out, z).reshape(B, S, -1))
+
         if mask is not None:
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)

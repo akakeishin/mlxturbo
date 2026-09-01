@@ -770,6 +770,36 @@ class Attention(nn.Module):
         q, k, v, gate = self._qkv(x, positions, rope, cache)
         B = x.shape[0]
 
+        # 段 P1: gather と softmax を 1 本の Metal カーネルに畳む経路
+        # (`mlxturbo/kernels/prefill_attn.py`、既定 off、
+        # `mlxturbo/gather_attn.py` の `enable_prefill_attn` が立てる)。
+        # 下の `_gather_tile_attn` は選んだ列を書いて読み直して union 幅の
+        # bool マスクを作るが、カーネルは読みっぱなしで書きが無い。
+        # **キャッシュを進めた後に判定している**のは、KV キャッシュの確保済み
+        # バッファを見ないと適格判定ができないため。ここで外れても
+        # `None` は返さず既存のタイル経路へ落ちるので、二重更新は起きない。
+        if getattr(self, "_prefill_attn", False):
+            # このファイルは `mlx_lm.models.qwen4_exp` として読み込まれる
+            # (`mlxturbo/_arch_registry.py` の meta_path フック) ので、
+            # 相対 import は mlx_lm 側を指す。絶対 import で取る
+            from mlxturbo.kernels import prefill_attn as _pa
+
+            if _pa.eligible(
+                q, k, v, blocks.keep_block, cache, cr,
+                blocks.kv_len, blocks.n_blocks, self.indexer.block_topk,
+            ):
+                fused = _pa.prefill_attn(
+                    q, k, v, blocks.keep_block, cache,
+                    cr=cr,
+                    kv_len=blocks.kv_len,
+                    n_blocks=blocks.n_blocks,
+                    block_topk=self.indexer.block_topk,
+                    offset=offset,
+                    scale=self.scale,
+                )
+                # カーネルは (B, S, n_heads, head_dim) で書くので転置は要らない
+                fused = fused.reshape(B, S, -1)
+                return self.o_proj(fused * mx.sigmoid(gate))
 
         if tile <= 0 or S <= tile:
             tile = S  # 従来どおり S 全体を 1 タイルとして 1 回で処理する
@@ -931,6 +961,41 @@ class GatedDeltaNet(nn.Module):
             if (cache is not None and cache[0] is not None)
             else mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=x.dtype)
         )
+
+        # mlxturbo.fused.enable_gdn_prework_kernel が立てる。conv1d -> silu ->
+        # q/k の rms_norm+スケール -> 次段 conv 状態の書き出し -> g -> beta を
+        # 1 dispatch に畳んだ decode/verify 幅専用の経路 (mlxturbo/kernels/
+        # gdn_prework.py)。mask 付き (バッチの右パディング) と長い prefill 幅
+        # は対象外で、その場合は下の素の経路に落ちる。既定 off。
+        if (
+            getattr(self, "_gdn_prework", False)
+            and mask is None
+            and cache is not None
+            and not self.training
+            and getattr(cache, "lengths", None) is None
+        ):
+            from mlxturbo.kernels import gdn_prework as gp
+
+            if gp.eligible(mixed_qkv, conv_state, self.conv1d.weight, a, b,
+                            self.A_log, self.dt_bias, self.n_k, self.n_v,
+                            self.dk, self.key_dim, self.value_dim):
+                q, k, v, g, beta, new_conv_state = gp.fused_gdn_prework(
+                    mixed_qkv, conv_state, self.conv1d.weight, a, b,
+                    self.A_log, self.dt_bias, self.n_k, self.n_v,
+                    self.dk, self.dv, self.key_dim, self.value_dim,
+                )
+                cache[0] = new_conv_state
+                from mlx_lm.models.gated_delta import gated_delta_kernel
+
+                state = cache[1]
+                if state is None:
+                    state = mx.zeros(
+                        (B, self.n_v, self.dv, self.dk), dtype=mx.float32)
+                out, state = gated_delta_kernel(q, k, v, g, beta, state, None)
+                cache[1] = state
+                cache.advance(S)
+                return self.out_proj(self.norm(out, z).reshape(B, S, -1))
+
         if mask is not None:
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)

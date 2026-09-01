@@ -63,6 +63,12 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              **集合が同じなので品質は変わらない**。合格条件: 17k の ms/token が
              改善すること。改善したら既定を bool に変える。
 
+`prefill-attn` prefill の gather + softmax を 1 本の Metal カーネルに畳む
+             (段 P1、MLXTURBO_PREFILL_ATTN、既定 off)。A がカーネル、
+             B が現行の汎用 op 2 段。**注意する集合は同じ**で、加算順と
+             スケーリングの順だけが変わる。判定は **prefill_s** で見る
+             (decode 幅では比の判定が先に効いて両者とも従来経路へ落ちる)。
+
 `moe-verify` 共有タイル gather v2 (MLXTURBO_MOE_VERIFY、既定 off)。
              verify 幅の MoE だけを差し替える。
              合格条件: **ms/token が短・長の両方で改善すること。**
@@ -72,6 +78,16 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
 
     tools/biglock.sh .venv/bin/python tools/decode_ab.py --knob moe-verify \\
         --model ~/models/ddalcu-mlxlm --ngram ~/models/ddalcu-ngram-sep
+
+`gdn-prework` GatedDeltaNet の前処理 (conv1d -> silu -> q/k の
+             rms_norm+スケール -> 次段 conv 状態の書き出し -> g -> beta) を
+             1 dispatch に畳む (MLXTURBO_GDN_PREWORK、既定 off、
+             mlxturbo/kernels/gdn_prework.py)。decode/verify 幅のみが対象
+             (gdn_prework.MAX_S / MAX_M)。**silu と beta の sigmoid は
+             参照とビット一致しない** (hyper_connection.py と同じ bf16 の
+             1 ulp 制約) ので出力一致は要求しない。
+             合格条件: **ms/token が短・長の両方で改善すること。**
+             どちらかで悪化したら既定 off のまま据え置く。
 
 `hc-write`   hyper-connection の書き戻し (`DecoderLayer._combine`、
              MLXTURBO_HC_WRITE、既定 off) を mx.compile で 1 kernel に畳む。
@@ -149,6 +165,23 @@ def _knob_moe_verify(ctx):
             fused.enable_moe_verify_gather()
         else:
             fused.disable_moe_verify_gather()
+
+    return apply
+
+
+def _knob_gdn_prework(ctx):
+    """A = GDN 前処理の融合カーネル on / B = off (既定)。"""
+    import os
+
+    from mlxturbo import fused
+
+    os.environ["MLXTURBO_GDN_PREWORK"] = "1"  # enable 側のゲートを開ける
+
+    def apply(variant):
+        if variant == "A":
+            fused.enable_gdn_prework_kernel()
+        else:
+            fused.disable_gdn_prework_kernel()
 
     return apply
 
@@ -401,6 +434,36 @@ def _knob_gather_tile(ctx):
     return apply
 
 
+def _knob_prefill_attn(ctx):
+    """A = 融合カーネル (段 P1) / B = 現行の gather (汎用 op 2 段)。
+
+    A は選ばれたブロックの gather と softmax を 1 本の Metal カーネルに畳む
+    (`mlxturbo/kernels/prefill_attn.py`)。B は `take_along_axis` で
+    `k_sel`/`v_sel` を実体化してから union 幅の bool マスク付き sdpa に渡す
+    現行経路。**注意する集合は同じ**で、変わるのは加算順とスケーリングの順。
+
+    合格条件: **17k の prefill 壁時計 (prefill_s)** が改善すること。
+    decode 幅では `_gather_forward` の比の判定が先に効いて両者とも従来経路に
+    落ちるので、この knob は prefill でしか差が出ない。
+    """
+    from mlxturbo.gather_attn import (
+        disable_prefill_attn,
+        enable_gather_attn,
+        enable_prefill_attn,
+    )
+
+    model = ctx["eng"].model
+
+    def apply(variant):
+        if variant == "A":
+            enable_prefill_attn(model)
+        else:
+            disable_prefill_attn(model)
+            enable_gather_attn(model)
+
+    return apply
+
+
 def _knob_prefill_pipeline(ctx):
     """group prefill の境界同期を非同期にする (段 D5)。A = 非同期 / B = 現行。
 
@@ -422,6 +485,7 @@ KNOBS = {
     #        まとめで基準にする variant)
     "qsa-tail": (_knob_qsa_tail, ["A", "B"], True, "B"),
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
+    "gdn-prework": (_knob_gdn_prework, ["A", "B"], False, "B"),
     "hc-write": (_knob_hc_write, ["A", "B"], True, "B"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
@@ -433,6 +497,7 @@ KNOBS = {
     "gather-attn": (_knob_gather_attn, ["A", "B"], False, "B"),
     # -1 は gather 自体を切る (現行既定)。0 はタイルなしの gather
     "gather-tile": (_knob_gather_tile, ["-1", "0", "256"], False, "-1"),
+    "prefill-attn": (_knob_prefill_attn, ["A", "B"], False, "B"),
     "wide": (_knob_wide, ["A", "B"], False, "B"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
 }

@@ -173,7 +173,7 @@ gate_proj/up_proj/down_proj が全て eligible なときだけ v2 経路に入�
 起きない設計。依頼の「既定は off」を関数自身が守る形にした)。prefill 幅
 (indices.size >= 64) は無条件で素の経路のまま。
 
-**正しさ検証**: `_verify_v2()` (この模块の `main()` から呼ぶ) で以下を確認—
+**正しさ検証**: `_verify_v2()` (このモジュールの `main()` から呼ぶ) で以下を確認—
 (1) `gather_gate_up` 単体を fp32 参照 (dequantize + silu*mul) と比較、
 (2) `gather_down` 単体を fp32 参照と比較、(3) `SparseMoeBlock` を合成量子化
 重みで組み立て (`mlx_lm.models.switch_layers.SwitchGLU` 経由、モデル全体の
@@ -182,9 +182,12 @@ gate_proj/up_proj/down_proj が全て eligible なときだけ v2 経路に入�
 を流用。理由は同じ — bf16 で K 本足し合わせる蓄積誤差の床で、実装のバグでは
 ない)。
 
-速度について: いま裏で大きいダウンロードが並走しており、このプロセス内で
-計測しても帯域が汚れるため、勝敗の判断はしない。ここで出す us/call の数字は
-「動いた」ことの記録であって「速い」ことの証明ではない (v1 の注記と同じ)。
+速度について: ここで出す us/call は温キャッシュのマイクロなので、案の
+優劣の目安にしか使わない。採否は in-model の A/B で決める (CLAUDE.md の
+計測の作法)。**この注記は 2026-09-01 に書き直した。**元は「いま裏で大きい
+ダウンロードが並走している」と書いてあったが、それは書いた当日の状況で、
+実況として読むと後から誤解する (実際 2026-09-01 に走っていない
+ダウンロードを探すことになった)。
 """
 
 from __future__ import annotations
@@ -229,6 +232,15 @@ def _source(K: int, H: int, P: int, max_seg: int) -> str:
     const uint e     = seg_expert[seg];
     const uint segr0 = seg_row0[seg];
     const uint segn  = seg_len[seg];
+    // grid.z は実セグメント数 nseg でなく、その自明な上限 P で固定している
+    // (`_segments_gpu` 参照 — nseg はホストに読み出さないと分からないデータ
+    // 依存の値なので、同期を消すために P を使う)。この P には nseg との
+    // 差分ぶんパディング枠が混じり、そこは segn==0 になる。MoE は帯域律速
+    // なので、パディング枠のためにここから先 (gw2 以降) で量子化重みへの
+    // ポインタを組んで読みに行くと、書き込みは `r < segn` で結局捨てるだけ
+    // なのに P/nseg 倍の帯域を無駄に使ってしまい、同期を消して稼いだ分を
+    // ここで溶かすことになる。だから重みに触れる前、ここで即抜ける。
+    if (segn == 0) return;
     const size_t wrow2 = (size_t)({K} / 16);
     const size_t grow  = (size_t)({K} / 64);
     const size_t ebase = (size_t)e * {H};
@@ -341,8 +353,12 @@ def segments_from_sorted_idx(idx_sorted: list[int]) -> tuple[list[int], list[int
     """昇順ソート済み添字を連続ランで区切る (エキスパートID, 開始行, 行数)。
 
     `_gather_sort` は argsort するだけなので、同じエキスパートを引く行は
-    ソート後に必ず連続する。ここは python (ホスト側) で計算してよい
-    ―― 依頼の設計通り、境界計算そのものはこのカーネルの対象外。
+    ソート後に必ず連続する。python (ホスト側) で計算する版 ―― `.tolist()`
+    が要る (GPU→CPU 同期点)。現在は `main()` の素の実装との突き合わせ表示
+    にしか使っていない。1 verify ラウンドあたり 48 層 x 呼び出しごとに同期
+    が乗る問題があったので、本番の呼び出し経路 (`gather_gate` /
+    `gather_gate_up` / `gather_down`) は `_segments_gpu` (同期なし版) に
+    切り替えた。
     """
     seg_expert: list[int] = []
     seg_row0: list[int] = []
@@ -360,6 +376,78 @@ def segments_from_sorted_idx(idx_sorted: list[int]) -> tuple[list[int], list[int
     return seg_expert, seg_row0, seg_len
 
 
+def _segments_gpu(idx_sorted: mx.array, P: int) -> tuple[mx.array, mx.array, mx.array]:
+    """`segments_from_sorted_idx` の同期なし版。GPU 上だけで完結させ、
+    `.tolist()` (GPU→CPU 同期点) を一切呼ばない。
+
+    出力は実セグメント数 nseg ではなく常に長さ P の固定長配列で返す —
+    nseg はデータ依存 (経路によって変わる) なのでホストに読み出さない限り
+    知りようがないが、`nseg <= P` は形状だけから常に成り立つ自明な上限
+    なので、それを使って固定長にパディングする。P-nseg 個ぶんの余りの
+    枠は seg_len=0 のまま (どこにも scatter されないので零初期化のまま残る)
+    で、カーネル側は `r < segn` でしか書き込まないため無害 (計算は無駄に
+    なるが出力は変わらない)。呼び出し側もこれに合わせて grid.z を
+    nseg でなく P に固定する。
+
+    連続ランの境界検出は「直前の値と違うか」の bool 配列 (is_start) を
+    作り、その累積和からセグメント番号 (seg_id, 各行がどのセグメントに
+    属すか) を求める、という標準的な run-length encoding の書き方。
+    そこから先 (seg_expert/seg_row0/seg_len) は `.at[seg_id].add(...)` の
+    scatter-add で埋める。is_start が 1 になるのは各セグメントでちょうど
+    1 行だけなので、`値 * is_start` を足し込む形にすれば重複や競合の
+    心配なく厳密な値になる (seg_len だけは全行が 1 を足すふつうの
+    histogram)。
+    """
+    idx_i32 = idx_sorted.astype(mx.int32)
+    is_start = mx.concatenate([
+        mx.ones((1,), dtype=mx.int32),
+        (idx_i32[1:] != idx_i32[:-1]).astype(mx.int32),
+    ])
+    seg_id = mx.cumsum(is_start) - 1
+    row_idx = mx.arange(P, dtype=mx.int32)
+    zeros_p = mx.zeros((P,), dtype=mx.int32)
+    seg_expert = zeros_p.at[seg_id].add(idx_i32 * is_start)
+    seg_row0 = zeros_p.at[seg_id].add(row_idx * is_start)
+    seg_len = zeros_p.at[seg_id].add(mx.ones((P,), dtype=mx.int32))
+    return (
+        seg_expert.astype(mx.uint32),
+        seg_row0.astype(mx.uint32),
+        seg_len.astype(mx.uint32),
+    )
+
+
+def _max_seg_bound(S: int) -> int:
+    """`max_seg` (カーネルの `for r in range(max_seg)` の展開幅) の、データに
+    依存しない静的な上限。
+
+    同一トークン内の top_k は argpartition の性質上すべて相異なるので、
+    同じエキスパートを引く行が連続する長さ (セグメント長) はトークン数 S を
+    超えない (`segments_from_sorted_idx` の元のドキュメント、および
+    このファイル冒頭「依頼2」節に実測込みで記載済みの前提)。この上限は
+    形状 (S) だけから決まりデータには依らないので、ホスト同期なしで安全に
+    使える ―― これが `.tolist()` を消せる理由の核心で、実データの
+    `max(seg_len)` を都度読みに行く代わりに、この証明済みの上界をそのまま
+    カーネル選択に使う。
+
+    S が HARD_MAX_SEG_CAP を超える場合は、実データを見なくても安全側の
+    保証ができない (セグメントが max_seg 行を超えると、カーネルは
+    `rows[]` を max_seg 本しか持たないため、あふれた行が同じセグメント ID
+    のまま黙って書き込まれず消える ―― 静かな取りこぼしになる)。元の
+    ホスト版はここを実データの `max(seg_len)` で判定していたが、同期なし版
+    ではその実測ができないので、その代わりに形状だけで判定できる、より
+    保守的な (静的上界ベースの) 同じ例外を出す。今日の実運用
+    (S=3, top_k=10) はどちらの判定でも通る。
+    """
+    if S > HARD_MAX_SEG_CAP:
+        raise ValueError(
+            f"S={S} が HARD_MAX_SEG_CAP={HARD_MAX_SEG_CAP} を超える。"
+            "セグメント長の静的上限 (= S) がキャップを超えるため、同期なし"
+            "のセグメント計算では安全性を保証できない (v1/v2 はここまでしか"
+            "検証していない)"
+        )
+    return max(1, min(HARD_MAX_SEG_CAP, S))
+
+
 def gather_gate(
     x_sorted: mx.array,
     idx_sorted: mx.array,
@@ -368,30 +456,27 @@ def gather_gate(
     gate_b: mx.array,
     K: int,
     H: int,
+    S: int,
 ) -> mx.array:
     """x_sorted (P, K) bf16 とソート済み idx (P,) から gate 出力 (P, H) を返す。
 
-    セグメント境界はここ (python) で計算してからカーネルへ渡す。MAX_SEG は
-    実データの最大セグメント長からその都度決め、キャッシュキーに含める
-    (qmv_wide_nocap.py の「M ごとに1本コンパイル」と同じ考え方)。
+    セグメント境界は `_segments_gpu` で GPU 上のまま計算する (`.tolist()`
+    によるホスト同期なし)。`S` (1 verify ラウンドのトークン数、`indices`
+    の形状だけから決まる静的な値) から `_max_seg_bound` で求まる max_seg は
+    データに依らないので、そのままキャッシュキー・カーネル選択に使える。
+    grid.z は実セグメント数 nseg でなく (nseg はホストに読まないと分からない)
+    その上限 P を常に使う (`_segments_gpu` のドキュメント参照)。
     """
     P = x_sorted.shape[0]
-    idx_list = [int(v) for v in idx_sorted.tolist()]
-    seg_expert, seg_row0, seg_len = segments_from_sorted_idx(idx_list)
-    max_seg = max(seg_len) if seg_len else 1
-    if max_seg > HARD_MAX_SEG_CAP:
-        raise ValueError(
-            f"segment length {max_seg} exceeds HARD_MAX_SEG_CAP="
-            f"{HARD_MAX_SEG_CAP} (v1 はここまでしか検証していない)"
-        )
-    nseg = len(seg_expert)
+    max_seg = _max_seg_bound(S)
+    seg_expert, seg_row0, seg_len = _segments_gpu(idx_sorted, P)
     kern = _get_kernel(K, H, P, max_seg)
     (out,) = kern(
         inputs=[
             x_sorted,
-            mx.array(seg_expert, dtype=mx.uint32),
-            mx.array(seg_row0, dtype=mx.uint32),
-            mx.array(seg_len, dtype=mx.uint32),
+            seg_expert,
+            seg_row0,
+            seg_len,
             gate_w.reshape(-1, gate_w.shape[-1]),
             gate_s.reshape(-1, gate_s.shape[-1]),
             gate_b.reshape(-1, gate_b.shape[-1]),
@@ -399,7 +484,7 @@ def gather_gate(
         template=[("T", mx.bfloat16)],
         output_shapes=[(P, H)],
         output_dtypes=[mx.bfloat16],
-        grid=(32 * NSIMD, (H + ROWS_PER_TG - 1) // ROWS_PER_TG, nseg),
+        grid=(32 * NSIMD, (H + ROWS_PER_TG - 1) // ROWS_PER_TG, P),
         threadgroup=(32 * NSIMD, 1, 1),
     )
     return out
@@ -428,6 +513,10 @@ def _source_gate_up(K: int, H: int, P: int, max_seg: int) -> str:
     const uint e     = seg_expert[seg];
     const uint segr0 = seg_row0[seg];
     const uint segn  = seg_len[seg];
+    // grid.z=P 固定によるパディング枠 (segn==0) は、gate_w/up_w どちらの
+    // ポインタも組む前にここで抜く (理由は `_source` のコメント参照 —
+    // 帯域律速なので、書かないと分かっている読み出しを先に無くす)。
+    if (segn == 0) return;
     const size_t wrow2 = (size_t)({K} / 16);
     const size_t grow  = (size_t)({K} / 64);
     const size_t ebase = (size_t)e * {H};
@@ -569,25 +658,21 @@ def gather_gate_up(
     up_b: mx.array,
     K: int,
     H: int,
+    S: int,
 ) -> mx.array:
-    """x_sorted (P, K) bf16 とソート済み idx (P,) から silu(gate)*up (P, H) を返す。"""
+    """x_sorted (P, K) bf16 とソート済み idx (P,) から silu(gate)*up (P, H) を返す。
+    セグメント境界の計算・grid.z の決め方は `gather_gate` と同じ (`_segments_gpu`
+    / `_max_seg_bound` 参照、ホスト同期なし)。`S` は 1 verify ラウンドのトークン数。"""
     P = x_sorted.shape[0]
-    idx_list = [int(v) for v in idx_sorted.tolist()]
-    seg_expert, seg_row0, seg_len = segments_from_sorted_idx(idx_list)
-    max_seg = max(seg_len) if seg_len else 1
-    if max_seg > HARD_MAX_SEG_CAP:
-        raise ValueError(
-            f"segment length {max_seg} exceeds HARD_MAX_SEG_CAP="
-            f"{HARD_MAX_SEG_CAP} (v1/v2 はここまでしか検証していない)"
-        )
-    nseg = len(seg_expert)
+    max_seg = _max_seg_bound(S)
+    seg_expert, seg_row0, seg_len = _segments_gpu(idx_sorted, P)
     kern = _get_kernel_gate_up(K, H, P, max_seg)
     (out,) = kern(
         inputs=[
             x_sorted,
-            mx.array(seg_expert, dtype=mx.uint32),
-            mx.array(seg_row0, dtype=mx.uint32),
-            mx.array(seg_len, dtype=mx.uint32),
+            seg_expert,
+            seg_row0,
+            seg_len,
             gate_w.reshape(-1, gate_w.shape[-1]),
             gate_s.reshape(-1, gate_s.shape[-1]),
             gate_b.reshape(-1, gate_b.shape[-1]),
@@ -598,7 +683,7 @@ def gather_gate_up(
         template=[("T", mx.bfloat16)],
         output_shapes=[(P, H)],
         output_dtypes=[mx.bfloat16],
-        grid=(32 * NSIMD, (H + ROWS_PER_TG - 1) // ROWS_PER_TG, nseg),
+        grid=(32 * NSIMD, (H + ROWS_PER_TG - 1) // ROWS_PER_TG, P),
         threadgroup=(32 * NSIMD, 1, 1),
     )
     return out
@@ -635,6 +720,9 @@ def _source_down(K: int, H: int, P: int, max_seg: int) -> str:
     const uint e     = seg_expert[seg];
     const uint segr0 = seg_row0[seg];
     const uint segn  = seg_len[seg];
+    // grid.z=P 固定によるパディング枠 (segn==0) は down_w のポインタを
+    // 組む前にここで抜く (理由は `_source` のコメント参照)。
+    if (segn == 0) return;
     const size_t wrow2 = (size_t)({K} / 16);
     const size_t grow  = (size_t)({K} / 64);
     const size_t ebase = (size_t)e * {H};
@@ -753,27 +841,22 @@ def gather_down(
     down_b: mx.array,
     K: int,
     H: int,
+    S: int,
 ) -> mx.array:
     """x_sorted (P, K) bf16 とソート済み idx (P,) から down 出力 (P, H) を返す。
-    gate/gate_up と同じセグメント境界計算だが、こちらは K=640 の端数処理が要る
-    (`_source_down` 参照)。"""
+    gate/gate_up と同じセグメント境界計算 (`_segments_gpu` / `_max_seg_bound`、
+    ホスト同期なし) だが、こちらは K=640 の端数処理が要る (`_source_down`
+    参照)。`S` は 1 verify ラウンドのトークン数。"""
     P = x_sorted.shape[0]
-    idx_list = [int(v) for v in idx_sorted.tolist()]
-    seg_expert, seg_row0, seg_len = segments_from_sorted_idx(idx_list)
-    max_seg = max(seg_len) if seg_len else 1
-    if max_seg > HARD_MAX_SEG_CAP:
-        raise ValueError(
-            f"segment length {max_seg} exceeds HARD_MAX_SEG_CAP="
-            f"{HARD_MAX_SEG_CAP} (v1/v2 はここまでしか検証していない)"
-        )
-    nseg = len(seg_expert)
+    max_seg = _max_seg_bound(S)
+    seg_expert, seg_row0, seg_len = _segments_gpu(idx_sorted, P)
     kern = _get_kernel_down(K, H, P, max_seg)
     (out,) = kern(
         inputs=[
             x_sorted,
-            mx.array(seg_expert, dtype=mx.uint32),
-            mx.array(seg_row0, dtype=mx.uint32),
-            mx.array(seg_len, dtype=mx.uint32),
+            seg_expert,
+            seg_row0,
+            seg_len,
             down_w.reshape(-1, down_w.shape[-1]),
             down_s.reshape(-1, down_s.shape[-1]),
             down_b.reshape(-1, down_b.shape[-1]),
@@ -781,7 +864,7 @@ def gather_down(
         template=[("T", mx.bfloat16)],
         output_shapes=[(P, H)],
         output_dtypes=[mx.bfloat16],
-        grid=(32 * NSIMD, (H + ROWS_PER_TG - 1) // ROWS_PER_TG, nseg),
+        grid=(32 * NSIMD, (H + ROWS_PER_TG - 1) // ROWS_PER_TG, P),
         threadgroup=(32 * NSIMD, 1, 1),
     )
     return out
@@ -828,7 +911,7 @@ def _build_decode_case(E=512, K=2560, H=640, S=3, top_k=10, seed=0):
     return {
         "gate_w": gate_w, "gate_s": gate_s, "gate_b": gate_b,
         "x_sorted": x_sorted, "idx_sorted": idx_sorted,
-        "E": E, "K": K, "H": H,
+        "E": E, "K": K, "H": H, "S": S,
     }
 
 
@@ -874,8 +957,9 @@ def _verify_v2() -> None:
     (2) gather_down 単体を fp32 参照と比較 (K=640 の端数処理が実際に通るかも
     ここで確認する)、(3) `mlx_lm.models.qwen4_exp.SparseMoeBlock` を合成量子化
     重みで組み立て、`fused.enable_moe_verify_gather` の on/off が allclose に
-    なるかを確認する (モデル全体のロードはしない)。速度は測らない — 裏で
-    ダウンロードが並走しており計測が汚れるため、正しさだけをここで見る。
+    なるかを確認する (モデル全体のロードはしない)。速度は測らない —
+    ここは正しさの確認だけを見る場所で、速度は `main()` のマイクロと
+    in-model の A/B が受け持つ。
     """
     import os
 
@@ -896,7 +980,7 @@ def _verify_v2() -> None:
     out_gu = gather_gate_up(
         case["x_sorted"], idx_arr,
         case["gate_w"], case["gate_s"], case["gate_b"],
-        up_w, up_s, up_b, K, H,
+        up_w, up_s, up_b, K, H, case["S"],
     )
     mx.eval(out_gu)
 
@@ -925,7 +1009,7 @@ def _verify_v2() -> None:
     mx.eval(down_w, down_s, down_b)
 
     x_down = out_gu  # 実運用と同じく gate+up の出力をそのまま down の入力にする
-    out_down = gather_down(x_down, idx_arr, down_w, down_s, down_b, Kd, Hd)
+    out_down = gather_down(x_down, idx_arr, down_w, down_s, down_b, Kd, Hd, case["S"])
     mx.eval(out_down)
 
     ddeq = mx.dequantize(down_w[uniq_arr], down_s[uniq_arr], down_b[uniq_arr],
@@ -1008,7 +1092,7 @@ def main() -> None:
 
     def run_b():
         return gather_gate(
-            case["x_sorted"], idx_arr, case["gate_w"], case["gate_s"], case["gate_b"], K, H
+            case["x_sorted"], idx_arr, case["gate_w"], case["gate_s"], case["gate_b"], K, H, case["S"]
         )
 
     out_a = run_a()
@@ -1040,8 +1124,8 @@ def main() -> None:
 
     print(f"(a) mx.gather_qmm       : {t_a / n_iters * 1e6:.1f} us/call (avg of {n_iters}, interleaved)")
     print(f"(b) moe_verify_gather   : {t_b / n_iters * 1e6:.1f} us/call (avg of {n_iters}, interleaved)")
-    print(f"ratio b/a = {t_b / t_a:.3f} (< 1 なら (b) が勝ち、暫定値。裏でダウンロードが"
-          f"並走しているため勝敗の判断はしない)")
+    print(f"ratio b/a = {t_b / t_a:.3f} (< 1 なら (b) が勝ち。温キャッシュの"
+          f"マイクロなので目安まで。採否は in-model の A/B で決める)")
 
     print()
     _verify_v2()

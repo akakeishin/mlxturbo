@@ -855,6 +855,129 @@ def start_batched_generation(
     return future
 
 
+# ------------------------------------------------------- batch x speculation
+#
+# 上の継続バッチング (FallbackRunner 限定、投機なし) とは別の機構。こちらは
+# FlashSpecRunner (Flash-Next + MTP 投機) の経路で同時要求をまとめる
+# (--max-batch-spec)。中核は mlxturbo/batch_spec.py で、そのモジュールの
+# 「coordinator」節に admission とスケジューラの決めごとが書いてある。
+#
+# 2 つは互いに素な要求を扱う: 継続バッチングは「非投機に降格された要求」、
+# こちらは「投機のまま処理される要求」。同じサーバーで両方を有効にしても
+# どちらの経路を通るかは一意に決まるが、駆動ループはどちらも同じ executor
+# (唯一の MLX ワーカースレッド) を使うので、走るときは互いに直列になる。
+
+
+def can_batch_spec(resolved_runner) -> bool:
+    """True は ``FlashSpecRunner`` のときだけ。他の投機 runner
+    (SpecRunner/DraftSpecRunner/LookupSpecRunner) は自前のドラフト状態機械が
+    別物で、mlxturbo/batch_spec.py はそのどれにも当たっていない。"""
+
+    return type(resolved_runner) is FlashSpecRunner
+
+
+def spec_batch_eligible(
+    coordinator, prompt_ids: list[int], max_tokens: int, sampling: dict
+) -> bool:
+    """この要求をバッチ x 投機のコーディネータに渡してよいか。
+
+    長さの条件は ``mlxturbo.batch_spec.spec_batchable`` (QSA が最後まで
+    活性化しないこと)。加えて履歴依存のサンプリングと logprobs を弾く
+    -- 前者は ``FlashSpecRunner`` が元から受けないので server.py が非投機へ
+    降ろしており (そちらは継続バッチングの担当)、後者はバッチ側が検証
+    logits の行を集めていないため。
+    """
+
+    from . import batch_spec as _bs
+
+    if sampling.get("logprobs"):
+        return False
+    return _bs.spec_batchable(
+        coordinator.model, len(prompt_ids), max_tokens, coordinator.engine.depth
+    )
+
+
+def start_batched_spec_generation(
+    coordinator,
+    prompt_ids: list[int],
+    max_tokens: int,
+    temp: float,
+    eos_ids,
+    on_tokens,
+    on_done,
+    cancel_event,
+    **sampling,
+):
+    """``mlxturbo.batch_spec.SpecAdmission`` を 1 つ組んで投げる。
+
+    ``start_batched_generation`` (継続バッチング側) と同じ外形: 返すのは
+    ``concurrent.futures.Future`` で、streaming の呼び手は ``on_tokens`` /
+    ``on_done`` の 3 分岐で結果を受け、非 streaming の呼び手は Future を直接
+    見る。サンプリングのパラメータはここでは解釈せず、そのまま
+    ``SpecAdmission.sampling`` に載せる -- 単独 (B=1) に落ちたときは
+    ``FlashSpecRunner.generate`` にそのまま渡り、バッチのときは
+    ``batch_spec`` 側が同じ ``_position_local_sampler`` を組む。
+    """
+
+    import concurrent.futures
+
+    from . import batch_spec as _bs
+
+    future: "concurrent.futures.Future" = concurrent.futures.Future()
+    coordinator.submit(
+        _bs.SpecAdmission(
+            prompt_ids=list(prompt_ids),
+            max_tokens=max_tokens,
+            temp=temp,
+            sampling=dict(sampling),
+            eos_ids=set(eos_ids),
+            on_tokens=on_tokens,
+            on_done=on_done,
+            cancel_event=cancel_event,
+            future=future,
+        )
+    )
+    return future
+
+
+def maybe_build_batch_spec_coordinator(
+    runner,
+    executor,
+    max_batch_spec: int,
+    eos_ids,
+    wait_ms: int = 15,
+    log_prefix: str = "[mlxturbo]",
+):
+    """``None`` になるのは ``--max-batch-spec`` が 1 以下のとき、または主
+    runner が ``FlashSpecRunner`` でないとき。既定 (フラグ未指定) で必ず
+    ``None`` になることが、この変更が既定の挙動を 1 ビットも変えない根拠。
+
+    ``mlxturbo.batch.enable_batch_cache()`` は**呼ばない**。あちらは
+    qwen4_exp のメソッドをプロセス全体で差し替えるが、こちらが要る差し替えは
+    ``batch_spec.ragged_attention`` がラウンドごとに張って外す (前提が違う --
+    継続バッチングは左パディング、こちらは dead slot)。
+    """
+
+    if max_batch_spec <= 1 or not can_batch_spec(runner):
+        return None
+
+    from . import batch_spec as _bs
+    from .arch import indexer_budget
+
+    coordinator = _bs.BatchSpecCoordinator(
+        runner, executor, max_batch=max_batch_spec, eos_ids=eos_ids, wait_ms=wait_ms
+    )
+    budget = indexer_budget(coordinator.model)
+    print(
+        f"{log_prefix} バッチ x 投機 有効 (--max-batch-spec {max_batch_spec},"
+        f" FlashSpecRunner 限定, 相方待ち {wait_ms}ms)。"
+        f" プロンプト長 + max_tokens が {budget} (indexer_budget) に収まる要求だけを"
+        " まとめ、それ以外は従来どおり直列。待ち行列に 1 本しか無いときは"
+        " 単独経路をそのまま使う (mlxturbo/batch_spec.py の coordinator 節参照)"
+    )
+    return coordinator
+
+
 class DraftSpecRunner:
     """Architecture-independent speculative path that uses mlx_lm's own
     draft-model speculative decoding (``mlx_lm.generate.
@@ -1185,6 +1308,12 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         fused.enable_moe_verify_gather()
         if os.environ.get("MLXTURBO_MOE_VERIFY") == "1":
             print(f"{log_prefix} moe_verify_gather カーネル有効 (verify 幅の gate+up 融合 + down)")
+        # enable_gdn_prework_kernel 自身が MLXTURBO_GDN_PREWORK=1 をゲートに
+        # 持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
+        fused.enable_gdn_prework_kernel()
+        if os.environ.get("MLXTURBO_GDN_PREWORK") == "1":
+            print(f"{log_prefix} gdn_prework カーネル有効 (conv1d/silu/rms_norm/g/beta を"
+                  " decode/verify 幅のみ 1 dispatch に融合)")
         if os.environ.get("MLXTURBO_FAST_QMM") == "1":
             # 検証フォワード (M=3..8) の密 qmm を 8x8 MMA タイルに通す。
             # stock qmv は M にほぼ比例して重みを読み直すが、MMA タイルは
@@ -1223,6 +1352,18 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
             print(f"{log_prefix} gather attention 有効 (段 3(b)、{n} 層、"
                   f"tile={tile or 'off'}、集める割合の上限 "
                   f"{os.environ.get('MLXTURBO_GATHER_MAX_RATIO', '0.20')})")
+
+        # 段 P1: prefill の gather + softmax を 1 本の Metal カーネルに畳む
+        # (`mlxturbo/kernels/prefill_attn.py`)。**既定 off。**
+        # gather 経路の中で `_gather_tile_attn` の代わりに走るので、
+        # `enable_prefill_attn` が `_gather_attn` も一緒に立てる。
+        # 採否は in-model の壁時計 (tools/decode_ab.py --knob prefill-attn)。
+        if os.environ.get("MLXTURBO_PREFILL_ATTN") == "1":
+            from . import gather_attn as _ga
+
+            n = _ga.enable_prefill_attn(model)
+            print(f"{log_prefix} prefill attention 融合カーネル有効"
+                  f" (段 P1、{n} 層、MLXTURBO_PREFILL_ATTN=1)")
 
 
 

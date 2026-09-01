@@ -13,7 +13,12 @@ from pathlib import Path
 
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 from mlx_lm.models.cache import KVCache
-from mlx_lm.models.gated_delta import compute_g, gated_delta_ops, gated_delta_update
+from mlx_lm.models.gated_delta import (
+    compute_g,
+    gated_delta_kernel,
+    gated_delta_ops,
+    gated_delta_update,
+)
 from mlx_lm.models.qwen3_5 import DecoderLayer, TextModelArgs
 from mlx_lm.utils import (
     create_model_card,
@@ -80,6 +85,10 @@ def validate_mlx_contract() -> None:
     _require_signature(
         gated_delta_update,
         ("q", "k", "v", "a", "b", "A_log", "dt_bias", "state", "mask"),
+    )
+    _require_signature(
+        gated_delta_kernel,
+        ("q", "k", "v", "g", "beta", "state", "mask"),
     )
     _require_signature(create_attention_mask, ("h", "cache"))
     _require_signature(create_ssm_mask, ("h", "cache"))

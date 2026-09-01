@@ -325,3 +325,44 @@ def gated_delta_update_with_states(
         q, k, v, g, beta, state, mask
     )
     return out, states_all
+
+
+def gated_delta_update_with_states_gb(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: Optional[mx.array] = None,
+    mask: Optional[mx.array] = None,
+) -> Tuple[mx.array, mx.array]:
+    """`gated_delta_update_with_states` の g/beta 計算済み版。
+
+    GDN 前処理の融合カーネル (`mlxturbo/kernels/gdn_prework.py`) は conv1d
+    以降に加えて g (`compute_g` 相当) と beta (`sigmoid(b)` 相当) まで
+    1 dispatch で計算し終えているため、a/b から作り直す
+    `gated_delta_update_with_states` の経路には乗らない (二度計算になる)。
+    こちらは `gated_delta_kernel_with_states` (既に g/beta を直接受け取る
+    形になっている) をそのまま呼ぶだけで、`state=None` のときのゼロ初期化
+    だけを足す。入出力の意味は `gated_delta_update_with_states` と同じ:
+
+    Shapes:
+      - q, k: [B, T, Hk, Dk]
+      - v: [B, T, Hv, Dv]
+      - g, beta: [B, T, Hv] (前処理カーネルの `g_out`/`beta_out` と同じ形)
+      - state: [B, Hv, Dv, Dk] (fp32) or None
+    Returns:
+      - out: [B, T, Hv, Dv]
+      - states_all: [B, T, Hv, Dv, Dk] (fp32)。states_all[:, t] は位置 t を
+        処理し終えた直後の状態。
+    """
+    Hv, Dv = v.shape[-2:]
+    Dk = q.shape[-1]
+    B = q.shape[0]
+    if state is None:
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+    out, _state_out, states_all = gated_delta_kernel_with_states(
+        q, k, v, g, beta, state, mask
+    )
+    return out, states_all

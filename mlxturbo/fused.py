@@ -315,6 +315,39 @@ def disable_rms_norm_gated() -> None:
     _ORIG_RNG = None
 
 
+def enable_gdn_prework_kernel() -> None:
+    """GatedDeltaNet の前処理 (conv1d -> silu -> q/k の rms_norm+スケール ->
+    次段 conv 状態の書き出し -> g -> beta) を 1 dispatch のカーネルに畳む
+    (mlxturbo/kernels/gdn_prework.py)。
+
+    `GatedResidual`/`RMSNormGated` の enable_* とは違い、この経路は
+    `GatedDeltaNet.__call__` 側にすでにあるシーム (`getattr(self,
+    "_gdn_prework", False)`、``_project_in`` の ``_wide_in`` と同じ形) を
+    使う。ここではそのフラグをクラス属性として立てるだけで、
+    実際に使えるかどうか (形・dtype・decode/verify 幅かどうか) は毎呼び出し
+    `gdn_prework.eligible` が判定する。外れれば素の経路 (conv1d -> silu ->
+    rms_norm -> ...) にそのまま落ちる。
+
+    既定 off。環境変数 `MLXTURBO_GDN_PREWORK=1` が立っているときだけ
+    有効化する (enable_moe_verify_gather と同じゲート方式 -- 呼ぶだけでは
+    何も起きない)。採否は in-model A/B (tools/decode_ab.py --knob
+    gdn-prework) で決める。
+    """
+    import os
+
+    import mlx_lm.models.qwen4_exp as Q
+
+    if os.environ.get("MLXTURBO_GDN_PREWORK") != "1":
+        return
+    Q.GatedDeltaNet._gdn_prework = True
+
+
+def disable_gdn_prework_kernel() -> None:
+    import mlx_lm.models.qwen4_exp as Q
+
+    Q.GatedDeltaNet._gdn_prework = False
+
+
 def disable_hyper_connection() -> None:
     global _ORIG_HC
     if _ORIG_HC is None:
@@ -681,7 +714,14 @@ def _ensure_moe_dispatch_installed() -> None:
         # S (1 verify ラウンドのトークン数) は形状だけから決まる静的な値。
         # gather_gate_up/gather_down 側の同期なしセグメント計算 (`_max_seg_bound`)
         # がこれを使ってセグメント長の静的上限を出す (実データは読まない)。
-        S = indices.shape[-2]
+        #
+        # **`indices.shape[-2]` にしないこと。**バッチ検証では indices が
+        # (B, T, top_k) になり、それは T であってトークン数ではない。
+        # `_max_seg_bound` の安全証明は「セグメント長 <= トークン数」なので、
+        # B=2, T=3 のとき実トークン数 6 に対し上限 3 のカーネルが選ばれ、
+        # あふれた行が書かれないまま返る (metal_kernel の出力は零初期化
+        # されないので、例外も出ずにゴミが混ざる)。
+        S = indices.size // indices.shape[-1]
         xx = mx.expand_dims(x, (-2, -3))
         xx, idx, inv_order = SL._gather_sort(xx, indices)
         x_sorted = xx.reshape(-1, K)
@@ -856,10 +896,12 @@ def disable_moe_verify_gather() -> None:
 
 __all__ = [
     "enable_gather_sort",
+    "enable_gdn_prework_kernel",
     "enable_moe_glu",
     "enable_moe_shared_fold",
     "enable_moe_verify_gather",
     "enable_wide_projections",
+    "disable_gdn_prework_kernel",
     "disable_hc_write",
     "disable_hyper_connection",
     "disable_hyper_connection_kernel",

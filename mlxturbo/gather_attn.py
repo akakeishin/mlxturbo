@@ -32,6 +32,12 @@
 `enable_gather_attn(model, tile=...)` / 環境変数 `MLXTURBO_GATHER_TILE`
 (既定 0 = 従来どおり S 全体で 1 回) で渡す。実 17k/50k でのタイル幅
 {0, 128, 256, 512} の壁時計掃引は段 P1b (実装はここまでで完了、計測は別途)。
+
+段 P1 (融合カーネル): 上の 2 つは汎用 op を 2 段重ねる形なので、選んだ列を
+**書いて読み直してマスクを作る**費用が必ず乗る。`enable_prefill_attn` は
+その 2 段を 1 本の Metal カーネル (`mlxturbo/kernels/prefill_attn.py`) に
+畳む。既定 off、環境変数は `MLXTURBO_PREFILL_ATTN=1`。正しさの確認は
+`tools/verify_prefill_attn.py` (GPU)。
 """
 
 from __future__ import annotations
@@ -83,5 +89,43 @@ def disable_gather_attn(model, mtp=None) -> int:
         sa = getattr(layer, "self_attn", None)
         if sa is not None and getattr(sa, "_gather_attn", False):
             sa._gather_attn = False
+            sa._prefill_attn = False
+            n += 1
+    return n
+
+
+def enable_prefill_attn(model, mtp=None) -> int:
+    """段 P1 の融合カーネル (`mlxturbo/kernels/prefill_attn.py`) を仕込む。
+
+    gather と softmax を 1 本の Metal カーネルに畳む
+    (`Attention._gather_forward` の中で `_gather_tile_attn` の代わりに走る)。
+    **gather 経路そのものの中の話**なので `_gather_attn` も一緒に立てる ---
+    `Attention.__call__` は `_gather_attn` を見て `_gather_forward` に入るかを
+    決めるため、こちらだけ立てても呼ばれない。
+
+    カーネルが引き受けられない形 (dtype・head_dim・キャッシュ型) では
+    `_gather_forward` が既存のタイル経路へ落ちる。落ちた理由は
+    `mlxturbo/kernels/prefill_attn.py` が 1 度だけ表示する。
+
+    既定 off。環境変数 `MLXTURBO_PREFILL_ATTN=1` で
+    `runner.enable_default_fusions` から有効になる。
+    """
+    n = 0
+    for layer in _each_layer(model, mtp):
+        sa = getattr(layer, "self_attn", None)
+        if sa is not None and hasattr(sa, "indexer"):
+            sa._gather_attn = True
+            sa._prefill_attn = True
+            n += 1
+    return n
+
+
+def disable_prefill_attn(model, mtp=None) -> int:
+    """`enable_prefill_attn` だけを打ち消す (gather 経路は残す)。"""
+    n = 0
+    for layer in _each_layer(model, mtp):
+        sa = getattr(layer, "self_attn", None)
+        if sa is not None and getattr(sa, "_prefill_attn", False):
+            sa._prefill_attn = False
             n += 1
     return n
