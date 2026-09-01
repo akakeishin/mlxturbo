@@ -261,16 +261,46 @@ _GATHER_RATIO_MEASURED = {
 _GATHER_RATIO_UNKNOWN = 0.10
 _GATHER_RATIO_ENV = os.environ.get("MLXTURBO_GATHER_MAX_RATIO")
 _gather_ratio_warned = set()
+_gather_calib_logged = False
 
 
-def _gather_max_ratio(head_dim: int) -> float:
+def _gather_max_ratio(head_dim: int, kv_len: int = 0,
+                      n_kv_heads: int = 2) -> float:
     """この形のモデルで「集める価値がある」割合の上限。
 
-    env > 実測表 > 保守側の既定、の順。実測の無い形では**一度だけ**
-    警告を出す (較正すれば正しい値が出せる、と伝えるため)。
+    env > 較正プロファイル > 実測表 > 保守側の既定、の順。実測の無い形では
+    **一度だけ**警告を出す (較正すれば正しい値が出せる、と伝えるため)。
+
+    較正プロファイルは `MLXTURBO_CALIBRATION` を指定したときだけ読む
+    (`mlxturbo/calibration.py`)。指定が無ければ M3 Max の実測表のままで、
+    **そのことを一度ログに出す** -- 黙って他機種の値を使わない、が段 C の
+    要件 (`docs/research/KERNEL-PROGRAM.md`)。
     """
+    global _gather_calib_logged
     if _GATHER_RATIO_ENV:
         return float(_GATHER_RATIO_ENV)
+
+    # このファイルは `mlx_lm.models.qwen4_exp` として読まれるので、相対
+    # インポートは mlx_lm 側に解決される (上の `from .base import ...` と同じ)。
+    # mlxturbo は絶対名で引く。
+    from mlxturbo import calibration as _cal
+
+    u = None
+    if kv_len > 0:
+        u = _cal.gather_ratio_from_profile(head_dim, kv_len,
+                                           n_kv_heads=n_kv_heads)
+    if not _gather_calib_logged:
+        _gather_calib_logged = True
+        if u is None:
+            print("[mlxturbo] gather attention: 較正プロファイルが無いので"
+                  " M3 Max の実測値を使う (MLXTURBO_CALIBRATION で指定できる。"
+                  " 測り方は tools/calibrate.py)。")
+        else:
+            print(f"[mlxturbo] gather attention: {_cal.describe()} から"
+                  f" 比を出す (head_dim={head_dim}、kv={kv_len} で {u:.3f})。")
+    if u is not None:
+        return u
+
     if head_dim in _GATHER_RATIO_MEASURED:
         return _GATHER_RATIO_MEASURED[head_dim]
     if head_dim not in _gather_ratio_warned:
@@ -745,7 +775,8 @@ class Attention(nn.Module):
         tile = getattr(self, "_gather_attn_tile", 0)
         rows = tile if 0 < tile < S else S
         bound = rows * (self.indexer.token_budget // cr)
-        if bound * cr > _gather_max_ratio(self.head_dim) * kv_len:
+        if bound * cr > _gather_max_ratio(
+                self.head_dim, kv_len, self.n_kv_heads) * kv_len:
             return None
 
         # 集めるだけの価値があるかを**ホスト側の算数だけ**で判定する。
