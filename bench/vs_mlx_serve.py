@@ -136,12 +136,19 @@ def stream_once(port: int, messages: list, n_tokens: int, model: str = "x"):
             except json.JSONDecodeError:
                 continue
             delta = (d.get("choices") or [{}])[0].get("delta") or {}
-            if delta.get("content"):
+            # **思考 (reasoning_content) も数える。**以前は content だけ見て
+            # いて、長い文脈だと 256 トークンが思考で尽きて本文が 1 つも
+            # 来ず、うちの側が nan / 0 tok になっていた (2026-09-02)。
+            # 速度の比較としては「どの経路であれトークンが出る速さ」が
+            # 見たいものなので、両方数えるのが正しい。両サーバーに同じ
+            # 扱いをする。
+            piece = delta.get("content") or delta.get("reasoning_content")
+            if piece:
                 if ttft is None:
                     ttft = time.perf_counter() - t0
                     t_dec = time.perf_counter()
                 n += 1
-                parts.append(delta["content"])
+                parts.append(piece)
     if ttft is None:
         return float("nan"), float("nan"), 0, ""
     return ttft, time.perf_counter() - t_dec, n, "".join(parts)
@@ -245,7 +252,13 @@ def main() -> int:
             mid = model_id(port)
             for c in ctxs:
                 msgs = [{"role": "user", "content": prompts[c]}]
-                stream_once(port, msgs, 8, mid)  # 温め (捨てる)
+                # **温めに測定と同じプロンプトを使わないこと。**同じものを
+                # 投げると接頭辞キャッシュに当たり、次の「冷 TTFT」が
+                # 冷えなくなる。2026-09-02 に相手側で 17k の冷 TTFT が
+                # 0.21s と出て気づいた (17k の prefill が 0.21s はあり得ない)。
+                # 温めの目的はカーネルの初回コンパイルを済ませることなので、
+                # 短い別プロンプトで足りる。
+                stream_once(port, [{"role": "user", "content": SHORT}], 8, mid)
                 ttft, dec, n, reply = stream_once(port, msgs, args.tokens, mid)
                 tps = (n - 1) / dec if dec > 0 and n > 1 else 0.0
                 # 追記ターン: 実クライアントと同じく履歴をまるごと送り直す。
