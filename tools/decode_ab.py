@@ -89,6 +89,15 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              合格条件: **ms/token が短・長の両方で改善すること。**
              どちらかで悪化したら既定 off のまま据え置く。
 
+`gdn-blocked` GDN の再帰を長さ C のブロックに切り、ブロック内を行列積
+             (単位下三角の連立) にまとめる (MLXTURBO_GDN_BLOCKED、既定 off、
+             mlxturbo/kernels/gated_delta_blocked.py)。**prefill 幅
+             (T >= 64) のみが対象**で、decode/verify 幅は両者とも逐次
+             カーネルに落ちる -- **したがって --long で prefill を見ないと
+             差が出ない。**加算順が変わるので出力一致は要求しない。
+             合格条件: prefill_s の改善に加え、tok/round と KLD が悪化
+             しないこと。
+
 `hc-write`   hyper-connection の書き戻し (`DecoderLayer._combine`、
              MLXTURBO_HC_WRITE、既定 off) を mx.compile で 1 kernel に畳む。
              読み側 (`enable_hyper_connection_kernel`) とは別のディスパッチで、
@@ -182,6 +191,34 @@ def _knob_gdn_prework(ctx):
             fused.enable_gdn_prework_kernel()
         else:
             fused.disable_gdn_prework_kernel()
+
+    return apply
+
+
+def _knob_gdn_blocked(ctx):
+    """A = GDN の再帰をブロック化スキャンで解く / B = 逐次カーネル (既定)。
+
+    A は再帰を長さ C のブロックに切り、ブロック内を行列積 (単位下三角の連立)
+    にまとめる (`mlxturbo/kernels/gated_delta_blocked.py`)。**prefill 幅
+    (T >= 64) だけ**が対象で、decode/verify 幅は両者とも逐次カーネルに落ちる。
+
+    合格条件: **17k の prefill 壁時計 (prefill_s)。**加算順が変わるので出力は
+    一致せず、`tok/round` と KLD も併せて見る (prefill の数値を変えた
+    カーネルが受理率を落として差し引きで負けた前例がある)。
+
+    発火の確認: `mlxturbo.kernels._fire.snapshot()` の `gdn_blocked`。
+    """
+    import os
+
+    from mlxturbo import fused
+
+    os.environ["MLXTURBO_GDN_BLOCKED"] = "1"  # enable 側のゲートを開ける
+
+    def apply(variant):
+        if variant == "A":
+            fused.enable_gdn_blocked_kernel()
+        else:
+            fused.disable_gdn_blocked_kernel()
 
     return apply
 
@@ -560,6 +597,7 @@ KNOBS = {
     "qsa-tail": (_knob_qsa_tail, ["A", "B"], True, "B"),
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
     "gdn-prework": (_knob_gdn_prework, ["A", "B"], False, "B"),
+    "gdn-blocked": (_knob_gdn_blocked, ["A", "B"], False, "B"),
     "hc-write": (_knob_hc_write, ["A", "C", "B"], True, "B"),
     "rms-norm-gated": (_knob_rms_norm_gated, ["A", "C", "B"], True, "B"),
     "moe-route": (_knob_moe_route, ["A", "C", "B"], False, "B"),
@@ -772,7 +810,9 @@ def main() -> int:
                 run_once(eng, ids, 32, eos_ids)
                 break
 
-    if args.prefill_once and args.knob in ("prefill-group", "stage-every"):
+    if args.prefill_once and args.knob in (
+        "prefill-group", "stage-every", "gdn-blocked",
+    ):
         print("この knob は prefill に効くので --prefill-once は使えない")
         return 1
 

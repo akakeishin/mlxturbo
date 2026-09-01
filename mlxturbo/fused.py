@@ -416,6 +416,33 @@ def disable_gdn_prework_kernel() -> None:
     Q.GatedDeltaNet._gdn_prework = False
 
 
+def enable_gdn_blocked_kernel() -> None:
+    """GDN の再帰を prefill 幅だけブロック化スキャンで解く
+    (mlxturbo/kernels/gated_delta_blocked.py)。
+
+    `enable_gdn_prework_kernel` と同じ形で、`GatedDeltaNet.__call__` 側の
+    シーム (`getattr(self, "_gdn_blocked", False)`) を立てるだけ。実際に
+    使えるかどうか (幅・形・マスクの有無) は毎呼び出し
+    `gated_delta_blocked.eligible` が判定し、外れれば逐次カーネルに落ちる。
+
+    既定 off。環境変数 `MLXTURBO_GDN_BLOCKED=1` が立っているときだけ
+    有効化する (呼ぶだけでは何も起きない)。
+    """
+    import os
+
+    import mlx_lm.models.qwen4_exp as Q
+
+    if os.environ.get("MLXTURBO_GDN_BLOCKED") != "1":
+        return
+    Q.GatedDeltaNet._gdn_blocked = True
+
+
+def disable_gdn_blocked_kernel() -> None:
+    import mlx_lm.models.qwen4_exp as Q
+
+    Q.GatedDeltaNet._gdn_blocked = False
+
+
 def disable_hyper_connection() -> None:
     global _ORIG_HC
     if _ORIG_HC is None:
@@ -1016,11 +1043,13 @@ def disable_moe_verify_gather() -> None:
 
 __all__ = [
     "enable_gather_sort",
+    "enable_gdn_blocked_kernel",
     "enable_gdn_prework_kernel",
     "enable_moe_glu",
     "enable_moe_shared_fold",
     "enable_moe_verify_gather",
     "enable_wide_projections",
+    "disable_gdn_blocked_kernel",
     "disable_gdn_prework_kernel",
     "disable_hc_write",
     "disable_hyper_connection",

@@ -1053,18 +1053,32 @@ class GatedDeltaNet(nn.Module):
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
         state = cache[1] if cache is not None else None
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
-        )
+        # mlxturbo.fused.enable_gdn_blocked_kernel が立てる。再帰を長さ C の
+        # ブロックに切り、ブロック内を行列積 (単位下三角の連立) にまとめた
+        # prefill 幅専用の経路 (mlxturbo/kernels/gated_delta_blocked.py)。
+        # decode/verify 幅とマスク付き (バッチの右パディング) は対象外で、
+        # その場合は下の逐次カーネルにそのまま落ちる。既定 off。
+        out = None
+        if getattr(self, "_gdn_blocked", False) and not self.training:
+            from mlxturbo.kernels import gated_delta_blocked as gdb
+
+            if gdb.eligible(q, k, v, b, state, mask):
+                out, state = gdb.gated_delta_update_blocked(
+                    q, k, v, a, b, self.A_log, self.dt_bias, state,
+                )
+        if out is None:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
         if cache is not None:
             cache[1] = state
             cache.advance(S)

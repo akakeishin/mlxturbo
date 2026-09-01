@@ -972,8 +972,12 @@ def maybe_build_batch_spec_coordinator(
         f"{log_prefix} バッチ x 投機 有効 (--max-batch-spec {max_batch_spec},"
         f" FlashSpecRunner 限定, 相方待ち {wait_ms}ms)。"
         f" プロンプト長 + max_tokens が {budget} (indexer_budget) に収まる要求だけを"
-        " まとめ、それ以外は従来どおり直列。待ち行列に 1 本しか無いときは"
-        " 単独経路をそのまま使う (mlxturbo/batch_spec.py の coordinator 節参照)"
+        " まとめ、それ以外は従来どおり直列。スケジューラは 1 ステップに"
+        f" トークン予算 {coordinator.token_budget} を 1 つ持つ chunked prefill 方式で、"
+        f" 新しい要求の prefill を {coordinator.prefill_chunk} トークンずつ刻んで"
+        " 走行中の decode と同じステップに混ぜる (走行中のバッチに join する)。"
+        " 待ち行列に 1 本しか無いときは単独経路をそのまま使う"
+        " (mlxturbo/batch_spec.py の coordinator 節参照)"
     )
     return coordinator
 
@@ -1318,6 +1322,12 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         if os.environ.get("MLXTURBO_GDN_PREWORK") == "1":
             print(f"{log_prefix} gdn_prework カーネル有効 (conv1d/silu/rms_norm/g/beta を"
                   " decode/verify 幅のみ 1 dispatch に融合)")
+        # enable_gdn_blocked_kernel 自身が MLXTURBO_GDN_BLOCKED=1 をゲートに
+        # 持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
+        fused.enable_gdn_blocked_kernel()
+        if os.environ.get("MLXTURBO_GDN_BLOCKED") == "1":
+            print(f"{log_prefix} GDN ブロック化スキャン有効 (再帰を prefill 幅のみ"
+                  " 行列積に畳む)")
         if os.environ.get("MLXTURBO_FAST_QMM") == "1":
             # 検証フォワード (M=3..8) の密 qmm を 8x8 MMA タイルに通す。
             # stock qmv は M にほぼ比例して重みを読み直すが、MMA タイルは
