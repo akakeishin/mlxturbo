@@ -72,7 +72,7 @@ def split_and_checkpoint_tail(
 
     注意: 分割は正しい計算だが、一括処理とビット一致とは限らない (チャンク
     割りが変わると量子化行列積の丸めが動くのは既知の性質。
-    docs/PREFILL-CHUNKING-DETERMINISM.md 参照)。checkpoints が有効なのは
+    docs/research/PREFILL-CHUNKING-DETERMINISM.md 参照)。checkpoints が有効なのは
     サーバー経路だけなので、generate() や検証プローブ (checkpoints=None)
     はこの分岐を通らない。
     """

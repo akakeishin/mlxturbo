@@ -106,6 +106,19 @@ def recurrent_layers(model) -> list[RecurrentLayer]:
                     ngram=3,
                 )
             )
+    if not out and any(getattr(layer, "is_linear", False) for layer in model.model.layers):
+        # 「再帰層 0 個は正常系」(Gemma の sliding window) と区別が付かない
+        # まま黙って空リストを返すと、呼び手の rollback_recurrent/
+        # rollback_recurrent_rows が黙って no-op になる。qwen3_5 など
+        # `layer.is_linear` で判定できる別名のマーカーを持つ層が実在するのに
+        # `layer_type == "linear_attention"` 側で 1 つも拾えていないのは
+        # 「0 個」ではなく「この族はまだ載せ替えていない」なので、
+        # 例外にして呼び手に伝える (Opus 設計レビュー A1 指摘)。
+        raise NotImplementedError(
+            "recurrent_layers: layer.is_linear を持つ層が存在するが"
+            " layer_type == 'linear_attention' では検出できない"
+            " (qwen3_5/GLM など、未対応のモデル族の可能性)"
+        )
     return out
 
 
@@ -198,8 +211,28 @@ def rollback_recurrent_rows(
 
     `ngram_ctx`/`pair` を渡さない場合は n-gram 文脈の更新をスキップする。
     """
-    keep_arr = mx.array(keeps)
     layers = recurrent_layers(model)
+    if layers:
+        # `keeps[b]` は「行 b の受理数 (1..total)」という契約 (docstring) だが
+        # 呼び手にそれを強制する型は無い。MLX の `mx.take_along_axis` は
+        # 範囲外の添字を例外にせず末尾へクランプするため (実測確認済み)、
+        # 契約違反を渡されると「その行だけ状態が静かにずれる」形で隠れる。
+        # `RaggedLedger.commit_round` の `assert 1 <= keep <= total` は
+        # rollback の後に呼ばれる順序なのでここでは防波堤にならない。
+        # 単一行版 `rollback_recurrent` の `keep - 1 if keep > 0 else None`
+        # という非対称なガードと揃え、ここでも明示的に落とす
+        # (F2、Opus 正しさレビュー指摘)。`total` を引数で受け取っていないので
+        # 捕獲済みの `states_all` の T 軸 (= このラウンドで実際に追加した
+        # 列数、commit_round の `total` と同じ意味) から求める。
+        _, states_all0 = cap.gdn[id(layers[0].module.linear_attn)]
+        total = states_all0.shape[1]
+        for b, keep in enumerate(keeps):
+            if not (1 <= keep <= total):
+                raise ValueError(
+                    f"rollback_recurrent_rows: keeps[{b}]={keep} が"
+                    f" 1..{total} の範囲外です"
+                )
+    keep_arr = mx.array(keeps)
     for rl in layers:
         la = rl.module.linear_attn
         c = caches[rl.index]

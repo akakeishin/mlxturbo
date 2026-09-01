@@ -316,14 +316,23 @@ def ragged_attention():
 
 
 @contextmanager
-def batched_capture(model):
+def batched_capture(model, light: bool = False):
     """1 ラウンドぶんの検証フォワードに要るフックをまとめて張る:
     ``mlxturbo.spec_flash.capture()`` (GDN/PLE/GatedResidual、無変更で再利用)
     と ``ragged_attention()`` (このモジュール、full attention 側) を同時に。
+
+    ``light`` は素通しで ``capture(model, light=light)`` に渡る。既定の
+    ``light=False`` (full capture) は ``states_all`` ((B, T, Hv, Dv, Dk) fp32、
+    層あたり ~3MiB/token) を 36 層ぶん確保するため、verify 幅 (T<=2 程度) では
+    無視できても **prefill 幅 (T がプロンプト長やチャンク幅) で使うと macOS の
+    memorystatus killer にプロセスごと消される** (`spec_flash.capture` の
+    docstring 参照。実測済みの既知の壊れ方で、B 行ぶん確保するバッチはさらに
+    悪化する)。prefill 幅のフォワードをこの関数越しに流す呼び手は
+    ``light=True`` を渡すこと (F1、Opus 正しさレビュー指摘)。
     """
     from .spec_flash import capture
 
-    with capture(model) as cap, ragged_attention():
+    with capture(model, light=light) as cap, ragged_attention():
         yield cap
 
 

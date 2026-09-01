@@ -6134,6 +6134,7 @@ def main() -> None:
         batch_coordinator = maybe_build_batch_coordinator(
             fallback_candidate, model, executor, args.max_batch, eos_ids,
             log_prefix="[mlxturbo-serve]",
+            primary_runner=runner,
         )
         return runner, tokenizer, max_context_tokens, source, downgrade_runner, batch_coordinator
 

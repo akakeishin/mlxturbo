@@ -5,11 +5,10 @@ name: test
 # 実モデルはロードしない (CI に置ける重みが無い) — モデル非ロードの
 # ユニットテスト・静的検証だけを対象にする。
 #
-# bench/test_server.py は除外している: このリポジトリは改名作業
-# (fastmlx -> mlxturbo) の途中で、同ファイルは別レーンが編集中のため
-# 追随できておらず、現時点では import の時点で必ず失敗する
-# (docs/BACKLOG.md 「サーバーの配布準備」係の作業と合流したら追加する)。
-# bench/test_qmm_skinny_mma_static.py も同様に、カーネル側の作業が
+# bench/test_server.py は import できることを確認済みなので CI に含める
+# (E1、Opus 設計レビュー指摘。以前は「import の時点で必ず失敗する」として
+# 除外していたが、実際には import は通る)。
+# bench/test_qmm_skinny_mma_static.py は、カーネル側の作業が
 # 未完了のため一時的に外している。
 #
 # continue-on-error にしているのは、CI 環境の Metal/GPU 挙動がローカルの
@@ -40,7 +39,6 @@ jobs:
       - name: Run tests (model-loading tests excluded)
         run: >
           uv run pytest bench/
-          --ignore=bench/test_server.py
           --ignore=bench/test_qmm_skinny_mma_static.py
           -q
 

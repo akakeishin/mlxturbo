@@ -60,11 +60,11 @@ def main() -> int:
     ids = mx.array(ids)[None]
     eng = SF.FlashSpecEngine(model, mtp)
 
-    def run(group):
+    def run(group, checkpoints=None):
         SF._PREFILL_GROUP = group
         caches = model.make_cache()
         mx.clear_cache()
-        gen = eng.generate_stream(ids, 0, caches=caches)
+        gen = eng.generate_stream(ids, 0, caches=caches, checkpoints=checkpoints)
         try:
             while True:
                 next(gen)
@@ -97,11 +97,56 @@ def main() -> int:
         )
     )
     n = ids.shape[1]
-    if ok:
-        print(f"OK: group=0/4 bit-identical (n={n}, cache arrays={len(a[2])})")
+
+    # checkpoints=[] を渡す検査 (F3、Opus 正しさレビュー指摘)。上の
+    # checkpoints=None (未指定) 検査は group prefill 単体のビット一致しか
+    # 見ておらず、サーバーの実構成である「group prefill + BPE 末尾分割
+    # (tail_split, prefill_common.split_and_checkpoint_tail)」の組み合わせは
+    # 一度も踏んでいなかった。checkpoints が非 None かつ最終チャンクが 2
+    # トークン以上のときだけ tail_split が起きる (spec_flash.generate_stream
+    # の docstring 参照) ので、ここでは両方の分岐 (checkpoints=None /
+    # checkpoints=[]) を検査する。
+    cps_a: list = []
+    cps_b: list = []
+    a2 = run(0, checkpoints=cps_a)
+    b2 = run(4, checkpoints=cps_b)
+    ok2 = (
+        bool(mx.all(a2[0] == b2[0]))
+        and bool(mx.all(a2[1] == b2[1]))
+        and all(
+            x.shape == y.shape and bool(mx.all(x == y))
+            for x, y in zip(a2[2], b2[2])
+        )
+    )
+    pos_a = [p for p, _ in cps_a]
+    pos_b = [p for p, _ in cps_b]
+    # tail_split が実際に起きた証拠: 最終チャンクの手前 (n-1) にも
+    # checkpoint が立つ (split_and_checkpoint_tail が head 側に積む分)。
+    # group prefill の粒度 (前方チャンクの間隔) は group=0/4 で違ってよいが、
+    # 末尾側 (端数チャンクと最終チャンク) は両方とも従来経路のままなので、
+    # 末尾の 2 点 (n-1, n) は group に関係なく一致するはず。
+    tail_ok = (
+        bool(pos_a) and bool(pos_b)
+        and pos_a[-1] == n and pos_b[-1] == n
+        and (n - 1) in pos_a and (n - 1) in pos_b
+    )
+
+    if ok and ok2 and tail_ok:
+        print(f"OK: group=0/4 bit-identical (n={n}, cache arrays={len(a[2])});"
+              f" checkpoints=[] 込みでも bit-identical (tail checkpoints"
+              f" group=0:{pos_a[-3:]} group=4:{pos_b[-3:]})")
         return 0
-    print(f"FAIL: group=0/4 の出力が食い違う (n={n})。"
-          " 本家と写し (spec_flash.py の docstring 参照) の差分を疑うこと。")
+    if not ok:
+        print(f"FAIL: group=0/4 の出力が食い違う (n={n})。"
+              " 本家と写し (spec_flash.py の docstring 参照) の差分を疑うこと。")
+    if not ok2:
+        print(f"FAIL: checkpoints=[] (tail_split 込み) で group=0/4 の出力が"
+              f" 食い違う (n={n})。prefill_common.split_and_checkpoint_tail"
+              " 周りの差分を疑うこと。")
+    if not tail_ok:
+        print(f"FAIL: tail_split の checkpoint 位置がおかしい"
+              f" (期待: 末尾に n-1={n - 1} と n={n} を含む)。"
+              f" group=0: {pos_a} / group=4: {pos_b}")
     return 1
 
 

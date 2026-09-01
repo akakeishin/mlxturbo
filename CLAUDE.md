@@ -24,12 +24,25 @@
 - `mlxturbo/spec_flash.py` の `_staged_forward` / `_group_prefill_forward` /
   `capture()` は `_vendor/qwen4_exp.py` の Model.__call__ の写し。
   **本家を変えたら写しも全部変える。**変更後は
-  `tools/verify_prefill_bitident.py` で旧経路とのビット一致を確認する。
+  `tools/verify_prefill_bitident.py` で旧経路とのビット一致を確認する
+  (詳しい対応表は `docs/BACKLOG.md` の「本家フォワードの写し 9 種の整理」)。
+- `mlxturbo/staged.py` の `staged_forward` は site-packages の
+  `mlx_lm.models.qwen3_5.Qwen3_5TextModel.__call__` の写し (27B/qwen3_5 側)。
+  **本家 (mlx_lm 更新時) を変えたらここも変える。**qwen4_exp 側の 3 つと違い
+  専用のビット一致ゲートは無いので、変更後は出力トークン列の一致で確認する。
 - 「作って捨てる」遅延グラフを組まない。捨てる可能性のあるグラフは規模を
   問わず MLX の暗黙 eval に罰される (楽観先組みは 3 回失敗して棄却済み)。
-- 既定 off の knob (MLXTURBO_PIPELINE / MOE_GLU / WIDE / PREFILL_CHUNK など) は
-  実測で負けて off にしたもの。有効化するなら棄却時の記録
-  (docs/research/DECODE-ANATOMY-2026-08-31.md) を先に読む。
+- knob の既定値は 3 種類を区別すること。同じ「既定 off」でも中身が違う。
+  `MLXTURBO_PIPELINE` / `MLXTURBO_MOE_GLU` / `MLXTURBO_WIDE` /
+  `MLXTURBO_PREFILL_CHUNK` / `MLXTURBO_FAST_QMM` / `MLXTURBO_HC_PREFILL` は
+  in-model 実測で負けたから off にしてある。有効化する前に棄却時の記録
+  (`docs/research/DECODE-ANATOMY-2026-08-31.md`、
+  `docs/research/KERNEL-BRIEF-DECODE-BW.md:283`) を読むこと。一方
+  `MLXTURBO_MOE_VERIFY` (`mlxturbo/kernels/moe_verify_gather.py`) はまだ
+  in-model A/B で決着していないだけで、負けたわけではない。逆に
+  `MLXTURBO_PREFILL_GROUP=4` / `MLXTURBO_STAGE_EVERY=2` /
+  `MLXTURBO_DRAFT_RERANK=1` / `MLXTURBO_HC=kernel` / `MLXTURBO_SORT_MIN=16`
+  は本番の既定値そのもので、値を変えると本番の挙動が変わる。
 - 品質を売って速度を買わない。fake を実物より緩くしない。KLD の受け入れ幅は
   現行比 +0.0005 (bench/quant_eval.py compare)。
 

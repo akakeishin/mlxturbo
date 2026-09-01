@@ -238,8 +238,9 @@ _ROUND_TRACE = os.environ.get("MLXTURBO_ROUND_TRACE") == "1"
 def _staged_forward(model, ids, caches):
     """Model.__call__ と同じ計算を、途中の hidden を async_eval しながら組む。
 
-    グラフを 48 層ぶん組み切ってから投げると、構築中 (~4ms) GPU が遊ぶ
-    (xctrace 実測の泡)。12 層ごとに投入すれば GPU は先頭から走り出し、
+    グラフを 48 層ぶん組み切ってから投げると、構築中 (7.3ms、xctrace 実測の
+    泡。docs/research/KERNEL-BRIEF-DECODE-BW.md 参照) GPU が遊ぶ。既定の
+    `_STAGE_EVERY=2` (2 層ごと) で投入すれば GPU は先頭から走り出し、
     CPU は残りを組み続けられる。計算内容は Qwen4ExpModel.__call__ +
     lm_head と完全に同一 (このファイルの capture と同様、写しであることが
     正しさの根拠。本家を変えるときはここも変えること)。

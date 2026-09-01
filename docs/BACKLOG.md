@@ -20,16 +20,14 @@
 
 音声・動画は扱う場所自体が無い。ViT のぶん重みも増えるので、91GB がさらに膨らむ点も込みで判断すること。
 
-## 2. サーバーの並列化 (継続バッチング)
+## 2. サーバーの並列化 (継続バッチング) — 実装・配線・実モデル検証済み
 
-**測定は済んでいて、実装も opt-in の形で存在する。配線だけしていない。**
+**測定・実装・配線が済んでいる。`--max-batch N` で有効化できる (既定 1 = 直列、README.md 参照)。**
 
 - 取り分の実測: gemma4-26B で B=4 実測 2.10x。Flash-Next はエキスパート和集合からの予測で 2.05〜2.19x (`tools/observe_flashnext_batch.py` の和集合モードで再現できる)。「512 エキスパートなら飽和しにくい」は誤りで、飽和は (B × top_k) / num_experts で決まる
 - prefill には一切効かない (B に線形)。cold 32k は TTFT 112 秒で壁時計の 84% を prefill が占める (同スクリプトの prefill/decode モードで再現できる)。**体感を狙うなら prefill 側が先**
-- 実装: `mlxturbo/batch.py` に `enable_batch_cache()` (既定 off、未配線)。合成モデルの CPU 検証で QSA off と長さ揃いは B=1/2/4 完全一致。**残る制限**: QSA 有効 (2048 超) かつ長さ不揃いでバッチ出力が単体と一致しない (破損ではなく QSA のブロックグリッドが絶対列で切られるため。パディングを揃えれば 3.7e-8)。実モデル検証 `tools/verify_batch_real.py` は未実行
+- 実装: `mlxturbo/batch.py` に `enable_batch_cache()`。`mlxturbo/runner.py` の `maybe_build_batch_coordinator()` が `--max-batch` から配線する (投機経路 spec/flash_spec は対象外、`FallbackRunner` に載るリクエストだけがまとめられる)。合成モデルの CPU 検証で QSA off と長さ揃いは B=1/2/4 完全一致。**残る制限**: QSA 有効 (2048 超) かつ長さ不揃いでバッチ出力が単体と一致しない (破損ではなく QSA のブロックグリッドが絶対列で切られるため。パディングを揃えれば 3.7e-8)。実モデル検証は `tools/verify_batch_real.py --mode kld` で実施済み: bit-exact は保証しない設計 (`mlxturbo/batch.py:705-712` 参照。プレフィルチャンク幅と同様、`mx.quantized_matmul` はバッチ長総数で丸めが変わる MLX の性質で、vLLM/llama.cpp も同じ非保証) だが、next-token KLD はこのプロジェクトの量子化ノイズ床 (v-fast6: 0.00378) と同オーダーに収まる。唯一 QSA 選択差が効く `long-uneq, B=4` だけノイズ床の最大 ~4.4x まで上がるため、QSA が発火しうるリクエスト (`classify()` の "solo" tier) は常に単独実行に倒し、バッチを共有させない設計になっている
 - やる根拠は速度でなく**可用性**: 直列サーバーだとサブエージェントを流しっぱなしにしたまま別の作業ができない。B=4 でレイテンシは 0.53x に悪化するので、対話 1 本の用途では逆効果
-
-継続バッチングを投機デコードと GDN の再帰状態の上に載せるのは片手間の規模ではない。着手するなら `verify_batch_real.py` の実行が最初の一歩。
 
 ## 3. 他モデル対応で投機を効かせる (一部済み)
 
@@ -154,7 +152,25 @@ Flash-Next 独自として扱わないこと** — 線形注意/再帰系は Qwe
 ないと決まったら 2 族対応は不要で qwen4 内の重複解消に格下げ /
 バッチ x 投機の配線を捨てる判断をしたら今回はやらない。
 
-## 本家フォワードの写し 8 種の整理 (2026-09-01、fable-advisor がコード実読)
+## 本家フォワードの写し 9 種の整理 (2026-09-01、fable-advisor がコード実読)
+
+### 対応表 (番号 → file:line → 何の写しか)
+
+以前は番号だけが本文中に散らばっていて、一覧できる表が無かった (D4、Opus
+正しさ/設計レビュー指摘)。今日 `staged.py` (qwen3_5/dense 側への段階投入の
+移植) が増えたので 9 番目として追加する。
+
+| # | 写し (file:line) | 複製元 (file:line) | 内容 | 扱い |
+|---|---|---|---|---|
+| 1 | `mlxturbo/spec_flash.py:238` `_staged_forward` | `mlxturbo/_vendor/qwen4_exp.py` `Qwen4ExpModel.__call__` + lm_head | 段階投入。既定 2 層ごとに `mx.async_eval(h)` を挟み、グラフ構築中の GPU 泡 (7.3ms) を刈る | 段 4 で前段 (mask 生成・PLE prev_ctx 更新) を共有化予定。ループ骨格自体 (本家に無い制御フロー) は残す |
+| 2 | `mlxturbo/spec_flash.py:296` `_group_prefill_forward` | 同上 | layer-major prefill。層主導 x G チャンクの二重ループで、MoE 行を concat して 1 回の GEMM にまとめる | 段 5 (保留)。pre_mlp/post_mlp 分解を検討中だが効果対リスク比が最悪、二重ループ自体は最適化の本体なので残す |
+| 3 | `mlxturbo/batch.py:584` `model_call` | 同上 `Qwen4ExpModel.__call__` | mask 生成・conv_mask 構築・n-gram prev_ctx 更新の 3 箇所がバッチ (左パディング) 対応版 | 段 3 で `_make_masks`/`_update_ngram_ctx` を vendor 側シームとして切り出し解消予定 |
+| 4 | `mlxturbo/spec_flash.py:158` `capture()` 内 `gdn`/`ple_conv` | `mlxturbo/_vendor/qwen4_exp.py` `GatedDeltaNet.__call__` / `PLELayer._short_conv` | rollback 用に `states_all` 等を保持するための転記 (カーネル差し替えのみ、ロジック不変) | 対象外。「本家と一字一句同じ」が `tools/verify_prefill_bitident.py` のビット一致ゲートの根拠なので抽象化しない (本文の番号ラベルが唯一無い項目 -- 除外 3 項目リストの 3 番目 `capture の GDN 転記` が写し 1/2 と同じ並びで対応する、という消去法での再構成) |
+| 5 | `mlxturbo/batch.py:516` `gdn_call` + `:564` `ple_short_conv` | `GatedDeltaNet.__call__` / `PLELayer._short_conv` | conv 状態の取り出しを `cache.lengths` (右パディング下の実長) 基準にする差分のみ | 段 1 で `_store_conv_state` 系のシームを vendor に切って解消予定 |
+| 6 | `mlxturbo/spec.py:432` `_linear_capture` | site-packages `mlx_lm/models/qwen3_5.py` の `GatedDeltaNet` (27B/qwen3_5 側) | qwen3_5 用の GDN 捕捉版 | 対象外。上流が site-packages で vendor していない (関数 1 つのために qwen3_5 を vendor するのは割に合わない) |
+| 7 | `mlxturbo/batch.py:456` `attention_call` | `mlxturbo/_vendor/qwen4_exp.py` `Attention.__call__` | rope 位置導出のみが左パディング対応の差分 | 段 2 で `_positions`/`_final_mask` を vendor 側シームとして切り出し解消予定 |
+| 8 | `mlxturbo/batch_spec.py:248` `ragged_attention()` 内 `call` | 同上 `Attention.__call__` | rope 位置と最終 mask 構成 (`cache.ledger.next_round_mask`) の 2 点が dead-slot 台帳対応の差分 | 段 2 で解消予定 (写し 7 と同じシーム) |
+| 9 | `mlxturbo/staged.py:35` `staged_forward` | site-packages `mlx_lm/models/qwen3_5.py` の `Qwen3_5TextModel.__call__` | 写し 1 と同じ段階投入手法を qwen3_5 (27B/dense) 側へアーキ非依存に一般化移植したもの | 対象外。写し 6 と同じ理由 (上流が site-packages)。今日追加 |
 
 **前提の変更 (ユーザー方針)**: 上流 mlx-lm PR #1788 への追随は気にしない。
 `mlxturbo/_vendor/qwen4_exp.py` は**うちが所有して自由に改変してよいファイル**

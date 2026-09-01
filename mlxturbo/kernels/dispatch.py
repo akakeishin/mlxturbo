@@ -95,12 +95,17 @@ def _load_kernels():
     global _KERNELS
     if _KERNELS is not None:
         return _KERNELS
-    import os
 
     # fast_qmm (MIT、ライセンス確認済み 2026-08-26) が依存チェーン実測で
     # m=8: 1.57x と自作 v3/v4/v5 (1.16-1.18x) を上回るため、MMA 経路の実体は
     # fast_qmm にする。wide (m=9..16) も有効化。適格外は内部で stock へ落ちる。
-    os.environ.setdefault("MLXLM_FAST_QMM_WIDE", "1")
+    # `MLXLM_FAST_QMM_WIDE` は fast_qmm.py 側で「既定 off」と読める公開の
+    # 環境変数なので、ここで os.environ.setdefault してプロセス全体の既定を
+    # 横取りしない -- fast_qmm 側に用意した内部フラグ経由で、この MMA 経路
+    # だけ wide を有効化する (A2, Opus 設計レビュー指摘。挙動は不変)。
+    from .. import fast_qmm as _fast_qmm_mod
+
+    _fast_qmm_mod._WIDE_FORCE_ON = True
     from ..fast_qmm import fast_qmm
     from .qmv_wide_nocap import qmv_wide_nocap
 

@@ -240,7 +240,10 @@ def run_batched(model, prompt_batch, oracle_seqs):
     )
 
     caches, ledger = make_ragged_cache(model, B)
-    with batched_capture(model) as cap:
+    # prefill 幅のフォワードなので light=True (F1、Opus 正しさレビュー指摘)。
+    # この cap は下で rollback に使わない (commit_round だけで確定するので
+    # states_all は要らない) -- batched_capture の docstring 参照。
+    with batched_capture(model, light=True) as cap:
         logits = model(prompt_batch, cache=caches)
         mx.eval(logits)
     ledger.commit_round([PROMPT_LEN] * B, PROMPT_LEN)

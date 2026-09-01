@@ -145,6 +145,18 @@ M_WIDE_MAX = 16    # up to the second MMA tile — the weight read is identical 
 # rows 8-15 lets that width share M=8's weight-read cost outright. The
 # in-window (M<=8) path is left untouched.
 
+# Wide (M=9..16) の既定は off。有効化は `MLXLM_FAST_QMM_WIDE=1` (公開の環境
+# 変数) か、この内部フラグの直接代入 (kernels/dispatch.py の MMA 経路が使う)
+# のどちらか -- dispatch.py は自分の経路だけ wide を強制したいので、
+# os.environ を書き換えてプロセス全体の既定を横取りする代わりにこのフラグを
+# 立てる (A2, Opus 設計レビュー指摘)。
+_WIDE_FORCE_ON = False
+
+
+def _wide_enabled() -> bool:
+    return _WIDE_FORCE_ON or os.environ.get("MLXLM_FAST_QMM_WIDE") == "1"
+
+
 _SRC_WIDE = r"""
     const int K = KD, N = ND, M = MD;
     const int KPS = KD / 8;
@@ -336,7 +348,7 @@ def fast_qmm(x, w, scales, biases, *, group_size: int, bits: int):
         _WIDTH_HIST[M] = _WIDTH_HIST.get(M, 0) + 1
     if (
         M_MAX < M <= M_WIDE_MAX
-        and os.environ.get("MLXLM_FAST_QMM_WIDE") == "1"
+        and _wide_enabled()
         and _eligible(x, w, scales, biases, group_size, bits, K, N)
     ):
         return _wide_qmm(x, w, scales, biases, M=M, K=K, N=N)

@@ -4,8 +4,9 @@
 
 spec_flash.py の ``_staged_forward`` (Flash-Next / qwen4_exp 型、hyper
 connection mixer あり) と同じ手法をここに一般化した: 全 layer ぶんの
-遅延グラフを組み切ってから流すと、グラフ構築中 (~7ms/round、spec_flash.py
-側の実測) の間 GPU が遊ぶ。``every`` 層ごとに ``mx.async_eval(h)`` で
+遅延グラフを組み切ってから流すと、グラフ構築中 (7.3ms/round、spec_flash.py
+側の実測。docs/research/KERNEL-BRIEF-DECODE-BW.md 参照) の間 GPU が遊ぶ。
+``every`` 層ごとに ``mx.async_eval(h)`` で
 途中結果を先に投入すれば、GPU がそこから計算を始める一方で CPU は残りの
 グラフを組み続けられる。``async_eval`` は値を変えずスケジューリングだけを
 変えるので、``every`` の値によらず計算内容は同一 (出力トークン列が正しさの

@@ -415,7 +415,7 @@ def enable_wide_projections(model, mtp=None) -> dict:
                 sw._fused_h = _rows(g)
                 counts["experts"] += 1
     if counts["experts"]:
-        _patch_switch_glu()
+        _ensure_moe_dispatch_installed()
     return counts
 
 
@@ -424,51 +424,180 @@ def _rows(lin) -> int:
     return lin.scales.shape[-2]
 
 
-_ORIG_SWITCH_GLU = None
+# --- SwitchGLU の統合ディスパッチ ---------------------------------------
+#
+# 以前は enable_wide_projections (経由の _patch_switch_glu) /
+# enable_gather_sort / enable_moe_glu / enable_moe_verify_gather の 4 つが
+# それぞれ独立に SL.SwitchGLU.__call__ を差し替え、別々の _ORIG_* に退避
+# していた。掛け順によって disable_* の復元先が壊れる (例: verify の後に
+# sort を掛けてから disable_moe_verify_gather すると、sort のパッチごと
+# verify 以前の実装で上書きされる) ため、1 つのディスパッチ関数 + 分岐に
+# 畳む (C1、Opus 設計レビュー指摘)。
+#
+# 分岐の優先順位は、これまで runner.py が実際に呼んでいた順序 (wide ->
+# gather_sort -> moe_glu -> moe_verify、後から掛けたパッチが前を覆う) を
+# 「後から掛けた方が優先」という固定順位として書き下しただけで、
+# どの条件でどの実装が走るかという既存の挙動は変えていない。
+# enable_gather_sort の実装自体には素通し条件が無い (常にそこで確定する)
+# ため、wide の _fused_w 経路より必ず優先される -- これは統合前から
+# あった挙動 (MLXTURBO_WIDE=1 でも既定の SORT_MIN>0 では wide 経路は
+# 事実上到達しない) で、ここで新たに変えたわけではない。
+_MOE_DISPATCH_STOCK = None          # 素の SL.SwitchGLU.__call__ (フォールバック先)
+_MOE_DISPATCH_SORT_MIN: "int | None" = None   # enable_gather_sort が設定
+_MOE_DISPATCH_GLU_ON = False        # enable_moe_glu が設定
+_MOE_DISPATCH_VERIFY_ON = False     # enable_moe_verify_gather が設定
+_MOE_DISPATCH_WIDE_SORT_MIN: "int | None" = None  # インストール時に一度だけ読む
 
 
-def _patch_switch_glu() -> None:
-    """SwitchGLU の gate/up gather を、_fused_* があれば 1 回にまとめる。"""
-    global _ORIG_SWITCH_GLU
+def _ensure_moe_dispatch_installed() -> None:
+    """4 経路共通のディスパッチ関数を SL.SwitchGLU.__call__ に一度だけ入れる。
+
+    実際にどの経路が使われるかは呼び出し時に _MOE_DISPATCH_* を見て決まる
+    (このインストール自体は決定に関与しない、副作用は初回だけ)。
+    """
+    global _MOE_DISPATCH_STOCK, _MOE_DISPATCH_WIDE_SORT_MIN
+    import os
+
     import mlx.core as mx
     import mlx_lm.models.switch_layers as SL
 
-    if _ORIG_SWITCH_GLU is not None:
+    if _MOE_DISPATCH_STOCK is not None:
         return
-    _ORIG_SWITCH_GLU = SL.SwitchGLU.__call__
-    orig = _ORIG_SWITCH_GLU
-
-    import os
+    _MOE_DISPATCH_STOCK = SL.SwitchGLU.__call__
+    stock = _MOE_DISPATCH_STOCK
 
     # 検証フォワード (T=2..4 -> 添字 22..44) は既定の 64 に届かずソートされない。
     # ソートすると同じエキスパートを引く行が隣接し、重みタイルの再利用が効く。
-    # 値は並べ替えて戻すだけなので不変。閾値は MLXTURBO_SORT_MIN で変えられる。
-    sort_min = int(os.environ.get("MLXTURBO_SORT_MIN", "64"))
+    # 値は並べ替えて戻すだけなので不変。閾値は MLXTURBO_WIDE_SORT_MIN で変え
+    # られる (enable_gather_sort 側の MLXTURBO_SORT_MIN とは別の変数 --
+    # 同名だと既定 64 と既定 16 が逆向きに衝突するため改名した。この連結射影
+    # 経路は既定 off の実験経路なので、改名の影響はこちら側に閉じている)。
+    _MOE_DISPATCH_WIDE_SORT_MIN = int(os.environ.get("MLXTURBO_WIDE_SORT_MIN", "64"))
 
-    def patched(self, x, indices):
+    def wide(self, x, indices):
+        """enable_wide_projections/enable_moe_shared_fold が仕込んだ
+        `_fused_w` があれば gate+up を 1 回の gather_qmm にまとめる。
+        無ければ None を返して呼び手 (dispatched) に素通しさせる。"""
         if not hasattr(self, "_fused_w"):
-            return orig(self, x, indices)
-        x = mx.expand_dims(x, (-2, -3))
-        do_sort = indices.size >= sort_min
+            return None
+        xx = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= _MOE_DISPATCH_WIDE_SORT_MIN
         idx = indices
         inv_order = None
         if do_sort:
-            x, idx, inv_order = SL._gather_sort(x, indices)
+            xx, idx, inv_order = SL._gather_sort(xx, indices)
         gp = self.gate_proj
         both = mx.gather_qmm(
-            x, self._fused_w, self._fused_s, self._fused_b,
+            xx, self._fused_w, self._fused_s, self._fused_b,
             rhs_indices=idx, transpose=True,
             group_size=gp.group_size, bits=gp.bits, mode=gp.mode,
             sorted_indices=do_sort,
         )
         h = self._fused_h
         x_gate, x_up = both[..., :h], both[..., h:]
-        x = self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices=do_sort)
+        out = self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices=do_sort)
         if do_sort:
-            x = SL._scatter_unsort(x, inv_order, indices.shape)
-        return x.squeeze(-2)
+            out = SL._scatter_unsort(out, inv_order, indices.shape)
+        return out.squeeze(-2)
 
-    SL.SwitchGLU.__call__ = patched
+    def gather_sort(self, x, indices, min_size):
+        """enable_gather_sort: ソート閾値だけを下げる (構造は素の 3 gather
+        のまま)。素通し条件を持たない -- 有効なら常にここで確定する。"""
+        xx = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= min_size
+        idx = indices
+        inv_order = None
+        if do_sort:
+            xx, idx, inv_order = SL._gather_sort(xx, indices)
+        if self.training:
+            idx = mx.stop_gradient(idx)
+        x_up = self.up_proj(xx, idx, sorted_indices=do_sort)
+        x_gate = self.gate_proj(xx, idx, sorted_indices=do_sort)
+        out = self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices=do_sort)
+        if do_sort:
+            out = SL._scatter_unsort(out, inv_order, indices.shape)
+        return out.squeeze(-2)
+
+    def moe_glu(self, x, indices):
+        """enable_moe_glu: gate+up+silu*mul を自作 1 ディスパッチカーネルへ。
+        適格でなければ None (素通し)。"""
+        from .kernels import moe_glu as _moe_glu_kernel
+
+        if indices.size >= 64 or not _moe_glu_kernel.eligible(
+            x, self.gate_proj, self.up_proj
+        ):
+            return None
+        topk = indices.shape[-1]
+        K = x.shape[-1]
+        H = self.gate_proj.scales.shape[-2]
+        # down 側の gather のために enable_gather_sort と同じソートを保つ
+        # (同一エキスパートを引く行を隣接させる。自作カーネル自身は順序不問)
+        do_sort = indices.size >= 16
+        xx = mx.expand_dims(x, (-2, -3))
+        idx = indices
+        inv_order = None
+        if do_sort:
+            xx, idx, inv_order = SL._gather_sort(xx, indices)
+            x_pairs = xx.reshape(-1, K)              # ソート済み対ごとの x
+            idx_flat = idx
+        else:
+            x_tok = x.reshape(-1, K)
+            x_pairs = mx.repeat(x_tok[:, None, :], topk, axis=1).reshape(-1, K)
+            idx_flat = indices.reshape(-1)
+        act = _moe_glu_kernel.fused_glu(x_pairs, idx_flat, self.gate_proj, self.up_proj)
+        if do_sort:
+            act = act[:, None, :]                    # (P, 1, H)
+            out = self.down_proj(act, idx, sorted_indices=True)
+            out = SL._scatter_unsort(out, inv_order, indices.shape)
+            return out.squeeze(-2)
+        act = act.reshape(*indices.shape, 1, H)
+        out = self.down_proj(act, indices, sorted_indices=False)
+        return out.squeeze(-2)
+
+    def moe_verify(self, x, indices):
+        """enable_moe_verify_gather: verify 幅だけ v2 (gate+up 融合 + down)
+        へ。適格でなければ None (素通し)。indices.size >= 64 (mlx_lm 自身の
+        ソート閾値、moe_glu と同じ基準) は prefill 幅とみなして素通し。"""
+        from .kernels import moe_verify_gather as mvg
+
+        if indices.size >= 64:
+            return None
+        gp, up, dp = self.gate_proj, self.up_proj, self.down_proj
+        if not (mvg.eligible_gate_up(x, gp, up) and mvg.eligible_down(dp)):
+            return None
+        K = x.shape[-1]
+        H = gp.scales.shape[-2]
+        xx = mx.expand_dims(x, (-2, -3))
+        xx, idx, inv_order = SL._gather_sort(xx, indices)
+        x_sorted = xx.reshape(-1, K)
+        act = mvg.gather_gate_up(
+            x_sorted, idx, gp.weight, gp.scales, gp.biases,
+            up.weight, up.scales, up.biases, K, H,
+        )
+        # down カーネルは (P, H) の2次元で返る。gather_qmm 経由の素の実装は
+        # M=1 の中間次元を挟むが、自作カーネルは最初から持たないので
+        # [:, None, :] や squeeze(-2) は不要 (挟むと形が壊れる)
+        out = mvg.gather_down(act, idx, dp.weight, dp.scales, dp.biases, H, K)
+        out = SL._scatter_unsort(out, inv_order, indices.shape)
+        return out
+
+    def dispatched(self, x, indices):
+        if _MOE_DISPATCH_VERIFY_ON:
+            out = moe_verify(self, x, indices)
+            if out is not None:
+                return out
+        if _MOE_DISPATCH_GLU_ON:
+            out = moe_glu(self, x, indices)
+            if out is not None:
+                return out
+        if _MOE_DISPATCH_SORT_MIN is not None:
+            return gather_sort(self, x, indices, _MOE_DISPATCH_SORT_MIN)
+        out = wide(self, x, indices)
+        if out is not None:
+            return out
+        return stock(self, x, indices)
+
+    SL.SwitchGLU.__call__ = dispatched
 
 
 def enable_moe_shared_fold(model) -> int:
@@ -535,11 +664,8 @@ def enable_moe_shared_fold(model) -> int:
         mlp._router513 = router
         n += 1
     if n:
-        _patch_switch_glu()
+        _ensure_moe_dispatch_installed()
     return n
-
-
-_ORIG_SWITCH_SORT = None
 
 
 def enable_gather_sort(min_size: int = 16) -> None:
@@ -548,36 +674,17 @@ def enable_gather_sort(min_size: int = 16) -> None:
     既定の閾値 64 は検証フォワード (T=2..4 -> 添字 22..44) に届かず、同じ
     エキスパートを引く行が散らばったまま読まれる。ソートすれば重みタイルの
     再利用が効く。並べ替えて戻すだけなので出力の値は不変。
+
+    実体は _ensure_moe_dispatch_installed が入れる統合ディスパッチ関数
+    (C1) の一分岐。この関数自体は「gather_sort 経路を有効にして min_size
+    を確定する」だけで、以後の呼び出しは冪等 (最初の min_size が残る --
+    以前の実装もそうだった)。
     """
-    global _ORIG_SWITCH_SORT
-    import mlx_lm.models.switch_layers as SL
-
-    if _ORIG_SWITCH_SORT is not None:
+    global _MOE_DISPATCH_SORT_MIN
+    if _MOE_DISPATCH_SORT_MIN is not None:
         return
-    _ORIG_SWITCH_SORT = SL.SwitchGLU.__call__
-
-    import mlx.core as mx
-
-    def patched(self, x, indices):
-        x = mx.expand_dims(x, (-2, -3))
-        do_sort = indices.size >= min_size
-        idx = indices
-        inv_order = None
-        if do_sort:
-            x, idx, inv_order = SL._gather_sort(x, indices)
-        if self.training:
-            idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
-        x = self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices=do_sort)
-        if do_sort:
-            x = SL._scatter_unsort(x, inv_order, indices.shape)
-        return x.squeeze(-2)
-
-    SL.SwitchGLU.__call__ = patched
-
-
-_ORIG_SWITCH_GLU_FULL = None
+    _MOE_DISPATCH_SORT_MIN = min_size
+    _ensure_moe_dispatch_installed()
 
 
 def enable_moe_glu() -> None:
@@ -587,58 +694,15 @@ def enable_moe_glu() -> None:
     適格でない層・経路 (量子化が 4bit/gs64 でない、prefill のソート済み大バッチ
     など) は素の実装へ落ちる。数値は gather_qmm x2 + swiglu とビット一致しない
     (積和順と bf16 sigmoid)。判定は in-model の複数プロンプト平均で。
+
+    実体は _ensure_moe_dispatch_installed が入れる統合ディスパッチ関数
+    (C1) の一分岐。
     """
-    global _ORIG_SWITCH_GLU_FULL
-    import mlx.core as mx
-    import mlx_lm.models.switch_layers as SL
-
-    from .kernels import moe_glu
-
-    if _ORIG_SWITCH_GLU_FULL is not None:
+    global _MOE_DISPATCH_GLU_ON
+    if _MOE_DISPATCH_GLU_ON:
         return
-    _ORIG_SWITCH_GLU_FULL = SL.SwitchGLU.__call__
-    orig = _ORIG_SWITCH_GLU_FULL
-
-    def patched(self, x, indices):
-        # デコードの小さい添字だけを対象にする。大きいバッチ (prefill) は
-        # ソート + gather_qmm の方が強いので素のまま
-        if indices.size >= 64 or not moe_glu.eligible(x, self.gate_proj, self.up_proj):
-            return orig(self, x, indices)
-        topk = indices.shape[-1]
-        K = x.shape[-1]
-        H = self.gate_proj.scales.shape[-2]
-        # down 側の gather のために enable_gather_sort と同じソートを保つ
-        # (同一エキスパートを引く行を隣接させる。自作カーネル自身は順序不問)
-        do_sort = indices.size >= 16
-        xx = mx.expand_dims(x, (-2, -3))
-        idx = indices
-        inv_order = None
-        if do_sort:
-            import mlx_lm.models.switch_layers as SL2
-
-            xx, idx, inv_order = SL2._gather_sort(xx, indices)
-            x_pairs = xx.reshape(-1, K)              # ソート済み対ごとの x
-            idx_flat = idx
-        else:
-            x_tok = x.reshape(-1, K)
-            x_pairs = mx.repeat(x_tok[:, None, :], topk, axis=1).reshape(-1, K)
-            idx_flat = indices.reshape(-1)
-        act = moe_glu.fused_glu(x_pairs, idx_flat, self.gate_proj, self.up_proj)
-        if do_sort:
-            act = act[:, None, :]                    # (P, 1, H)
-            out = self.down_proj(act, idx, sorted_indices=True)
-            import mlx_lm.models.switch_layers as SL2
-
-            out = SL2._scatter_unsort(out, inv_order, indices.shape)
-            return out.squeeze(-2)
-        act = act.reshape(*indices.shape, 1, H)
-        out = self.down_proj(act, indices, sorted_indices=False)
-        return out.squeeze(-2)
-
-    SL.SwitchGLU.__call__ = patched
-
-
-_ORIG_SWITCH_GLU_VERIFY = None
+    _MOE_DISPATCH_GLU_ON = True
+    _ensure_moe_dispatch_installed()
 
 
 def enable_moe_verify_gather() -> None:
@@ -650,56 +714,29 @@ def enable_moe_verify_gather() -> None:
     (呼び出し側が env var を忘れても既定 off が保たれるように、ゲートを
     関数自身の中に持たせている)。indices.size >= 64 (mlx_lm 自身のソート
     閾値、enable_moe_glu と同じ基準) は prefill 幅とみなして素の経路のまま。
+
+    実体は _ensure_moe_dispatch_installed が入れる統合ディスパッチ関数
+    (C1) の一分岐。
     """
-    global _ORIG_SWITCH_GLU_VERIFY
+    global _MOE_DISPATCH_VERIFY_ON
     import os
 
     if os.environ.get("MLXTURBO_MOE_VERIFY") != "1":
         return
-
-    import mlx.core as mx
-    import mlx_lm.models.switch_layers as SL
-
-    from .kernels import moe_verify_gather as mvg
-
-    if _ORIG_SWITCH_GLU_VERIFY is not None:
+    if _MOE_DISPATCH_VERIFY_ON:
         return
-    _ORIG_SWITCH_GLU_VERIFY = SL.SwitchGLU.__call__
-    orig = _ORIG_SWITCH_GLU_VERIFY
-
-    def patched(self, x, indices):
-        if indices.size >= 64:
-            return orig(self, x, indices)
-        gp, up, dp = self.gate_proj, self.up_proj, self.down_proj
-        if not (mvg.eligible_gate_up(x, gp, up) and mvg.eligible_down(dp)):
-            return orig(self, x, indices)
-        K = x.shape[-1]
-        H = gp.scales.shape[-2]
-        xx = mx.expand_dims(x, (-2, -3))
-        xx, idx, inv_order = SL._gather_sort(xx, indices)
-        x_sorted = xx.reshape(-1, K)
-        act = mvg.gather_gate_up(
-            x_sorted, idx, gp.weight, gp.scales, gp.biases,
-            up.weight, up.scales, up.biases, K, H,
-        )
-        # down カーネルは (P, H) の2次元で返る。gather_qmm 経由の素の実装は
-        # M=1 の中間次元を挟むが、自作カーネルは最初から持たないので
-        # [:, None, :] や squeeze(-2) は不要 (挟むと形が壊れる)
-        out = mvg.gather_down(act, idx, dp.weight, dp.scales, dp.biases, H, K)
-        out = SL._scatter_unsort(out, inv_order, indices.shape)
-        return out
-
-    SL.SwitchGLU.__call__ = patched
+    _MOE_DISPATCH_VERIFY_ON = True
+    _ensure_moe_dispatch_installed()
 
 
 def disable_moe_verify_gather() -> None:
-    global _ORIG_SWITCH_GLU_VERIFY
-    if _ORIG_SWITCH_GLU_VERIFY is None:
-        return
-    import mlx_lm.models.switch_layers as SL
-
-    SL.SwitchGLU.__call__ = _ORIG_SWITCH_GLU_VERIFY
-    _ORIG_SWITCH_GLU_VERIFY = None
+    """enable_moe_verify_gather を打ち消す。統合ディスパッチ (C1) では
+    フラグを下ろすだけでよく、他の 3 経路 (wide/gather_sort/moe_glu) が
+    その時点で有効かどうかに関係なく、それらの分岐だけを正しく戻す
+    (以前のクラスメソッド丸ごと差し替え方式では、これが掛け順によって
+    壊れていた)。"""
+    global _MOE_DISPATCH_VERIFY_ON
+    _MOE_DISPATCH_VERIFY_ON = False
 
 
 __all__ = [

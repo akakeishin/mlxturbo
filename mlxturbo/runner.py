@@ -1124,6 +1124,7 @@ def maybe_build_batch_coordinator(
     eos_ids,
     prefill_step_size: int | None = None,
     log_prefix: str = "[mlxturbo]",
+    primary_runner=None,
 ):
     """``None`` unless both hold: ``--max-batch`` asked for more than 1, and
     ``resolved_runner`` is a plain ``FallbackRunner`` (see ``can_batch``). The
@@ -1146,6 +1147,22 @@ def maybe_build_batch_coordinator(
     harmless to call even when the served model is not qwen4_exp (the patches
     only touch qwen4_exp's own classes; see that module's docstring), and
     necessary when it is.
+
+    ``primary_runner`` (省略可) は server.py の実際の ``STATE.runner``
+    (上の段落で説明した ``resolved_runner`` とは別物) で、これを渡すのは
+    次の 1 組み合わせだけを警告するため: Flash-Next (``qwen4_exp``) を
+    ``FlashSpecRunner`` (MTP 投機) で提供しつつ同時に ``--max-batch`` も
+    有効、というケース。``enable_batch_cache()`` は qwen4_exp 自身の
+    メソッドをプロセス全体で差し替える (``mlxturbo/batch.py`` のモジュール
+    docstring 参照) ため、FlashSpecEngine 自体は batch coordinator に
+    降格されなくても、その decode はこの差し替え後のメソッドを踏む。
+    現時点で数値は壊れないが、``MLXTURBO_WIDE=1`` の ``_wide_qkv`` 分岐
+    (``fused.enable_wide_projections``) は batch 側の写しに未実装なので、
+    この組み合わせで有効にすると投機 decode の速度だけが (--max-batch
+    無しの場合と違う形で) 変わりうる (恒久解は写しのシーム化 --
+    BACKLOG 段 1-2、ここでは対象外)。「黙って別構成に落ちて気づけない」を
+    避けるこの repo の規律を、単体では例外にならないこのケースに適用した
+    ものが以下の警告ログ (C2、Opus 設計レビュー指摘)。
     """
 
     if max_batch <= 1 or not can_batch(resolved_runner):
@@ -1153,6 +1170,20 @@ def maybe_build_batch_coordinator(
 
     from . import batch as _batch
     from .spec import PREFILL_STEP_SIZE
+
+    if (
+        primary_runner is not None
+        and getattr(primary_runner, "KIND", None) == FlashSpecRunner.KIND
+        and getattr(getattr(model, "args", None), "model_type", None) == "qwen4_exp"
+    ):
+        print(
+            f"{log_prefix} 警告: 主 runner が FlashSpecRunner (Flash-Next MTP 投機) で"
+            " --max-batch も有効です。enable_batch_cache() はプロセス全体の"
+            " qwen4_exp 用メソッドを差し替えます (現時点で数値は壊れませんが、"
+            " MLXTURBO_WIDE=1 の連結射影分岐は batch 側の写しに未実装のため"
+            " 有効にすると投機 decode の速度だけが変わりえます。恒久解は写しの"
+            " シーム化 -- BACKLOG 段 1-2)"
+        )
 
     _batch.enable_batch_cache()
     coordinator = _batch.BatchCoordinator(
@@ -1283,6 +1314,14 @@ def _build_base_runner(
         if os.environ.get("MLXTURBO_MOE_GLU") == "1":
             fused.enable_moe_glu()
             print(f"{log_prefix} moe_glu カーネル有効 (gate+up+silu*mul を 1 ディスパッチ)")
+        # enable_moe_verify_gather 自身が MLXTURBO_MOE_VERIFY=1 をゲートに
+        # 持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
+        # 以前はこの呼び出し自体が無く、環境変数を立ててもサーバーでは
+        # 何も起きなかった (B1、Opus 設計レビュー指摘。統合ディスパッチ
+        # (C1) 済みなので、他の 3 経路と掛け順で衝突する心配は無い)。
+        fused.enable_moe_verify_gather()
+        if os.environ.get("MLXTURBO_MOE_VERIFY") == "1":
+            print(f"{log_prefix} moe_verify_gather カーネル有効 (verify 幅の gate+up 融合 + down)")
         if os.environ.get("MLXTURBO_FAST_QMM") == "1":
             # 検証フォワード (M=3..8) の密 qmm を 8x8 MMA タイルに通す。
             # stock qmv は M にほぼ比例して重みを読み直すが、MMA タイルは

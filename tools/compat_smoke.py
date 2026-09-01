@@ -78,9 +78,18 @@ def _hc_kernel_status(model) -> str:
 
 
 def _gather_sort_status() -> str:
+    """enable_gather_sort (本番既定 on) 側の閾値。`MLXTURBO_SORT_MIN` は
+    enable_wide_projections 側の `MLXTURBO_WIDE_SORT_MIN` (既定 64、既定 off の
+    実験経路) とは別の変数 (B2、Opus 設計レビュー指摘で改名済み)。
+
+    on/off は統合ディスパッチ (C1、fused._ensure_moe_dispatch_installed) の
+    `_MOE_DISPATCH_SORT_MIN` フラグで判定する (以前は SwitchGLU.__call__ を
+    直接差し替えていた頃の `_ORIG_SWITCH_SORT` を見ていたが、統合後はその
+    グローバルは無い)。
+    """
     from mlxturbo import fused
 
-    if fused._ORIG_SWITCH_SORT is None:
+    if fused._MOE_DISPATCH_SORT_MIN is None:
         return "off"
     sort_min = int(os.environ.get("MLXTURBO_SORT_MIN", "16"))
     return f"on (閾値 {sort_min})" if sort_min else "off (MLXTURBO_SORT_MIN=0)"
