@@ -341,6 +341,43 @@ def _knob_null(ctx):
     return apply
 
 
+
+def _knob_hc_prefill(ctx):
+    """A = prefill 用の 1 ディスパッチ版 / C = 機構だけ / B = 素 (既定)。
+
+    `mlxturbo/kernels/hyper_connection.py` の `fused_gated_residual_prefill` は
+    prefill 幅で hyper-connection の読みを 1 ディスパッチに畳む。**既定 off で、
+    `CLAUDE.md` に「in-model 実測で負けたから off」と記録されている。**
+
+    **その判定はハーネスを直す前のもの。**2026-09-02 に長文脈の A/B が A 側に
+    +5.6% の下駄を履かせていたことが分かり、`rms_norm_gated` と `moe_route` も
+    同じ理由で測り直した (どちらも結論は変わらなかったが、値は動いた)。
+    ここも同じ扱いで測り直す。
+
+    段 P0 の実測では **HC は prefill の 10%、効率 52-55% で prefill 最低。**
+    伸びしろは 17k 全体で 1.65s。
+
+    有効化のゲートは `enable_hyper_connection_kernel` が起動時に 1 回だけ
+    `MLXTURBO_HC_PREFILL` を読む形なので、env を差し替えてから貼り直す。
+    C は env を off にしたまま貼り直すだけで、**差し替えの機構は A と同じ**。
+
+    prefill に効くので `--prefill-once` は使えない (`DECODE_ONLY_KNOBS` の外)。
+    見るのは `prefill_s`。
+    """
+    import os
+
+    from mlxturbo import fused
+
+    def apply(variant):
+        fused.disable_hyper_connection_kernel()
+        os.environ["MLXTURBO_HC_PREFILL"] = "1" if variant == "A" else "0"
+        if variant != "B":
+            fused.enable_hyper_connection_kernel()
+        # B は読み側の融合カーネルごと外した素の経路
+
+    return apply
+
+
 def _knob_indexer_cache(ctx):
     """A = 確保方式 (現行) / B = 毎更新 concat (2026-09-01 以前)。
 
@@ -601,6 +638,7 @@ KNOBS = {
     "hc-write": (_knob_hc_write, ["A", "C", "B"], True, "B"),
     "rms-norm-gated": (_knob_rms_norm_gated, ["A", "C", "B"], True, "B"),
     "moe-route": (_knob_moe_route, ["A", "C", "B"], False, "B"),
+    "hc-prefill": (_knob_hc_prefill, ["A", "C", "B"], False, "C"),
     "null": (_knob_null, ["A", "B"], True, "B"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
