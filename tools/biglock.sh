@@ -61,6 +61,38 @@ while true; do
 done
 
 [ "$WAITED" -gt 0 ] && echo "biglock: ${WAITED}s 待った。開始する" >&2
+
+# ---- メモリが空くのを待つ ----------------------------------------------
+#
+# 91GB のモデル + n-gram の RAM テーブル 32GB で 123GB / 128GB。**直前の
+# 実行のページが返る前に次を始めると、丸ごと圧縮領域に落ちてスラッシングする。**
+# 実測: 空き 14MB / 圧縮 62GB / 伸長 21 億回まで行き、13 分間 CPU を回して
+# 何も進まなかった。プロセスを落としたら空き 116GB に戻ったので、待てば済む。
+#
+# 他のプロセス (Claude Code の多重起動を含む) がメモリを握っている場合も
+# 同じ待ちで守れる。ここは 91GB を読む全経路が通る唯一の場所。
+MEM_NEED_GB="${MLXTURBO_MIN_FREE_GB:-100}"
+MEM_WAITED=0
+while [ "$MEM_WAITED" -lt 600 ]; do
+  # 空き + 非活性 (回収可能) を見る。圧縮済みは「使用中」なので数えない
+  FREE_GB=$(vm_stat | awk '
+    /Pages free/        {f=$3}
+    /Pages inactive/    {i=$3}
+    /Pages speculative/ {s=$3}
+    END {gsub(/\./,"",f); gsub(/\./,"",i); gsub(/\./,"",s);
+         printf "%d", (f+i+s)*16384/1073741824}')
+  [ "$FREE_GB" -ge "$MEM_NEED_GB" ] && break
+  [ "$MEM_WAITED" -eq 0 ] &&     echo "biglock: 回収可能メモリ ${FREE_GB}GB < ${MEM_NEED_GB}GB。空くまで待つ" >&2
+  sleep 15
+  MEM_WAITED=$((MEM_WAITED + 15))
+done
+if [ "$MEM_WAITED" -ge 600 ]; then
+  echo "biglock: 警告 -- 10 分待ってもメモリが空かない (${FREE_GB}GB)。" >&2
+  echo "biglock:   このまま始めるとスワップで空転する可能性が高い。" >&2
+  echo "biglock:   他のプロセス (Claude Code の多重起動など) を確認すること。" >&2
+elif [ "$MEM_WAITED" -gt 0 ]; then
+  echo "biglock: メモリ待ち ${MEM_WAITED}s (回収可能 ${FREE_GB}GB)。開始する" >&2
+fi
 trap 'rm -f "$LOCK"' EXIT INT TERM
 
 "$@"
