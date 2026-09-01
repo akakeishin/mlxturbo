@@ -609,6 +609,58 @@ def test_flash_spec_runner_takes_position_local_sampling_params(
     assert runner.calls[0][key] == value
 
 
+def test_flash_spec_runner_emits_logprobs_without_downgrading():
+    """logprobs を投機経路そのものから出せること。
+
+    採用位置 j の logits は pair[:j+1] に正しく条件付いていて、棄却位置の
+    ものは採用側に混ざらない。先頭トークンだけ出所が prefill 末尾の
+    logits_tail。以前はここが降格の引き金の 1 つだった。
+    """
+
+    import mlxturbo.spec_flash as spec_flash_module
+
+    class _Tok:
+        def decode(self, ids):
+            return f"<{ids[0]}>"
+
+    mx.random.seed(3)
+    model, mtp = _build_tiny_qwen4_exp()
+    engine = spec_flash_module.FlashSpecEngine(model, mtp)
+    runner = FlashSpecRunner(engine, _Tok())
+
+    res = runner.generate(
+        [1, 2, 3, 4, 5],
+        max_tokens=6,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=None,
+        logprobs=True,
+        top_logprobs=3,
+    )
+
+    entries = res["logprobs"]
+    # トークン列と 1:1
+    assert len(entries) == len(res["tokens"])
+    for tok, e in zip(res["tokens"], entries):
+        assert e["token_id"] == tok
+        assert e["token"] == f"<{tok}>"
+        # log 確率なので 0 以下。log_softmax の行から引いている以上、
+        # そのトークンの値は top_logprobs のどれよりは下回らない
+        assert e["logprob"] <= 0.0
+        assert len(e["top_logprobs"]) == 3
+        assert e["logprob"] <= max(t["logprob"] for t in e["top_logprobs"]) + 1e-6
+        # 貪欲なので、選ばれたトークンは最上位のはず
+        assert e["top_logprobs"][0]["token_id"] == tok
+
+    # 要求しなければキー自体が出ない (集めるのはただではない)
+    res2 = runner.generate(
+        [1, 2, 3, 4, 5], max_tokens=3, temp=0.0, eos_ids=set(),
+        on_tokens=None, session=None,
+    )
+    assert "logprobs" not in res2
+
+
 def test_flash_spec_runner_allows_seed(client, monkeypatch):
     seeded = []
     monkeypatch.setattr(mx.random, "seed", seeded.append)

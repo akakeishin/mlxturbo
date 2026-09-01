@@ -2040,10 +2040,15 @@ def _resolve_runner_for_request(
     non_identity = sorted(
         name for name in unrecognized if not _is_identity_sampling_value(name, params[name])
     )
-    needs_downgrade = bool(non_identity) or logprobs_requested
+    # logprobs は runner が自分で出せると宣言していれば降格しない
+    # (FlashSpecRunner は検証フォワードの logits から出せる)。
+    logprobs_unsupported = logprobs_requested and not getattr(
+        STATE.runner, "SUPPORTS_LOGPROBS", False
+    )
+    needs_downgrade = bool(non_identity) or logprobs_unsupported
     if needs_downgrade and STATE.downgrade_runner is not None:
         triggers = list(non_identity)
-        if logprobs_requested:
+        if logprobs_unsupported:
             triggers.append("logprobs")
         kind = getattr(STATE.runner, "KIND", type(STATE.runner).__name__)
         reason = (

@@ -61,6 +61,9 @@ class Runner(Protocol):
     """
 
     SUPPORTED_SAMPLING_PARAMS: frozenset
+    # logprobs を自分で出せるか (server.py が降格の判定に使う)。宣言しない
+    # runner は False 扱い = logprobs 付きのリクエストは非投機へ降ろされる。
+    SUPPORTS_LOGPROBS: bool
     fallback_reason: str | None
 
     def generate(
@@ -237,19 +240,29 @@ class FlashSpecRunner:
     SUPPORTED_SAMPLING_PARAMS = frozenset(
         {"seed", "top_p", "top_k", "min_p", "logit_bias"}
     )
+    # 検証フォワードの logits から出せる。採用位置 j の logits は pair[:j+1] に
+    # 正しく条件付いていて、棄却位置のものは採用側に混ざらない。先頭トークン
+    # だけ出所が prefill 末尾の logits_tail。
+    SUPPORTS_LOGPROBS = True
 
-    def __init__(self, engine):
+    def __init__(self, engine, tokenizer=None):
         self.engine = engine
+        # logprobs のトークン文字列化にだけ使う (無ければ logprobs は
+        # server.py 側が降格させる。build_runner は必ず渡す)
+        self.tokenizer = tokenizer
         self.fallback_reason = None
 
     def generate(
         self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session,
         seed=None, top_p: float = 0.0, top_k: int = 0, min_p: float = 0.0,
-        logit_bias: dict | None = None, **extra
+        logit_bias: dict | None = None, logprobs: bool = False,
+        top_logprobs: int = 0, **extra
     ):
         if seed is not None:
             mx.random.seed(seed)
         sampler = _position_local_sampler(temp, top_p, top_k, min_p, logit_bias)
+        logprob_rows: list | None = [] if logprobs else None
+        logprob_entries: list = []
 
         # The same LCP (longest common prefix) contract as
         # FallbackRunner.generate: this function itself only looks for "the
@@ -325,6 +338,7 @@ class FlashSpecRunner:
             base_pos=reused,
             resume=resume,
             sampler=sampler,
+            logprob_rows=logprob_rows,
             **extra,
         )
         try:
@@ -333,6 +347,16 @@ class FlashSpecRunner:
                 if ttft is None:
                     ttft = time.perf_counter() - t0
                 tokens.extend(step_tokens)
+                if logprob_rows is not None:
+                    # ラウンドごとに畳む。語彙長のベクトルを最後まで溜めると
+                    # 512 トークンで数百 MB になる
+                    for tok, row in zip(step_tokens, logprob_rows):
+                        logprob_entries.append(
+                            _logprob_entry_from_row(
+                                tok, row, self.tokenizer, top_logprobs
+                            )
+                        )
+                    logprob_rows.clear()
                 if on_tokens:
                     on_tokens(step_tokens)
         except StopIteration as stop:
@@ -374,6 +398,8 @@ class FlashSpecRunner:
             # report 0.0, the same as SpecEngine.
             "tokens_per_step": (n_decode / rounds) if rounds else 0.0,
         }
+        if logprob_rows is not None:
+            result["logprobs"] = logprob_entries
         # MLXTURBO_PHASE_TIMERS=1 のときだけ engine が埋める (spec_flash.py)。
         if getattr(self.engine, "last_phase", None):
             result["phase"] = {**self.engine.last_phase, "rounds": rounds}
@@ -442,6 +468,35 @@ class FallbackSession:
         self.processed = processed
         self.checkpoints = checkpoints if checkpoints is not None else []
         self.tail = tail
+
+
+def _logprob_entry_from_row(token: int, row, tokenizer, top_n: int) -> dict:
+    """1 トークンぶんの logprobs レコードを、log 確率の行から組む。
+
+    ``_logprob_entry`` は mlx_lm の ``GenerationResponse`` を受ける形なので
+    投機経路からは使えない。中身は同じで入口だけ「トークン id と log 確率の
+    行」にしたもの。**経路が違っても同じリクエストには同じ答えを返す**のが
+    要件なので、両者は必ず同じ規約 (log_softmax の段、top_n の取り方) で
+    書くこと。
+    """
+    entry = {
+        "token": tokenizer.decode([token]),
+        "logprob": float(row[token]),
+        "token_id": token,
+    }
+    top_n = max(top_n, 0)
+    if top_n > 0:
+        k = min(top_n, row.shape[-1])
+        top_idx = mx.argsort(row)[::-1][:k].tolist()
+        entry["top_logprobs"] = [
+            {
+                "token": tokenizer.decode([idx]),
+                "logprob": float(row[idx]),
+                "token_id": idx,
+            }
+            for idx in top_idx
+        ]
+    return entry
 
 
 def _logprob_entry(resp, tokenizer, top_n: int) -> dict:
@@ -541,6 +596,7 @@ class FallbackRunner:
             "seed",
         }
     )
+    SUPPORTS_LOGPROBS = True
 
     def __init__(self, model, tokenizer, fallback_reason: str | None = None):
         self.model = model
@@ -1529,7 +1585,7 @@ def _build_base_runner(
             f"{log_prefix} Flash-Next 投機デコード有効 (FlashSpecEngine, MTP: あり"
             f" [{source_label}], {bits_note})"
         )
-        return FlashSpecRunner(engine)
+        return FlashSpecRunner(engine, tokenizer)
 
     try:
         text_args = TextModelArgs.from_dict(model.args.text_config)

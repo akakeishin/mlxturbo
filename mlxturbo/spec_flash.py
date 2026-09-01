@@ -126,6 +126,21 @@ DEPTH_CONTEXT_LIMIT = int(os.environ.get("MLXTURBO_DEPTH_CTX_LIMIT", "0")) or No
 _DEPTH_CTX_LIMIT_FALLBACK = 262144
 
 
+def _logsoftmax_rows(logits: mx.array, n: int) -> list:
+    """``logits`` の先頭 n 位置を log 確率にして 1 行ずつ返す。
+
+    形は ``(1, V)`` (prefill 末尾) と ``(1, S, V)`` (検証フォワード) の両方を
+    受ける。正規化の仕方は ``mlxturbo/runner.py`` の ``_logprob_entry`` が
+    前提にしているもの (logits - logsumexp) と同じにしてある -- 投機経路と
+    降格経路で同じリクエストの答えが変わるのが一番悪い。
+    """
+    x = logits.astype(mx.float32)
+    if x.ndim == 2:
+        x = x[:, None]
+    x = x[0, :n]
+    return list(x - mx.logsumexp(x, axis=-1, keepdims=True))
+
+
 def choose_depth(
     pos: int,
     depth: int,
@@ -870,6 +885,7 @@ class FlashSpecEngine:
         base_pos: int = 0,
         resume: tuple | None = None,
         sampler=None,
+        logprob_rows: list | None = None,
     ):
         """The token-by-token version of ``generate()`` (for mlxturbo-serve's
         streaming).
@@ -1125,6 +1141,8 @@ class FlashSpecEngine:
 
         first = int(cur.item())
         out = [first]
+        if logprob_rows is not None:
+            logprob_rows.extend(_logsoftmax_rows(logits_tail, 1))
         yield [first]
         accepted, rounds = 0, 0
         if first in eos:
@@ -1256,6 +1274,12 @@ class FlashSpecEngine:
                 base_t = _rt[0][1]
                 print(f"[round] t={base_t * 1e3:.2f}", " ".join(
                     f"{k}={(t - base_t) * 1e3:.2f}" for k, t in _rt[1:]), flush=True)
+            if logprob_rows is not None:
+                # 採用位置 j の logits は pair[:j+1] に正しく条件付いている
+                # (棄却位置のものは採用側に混ざらない)。呼び手はラウンドごとに
+                # 引き取って entry へ畳むこと -- 語彙長のベクトルを溜め込むと
+                # 512 トークンで数百 MB になる。
+                logprob_rows.extend(_logsoftmax_rows(lg, len(vals)))
             yield vals
             if cut is not None:
                 break
