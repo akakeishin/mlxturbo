@@ -29,6 +29,16 @@ from __future__ import annotations
 CLASSES = ("gdn", "hc", "attn", "head", "router", "shared")
 
 
+def has_layers(model) -> bool:
+    """`model.model.layers` の形を持つか。qwen4_exp や大半の mlx-lm dense/GDN
+    アーキテクチャはここを持つが、VLM ラッパー (例: model.language_model.model.layers)
+    などはこの形を持たない。持たない場合に model.model.layers へ直接アクセスすると
+    AttributeError で起動ごと落ちるので、_targets はここを経由して安全に空へ倒す。
+    """
+    inner = getattr(model, "model", None)
+    return getattr(inner, "layers", None) is not None
+
+
 def _targets(model, cls: str):
     """Enumerate (parent module, attribute name, quantized linear)."""
 
@@ -44,6 +54,11 @@ def _targets(model, cls: str):
 
     if cls == "head":
         yield from q(model, "lm_head")
+        return
+
+    if not has_layers(model):
+        # アーキテクチャ非対応 (model.model.layers が無い)。呼び出し側 (apply)
+        # が理由付きでログに出し、0 本のまま次のクラスへ進む。
         return
 
     for layer in model.model.layers:
@@ -128,7 +143,13 @@ def parse(spec: str) -> dict[str, tuple[int, int]]:
 def apply(model, spec: str, verbose: bool = True) -> None:
     import mlx.core as mx
 
-    for cls, (bits, gs) in parse(spec).items():
+    parsed = parse(spec)
+    if verbose and any(cls != "head" for cls in parsed) and not has_layers(model):
+        print(
+            "  rebit: このモデルは model.model.layers を持たないアーキテクチャ"
+            " (VLM ラッパー等) のため、head 以外のクラスは 0 本のままスキップします"
+        )
+    for cls, (bits, gs) in parsed.items():
         n = 0
         saved = 0
         for parent, attr, lin in list(_targets(model, cls)):

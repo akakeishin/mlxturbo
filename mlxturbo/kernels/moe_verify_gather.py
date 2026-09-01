@@ -535,8 +535,16 @@ def _get_kernel_gate_up(K: int, H: int, P: int, max_seg: int):
     return k
 
 
-def eligible_gate_up(gate_proj, up_proj) -> bool:
-    """gate+up 融合カーネルの前提 (K=hidden_size は常に512の倍数)。"""
+def eligible_gate_up(x, gate_proj, up_proj) -> bool:
+    """gate+up 融合カーネルの前提 (K=hidden_size は常に512の倍数)。
+
+    x はモデルの生の隠れ状態 (呼び出し元は SwitchGLU の入力)。カーネルは
+    `template=[("T", mx.bfloat16)]` で T を bf16 に固定しているので、x が
+    bf16 以外だとバッファを誤った幅で読む静かな誤りになる。ここで弾く
+    (eligible_down 側の x は必ずこのカーネルの bf16 出力なのでチェック不要)。
+    """
+    if x.dtype != mx.bfloat16:
+        return False
     for l in (gate_proj, up_proj):
         if not hasattr(l, "scales"):
             return False

@@ -120,8 +120,15 @@ def _get_kernel(K: int, H: int):
     return k
 
 
-def eligible(gate_proj, up_proj) -> bool:
-    """量子化・形状がこのカーネルの前提に合うか。外れたら素の経路へ。"""
+def eligible(x, gate_proj, up_proj) -> bool:
+    """量子化・形状がこのカーネルの前提に合うか。外れたら素の経路へ。
+
+    カーネルは `template=[("T", mx.bfloat16)]` で T を bf16 に固定している
+    (fused_glu 参照)。x が bf16 以外 (fp16/fp32 のモデル) だとバッファを
+    誤った幅で読む静かな誤りになるため、ここで弾く。
+    """
+    if x.dtype != mx.bfloat16:
+        return False
     for l in (gate_proj, up_proj):
         if not hasattr(l, "scales"):
             return False

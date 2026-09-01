@@ -67,7 +67,11 @@ def load_cli_mtp(
     except (FileNotFoundError, RuntimeError) as exc:
         print(
             f"[mlxturbo] MTP 重みが見つからないため無効化します "
-            f"({type(exc).__name__}: {exc}); lookup のみで投機します"
+            f"({type(exc).__name__}: {exc}); lookup のみで投機します。"
+            " 投機を有効にするには MTP (draft) ヘッドが要ります —"
+            " 専用の MTP サイドカー (train_mtp.py が吐く単一 safetensors) が"
+            " あれば --mtp PATH で渡してください (体感速度は投機の有無で"
+            " 1.5-2 倍ほど変わります)"
         )
         return None
 

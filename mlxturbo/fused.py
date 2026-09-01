@@ -602,7 +602,7 @@ def enable_moe_glu() -> None:
     def patched(self, x, indices):
         # デコードの小さい添字だけを対象にする。大きいバッチ (prefill) は
         # ソート + gather_qmm の方が強いので素のまま
-        if indices.size >= 64 or not moe_glu.eligible(self.gate_proj, self.up_proj):
+        if indices.size >= 64 or not moe_glu.eligible(x, self.gate_proj, self.up_proj):
             return orig(self, x, indices)
         topk = indices.shape[-1]
         K = x.shape[-1]
@@ -671,7 +671,7 @@ def enable_moe_verify_gather() -> None:
         if indices.size >= 64:
             return orig(self, x, indices)
         gp, up, dp = self.gate_proj, self.up_proj, self.down_proj
-        if not (mvg.eligible_gate_up(gp, up) and mvg.eligible_down(dp)):
+        if not (mvg.eligible_gate_up(x, gp, up) and mvg.eligible_down(dp)):
             return orig(self, x, indices)
         K = x.shape[-1]
         H = gp.scales.shape[-2]
