@@ -306,6 +306,22 @@ class QSAIndexer(nn.Module):
                 ],
                 axis=-1,
             )
+        if offset < self.compress_ratio - 1:
+            # 可視ブロックが 1 つも無い行の救済。``visible`` は
+            # block_end <= q_col を要求するので、q_col < compress_ratio-1 の
+            # クエリはどのブロックも見えない。sparse が非 None のとき
+            # Attention は causal を捨てる規約なので、その行は mask が全面
+            # -inf になり、softmax が全列一様 = **未来まで見る**。因果窓
+            # (自分の位置まで) を開けて塞ぐ。
+            #
+            # 本番構成では踏まない (budget 2048 / prefill チャンク 2048 なので、
+            # QSA が効き始める時点で offset >= 2048)。budget をチャンク幅より
+            # 小さくしたパックでだけ起きる。判定は offset (python int) だけで
+            # 決まるので、踏まない構成ではこのブロック自体が走らない
+            # (mask を読む形にすると毎層 GPU 同期が要る)。
+            need = (q_col < self.compress_ratio - 1)[None, :, None]
+            causal = mx.arange(kv_len)[None, None, :] <= q_col[None, :, None]
+            keep = keep | (need & causal)
         return keep[:, None]  # (B, 1, S, kv_len)
 
 

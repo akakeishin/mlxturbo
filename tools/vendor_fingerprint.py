@@ -168,6 +168,26 @@ def check_causal() -> bool:
     model = build(budget)
     head = [(i * 7 + 3) % TINY["vocab_size"] for i in range(budget)]
     ok = True
+
+    # (0) 1 回の呼び出しで位置 0 から QSA が活性になる構成。可視ブロックが
+    # 1 つも無い行 (q_col < compress_ratio-1) の救済が入っていないと、その行の
+    # mask が全面 -inf になって softmax が一様になり、そこ経由で未来が後段の
+    # 層へ漏れる (修正前の実測 7.2e-5)。
+    plen = 40
+    base = [(i * 7 + 3) % TINY["vocab_size"] for i in range(plen)]
+    alt = list(base)
+    alt[-1] = (alt[-1] + 101) % TINY["vocab_size"]
+
+    def run_one(seq):
+        cache = model.make_cache()
+        return model(mx.array(seq)[None], cache=cache)
+
+    a, b = run_one(base), run_one(alt)
+    mx.eval(a, b)
+    d = float(mx.max(mx.abs(a[0, plen - 2] - b[0, plen - 2])))
+    ok &= d == 0.0
+    print(f"causal (単発 plen={plen}, offset=0 から QSA 活性): "
+          f"未来の影響 max|diff|={d:.3e}")
     for seg_len in (3, 5, 6, 7):
         def run(last):
             cache = model.make_cache()
