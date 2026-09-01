@@ -198,9 +198,51 @@ class RotaryEmbedding:
 # ------------------------------------------------------------------------ QSA
 
 
-# 集めた列が kv 長のこの割合を超えるなら gather しない (上の判定を参照)。
-# M3 Max の実測から 0.20。機種が変わったら測り直すこと。
-_GATHER_MAX_RATIO = float(os.environ.get("MLXTURBO_GATHER_MAX_RATIO", "0.20"))
+# 集めた列が kv 長のこの割合を超えるなら gather しない (使う場所の注記を参照)。
+#
+# **モデルの形で変わる。**KV は (B, n_kv_heads, kv, head_dim) なので、kv 軸で
+# 集めるときの連続長は `head_dim * 2` バイト。連続長が短いほど飛び飛びの読みは
+# 効率が落ち、gather が割に合う境界は前に動く。QSA を持つモデルが増えるなら、
+# ここをモデルごとに分けられる形にしておく必要がある。
+#
+# **外挿はしない。**機構モデル (Δ% = share*(u*k-1)) を 2 点に当てると
+# k が 4.28 と 8.56 で揃わず、外挿に耐えないと分かった。よって
+# **実測した形にだけ実測値を置き、それ以外は保守側の値を使ってログに出す。**
+# 黙って未検証の値を使わない。
+_GATHER_RATIO_MEASURED = {
+    # head_dim -> 比。Flash-Next (qwen4_exp, head_dim 256) を M3 Max で実測:
+    # 集める割合 24%/16%/8% で ms/round +1.1%/-6.7%/-15.4%、ゼロ交差 23%。
+    # 安全側に倒して 0.20。
+    256: 0.20,
+}
+# 実測の無い形に使う値。連続長が短いほど gather は不利なので、**小さめ**に
+# 置く (= あまり集めに行かない = 従来経路に落ちる)。外すと損は 1-2% で頭打ち
+# だが、攻めて外すと数の多い中尺で損をする。
+_GATHER_RATIO_UNKNOWN = 0.10
+_GATHER_RATIO_ENV = os.environ.get("MLXTURBO_GATHER_MAX_RATIO")
+_gather_ratio_warned = set()
+
+
+def _gather_max_ratio(head_dim: int) -> float:
+    """この形のモデルで「集める価値がある」割合の上限。
+
+    env > 実測表 > 保守側の既定、の順。実測の無い形では**一度だけ**
+    警告を出す (較正すれば正しい値が出せる、と伝えるため)。
+    """
+    if _GATHER_RATIO_ENV:
+        return float(_GATHER_RATIO_ENV)
+    if head_dim in _GATHER_RATIO_MEASURED:
+        return _GATHER_RATIO_MEASURED[head_dim]
+    if head_dim not in _gather_ratio_warned:
+        _gather_ratio_warned.add(head_dim)
+        print(
+            f"[mlxturbo] gather attention: head_dim={head_dim} は実測が無いので"
+            f" 保守側の比 {_GATHER_RATIO_UNKNOWN} を使う (実測があるのは"
+            f" {sorted(_GATHER_RATIO_MEASURED)})。"
+            " docs/research/KERNEL-PROGRAM.md の段 C の手順で測り直せば"
+            " MLXTURBO_GATHER_MAX_RATIO で指定できる。"
+        )
+    return _GATHER_RATIO_UNKNOWN
 
 
 @dataclass
@@ -654,7 +696,7 @@ class Attention(nn.Module):
         tile = getattr(self, "_gather_attn_tile", 0)
         rows = tile if 0 < tile < S else S
         bound = rows * (self.indexer.token_budget // cr)
-        if bound < n_blocks and bound * cr > _GATHER_MAX_RATIO * kv_len:
+        if bound < n_blocks and bound * cr > _gather_max_ratio(self.head_dim) * kv_len:
             return None
 
         # 集めるだけの価値があるかを**ホスト側の算数だけ**で判定する。

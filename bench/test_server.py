@@ -8185,7 +8185,11 @@ def test_gather_attention_guard_switches_on_context_length():
     import mlx_lm.models.qwen4_exp as Q
 
     budget, cr = 2048, 4
-    ratio = Q._GATHER_MAX_RATIO
+    # 本番のパック (Flash-Next) は head_dim 256 で、そこは実測値がある
+    ratio = Q._gather_max_ratio(256)
+    assert ratio == 0.20, "実測表の値が変わった"
+    # 実測の無い形は保守側に落ちる (黙って未検証の値を使わない)
+    assert Q._gather_max_ratio(64) == Q._GATHER_RATIO_UNKNOWN
 
     def keeps_gather(kv_len, rows):
         n_blocks = kv_len // cr
