@@ -147,9 +147,18 @@ def enable_hyper_connection_kernel() -> None:
     default. Only those calls that hit a shape or a quantization the kernel cannot
     handle (see :func:`mlxturbo.kernels.hyper_connection.eligible`) drop to the
     plain implementation, on the spot.
+
+    prefill 幅 (M 大) 向けの 1 ディスパッチ経路 (kernels/hyper_connection.py の
+    `fused_gated_residual_prefill`) は既定 off。環境変数
+    `MLXTURBO_HC_PREFILL=1` を立てたときだけ、この関数を呼んだ時点でその分岐を
+    組み込む (enable_moe_verify_gather と同じゲート方式 — 呼ぶだけでは何も
+    起きない)。env var が立っていなければ decode 用の hc_pre/hc_post 経路
+    (下の分岐) だけが有効になり、挙動は今まで通り。
     """
 
     global _ORIG_HC_KERNEL
+    import os
+
     import mlx_lm.models.qwen4_exp as Q
 
     from .kernels import hyper_connection as hck
@@ -159,18 +168,35 @@ def enable_hyper_connection_kernel() -> None:
     _ORIG_HC_KERNEL = Q.GatedResidual.__call__
     orig = _ORIG_HC_KERNEL
 
+    # 起動時に 1 回だけ読む (呼び出しごとの getenv を避ける)。既定 off なので
+    # このフラグが False なら以下の prefill 分岐は一度も実行されない。
+    prefill_on = os.environ.get("MLXTURBO_HC_PREFILL") == "1"
+
     def patched(self, hyper):
         down = _pack_quantized(self.input_mix_weight_down)
         up = _pack_quantized(self.input_mix_weight_up)
         combine = self.block_inject_weight is not None
         inject = _pack_quantized(self.block_inject_weight) if combine else None
-        if (
-            down is None
-            or up is None
-            or (combine and inject is None)
-            or not hck.eligible(hyper, self.hc_norm.weight, down, up, inject,
-                                self.hc, self.d)
-        ):
+        if down is None or up is None or (combine and inject is None):
+            return orig(self, hyper)
+
+        if prefill_on:
+            m = 1
+            for s in hyper.shape[:-1]:
+                m *= s
+            if hck.eligible_prefill(hyper, self.hc_norm.weight, down, up,
+                                     inject, self.hc, self.d, m):
+                out = hck.fused_gated_residual_prefill(
+                    hyper, self.hc_norm.weight, self.hc_norm.eps, self.hc,
+                    self.d, down, up, inject,
+                )
+                if not combine:
+                    return out
+                mixed, inj = out
+                return mixed, hyper, inj
+
+        if not hck.eligible(hyper, self.hc_norm.weight, down, up, inject,
+                            self.hc, self.d):
             return orig(self, hyper)
 
         out = hck.fused_gated_residual(

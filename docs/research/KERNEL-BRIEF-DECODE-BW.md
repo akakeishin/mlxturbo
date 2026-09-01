@@ -268,3 +268,18 @@ mlxturbo/kernels/moe_verify_gather.py の docstring)。v1 (gate 単体) は micr
 - 長さバケツ化 (1k と 16k を同居させない) を admission の初期仕様に入れる。
   QSA solo tier (indexer_budget 超) は 17k をバッチから除外する — throughput
   セルは短〜中尺の話だと明記しておく。
+
+## 面④ (HC prefill) の格下げ (2026-09-01 夜、実装後の訂正)
+
+「帯域理論値の 10 倍の伸びしろ」は**分析ミス**だった。hyper の読み書きだけで
+見積もり、低ランク GEMM (M=2048 x 10240->320->10240、~27 GFLOP/call) の
+FLOP 項を落としていた。eager の 3.8ms/call はこの GEMM でほぼ天井に居る。
+1 行 = 1 threadgroup の融合カーネルを実装して確認: 既存カーネルと
+ビット一致だが prefill 幅では eager の 6 倍遅い (重みの行ごと再 dequant が
+律速、KERNEL-HANDOFF-HC.md が既に指摘していた)。真の伸びしろは
+elementwise 融合分の ~20% (17k で ~1s) で、それにも M ブロック化 GEMM の
+別設計が要る。**面④は優先度低に格下げ。prefill の残る的は ②GDN (9.4s) と
+③attention (9.0s)。**実装は kernels/hyper_connection.py に既定 off
+(MLXTURBO_HC_PREFILL) で残す (moe_glu v1-v3 と同じ、負の結果の記録)。
+なお既存 HC カーネルは prefill 幅では eligible() が弾いて eager に落ちて
+いたので、サーバーが遅い経路を踏んでいた事実は無い。
