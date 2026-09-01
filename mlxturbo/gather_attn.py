@@ -1,0 +1,67 @@
+"""段 3(b): QSA の疎性を sdpa 自身の読み出しへ伝える経路 (gather attention)。
+
+`docs/research/KERNEL-PROGRAM.md` 段 3(b) の出し口。いまの QSA (疎注意) は
+選んだブロックを加算マスクとして sdpa に渡しているが、
+`mx.fast.scaled_dot_product_attention` は加算マスクを渡されても全 KV を
+読んで全スコアを計算する (段 1 の実測、17k の attention 実効帯域が下限の
+25% しか出ていない一因)。つまり疎性が sdpa 側の節約になっていない。
+
+ここでは、選ばれたブロックだけを先に集めてから、マスク無しの (集めた列に
+対する小さい bool マスクだけを持つ) dense sdpa に渡す:
+
+    from mlxturbo import gather_attn
+    gather_attn.enable_gather_attn(model)
+
+実装本体は `mlxturbo/_vendor/qwen4_exp.py` の
+`QSAIndexer.select_blocks` / `Attention._gather_forward` (既存のシーム
+`_positions` / `_final_mask` と同じ作法で追加した別口)。ここは `fused.py`
+の `enable_*` と同じ形の有効化・無効化関数を置くだけ。
+
+既定 off。環境変数 `MLXTURBO_GATHER_ATTN=1` で `runner.enable_default_fusions`
+から有効になる。出力はビット一致しない (softmax の対象集合は元の `keep`
+と同じだが、加算順が変わる) ので、採否は KLD / tok-step の in-model 計測で
+決める。合成モデルでの正しさ確認は `tools/verify_gather_attn.py`。
+"""
+
+from __future__ import annotations
+
+
+def _each_layer(model, mtp=None):
+    for layer in model.model.layers:
+        yield layer
+    if mtp is not None:
+        for layer in mtp.layers:
+            yield layer
+
+
+def enable_gather_attn(model, mtp=None, stats: list | None = None) -> int:
+    """レイヤーの ``Attention`` に gather 経路を仕込む。戻り値は適用した層数。
+
+    `QSAIndexer` を持つ層 (= self_attn がある層) にだけ `_gather_attn = True`
+    を立てる。GDN 層 (`linear_attn`) には触らない。
+
+    ``stats`` にリストを渡すと、gather が実際に活性化した呼び出しごとに
+    ``(S, n_blocks, U, n_sel)`` を追記する (`_gather_stats` 属性、
+    `_wide_qkv` と同じ注入の作法)。既定 None のときは 1 行も増えない
+    (計測・検証専用、`tools/verify_gather_attn.py` が使う)。
+    """
+    n = 0
+    for layer in _each_layer(model, mtp):
+        sa = getattr(layer, "self_attn", None)
+        if sa is not None and hasattr(sa, "indexer"):
+            sa._gather_attn = True
+            if stats is not None:
+                sa._gather_stats = stats
+            n += 1
+    return n
+
+
+def disable_gather_attn(model, mtp=None) -> int:
+    """`enable_gather_attn` を打ち消す。戻り値は外した数。A/B で交互に測るために要る。"""
+    n = 0
+    for layer in _each_layer(model, mtp):
+        sa = getattr(layer, "self_attn", None)
+        if sa is not None and getattr(sa, "_gather_attn", False):
+            sa._gather_attn = False
+            n += 1
+    return n

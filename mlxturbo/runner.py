@@ -1191,6 +1191,16 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
             fast_qmm.M_MIN = int(os.environ.get("MLXTURBO_QMM_M_MIN", "3"))
             fast_qmm.enable()
             print(f"{log_prefix} fast_qmm 有効 (M={fast_qmm.M_MIN}..8 を MMA タイルへ)")
+        if os.environ.get("MLXTURBO_GATHER_ATTN") == "1":
+            # 段 3(b) (KERNEL-PROGRAM.md): 選ばれたブロックだけ集めてから
+            # マスク無し sdpa に渡す。出力はビット不一致で、採否は
+            # KLD / tok-step の in-model 計測がまだ (このコミット時点では
+            # 実装と合成モデルでの正しさ確認のみ)。
+            from . import gather_attn
+
+            n = gather_attn.enable_gather_attn(model)
+            print(f"{log_prefix} gather attention 有効 (段 3(b)、{n} 層。"
+                  "出力はビット不一致、採否は未計測)")
 
 
 

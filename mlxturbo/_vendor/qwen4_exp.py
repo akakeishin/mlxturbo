@@ -198,6 +198,25 @@ class RotaryEmbedding:
 # ------------------------------------------------------------------------ QSA
 
 
+@dataclass
+class QSABlockSelection:
+    """段 3(b) の gather 経路 (``mlxturbo/gather_attn.py``) 向け: ブロック選択を
+    トークン幅へ展開する前の、ブロック添字のままの形で持つ。
+
+    ``QSAIndexer.select_blocks`` の戻り値。``__call__`` が返す ``keep``
+    ((B,1,S,kv_len) の bool、trueの位置がトークン単位) とは違い、こちらは
+    ``keep_block`` が (B,S,n_blocks) で、1 要素が 1 ブロック
+    (``compress_ratio`` トークン分) を表す。Attention 側はこれの S 行の
+    和集合を取ってから、対応する KV 列だけを集める。
+    """
+
+    keep_block: Any  # mx.array (B, S, n_blocks) bool
+    n_blocks: int
+    kv_len: int
+    tail: int
+    q_col: Any  # mx.array (S,) int
+
+
 class QSAIndexer(nn.Module):
     """Select, per query, a budget of compressed key blocks.
 
@@ -220,12 +239,15 @@ class QSAIndexer(nn.Module):
         self.q_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
-    def __call__(
-        self, x, rope, cache, offset: int, positions=None
-    ) -> Optional[mx.array]:
-        """``offset`` はキャッシュの列位置 (ブロック格子と可視判定に使う)、
-        ``positions`` はその系列の先頭から数えた真の位置 (rope の角度に使う)。
-        パディングが無ければ両者は一致するので ``positions`` は省略できる。"""
+    def _pooled_and_top(self, x, rope, cache, offset: int, positions=None):
+        """pooled key の作成からブロック top-k 選択まで。``__call__`` と
+        ``select_blocks`` の共通部 (段 3(b) で切り出した)。
+
+        ``kv_len <= self.token_budget`` (疎化が要らない) のときは ``None``。
+        それ以外は ``(keep_block, n_blocks, kv_len, q_col)`` を返す。
+        ``keep_block`` は (B, S, n_blocks) の bool で、まだトークン幅へは
+        展開していない。
+        """
         B, S, _ = x.shape
         qk = self.index_qk_proj(x)
         split = self.n_heads * self.head_dim
@@ -277,6 +299,19 @@ class QSAIndexer(nn.Module):
         keep_block = mx.put_along_axis(keep_block, top, mx.array(True), axis=-1)[
             ..., :n_blocks
         ]
+        return keep_block, n_blocks, kv_len, q_col
+
+    def __call__(
+        self, x, rope, cache, offset: int, positions=None
+    ) -> Optional[mx.array]:
+        """``offset`` はキャッシュの列位置 (ブロック格子と可視判定に使う)、
+        ``positions`` はその系列の先頭から数えた真の位置 (rope の角度に使う)。
+        パディングが無ければ両者は一致するので ``positions`` は省略できる。"""
+        B, S, _ = x.shape
+        res = self._pooled_and_top(x, rope, cache, offset, positions)
+        if res is None:
+            return None
+        keep_block, n_blocks, kv_len, q_col = res
 
         # remap block -> tokens; the incomplete tail is visible as far as
         # causality allows.
@@ -324,6 +359,34 @@ class QSAIndexer(nn.Module):
             keep = keep | (need & causal)
         return keep[:, None]  # (B, 1, S, kv_len)
 
+    def select_blocks(
+        self, x, rope, cache, offset: int, positions=None
+    ) -> Optional["QSABlockSelection"]:
+        """段 3(b) の gather 経路向け: ブロック選択をブロック添字のまま返す。
+
+        ``__call__`` と選択ロジックそのものは ``_pooled_and_top`` を共有する
+        (計算内容は同一)。違うのはトークン幅への展開をしないことだけ。
+        呼び出し側 (``Attention._gather_forward``) が S 行の和集合を取ってから
+        ``mx.take_along_axis`` で KV 列を集める。
+
+        ``__call__`` 末尾の早期救済 (``offset < compress_ratio - 1`` のとき
+        可視ブロックが無い行をフル causal で救う分岐) には対応しない —
+        呼び出し側がその条件を避けてから呼ぶ規約 (Attention 側で判定済み)。
+        ``kv_len <= token_budget`` で疎化が要らないときは ``__call__`` と
+        同じく ``None`` を返す。
+        """
+        res = self._pooled_and_top(x, rope, cache, offset, positions)
+        if res is None:
+            return None
+        keep_block, n_blocks, kv_len, q_col = res
+        return QSABlockSelection(
+            keep_block=keep_block,
+            n_blocks=n_blocks,
+            kv_len=kv_len,
+            tail=kv_len - n_blocks * self.compress_ratio,
+            q_col=q_col,
+        )
+
 
 class Attention(nn.Module):
     def __init__(self, args: TextArgs):
@@ -369,12 +432,14 @@ class Attention(nn.Module):
             return add
         return mask + add
 
-    def __call__(self, x, rope, mask, cache, idx_cache) -> mx.array:
+    def _qkv(self, x, positions, rope, cache):
+        """q/k/v/gate 射影から rope・KV キャッシュ更新まで。
+
+        ``__call__`` の本体と ``_gather_forward`` (段 3(b)、
+        ``MLXTURBO_GATHER_ATTN=1``) の共通部として切り出した。計算内容は
+        ``__call__`` に元々あったものと同一。
+        """
         B, S, _ = x.shape
-        offset, positions = self._positions(cache, S)
-
-        sparse = self.indexer(x, rope, idx_cache, offset, positions)
-
         wide = getattr(self, "_wide_qkv", None)
         if wide is None:
             qg, kk, vv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
@@ -397,6 +462,123 @@ class Attention(nn.Module):
 
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
+        return q, k, v, gate
+
+    def _gather_forward(self, x, rope, cache, idx_cache, offset: int, positions):
+        """段 3(b): 選ばれたブロックだけ集めてから、mask 無しの dense sdpa に渡す経路。
+
+        `docs/research/KERNEL-PROGRAM.md` 段 3(b) の出し口。
+        `mx.fast.scaled_dot_product_attention` は加算マスクを渡されても全 KV を
+        読んで全スコアを計算する (段 1 の実測) ので、``_final_mask`` が組む
+        加算マスク経由では QSA の疎性が sdpa 側の節約になっていなかった。
+        ここでは選ばれた列だけを `mx.take_along_axis` で集めた小さな K/V に、
+        同じく小さい bool マスクを渡す。選ぶ集合は元の `keep` と同じだが、
+        和の順序が変わるので出力はビット一致しない (呼び出し側はこの前提で
+        KLD / tok-step の in-model 計測を経てから採否を決めること)。
+
+        ``MLXTURBO_GATHER_ATTN=1`` (`mlxturbo/gather_attn.py`) のときだけ
+        `__call__` から呼ばれる。次のいずれかに該当すると ``None`` を返し、
+        呼び出し側に通常経路 (加算マスク) を任せる — いずれの判定も
+        cache を更新する前に済ませるので、``None`` を返しても
+        ``idx_cache``/``cache`` は二重更新されない:
+
+        - 疎化が要らない (``offset + S <= token_budget``)
+        - ``QSAIndexer.__call__`` 末尾の早期救済に該当する
+          (``offset < compress_ratio - 1``。select_blocks は非対応)
+        - 量子化 KV キャッシュ (``hasattr(cache, "bits")``)。gather は
+          k/v がプレーンな配列であることを前提にしている
+        """
+        if hasattr(cache, "bits"):
+            return None
+        cr = self.indexer.compress_ratio
+        S = x.shape[1]
+        if offset + S <= self.indexer.token_budget or offset < cr - 1:
+            return None
+
+        blocks = self.indexer.select_blocks(x, rope, idx_cache, offset, positions)
+        if blocks is None:
+            return None
+
+        q, k, v, gate = self._qkv(x, positions, rope, cache)
+        B = x.shape[0]
+        keep_block = blocks.keep_block  # (B, S, n_blocks) bool
+        n_blocks = blocks.n_blocks
+        tail = blocks.tail
+        q_col = blocks.q_col  # (S,)
+
+        # S クエリの選択ブロックの和集合 (union)。上限は S * block_topk
+        # (KERNEL-PROGRAM.md 段 3(b))。隣り合うクエリは似たブロックを引く
+        # ので、実際の和集合はこれよりずっと小さいことが多い。
+        k_top = min(self.indexer.block_topk, n_blocks)
+        U = min(n_blocks, S * k_top)
+
+        union = mx.any(keep_block, axis=1)  # (B, n_blocks)
+        # True を先頭に寄せてから先頭 U 個を取る。1 バッチあたりの True 数は
+        # 定義上 U 以下なので、これで実在する選択ブロックを取りこぼさない。
+        # 残りの詰め物スロットはどの行の keep_block でも False (union の
+        # 定義そのもの) なので、下のクエリごとマスクで自然に False になる。
+        order = mx.argsort(-union.astype(mx.int32), axis=-1)
+        sel_blocks = order[:, :U]  # (B, U) ブロック添字、重複なし
+
+        sel_tok = sel_blocks[:, :, None] * cr + mx.arange(cr)[None, None, :]
+        sel_tok = sel_tok.reshape(B, U * cr)
+        if tail:
+            # 端数列 (最後の未満ブロック) は block 添字を持たないので、
+            # union の対象外のまま常に列末尾へ足す。可視かどうかは下の
+            # クエリごとマスクが因果窓 (tail_col <= q_col) で決める。
+            tail_idx = mx.arange(n_blocks * cr, blocks.kv_len)[None, :]
+            sel_tok = mx.concatenate(
+                [sel_tok, mx.broadcast_to(tail_idx, (B, tail))], axis=1
+            )
+        n_sel = sel_tok.shape[1]
+
+        gather_idx = mx.broadcast_to(
+            sel_tok[:, None, :, None], (B, self.n_kv_heads, n_sel, self.head_dim)
+        )
+        k_sel = mx.take_along_axis(k, gather_idx, axis=2)
+        v_sel = mx.take_along_axis(v, gather_idx, axis=2)
+
+        # クエリごとの差は、集めた列に対する小さい bool マスクで表す
+        # (union 幅であって元の kv_len 幅ではない)。完全なブロックは
+        # select_blocks の時点で「block_end <= q_col」を満たすものだけが
+        # 候補なので、選ばれたブロックの中身は追加の因果チェックなしに
+        # そのまま可視 (元の keep と同じ集合になる)。
+        idx_bsu = mx.broadcast_to(sel_blocks[:, None, :], (B, S, U))
+        keep_sel = mx.take_along_axis(keep_block, idx_bsu, axis=-1)  # (B,S,U)
+        keep_sel = mx.repeat(keep_sel, cr, axis=-1)  # (B,S,U*cr)
+        if tail:
+            tail_col = n_blocks * cr + mx.arange(tail)
+            tail_keep = mx.broadcast_to(
+                (tail_col[None, :] <= q_col[:, None])[None], (B, S, tail)
+            )
+            keep_sel = mx.concatenate([keep_sel, tail_keep], axis=-1)
+
+        stats = getattr(self, "_gather_stats", None)
+        if stats is not None:
+            # 計測・検証専用のフック (既定 None、`_wide_qkv` と同じ属性注入の
+            # 作法)。`tools/verify_gather_attn.py` が union の実サイズを見るのに使う。
+            stats.append((S, n_blocks, U, n_sel))
+
+        out = scaled_dot_product_attention(
+            q, k_sel, v_sel, cache=cache, scale=self.scale,
+            mask=keep_sel[:, None],
+        )
+        out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+        return self.o_proj(out * mx.sigmoid(gate))
+
+    def __call__(self, x, rope, mask, cache, idx_cache) -> mx.array:
+        B, S, _ = x.shape
+        offset, positions = self._positions(cache, S)
+
+        if getattr(self, "_gather_attn", False) and cache is not None:
+            gathered = self._gather_forward(
+                x, rope, cache, idx_cache, offset, positions
+            )
+            if gathered is not None:
+                return gathered
+
+        sparse = self.indexer(x, rope, idx_cache, offset, positions)
+        q, k, v, gate = self._qkv(x, positions, rope, cache)
 
         mask = self._final_mask(mask, sparse, cache, S, q.dtype)
 
