@@ -49,7 +49,7 @@ curl -sS http://127.0.0.1:8765/v1/models
 | `--mtp-bits` | `4` | MTP ヘッドの量子化ビット数 |
 | `--no-mtp` | 無効 | MTP を読み込まず lookup (SAM) のみで投機する |
 | `--mtp PATH` | 無効 | MTP ヘッドを単一 safetensors サイドカーから読み込む (後述) |
-| `--ngram DIR` | 無効 | n-gram (PLE) 表を外部サイドカーから読み込む |
+| `--ngram DIR` | 無効 | n-gram (PLE) 表を外部サイドカーから読み込む。**layout=interleaved を推奨** (下記) |
 | `--no-fused` | 無効 | hyper-connections 融合カーネルを無効化する |
 | `--allowed-origins` | 無効 (CORS 無し) | ブラウザからのクロスオリジン fetch を許可する Origin (カンマ区切り、`*` で全許可) |
 | `--max-sessions` | `8` | 会話ごとの session (KV/prompt cache) を同時保持する上限 (LRU、1以上) |
@@ -59,6 +59,29 @@ curl -sS http://127.0.0.1:8765/v1/models
 | `--max-queue N` | `8` | 直列化ロックの待ち行列上限。超えたら 503 |
 | `--require-runner KIND` | なし | 解決 runner が `flash_spec` / `spec` / `fallback` の指定値と違えば exit 1 |
 | `--version` | — | バージョンを表示して終了 |
+
+
+### n-gram サイドカーは interleaved を使う (2026-09-02)
+
+サイドカーの `manifest.json` の `layout` で経路が変わる。
+
+| layout | 経路 | RAM | 50k のプロンプト |
+|---|---|---|---|
+| **`interleaved`** (推奨) | ディスク参照 (pread) | **0** | **通る** |
+| `separate` | RAM 常駐 | **32GB** | **落ちる** |
+
+`separate` は gather 1 回で読める速度優先の形だが、**91GB のモデルと合わせると
+128GB の機体で 123GB を占め、50k のプロンプトが `[METAL] Insufficient Memory`
+で落ちる。**サーバーは 200 を返してから 31 秒後にストリームへエラーを流すので、
+使う側からは原因が分かりにくい。
+
+**速度差はほとんど無い。**17k の decode で 44.4 (interleaved) vs 43.8
+(separate) tok/s。プロセスをまたぐ比較なので数 % は誤差だが、32GB 払うほどの
+差は見えない。モデルの宣言は 262144 トークンなので、**50k で落ちる構成を
+推奨とは呼べない。**
+
+`separate` のサイドカーを渡すと起動時に警告が出る。
+
 
 ## API キー認証 (`--api-key`)
 

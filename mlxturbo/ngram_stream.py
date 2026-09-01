@@ -436,7 +436,22 @@ def install_ram(model, sidecar: str | Path) -> None:
         n += 1
     if n == 0:
         raise ValueError("PLE 層が見つからない")
+    gb = table.nbytes / 1e9
     print(
         f"n-gram を連結テーブルに差し替えた "
-        f"({n} 層, {table.bits}bit, RAM {table.nbytes / 1e9:.1f}GB, gather 1 回)"
+        f"({n} 層, {table.bits}bit, RAM {gb:.1f}GB, gather 1 回)"
     )
+    # **長い文脈で落ちる構成なので、起動時に言う。**2026-09-02 に実際に踏んだ:
+    # モデル 91GB + このテーブル 32GB = 123GB / 128GB で、50k のプロンプトが
+    # `[METAL] Insufficient Memory` になる。サーバーは 200 を返してから
+    # 31 秒後にストリームへエラーを流すので、**使う側は原因が分からない。**
+    # interleaved のサイドカーなら同じデータをディスク参照 (RAM 0) で読み、
+    # 50k が通る。17k の decode 実測でも 44.4 vs 43.8 tok/s とほとんど差が無い。
+    if gb >= 8.0:
+        print(
+            f"n-gram: 警告 -- このサイドカーは layout=separate で RAM に "
+            f"{gb:.0f}GB 常駐する。長い文脈でメモリ不足になりやすい "
+            f"(91GB のモデルと合わせて 128GB 機で 50k が通らない実測がある)。"
+            f"\nn-gram:   layout=interleaved のサイドカーを使うと RAM 0 で、"
+            f"decode の差はほとんど無い (17k で 44.4 vs 43.8 tok/s)。"
+        )
