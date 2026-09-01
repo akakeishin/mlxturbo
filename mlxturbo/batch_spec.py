@@ -640,7 +640,7 @@ class BatchSpecGenerator:
 
     def step(self) -> list[list[int]]:
         """1 ラウンド進めて、行ごとの新規トークンを返す。"""
-        from .spec_flash import capture  # noqa: F401  (batched_capture 経由)
+        from .spec_flash import _staged_forward
 
         eng = self.eng
         with ragged_attention():
@@ -651,7 +651,11 @@ class BatchSpecGenerator:
         total = pair.shape[1]
         pre_ctx = snapshot_pre_ctx(self.model, self.caches)
         with batched_capture(self.model) as cap:
-            lg = self.model(pair, cache=self.caches)
+            # 段階投入 (spec_flash._staged_forward)。単独経路の検証
+            # フォワードはこれを通っていて、グラフ構築中の GPU 泡を刈る分
+            # だけ速い。バッチ側が `model(...)` を直接呼んでいると、B=1 でも
+            # 単独に負ける (実測 0.82x)。計算内容は同じ。
+            lg = _staged_forward(self.model, pair, self.caches)
             nxt = mx.argmax(lg, axis=-1)          # (B, T+1)
             dv = mx.concatenate(drafts, axis=1)   # (B, T)
             mx.eval(nxt, dv, cap.hyper)
