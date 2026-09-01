@@ -1,27 +1,37 @@
-"""QSA の端数ブロック因果性の修正 (5d1e1c5) が、速度と受理率をどう動かすか。
+"""decode 経路の A/B を 1 プロセス内で交互に測る (knob 差し替え式)。
 
-## 何を比べるか
+A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ごとに
+「どう切り替えるか」と「何をもって合格とするか」を `KNOBS` に書いてある。
 
-A = 現行 (端数ブロックを因果性で切る)
-B = 修正前 (端数ブロックを常に可視 = stock の `ones`)
+## 共通の作法 (CLAUDE.md の計測の作法に従う)
 
-B は `QSAIndexer.__call__` の返り値の端数列を True に戻すだけの薄い包みで
-作る (写しは作らない)。他は 1 バイトも変えない。
+- 1 プロセス内でプロンプトごとに A→B→B→A。線形の熱ドリフトを相殺する。
+- **プロセスの最初の 1 本は捨てる。**実測で最初だけ 19.19 ms/tok
+  (以降 16.45)、長文脈の TTFT は 73s (以降 35s) になる。混ぜると数 % の
+  嘘の差が出る。温まってからの繰り返しは 0.2% 以内。
+- 長時間回し続けると熱で 25% 落ちる (16.9k TTFT 35s -> 45s の実測)。
+  絶対値を語るなら冷ましてから短く測る。ここで信じるのは A/B の差だけ。
+- 生成長は全条件そろえる (既定 512)。長文脈は実文書から切った窓を使う
+  (繰り返し文字列だと n-gram と MTP が当てすぎて受理率が嘘になる)。
 
-## 判定基準 (測る前に宣言)
+## knob
 
-1. **対照 (短文脈、QSA 不活性)**: A と B で出力トークン列が完全一致すること。
-   kv 長が indexer_budget を超えないので sparse は None のまま = 修正が
-   触れない領域。ここが割れたら測定そのものが無効なので、以降の数字は
-   読まない。
-2. **本番 (17k、QSA 活性)**: tok/round と ms/token を比べる。これは正しさの
-   修正なので合否は付けない (遅くなっても戻さない)。ただし tok/round の
-   相対低下が 5% を超えたら、修正の代償として目立つ形で報告する。
-3. **順序バイアス**: プロンプトごとに A→B→B→A で回し、A 2 本と B 2 本の
-   平均を取る。1 プロセス内で交互 (CLAUDE.md の計測の作法)。
-4. 生成長は全条件 512 トークンで揃える。
+`qsa-tail`   QSA の端数ブロック因果性 (5d1e1c5)。B は返り値の端数列を
+             True に戻す薄い包みで再現する (写しは作らない)。
+             合格条件: 短文脈 (QSA 不活性) で A/B の出力が完全一致すること。
+             ここが割れたら測定は無効。長文脈は合否を付けない (正しさの
+             修正なので遅くても戻さない) が、tok/round の相対低下が 5% を
+             超えたら代償として目立つ形で報告する。
+             結果 (2026-09-01): tok/round +2.1%、ms/token は符号が揃わず。
 
-    tools/biglock.sh .venv/bin/python tools/qsa_causal_ab.py \\
+`moe-verify` 共有タイル gather v2 (MLXTURBO_MOE_VERIFY、既定 off)。
+             verify 幅の MoE だけを差し替える。
+             合格条件: **ms/token が短・長の両方で改善すること。**
+             どちらかで悪化したら既定 off のまま据え置く。出力は
+             累積順が変わるので一致を要求しない (tok/round の変化は
+             テキスト運と区別できないので、判定は ms/token で行う)。
+
+    tools/biglock.sh .venv/bin/python tools/decode_ab.py --knob moe-verify \\
         --model ~/models/ddalcu-mlxlm --ngram ~/models/ddalcu-ngram-sep
 """
 
@@ -53,13 +63,18 @@ SHORT_PROMPTS = [
 ]
 
 
-def install_stock_tail(Q):
-    """B 条件: 端数ブロックを常に可視に戻す薄い包み。返り値だけを触る。"""
+def _knob_qsa_tail():
+    """A = 現行 (因果性で切る) / B = 修正前 (端数を常に可視)。
+
+    B は `QSAIndexer.__call__` の返り値の端数列を True に戻す薄い包みで作る。
+    写しを作らないので、A 側の実装がこの先変わっても B の意味はずれない。
+    """
     import mlx.core as mx
+    import mlx_lm.models.qwen4_exp as Q
 
     orig = Q.QSAIndexer.__call__
 
-    def call(self, x, rope, cache, offset, positions=None):
+    def stock_tail(self, x, rope, cache, offset, positions=None):
         keep = orig(self, x, rope, cache, offset, positions)
         if keep is None:
             return None
@@ -70,8 +85,34 @@ def install_stock_tail(Q):
         ones = mx.ones(keep.shape[:-1] + (tail,), dtype=keep.dtype)
         return mx.concatenate([keep[..., : kv_len - tail], ones], axis=-1)
 
-    Q.QSAIndexer.__call__ = call
-    return orig
+    def apply(variant):
+        Q.QSAIndexer.__call__ = orig if variant == "A" else stock_tail
+
+    return apply
+
+
+def _knob_moe_verify():
+    """A = 共有タイル gather v2 on / B = off (既定)。"""
+    import os
+
+    from mlxturbo import fused
+
+    os.environ["MLXTURBO_MOE_VERIFY"] = "1"  # enable 側のゲートを開ける
+
+    def apply(variant):
+        if variant == "A":
+            fused.enable_moe_verify_gather()
+        else:
+            fused.disable_moe_verify_gather()
+
+    return apply
+
+
+KNOBS = {
+    # name: (setup -> apply(variant), 短文脈で A/B 出力の一致を要求するか)
+    "qsa-tail": (_knob_qsa_tail, True),
+    "moe-verify": (_knob_moe_verify, False),
+}
 
 
 def run_once(eng, ids, n_tokens, eos_ids):
@@ -99,6 +140,7 @@ def run_once(eng, ids, n_tokens, eos_ids):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--knob", required=True, choices=sorted(KNOBS))
     ap.add_argument("--model", required=True)
     ap.add_argument("--ngram", default=None)
     ap.add_argument("--mtp", default=None,
@@ -132,8 +174,6 @@ def main() -> int:
     mx.eval(mtp.parameters())
     eng = spec_flash.FlashSpecEngine(model, mtp)
 
-    import mlx_lm.models.qwen4_exp as Q
-
     eos = tok.eos_token_ids if hasattr(tok, "eos_token_ids") else ()
     eos_ids = tuple(eos) if eos else ()
 
@@ -158,17 +198,26 @@ def main() -> int:
     cases = [("short", to_ids(p)) for p in SHORT_PROMPTS]
     cases += [("long", to_ids(p)) for p in longs]
 
-    orig_call = Q.QSAIndexer.__call__
+    setup, control_identical = KNOBS[args.knob]
+    set_variant = setup()
 
-    def set_variant(v):
-        if v == "A":
-            Q.QSAIndexer.__call__ = orig_call
-        else:
-            Q.QSAIndexer.__call__ = orig_call  # 一度戻してから包み直す
-            install_stock_tail(Q)
+    print(f"knob={args.knob}  判定基準はモジュール docstring のとおり"
+          " (測る前に宣言済み)。")
+    print(f"生成長 {args.tokens} トークンで全条件そろえる。"
+          " 最初の 1 本は温めなので捨てる。\n")
 
-    print("判定基準はモジュール docstring のとおり (測る前に宣言済み)。")
-    print(f"生成長 {args.tokens} トークンで全条件そろえる。\n")
+    # 温め: 最初の 1 本は必ず遅いので、計測に混ぜず先に捨てる。短文脈だけ
+    # 温めても長文脈の初回は重みのページインで 2 倍かかる (73s vs 35s の実測)
+    # ので、長い方も 1 本捨てる
+    set_variant("A")
+    for kind, ids in cases:
+        if kind == "short":
+            run_once(eng, ids, 32, eos_ids)
+            break
+    for kind, ids in cases:
+        if kind == "long":
+            run_once(eng, ids, 32, eos_ids)
+            break
 
     rows = []
     for kind, ids in cases:
@@ -186,7 +235,7 @@ def main() -> int:
             print(f"  {v}: prefill {tp:6.2f}s  decode {td:6.2f}s  "
                   f"{ms:6.2f} ms/tok  tok/round {tpr:.3f}  "
                   f"({acc}/{rounds})", flush=True)
-    Q.QSAIndexer.__call__ = orig_call
+    set_variant("A")
 
     # ---- まとめ -------------------------------------------------------
     print("\n=== まとめ ===")
@@ -203,18 +252,18 @@ def main() -> int:
             print(f"  {kind:5s} {metric:14s} A={ma:8.3f}  B={mb:8.3f}  "
                   f"({d:+.2f}% vs 修正前)")
             if kind == "long" and metric == "tok_per_round" and d < -5:
-                print("    ** tok/round が 5% 超落ちた。修正の代償として報告する **")
+                print("    ** tok/round が 5% 超落ちた。代償として報告する **")
 
-    # 対照: 短文脈は A と B で出力が完全一致するはず
-    for ctx in sorted({r["ctx"] for r in rows if r["kind"] == "short"}):
-        sub = [r for r in rows if r["ctx"] == ctx]
-        heads = {tuple(r["head"]) for r in sub}
-        if len(heads) != 1:
-            ok = False
-            print(f"  対照 NG: ctx={ctx} で A/B の出力が食い違う "
-                  "(QSA 不活性なら一致するはず。測定は無効)")
-    if ok:
-        print("  対照 OK: 短文脈 (QSA 不活性) は A/B で出力が一致")
+    if control_identical:
+        # 対照: 短文脈は A と B で出力が完全一致するはず
+        for ctx in sorted({r["ctx"] for r in rows if r["kind"] == "short"}):
+            sub = [r for r in rows if r["ctx"] == ctx]
+            if len({tuple(r["head"]) for r in sub}) != 1:
+                ok = False
+                print(f"  対照 NG: ctx={ctx} で A/B の出力が食い違う"
+                      " (一致するはずの領域。測定は無効)")
+        if ok:
+            print("  対照 OK: 短文脈は A/B で出力が一致")
 
     if args.out:
         Path(args.out).write_text(json.dumps(rows, ensure_ascii=False, indent=1))
