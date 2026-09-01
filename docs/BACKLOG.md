@@ -114,3 +114,42 @@ Flash-Next 独自として扱わないこと** — 線形注意/再帰系は Qwe
 ハイブリッド (linear:full 3:1) にも GLM-5.3-Flash の KDA にも入っており、
 今後の主流側。「再帰状態を持つ層の行別 take」は**族として汎用の部品**として
 書き、qwen4_exp に閉じるのは状態テンソルの形とフックの当て先だけにする。
+
+## アーキ能力レイヤの設計 (2026-09-01 決定、advisor 判断)
+
+**採用: 薄い能力関数レジストリ (能力関数は汎用・解決は族ごと)。範囲は 2 能力のみ。**
+根拠は予報ではなく実測: qwen4 だけで既に同じ知識が 3 箇所に重複している
+(spec_flash.rollback / batch_spec.batched_rollback / snapshot_pre 系が
+`layer_type == "full_attention"`、`layer.linear_attn`、スロットの意味
+(conv/状態/PLE conv/n-gram)、`layer.ple` を独立に書いている)。
+
+切る 2 能力:
+1. **層トポロジ + キャッシュスロットの名前付け** — 再帰状態を持つ層とその
+   スロットを **名前付きで** 返す (`conv` / `state` / `ple_conv` / `ngram`、
+   無い族は None)。**添字で返さないこと** — 添字のまま汎用 API にすると
+   「汎用の名前で qwen4 を再凍結」し、結合が今より見えにくくなる。
+   再帰層 0 個 (Gemma の sliding window 等) を正常系として返し、
+   rollback が no-op になる契約を最初から入れる。
+2. **rollback ループ** — 上を使った per-row / 単一行の巻き戻し。
+   **indexer/疎注意の trim は別能力として分離** (族ごとに有無が違うため、
+   rollback 本体に埋めると if が増える)。
+
+やらないこと (明示的な決定):
+- **`_arch()` の一本化はしない。** seam を `model -> モジュール` にすると
+  他族を渡したとき「即 ImportError」から「実行途中の AttributeError」に
+  劣化する。切るのは `model -> 能力` だけ。`_arch()` は qwen4 固有ヘルパー
+  のまま残す。
+- **フォワードの写し 3 つ (_staged_forward / _group_prefill_forward /
+  capture の GDN 転記) は抽象化しない。**「本家と一字一句同じ」が正しさの
+  根拠で、tools/verify_prefill_bitident.py がそれを守っている。抽象の下に
+  隠すとゲートの検査対象との対応が切れる。
+- **今回 27B を載せ替えない。** qwen4 の 3 コピーを 1 つに畳むところまでで
+  止め、qwen3_5 側は「この形で表せるか」を紙で確認するだけ (2 族同時に
+  動かすと回帰の切り分けができない)。
+- 命名は概念で書く (`recurrent state` / `conv window`)。クラス名
+  (GatedDeltaNet) を汎用 API の名前に使わない。
+
+反転条件: GLM の KDA が「位置ごとの再帰状態の一括取り出し」で表せないと
+判明したら能力 2 は捨てて族ごとに持つ / spec.py (27B) 経路が今後実行され
+ないと決まったら 2 族対応は不要で qwen4 内の重複解消に格下げ /
+バッチ x 投機の配線を捨てる判断をしたら今回はやらない。
