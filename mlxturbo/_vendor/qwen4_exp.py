@@ -464,8 +464,96 @@ class Attention(nn.Module):
             k, v = cache.update_and_fetch(k, v)
         return q, k, v, gate
 
+    def _gather_tile_attn(self, q, k, v, cache, blocks, cr: int, B: int, t0: int, t1: int):
+        """`_gather_forward` の 1 タイルぶん (クエリ行 ``[t0, t1)``) の
+        gather + dense sdpa。
+
+        段 3(b) の元々の (タイル無し) 本体そのもので、``blocks`` の S 行を
+        ``[t0, t1)`` に絞って同じ手順 (union → 添字集め → 小 bool マスク) を
+        やり直すだけ。``q`` は呼び出し側で既に ``[:, :, t0:t1]`` へ切ってある。
+
+        **タイルごとに union を取り直す**ので、同じ K/V ブロックが複数タイルに
+        跨って重複して読まれることがある (タイル分割の代償。K/V 全体を読む
+        密の sdpa よりは軽いはずだが、タイル数が増えるほど重複も増えるので
+        タイル幅は掃引して決める --- `docs/research/KERNEL-PROGRAM.md` 段 P1a)。
+        """
+        keep_block = blocks.keep_block[:, t0:t1]  # (B, T, n_blocks)
+        n_blocks = blocks.n_blocks
+        tail = blocks.tail
+        q_col = blocks.q_col[t0:t1]  # (T,)
+        T = t1 - t0
+
+        # T クエリの選択ブロックの和集合 (union)。上限は T * block_topk
+        # (KERNEL-PROGRAM.md 段 3(b)/P1a)。隣り合うクエリは似たブロックを引く
+        # ので、実際の和集合はこれよりずっと小さいことが多い。タイル幅 T を
+        # S より小さく切るほど、この上限自体が縮む (P1b の狙いそのもの)。
+        k_top = min(self.indexer.block_topk, n_blocks)
+        U = min(n_blocks, T * k_top)
+
+        union = mx.any(keep_block, axis=1)  # (B, n_blocks)
+        # True を先頭に寄せてから先頭 U 個を取る。1 バッチあたりの True 数は
+        # 定義上 U 以下なので、これで実在する選択ブロックを取りこぼさない。
+        # 残りの詰め物スロットはどの行の keep_block でも False (union の
+        # 定義そのもの) なので、下のクエリごとマスクで自然に False になる。
+        order = mx.argsort(-union.astype(mx.int32), axis=-1)
+        sel_blocks = order[:, :U]  # (B, U) ブロック添字、重複なし
+
+        sel_tok = sel_blocks[:, :, None] * cr + mx.arange(cr)[None, None, :]
+        sel_tok = sel_tok.reshape(B, U * cr)
+        if tail:
+            # 端数列 (最後の未満ブロック) は block 添字を持たないので、
+            # union の対象外のまま常に列末尾へ足す。可視かどうかは下の
+            # クエリごとマスクが因果窓 (tail_col <= q_col) で決める。
+            # タイル分割の下でも tail 自体はブロック格子の外なので全タイル
+            # 共通 --- どのタイルも同じ tail 列を読み直す (重複読みの一種)。
+            tail_idx = mx.arange(n_blocks * cr, blocks.kv_len)[None, :]
+            sel_tok = mx.concatenate(
+                [sel_tok, mx.broadcast_to(tail_idx, (B, tail))], axis=1
+            )
+        n_sel = sel_tok.shape[1]
+
+        gather_idx = mx.broadcast_to(
+            sel_tok[:, None, :, None], (B, self.n_kv_heads, n_sel, self.head_dim)
+        )
+        k_sel = mx.take_along_axis(k, gather_idx, axis=2)
+        v_sel = mx.take_along_axis(v, gather_idx, axis=2)
+
+        # クエリごとの差は、集めた列に対する小さい bool マスクで表す
+        # (union 幅であって元の kv_len 幅ではない)。完全なブロックは
+        # select_blocks の時点で「block_end <= q_col」を満たすものだけが
+        # 候補なので、選ばれたブロックの中身は追加の因果チェックなしに
+        # そのまま可視 (元の keep と同じ集合になる)。
+        idx_bsu = mx.broadcast_to(sel_blocks[:, None, :], (B, T, U))
+        keep_sel = mx.take_along_axis(keep_block, idx_bsu, axis=-1)  # (B,T,U)
+        keep_sel = mx.repeat(keep_sel, cr, axis=-1)  # (B,T,U*cr)
+        if tail:
+            tail_col = n_blocks * cr + mx.arange(tail)
+            tail_keep = mx.broadcast_to(
+                (tail_col[None, :] <= q_col[:, None])[None], (B, T, tail)
+            )
+            keep_sel = mx.concatenate([keep_sel, tail_keep], axis=-1)
+
+        stats = getattr(self, "_gather_stats", None)
+        if stats is not None:
+            # 計測・検証専用のフック (既定 None、`_wide_qkv` と同じ属性注入の
+            # 作法)。`tools/verify_gather_attn.py` が union の実サイズを見るのに
+            # 使う。union_ratio = U/n_blocks (ブロック単位の刈り込み率)、
+            # kv_frac = U*cr/kv_len (元の kv_len に対する、集めた列の割合。
+            # tail は分母にだけ含み分子には含めない --- tail は端数ぶんの
+            # 小さな定数なので比の主要項ではない)。段 P1a のタイル掃引と
+            # 同じ量をタイル分割後にも取れるようにするための拡張。
+            union_ratio = (U / n_blocks) if n_blocks else 0.0
+            kv_frac = (U * cr / blocks.kv_len) if blocks.kv_len else 0.0
+            stats.append((T, n_blocks, U, n_sel, union_ratio, kv_frac))
+
+        out = scaled_dot_product_attention(
+            q, k_sel, v_sel, cache=cache, scale=self.scale,
+            mask=keep_sel[:, None],
+        )
+        return out
+
     def _gather_forward(self, x, rope, cache, idx_cache, offset: int, positions):
-        """段 3(b): 選ばれたブロックだけ集めてから、mask 無しの dense sdpa に渡す経路。
+        """段 3(b)/P1a: 選ばれたブロックだけ集めてから、mask 無しの dense sdpa に渡す経路。
 
         `docs/research/KERNEL-PROGRAM.md` 段 3(b) の出し口。
         `mx.fast.scaled_dot_product_attention` は加算マスクを渡されても全 KV を
@@ -487,6 +575,26 @@ class Attention(nn.Module):
           (``offset < compress_ratio - 1``。select_blocks は非対応)
         - 量子化 KV キャッシュ (``hasattr(cache, "bits")``)。gather は
           k/v がプレーンな配列であることを前提にしている
+
+        段 P1a (タイル分割、`docs/research/KERNEL-PROGRAM.md` 段 P1): decode
+        (S=2) では union が ``S * block_topk`` で頭打ちになり、選ぶ列数が
+        小さいまま済む。だが prefill のように S が大きいと (S=2048 など)、
+        S クエリ全体の和集合はほぼ全ブロックになって gather の得が消える ---
+        ただしこれは union がタイル幅の関数だからであって、経路そのものが
+        不成立なわけではない。隣り合うクエリのブロック選択は強く相関する
+        (局所窓 + 少数のグローバルブロック) ので、クエリ行を幅 ``tile`` の
+        タイルに割り、タイルごとに ``_gather_tile_attn`` を呼んで union を
+        取り直す。タイル幅は `_gather_attn_tile` 属性 (`mlxturbo/gather_attn.py`
+        の `enable_gather_attn(..., tile=...)`、既定 0) で渡す。``0`` または
+        ``S <= tile`` なら S 全体を 1 タイルとして扱う --- これは従来の
+        (タイル無し) 経路とビット単位で同じ計算になる (decode の S<=8 は
+        普段このまま)。新しいカーネルは要らない。`take_along_axis` + 小 bool
+        マスク sdpa という既存の型をタイルの数だけ回すだけ。ただし
+        **タイルごとの gather は重複読みになる** --- 同じブロックを複数の
+        タイルがそれぞれ集め直すので、sdpa 呼び出し回数も列の読み出し延べ量も、
+        タイル無しの 1 回呼び出しより増える (union が縮む分と天秤にかける
+        代償。詳しくは `_gather_tile_attn` のコメント)。実 17k/50k での
+        タイル幅 {0, 128, 256, 512} の壁時計掃引は段 P1b (別途、実モデル向け)。
         """
         if hasattr(cache, "bits"):
             return None
@@ -501,68 +609,23 @@ class Attention(nn.Module):
 
         q, k, v, gate = self._qkv(x, positions, rope, cache)
         B = x.shape[0]
-        keep_block = blocks.keep_block  # (B, S, n_blocks) bool
-        n_blocks = blocks.n_blocks
-        tail = blocks.tail
-        q_col = blocks.q_col  # (S,)
 
-        # S クエリの選択ブロックの和集合 (union)。上限は S * block_topk
-        # (KERNEL-PROGRAM.md 段 3(b))。隣り合うクエリは似たブロックを引く
-        # ので、実際の和集合はこれよりずっと小さいことが多い。
-        k_top = min(self.indexer.block_topk, n_blocks)
-        U = min(n_blocks, S * k_top)
+        tile = getattr(self, "_gather_attn_tile", 0)
+        if tile <= 0 or S <= tile:
+            tile = S  # 従来どおり S 全体を 1 タイルとして 1 回で処理する
 
-        union = mx.any(keep_block, axis=1)  # (B, n_blocks)
-        # True を先頭に寄せてから先頭 U 個を取る。1 バッチあたりの True 数は
-        # 定義上 U 以下なので、これで実在する選択ブロックを取りこぼさない。
-        # 残りの詰め物スロットはどの行の keep_block でも False (union の
-        # 定義そのもの) なので、下のクエリごとマスクで自然に False になる。
-        order = mx.argsort(-union.astype(mx.int32), axis=-1)
-        sel_blocks = order[:, :U]  # (B, U) ブロック添字、重複なし
+        if tile >= S:
+            out = self._gather_tile_attn(q, k, v, cache, blocks, cr, B, 0, S)
+        else:
+            outs = [
+                self._gather_tile_attn(
+                    q[:, :, t0 : t0 + tile], k, v, cache, blocks, cr, B,
+                    t0, min(t0 + tile, S),
+                )
+                for t0 in range(0, S, tile)
+            ]
+            out = mx.concatenate(outs, axis=2)
 
-        sel_tok = sel_blocks[:, :, None] * cr + mx.arange(cr)[None, None, :]
-        sel_tok = sel_tok.reshape(B, U * cr)
-        if tail:
-            # 端数列 (最後の未満ブロック) は block 添字を持たないので、
-            # union の対象外のまま常に列末尾へ足す。可視かどうかは下の
-            # クエリごとマスクが因果窓 (tail_col <= q_col) で決める。
-            tail_idx = mx.arange(n_blocks * cr, blocks.kv_len)[None, :]
-            sel_tok = mx.concatenate(
-                [sel_tok, mx.broadcast_to(tail_idx, (B, tail))], axis=1
-            )
-        n_sel = sel_tok.shape[1]
-
-        gather_idx = mx.broadcast_to(
-            sel_tok[:, None, :, None], (B, self.n_kv_heads, n_sel, self.head_dim)
-        )
-        k_sel = mx.take_along_axis(k, gather_idx, axis=2)
-        v_sel = mx.take_along_axis(v, gather_idx, axis=2)
-
-        # クエリごとの差は、集めた列に対する小さい bool マスクで表す
-        # (union 幅であって元の kv_len 幅ではない)。完全なブロックは
-        # select_blocks の時点で「block_end <= q_col」を満たすものだけが
-        # 候補なので、選ばれたブロックの中身は追加の因果チェックなしに
-        # そのまま可視 (元の keep と同じ集合になる)。
-        idx_bsu = mx.broadcast_to(sel_blocks[:, None, :], (B, S, U))
-        keep_sel = mx.take_along_axis(keep_block, idx_bsu, axis=-1)  # (B,S,U)
-        keep_sel = mx.repeat(keep_sel, cr, axis=-1)  # (B,S,U*cr)
-        if tail:
-            tail_col = n_blocks * cr + mx.arange(tail)
-            tail_keep = mx.broadcast_to(
-                (tail_col[None, :] <= q_col[:, None])[None], (B, S, tail)
-            )
-            keep_sel = mx.concatenate([keep_sel, tail_keep], axis=-1)
-
-        stats = getattr(self, "_gather_stats", None)
-        if stats is not None:
-            # 計測・検証専用のフック (既定 None、`_wide_qkv` と同じ属性注入の
-            # 作法)。`tools/verify_gather_attn.py` が union の実サイズを見るのに使う。
-            stats.append((S, n_blocks, U, n_sel))
-
-        out = scaled_dot_product_attention(
-            q, k_sel, v_sel, cache=cache, scale=self.scale,
-            mask=keep_sel[:, None],
-        )
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
 

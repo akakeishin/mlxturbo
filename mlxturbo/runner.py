@@ -1196,11 +1196,15 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
             # マスク無し sdpa に渡す。出力はビット不一致で、採否は
             # KLD / tok-step の in-model 計測がまだ (このコミット時点では
             # 実装と合成モデルでの正しさ確認のみ)。
+            # 段 P1a: MLXTURBO_GATHER_TILE (既定 0 = 従来どおり S 全体で 1 回)
+            # で prefill 幅のクエリ行をタイルに割る。採否は段 P1b (実 17k/50k
+            # でタイル幅 {0, 128, 256, 512} を掃引し、prefill 壁時計で判定)。
             from . import gather_attn
 
-            n = gather_attn.enable_gather_attn(model)
-            print(f"{log_prefix} gather attention 有効 (段 3(b)、{n} 層。"
-                  "出力はビット不一致、採否は未計測)")
+            tile = int(os.environ.get("MLXTURBO_GATHER_TILE", "0"))
+            n = gather_attn.enable_gather_attn(model, tile=tile)
+            print(f"{log_prefix} gather attention 有効 (段 3(b)、{n} 層、"
+                  f"tile={tile or 'off'}。出力はビット不一致、採否は未計測)")
 
 
 

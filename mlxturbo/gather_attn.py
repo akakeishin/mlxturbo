@@ -1,4 +1,4 @@
-"""段 3(b)/P1b: QSA の疎性を sdpa 自身の読み出しへ伝える経路 (gather attention)。
+"""段 3(b)/P1a: QSA の疎性を sdpa 自身の読み出しへ伝える経路 (gather attention)。
 
 `docs/research/KERNEL-PROGRAM.md` 段 3(b) の出し口。いまの QSA (疎注意) は
 選んだブロックを加算マスクとして sdpa に渡しているが、
@@ -22,14 +22,16 @@
 と同じだが、加算順が変わる) ので、採否は KLD / tok-step の in-model 計測で
 決める。合成モデルでの正しさ確認は `tools/verify_gather_attn.py`。
 
-段 P1b (タイル分割): decode (S=2) では union が `S * block_topk` で頭打ちに
-なり効くが、prefill (S=2048) のように S が大きいと 2048 クエリ全体の和集合が
-ほぼ全ブロックになって効かない。ただし隣り合うクエリの選択は強く相関する
-(局所窓 + 少数のグローバルブロック) ので、クエリ行をタイルに切れば
-タイルごとの union は縮む。`_gather_forward` はタイル幅 `tile` を受け取り、
-クエリ行をその幅で分割してタイルごとに (既存と同じ手順で) union を取り
-なおす。タイル幅は `enable_gather_attn(model, tile=...)` /
-環境変数 `MLXTURBO_GATHER_TILE` (既定 0 = 従来どおり S 全体で 1 回) で渡す。
+段 P1a (タイル分割、`docs/research/KERNEL-PROGRAM.md` 段 P1): decode (S=2)
+では union が `S * block_topk` で頭打ちになり効くが、prefill (S=2048) の
+ように S が大きいと 2048 クエリ全体の和集合がほぼ全ブロックになって効かない。
+ただし隣り合うクエリの選択は強く相関する (局所窓 + 少数のグローバルブロック)
+ので、クエリ行をタイルに切ればタイルごとの union は縮む。`_gather_forward`
+はタイル幅 `tile` を受け取り、クエリ行をその幅で分割してタイルごとに
+(既存と同じ手順で) union を取りなおす。タイル幅は
+`enable_gather_attn(model, tile=...)` / 環境変数 `MLXTURBO_GATHER_TILE`
+(既定 0 = 従来どおり S 全体で 1 回) で渡す。実 17k/50k でのタイル幅
+{0, 128, 256, 512} の壁時計掃引は段 P1b (実装はここまでで完了、計測は別途)。
 """
 
 from __future__ import annotations
@@ -58,7 +60,7 @@ def enable_gather_attn(
     ``kv_frac = U * compress_ratio / kv_len``。既定 None のときは 1 行も
     増えない (計測・検証専用、`tools/verify_gather_attn.py` が使う)。
 
-    ``tile`` は段 P1b のタイル幅 (`_gather_attn_tile` 属性、`_wide_qkv` と
+    ``tile`` は段 P1a のタイル幅 (`_gather_attn_tile` 属性、`_wide_qkv` と
     同じ注入の作法)。既定 0 は従来どおり S 全体を 1 回で処理する
     (decode の S<=8 はこの既定のままで実質タイル無効)。
     """
