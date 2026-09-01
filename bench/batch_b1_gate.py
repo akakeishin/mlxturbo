@@ -15,7 +15,13 @@ exit code 1 で落ちる (CIやワンライナーで拾いやすくするため)
 
 サーバー自体の起動はこのスクリプトの外で行うこと。例:
 
+    # 継続バッチング (非投機、mlxturbo/batch.py) を有効にした状態を見る場合
     uv run mlxturbo-serve --model <model> --max-batch 8 --port 8765
+
+    # バッチ x 投機 (mlxturbo/batch_spec.py) を有効にした状態を見る場合。
+    # こちらは待ち行列に 1 本しか無いとき単独経路をそのまま使う設計なので、
+    # このゲートは「その設計が実際に守られているか」を測ることになる
+    uv run mlxturbo-serve --model <model> --max-batch-spec 8 --port 8765
 
 使い方の例:
 

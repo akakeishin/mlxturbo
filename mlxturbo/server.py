@@ -120,8 +120,12 @@ from .runner import (
     Runner,
     build_runner,
     can_batch,
+    can_batch_spec,
     maybe_build_batch_coordinator,
+    maybe_build_batch_spec_coordinator,
+    spec_batch_eligible,
     start_batched_generation,
+    start_batched_spec_generation,
 )
 from .runner import batch_tier as _runner_batch_tier
 from .spec import PREFILL_STEP_SIZE, ChatSession, restore_untrimmable_caches
@@ -332,6 +336,14 @@ class ModelState:
     # provably unchanged.
     batch_coordinator: "Any" = None
     max_batch: int = 1
+    # --max-batch-spec (バッチ x 投機)。上の batch_coordinator と同じ扱いで、
+    # None 以外になるのは max_batch_spec>1 かつ主 runner が FlashSpecRunner の
+    # ときだけ (mlxturbo.runner.maybe_build_batch_spec_coordinator)。8 箇所の
+    # 生成呼び出しは _resolve_batch_route を通してどちらのコーディネータに
+    # 渡すかを決め、None なら従来どおり STATE.lock を取る。既定 (フラグ未指定)
+    # では必ず None なので、既定の挙動は変わらない。
+    spec_batch_coordinator: "Any" = None
+    max_batch_spec: int = 1
 
 
 STATE: ModelState | None = None
@@ -2480,44 +2492,61 @@ class _GenerationCancelled(Exception):
     """Private cooperative-stop signal raised from a runner callback."""
 
 
-def _resolve_batch_tier(
-    gen_runner, prompt_ids: list[int], max_tokens: int, logprobs_requested: bool = False
-) -> str | None:
+def _resolve_batch_route(
+    gen_runner,
+    prompt_ids: list[int],
+    max_tokens: int,
+    logprobs_requested: bool = False,
+    sampling_kwargs: dict | None = None,
+):
     """``None`` means "not batch-eligible — route through STATE.lock exactly
-    as before" (this is also what makes --max-batch's default of 1, and any
-    server not passing it at all, provably identical to before this change:
-    STATE.batch_coordinator is None, so every call short-circuits here).
+    as before" (this is also what makes --max-batch/--max-batch-spec's default
+    of 1, and any server not passing them at all, provably identical to before
+    these changes: both coordinators are None, so every call short-circuits
+    here).
 
-    Otherwise ``"pool"``/``"solo"`` (mlxturbo.batch.classify, via
-    runner.batch_tier) — see the ModelState.batch_coordinator field
-    docstring and mlxturbo/batch.py's module docstring for what the two mean.
+    Otherwise a ``(coordinator, tier)`` pair. Two mechanisms can answer, and
+    they cover disjoint request classes, so at most one ever matches:
 
-    Excludes logprobs requests: batching does not collect logprobs yet (see
-    runner.start_batched_generation's docstring), so such a request simply
-    keeps going through the existing STATE.lock + FallbackRunner.generate
-    path, identical to how it is served today.
+    - ``STATE.batch_coordinator`` (--max-batch, mlxturbo/batch.py): continuous
+      batching for requests resolved to a plain ``FallbackRunner``. ``tier`` is
+      ``"pool"``/``"solo"`` — see mlxturbo/batch.py's ``classify``.
+    - ``STATE.spec_batch_coordinator`` (--max-batch-spec,
+      mlxturbo/batch_spec.py): batch x speculation for requests resolved to
+      ``FlashSpecRunner``. ``tier`` is always ``"spec"`` (that mechanism has no
+      tier of its own — admission is a straight yes/no, see
+      ``runner.spec_batch_eligible``).
+
+    Excludes logprobs requests on both paths: neither collects logprobs yet, so
+    such a request simply keeps going through the existing STATE.lock +
+    runner.generate path, identical to how it is served today.
     """
 
+    if logprobs_requested:
+        return None
     coordinator = STATE.batch_coordinator
-    if coordinator is None or logprobs_requested:
-        return None
-    if not can_batch(gen_runner):
-        return None
-    return _runner_batch_tier(coordinator, prompt_ids, max_tokens)
+    if coordinator is not None and can_batch(gen_runner):
+        return coordinator, _runner_batch_tier(coordinator, prompt_ids, max_tokens)
+    spec = STATE.spec_batch_coordinator
+    if spec is not None and can_batch_spec(gen_runner):
+        if spec_batch_eligible(spec, prompt_ids, max_tokens, sampling_kwargs or {}):
+            return spec, "spec"
+    return None
 
 
 async def _run_generate_batched(
-    prompt_ids, max_tokens, temp, on_tokens=None, **sampling_kwargs
+    route, prompt_ids, max_tokens, temp, on_tokens=None, **sampling_kwargs
 ) -> dict:
     """The batched-path analogue of ``_run_generate`` — used instead of it
-    (never both) whenever ``_resolve_batch_tier`` returned non-``None``.
+    (never both) whenever ``_resolve_batch_route`` returned non-``None``.
+    ``route`` is that function's ``(coordinator, tier)`` pair.
 
     No session is passed (batched requests always do a fresh prefill; see
     mlxturbo/batch.py's module docstring — the same simplification already
     used for a per-request-downgraded request, see the callers'
     ``session=None`` comment). No ``STATE.lock`` either: concurrency between
     admissions is the entire point, and mutual exclusion around the model
-    forward pass now lives inside ``BatchCoordinator`` itself.
+    forward pass now lives inside the coordinator itself.
 
     Cancellation: mirrors ``_run_generate``'s own shield/defer pattern. A
     non-streaming caller has no ``cancel_event`` to signal early, so — same
@@ -2526,10 +2555,17 @@ async def _run_generate_batched(
     ``CancelledError`` is allowed to propagate until the Future is done.
     """
 
-    future = start_batched_generation(
-        STATE.batch_coordinator, prompt_ids, max_tokens, temp, on_tokens, None, None,
-        **sampling_kwargs,
-    )
+    coordinator, tier = route
+    if tier == "spec":
+        future = start_batched_spec_generation(
+            coordinator, prompt_ids, max_tokens, temp, STATE.eos_ids,
+            on_tokens, None, None, **sampling_kwargs,
+        )
+    else:
+        future = start_batched_generation(
+            coordinator, prompt_ids, max_tokens, temp, on_tokens, None, None,
+            **sampling_kwargs,
+        )
     wrapped = asyncio.wrap_future(future)
     cancelled: asyncio.CancelledError | None = None
     while True:
@@ -2550,6 +2586,7 @@ async def _run_generate_batched(
 
 
 def _start_batched_generation(
+    route,
     prompt_ids,
     max_tokens,
     temp,
@@ -2563,22 +2600,37 @@ def _start_batched_generation(
     streaming call site can swap one for the other without any other change:
     the SSE-side consumption code (``_await_with_keepalive``,
     ``asyncio.to_thread(q.get)``, ``_await_worker``) neither knows nor cares
-    which one produced its queue.
+    which one produced its queue. ``route`` is ``_resolve_batch_route``'s
+    ``(coordinator, tier)`` pair.
     """
 
     q, cancel_event, raw_token_count, on_tokens, on_done = _build_streaming_pipeline(
         prompt_ids, thinking_budget, tool_calling_enabled, tools_for_parsing
     )
-    future = start_batched_generation(
-        STATE.batch_coordinator,
-        prompt_ids,
-        max_tokens,
-        temp,
-        on_tokens,
-        on_done,
-        cancel_event,
-        **sampling_kwargs,
-    )
+    coordinator, tier = route
+    if tier == "spec":
+        future = start_batched_spec_generation(
+            coordinator,
+            prompt_ids,
+            max_tokens,
+            temp,
+            STATE.eos_ids,
+            on_tokens,
+            on_done,
+            cancel_event,
+            **sampling_kwargs,
+        )
+    else:
+        future = start_batched_generation(
+            coordinator,
+            prompt_ids,
+            max_tokens,
+            temp,
+            on_tokens,
+            on_done,
+            cancel_event,
+            **sampling_kwargs,
+        )
     # A plain concurrent.futures.Future, exactly like _start_generation's own
     # STATE.executor.submit(worker) return value — _await_worker wraps it
     # with asyncio.wrap_future itself.
@@ -3337,16 +3389,18 @@ async def chat_completions(request: Request):
             headers=_downgrade_headers(downgrade_reason),
         )
 
-    batch_tier = _resolve_batch_tier(
-        gen_runner, prompt_ids, max_tokens, logprobs_requested=logprobs_requested
+    batch_route = _resolve_batch_route(
+        gen_runner, prompt_ids, max_tokens, logprobs_requested=logprobs_requested,
+        sampling_kwargs=sampling_params,
     )
     try:
-        if batch_tier is not None:
-            # Continuous batching (--max-batch): no STATE.lock, no session
-            # (see mlxturbo/batch.py's module docstring) — concurrency with
-            # other in-flight requests is the entire point.
+        if batch_route is not None:
+            # Batched path (--max-batch / --max-batch-spec): no STATE.lock, no
+            # session (see mlxturbo/batch.py's and mlxturbo/batch_spec.py's
+            # module docstrings) — concurrency with other in-flight requests is
+            # the entire point.
             res = await _run_generate_batched(
-                prompt_ids, max_tokens, temp, None, **sampling_params
+                batch_route, prompt_ids, max_tokens, temp, None, **sampling_params
             )
         else:
             async with STATE.lock:
@@ -3483,16 +3537,20 @@ async def _openai_stream(
     # first token"). Ownership of the queue slot is centralized in
     # _queue_owned_stream, and ownership of the lock in the owned flag below.
     owned = [False]
-    batch_tier = _resolve_batch_tier(runner or STATE.runner, prompt_ids, max_tokens)
+    batch_route = _resolve_batch_route(
+        runner or STATE.runner, prompt_ids, max_tokens,
+        sampling_kwargs=sampling_params or {},
+    )
     try:
-        if batch_tier is not None:
-            # Continuous batching (--max-batch): no STATE.lock (owned stays
-            # False, so the function's own final `if owned[0]:` is already a
-            # correct no-op), no session (see mlxturbo/batch.py's module
-            # docstring — batched requests always do a fresh prefill).
+        if batch_route is not None:
+            # Batched path (--max-batch / --max-batch-spec): no STATE.lock
+            # (owned stays False, so the function's own final `if owned[0]:` is
+            # already a correct no-op), no session (batched requests always do a
+            # fresh prefill — see mlxturbo/batch.py's module docstring).
             session = None
             reused_at_select = 0
             q, future, cancel_event, raw_token_count = _start_batched_generation(
+                batch_route,
                 prompt_ids,
                 max_tokens,
                 temp,
@@ -3886,11 +3944,13 @@ async def anthropic_messages(request: Request):
             headers=_downgrade_headers(downgrade_reason),
         )
 
-    batch_tier = _resolve_batch_tier(gen_runner, prompt_ids, max_tokens)
+    batch_route = _resolve_batch_route(
+        gen_runner, prompt_ids, max_tokens, sampling_kwargs=sampling_params,
+    )
     try:
-        if batch_tier is not None:
+        if batch_route is not None:
             res = await _run_generate_batched(
-                prompt_ids, max_tokens, temp, None, **sampling_params
+                batch_route, prompt_ids, max_tokens, temp, None, **sampling_params
             )
         else:
             async with STATE.lock:
@@ -4006,12 +4066,16 @@ async def _anthropic_stream(
     yield sse("ping", {"type": "ping"})
 
     owned = [False]
-    batch_tier = _resolve_batch_tier(runner or STATE.runner, prompt_ids, max_tokens)
+    batch_route = _resolve_batch_route(
+        runner or STATE.runner, prompt_ids, max_tokens,
+        sampling_kwargs=sampling_params or {},
+    )
     try:
-        if batch_tier is not None:
+        if batch_route is not None:
             session = None
             reused_at_select = 0
             q, future, cancel_event, raw_token_count = _start_batched_generation(
+                batch_route,
                 prompt_ids,
                 max_tokens,
                 temp,
@@ -4395,13 +4459,14 @@ async def completions(request: Request):
             headers=_downgrade_headers(downgrade_reason),
         )
 
-    batch_tier = _resolve_batch_tier(
-        gen_runner, prompt_ids, max_tokens, logprobs_requested=logprobs_requested
+    batch_route = _resolve_batch_route(
+        gen_runner, prompt_ids, max_tokens, logprobs_requested=logprobs_requested,
+        sampling_kwargs=sampling_params,
     )
     try:
-        if batch_tier is not None:
+        if batch_route is not None:
             res = await _run_generate_batched(
-                prompt_ids, max_tokens, temp, None, **sampling_params
+                batch_route, prompt_ids, max_tokens, temp, None, **sampling_params
             )
         else:
             async with STATE.lock:
@@ -4478,14 +4543,18 @@ async def _completions_stream(
     runner=None,
 ):
     owned = [False]
-    batch_tier = _resolve_batch_tier(runner or STATE.runner, prompt_ids, max_tokens)
+    batch_route = _resolve_batch_route(
+        runner or STATE.runner, prompt_ids, max_tokens,
+        sampling_kwargs=sampling_params or {},
+    )
     try:
-        if batch_tier is not None:
+        if batch_route is not None:
             session = None
             reused_at_select = 0
             # thinking_budget=0 pins ThinkingRouter to content-only (regardless of
             # has_thinking), so reasoning_delta can never arrive.
             q, future, cancel_event, raw_token_count = _start_batched_generation(
+                batch_route,
                 prompt_ids, max_tokens, temp, 0, **(sampling_params or {})
             )
         else:
@@ -5230,11 +5299,13 @@ async def responses_endpoint(request: Request):
             headers=_downgrade_headers(downgrade_reason),
         )
 
-    batch_tier = _resolve_batch_tier(gen_runner, prompt_ids, max_tokens)
+    batch_route = _resolve_batch_route(
+        gen_runner, prompt_ids, max_tokens, sampling_kwargs=sampling_params,
+    )
     try:
-        if batch_tier is not None:
+        if batch_route is not None:
             res = await _run_generate_batched(
-                prompt_ids, max_tokens, temp, None, **sampling_params
+                batch_route, prompt_ids, max_tokens, temp, None, **sampling_params
             )
         else:
             async with STATE.lock:
@@ -5342,11 +5413,15 @@ async def _responses_stream(
     )
 
     owned = [False]
-    batch_tier = _resolve_batch_tier(runner or STATE.runner, prompt_ids, max_tokens)
+    batch_route = _resolve_batch_route(
+        runner or STATE.runner, prompt_ids, max_tokens,
+        sampling_kwargs=sampling_params or {},
+    )
     try:
-        if batch_tier is not None:
+        if batch_route is not None:
             session = None
             q, future, cancel_event, _raw_token_count = _start_batched_generation(
+                batch_route,
                 prompt_ids,
                 max_tokens,
                 temp,
@@ -6022,6 +6097,33 @@ def main() -> None:
         " 同一バッチ構成内の決定性",
     )
     ap.add_argument(
+        "--max-batch-spec",
+        type=int,
+        default=1,
+        metavar="N",
+        help="バッチ x 投機 (mlxturbo/batch_spec.py) を有効にし、投機のまま"
+        " 同時に処理するリクエスト数の上限を N にする。既定 (未指定、または 1)"
+        " では従来どおり直列 — この既定の挙動は変えない。効くのは主 runner が"
+        " FlashSpecRunner (Flash-Next + MTP 投機) のときだけで、上の --max-batch"
+        " (非投機に降格された要求が対象) とは対象が互いに素なので、両方を同時に"
+        " 指定してもよい。まとめる条件は「サンプリング設定が同じ」「プロンプト長"
+        " + max_tokens が indexer_budget (2048) に収まる」「長さの比が 1.5 倍"
+        " 以内」の 3 つで、外れた要求は従来どおり直列に流れる。走行中のバッチに"
+        " 後から入れることはしない (次のバッチまで待つ)。待ち行列に 1 本しか"
+        " 無いときは単独経路をそのまま使うので、単独リクエストの decode は"
+        " 変わらない (bench/batch_b1_gate.py)",
+    )
+    ap.add_argument(
+        "--batch-spec-wait-ms",
+        type=int,
+        default=15,
+        metavar="MS",
+        help="--max-batch-spec 有効時、待ち行列に 1 本しか無いときに相方を待つ"
+        " 時間 (既定 15ms)。同時到着を同じバッチに拾うためのもので、待つのは"
+        " 最初の 1 トークンの手前だけ (decode の ms/token には乗らない)。"
+        " 0 にすると待たない = 同時到着でもほぼ直列になる",
+    )
+    ap.add_argument(
         "--mtp",
         default=None,
         metavar="PATH",
@@ -6143,7 +6245,20 @@ def main() -> None:
             log_prefix="[mlxturbo-serve]",
             primary_runner=runner,
         )
-        return runner, tokenizer, max_context_tokens, source, downgrade_runner, batch_coordinator
+        # --max-batch-spec (既定 1 = off)。上の --max-batch と対象が互いに素で、
+        # こちらは「投機のまま処理される要求」だけをまとめる (mlxturbo/
+        # batch_spec.py の coordinator 節)。主 runner が FlashSpecRunner の
+        # ときだけ組み立つ。--max-batch と同じ理由でこの中 (executor スレッド)
+        # で作る。
+        spec_batch_coordinator = maybe_build_batch_spec_coordinator(
+            runner, executor, args.max_batch_spec, eos_ids,
+            wait_ms=args.batch_spec_wait_ms,
+            log_prefix="[mlxturbo-serve]",
+        )
+        return (
+            runner, tokenizer, max_context_tokens, source, downgrade_runner,
+            batch_coordinator, spec_batch_coordinator,
+        )
 
     (
         runner,
@@ -6152,6 +6267,7 @@ def main() -> None:
         source,
         downgrade_runner,
         batch_coordinator,
+        spec_batch_coordinator,
     ) = executor.submit(_load).result()
     if max_context_tokens is not None:
         print(
@@ -6194,6 +6310,8 @@ def main() -> None:
         max_stored_responses=args.max_stored_responses,
         batch_coordinator=batch_coordinator,
         max_batch=args.max_batch,
+        spec_batch_coordinator=spec_batch_coordinator,
+        max_batch_spec=args.max_batch_spec,
     )
     print(f"[mlxturbo-serve] version {_FASTMLX_VERSION}")
     if batch_coordinator is not None:
@@ -6210,6 +6328,11 @@ def main() -> None:
         print(
             f"[mlxturbo-serve] --max-batch {args.max_batch} が指定されましたが無効"
             " (継続バッチングが使える runner が見当たらない)"
+        )
+    if spec_batch_coordinator is None and args.max_batch_spec > 1:
+        print(
+            f"[mlxturbo-serve] --max-batch-spec {args.max_batch_spec} が指定されましたが無効"
+            f" (runner={runner.KIND} — バッチ x 投機は FlashSpecRunner 限定)"
         )
     if downgrade_runner is not None:
         print(

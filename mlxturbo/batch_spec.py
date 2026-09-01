@@ -51,13 +51,19 @@ QSA のブロック選択は絶対列位置で切られる。dead slot を挟ん
 ``mlxturbo/batch.py`` の "solo tier" と同じ考え方で、QSA が活性化しうる
 リクエストは常にこの機構の対象外にすること。
 
+## サーバー配線
+
+このファイルの末尾「coordinator」節にある (``--max-batch-spec``)。admission と
+スケジューラの決めごと 4 点はそこに書いてある。走行中のバッチに後から行を
+足すことだけはやっていない (理由も同じ節)。
+
 ## 未対応 (このモジュールの範囲外)
 
-- サーバー配線・admission・スケジューラは書いていない (依頼どおり)。
 - indexer / QSA (上記)。
-- サンプリング (温度 > 0) の分布保証はここでは検証していない (貪欲のみ)。
-  spec_flash.py 側の議論 (位置ごとの分布は独立) はそのまま当てはまるはずだが
-  未確認。
+- サンプリング (温度 > 0) の分布保証は実測していない。全位置を先に引く形は
+  spec_flash.py 側の議論 (位置ごとの分布は独立) がそのまま当てはまり、
+  ``BatchSpecGenerator._sample_rows`` はその B 行版だが、KLD などで確かめた
+  わけではない。
 
 ## 検証
 
@@ -96,10 +102,45 @@ class RaggedLedger:
         self.L = 0
         self._alive: list[list[bool]] = [[] for _ in range(batch_size)]
         self._valid_len: list[int] = [0] * batch_size
-        # prefill の 1 回だけ立てる。右パディングで流すので、そのラウンドの
-        # マスクは「因果 かつ 実長より手前」であって、通常ラウンドの
-        # 「生きている過去 + 因果」とは別物 (round_mask 参照)
-        self.prefill_lengths: list[int] | None = None
+        self._prefill_lengths: list[int] | None = None
+        # round_mask の memo (キーは T)。同じラウンドの中では帳簿が動かないので
+        # 全 full attention 層 (このモデルで 12 層) が同じ配列を使い回せる。
+        # memo が無いと層ごとに (B, L) の Python リストを mx.array に変換し直す
+        # ことになり、L が伸びるほど decode の 1 ラウンドが重くなる (B=1 でも
+        # 効くので、単独リクエストの無劣化に直接効く)。帳簿を動かす操作
+        # (commit_round / compact / filter_rows / prefill_lengths の付け外し) が
+        # 全て _invalidate を通る。
+        self._mask_memo: dict[int, mx.array] = {}
+
+    def _invalidate(self) -> None:
+        self._mask_memo.clear()
+
+    @property
+    def prefill_lengths(self) -> "list[int] | None":
+        """prefill の 1 回だけ立てる。右パディングで流すので、そのラウンドの
+        マスクは「因果 かつ 実長より手前」であって、通常ラウンドの
+        「生きている過去 + 因果」とは別物 (round_mask 参照)。"""
+        return self._prefill_lengths
+
+    @prefill_lengths.setter
+    def prefill_lengths(self, value: "list[int] | None") -> None:
+        self._prefill_lengths = value
+        self._invalidate()
+
+    def max_valid_len(self) -> int:
+        """行の論理長の最大 (= compaction 後の物理列数)。"""
+        return max(self._valid_len) if self._valid_len else 0
+
+    def filter_rows(self, rows: list[int]) -> None:
+        """``rows`` の行だけを残す (帳簿側)。キャッシュ側は
+        ``RaggedAttnCache.filter_rows`` / ``ArraysCache.filter`` が同じ添字で
+        揃えること (``BatchSpecGenerator.retire`` が両方を呼ぶ)。"""
+        self.B = len(rows)
+        self._alive = [self._alive[b] for b in rows]
+        self._valid_len = [self._valid_len[b] for b in rows]
+        if self._prefill_lengths is not None:
+            self._prefill_lengths = [self._prefill_lengths[b] for b in rows]
+        self._invalidate()
 
     def valid_len_array(self) -> mx.array:
         """行ごとの論理長 (B,)。RoPE の位置 (= このラウンドの新規列の
@@ -132,14 +173,23 @@ class RaggedLedger:
         prefill 中 (``prefill_lengths`` が立っている) は、まだ過去が無く、
         右パディングを隠す必要があるので「因果 かつ 実長より手前」。
         それ以外は ``next_round_mask``。
+
+        同じラウンドの中では帳簿が動かないので、T ごとに 1 回だけ作って
+        memo から返す (__init__ の _mask_memo を参照)。
         """
-        if self.prefill_lengths is None:
-            return self.next_round_mask(T)
-        lens = mx.array(self.prefill_lengths)
-        cols = mx.arange(T)
-        causal = cols[None, :] <= cols[:, None]  # (T, T)
-        valid = cols[None, :] < lens[:, None]  # (B, T)
-        return (causal[None] & valid[:, None, :])[:, None]
+        got = self._mask_memo.get(T)
+        if got is not None:
+            return got
+        if self._prefill_lengths is None:
+            out = self.next_round_mask(T)
+        else:
+            lens = mx.array(self._prefill_lengths)
+            cols = mx.arange(T)
+            causal = cols[None, :] <= cols[:, None]  # (T, T)
+            valid = cols[None, :] < lens[:, None]  # (B, T)
+            out = (causal[None] & valid[:, None, :])[:, None]
+        self._mask_memo[T] = out
+        return out
 
     def commit_round(self, keeps: list[int], total: int) -> None:
         """検証後、行 b は先頭 ``keeps[b]`` 列 (1..total) を alive として
@@ -153,6 +203,7 @@ class RaggedLedger:
             self._alive[b].extend([True] * keep + [False] * (total - keep))
             self._valid_len[b] += keep
         self.L += total
+        self._invalidate()
 
     def compact(self, model, caches) -> None:
         """dead slot を物理的に詰める (mx.take_along_axis で KV/indexer を
@@ -191,6 +242,7 @@ class RaggedLedger:
             [False] * (new_L - self._valid_len[b]) + [True] * self._valid_len[b]
             for b in range(self.B)
         ]
+        self._invalidate()
 
 
 def _gather_cols(arr: mx.array, idx: mx.array, axis: int) -> mx.array:
@@ -246,6 +298,17 @@ class RaggedAttnCache:
     def is_trimmable(self) -> bool:
         # 行別 trim をしない設計そのもの (dead slot が代わりに扱う)
         return False
+
+    def filter_rows(self, idx: mx.array) -> None:
+        """バッチ軸 (axis 0) から ``idx`` の行だけを残す。列の意味は行ごとに
+        独立なので、列側の詰め直しは要らない (残る行の物理列はそのまま)。
+        帳簿は共有物なので、ここでは触らず ``BatchSpecGenerator.retire`` が
+        1 回だけ ``RaggedLedger.filter_rows`` を呼ぶ。"""
+        if self.keys is not None:
+            self.keys = mx.contiguous(self.keys[idx])
+            self.values = mx.contiguous(self.values[idx])
+        if self.indexer.keys is not None:
+            self.indexer.keys = mx.contiguous(self.indexer.keys[idx])
 
 
 class RaggedDraftCache:
@@ -318,6 +381,16 @@ class RaggedDraftCache:
 
     def is_trimmable(self) -> bool:
         return True
+
+    def filter_rows(self, idx: mx.array) -> None:
+        """バッチ軸から ``idx`` の行だけを残す。列は全行そろって伸びるので
+        (どの行も priming 窓 + ラウンド数)、列側は触らなくてよい。"""
+        if self.keys is not None:
+            self.keys = mx.contiguous(self.keys[idx])
+            self.values = mx.contiguous(self.values[idx])
+        if self.indexer.keys is not None:
+            self.indexer.keys = mx.contiguous(self.indexer.keys[idx])
+        self._base = self._base[idx]
 
 
 def make_ragged_cache(model, batch_size: int):
@@ -539,11 +612,27 @@ class BatchSpecGenerator:
     ``ragged_attention`` が ``NotImplementedError`` で止まる (モジュール
     docstring 参照)。呼び手は長いリクエストをバッチから外すこと。
 
-    貪欲のみ。温度つきサンプリングは行ごとに受理判定が変わるだけで構造は
-    同じだが、まだ書いていない。
+    ## サンプリング
+
+    既定は貪欲 (``temp=0`` / ``sampler=None``) で、これは以前と 1 ビットも
+    変わらない。``temp>0`` / ``sampler`` を渡すと ``mlxturbo.spec_flash`` の
+    ``FlashSpecEngine._verify`` と同じ形で全位置を先に引く -- あちらが
+    ``(1, T+1)`` に対してやっていることを ``(B, T+1)`` に広げただけで、
+    「位置 j のサンプルは lg[:, j] にしか依存しない」という独立性の議論
+    (``FlashSpecEngine._verify`` の注記) はそのまま成り立つ。**バッチ内の
+    全行が同じサンプラーを共有する**前提なので (1 回の呼び出しで全行ぶんを
+    引く)、パラメータの違う要求を同じバッチに入れてはいけない -- admission
+    側の責務 (``BatchSpecCoordinator._sampling_key``)。
     """
 
-    def __init__(self, engine, prompts: list[list[int]], depth: int | None = None):
+    def __init__(
+        self,
+        engine,
+        prompts: list[list[int]],
+        depth: int | None = None,
+        temp: float = 0.0,
+        sampler=None,
+    ):
         from .spec_flash import PRIME_WINDOW
 
         if not prompts:
@@ -565,9 +654,25 @@ class BatchSpecGenerator:
         self.out: list[list[int]] = [[] for _ in range(self.B)]
         self.rounds = 0
         self.accepted = 0
+        self.temp = float(temp)
+        self.sampler = sampler
         self._cur = None
         self._hyper_prev = None
         self._mtp_cache = None
+
+    def _sample_rows(self, lg: mx.array) -> mx.array:
+        """検証フォワードの logits (B, S, vocab) から各位置のトークン (B, S)。
+
+        ``FlashSpecEngine._verify`` / ``_sample`` の B 行版。貪欲のときは
+        以前と同じ ``mx.argmax`` をそのまま通る。
+        """
+        if self.sampler is None and self.temp <= 0:
+            return mx.argmax(lg, axis=-1)
+        b, s, v = lg.shape
+        flat = lg.reshape(b * s, v)
+        if self.sampler is not None:
+            return self.sampler(flat).reshape(b, s)
+        return mx.random.categorical(flat.astype(mx.float32) / self.temp).reshape(b, s)
 
     # ---- prefill ----------------------------------------------------
 
@@ -601,7 +706,7 @@ class BatchSpecGenerator:
         self.ledger.commit_round(self.lengths, self.L)
 
         last = [n - 1 for n in self.lengths]
-        first = mx.argmax(self._row_take(logits, last)[:, 0], axis=-1)
+        first = self._sample_rows(self._row_take(logits, last))[:, 0]
         mx.eval(first)
         for b, t in enumerate(first.tolist()):
             self.out[b].append(int(t))
@@ -638,8 +743,16 @@ class BatchSpecGenerator:
 
     # ---- rounds -----------------------------------------------------
 
-    def step(self) -> list[list[int]]:
-        """1 ラウンド進めて、行ごとの新規トークンを返す。"""
+    def step(self, truncate=None) -> list[list[int]]:
+        """1 ラウンド進めて、行ごとの新規トークンを返す。
+
+        ``truncate`` (省略可) は ``(b, toks) -> 残す個数 (1 以上)``。eos や
+        残り max_tokens で行 b の出力をこのラウンドの途中で打ち切るための口で、
+        単独経路 (``FlashSpecEngine.generate_stream``) が ``cut``/``remaining``
+        で ``vals`` を切り詰めてから ``rollback(keep=len(vals))`` を呼ぶのと
+        同じ形 -- 打ち切った分は受理しなかったことにするので、キャッシュと
+        出力が食い違わない。
+        """
         from .spec_flash import _staged_forward
 
         eng = self.eng
@@ -656,7 +769,7 @@ class BatchSpecGenerator:
             # だけ速い。バッチ側が `model(...)` を直接呼んでいると、B=1 でも
             # 単独に負ける (実測 0.82x)。計算内容は同じ。
             lg = _staged_forward(self.model, pair, self.caches)
-            nxt = mx.argmax(lg, axis=-1)          # (B, T+1)
+            nxt = self._sample_rows(lg)            # (B, T+1)
             dv = mx.concatenate(drafts, axis=1)   # (B, T)
             mx.eval(nxt, dv, cap.hyper)
         self.rounds += 1
@@ -667,10 +780,15 @@ class BatchSpecGenerator:
             hit = 0
             while hit < total - 1 and nxt_l[b][hit] == dv_l[b][hit]:
                 hit += 1
-            keeps.append(hit + 1)
             self.accepted += hit
-            new.append(nxt_l[b][: hit + 1])
-            self.out[b].extend(new[-1])
+            toks = nxt_l[b][: hit + 1]
+            if truncate is not None:
+                n_keep = truncate(b, toks)
+                if n_keep < len(toks):
+                    toks = toks[:n_keep]
+            keeps.append(len(toks))
+            new.append(toks)
+            self.out[b].extend(toks)
 
         batched_rollback(self.model, self.caches, cap, keeps, pre_ctx, pair)
         self.ledger.commit_round(keeps, total)
@@ -679,12 +797,579 @@ class BatchSpecGenerator:
         self._hyper_prev = self._row_take(cap.hyper, last)
         return new
 
+    def retire(self, rows: list[int]) -> None:
+        """終わった行を物理的に落とし、``rows`` の行だけを残す (入力は残す側の
+        添字、昇順)。
+
+        残さない選択肢 (終わった行を計算し続けて、全行が終わったらバッチごと
+        畳む) もあるが、そちらは 20 トークンで終わった行が 500 トークンの行に
+        付き合って 480 ラウンドぶんの前進計算と KV を占め続ける。行の可視性は
+        元から行ごと (`RaggedLedger._alive`) で、キャッシュもバッチ軸が先頭に
+        揃っているので、落とすのは軸 0 のスライスで済む。
+        """
+        if len(rows) == self.B:
+            return
+        idx = mx.array(rows)
+        for c in self.caches:
+            if hasattr(c, "ledger"):
+                c.filter_rows(idx)
+            else:
+                # 上流 (ArraysCache.filter) がそのまま使える。GDN/PLE/n-gram の
+                # テンソルは先頭次元がバッチ次元
+                c.filter(idx)
+        if self._mtp_cache is not None:
+            self._mtp_cache.filter_rows(idx)
+        self.ledger.filter_rows(rows)
+        self.lengths = [self.lengths[b] for b in rows]
+        self.out = [self.out[b] for b in rows]
+        self._cur = self._cur[idx]
+        self._hyper_prev = self._hyper_prev[idx]
+        self.B = len(rows)
+
+    def maybe_compact(self, hard_limit: int | None = None, waste_ratio: float = 1.5) -> bool:
+        """dead slot が溜まってきたら詰める。詰めたら True。
+
+        2 つの理由で呼ぶ:
+
+        - 硬い上限 (``hard_limit``): 物理列数が QSA の境界 (``indexer_budget``)
+          に届くと ``ragged_attention`` が ``NotImplementedError`` で止まる。
+          次のラウンドで足す ``depth+1`` 列を含めて境界の手前に収まるよう、
+          越えそうなら必ず詰める。論理長がこの境界より短いことは admission が
+          保証しているので (``spec_batchable``)、詰めれば必ず収まる。
+        - 無駄 (``waste_ratio``): 物理列が論理長の ``waste_ratio`` 倍を超えたら
+          詰める。受理率が 1.6 tok/round 程度なので、詰めないと物理列は論理長の
+          およそ ``(depth+1)/1.6`` 倍で伸び続け、attention の費用がそのぶん
+          丸ごと無駄になる。
+        """
+        valid = self.ledger.max_valid_len()
+        need = (
+            hard_limit is not None
+            and self.ledger.L + self.depth + 1 > hard_limit
+        ) or (valid and self.ledger.L > valid * waste_ratio)
+        if not need or self.ledger.L <= valid:
+            return False
+        self.ledger.compact(self.model, self.caches)
+        return True
+
     def generate(self, max_tokens: int) -> list[list[int]]:
         """全行が ``max_tokens`` 個に達するまで回す (eos は見ない)。"""
         self.prefill()
         while min(len(o) for o in self.out) < max_tokens:
             self.step()
         return [o[:max_tokens] for o in self.out]
+
+
+# ------------------------------------------------------------- coordinator
+#
+# 上の部品をサーバーに配線する層 (--max-batch-spec)。形は
+# `mlxturbo/batch.py` の BatchCoordinator に寄せてある: inbox に Admission を
+# 積み、駆動ループを 1 本だけ executor (モデルを読んだ唯一の MLX ワーカー
+# スレッド) に投げ、live な仕事が無くなったら抜ける。違いは駆動する対象
+# だけ -- あちらは mlx_lm の BatchGenerator (投機なし)、こちらは上の
+# BatchSpecGenerator (MTP 投機つき)。
+#
+# ## 決めたこと 4 点 (依頼の admission / スケジューラの論点)
+#
+# 1. まとめる条件。同じ**サンプリング設定**を持ち、長さが近いものだけを
+#    まとめる。長さは `bucket_batches` (既存) に任せる -- 右パディングの無駄は
+#    行あたり `max_len - len` 列で、比が開くほど丸ごと捨てる計算が増えるため。
+#    サンプリングを揃えるのは、`BatchSpecGenerator._sample_rows` が全行ぶんを
+#    1 回の呼び出しで引くから (行ごとに違うサンプラーを混ぜると分布が壊れる)。
+#    seed 指定つきの要求は混ぜない (`mx.random.seed` はプロセス全体の状態で、
+#    同居する他の行の乱数まで動かしてしまうため) -- 直列経路に回す。
+#
+# 2. 途中で終わった列。終わった行はその場で完了させ、`retire()` で物理的に
+#    落とす (バッチ軸のスライス)。dead slot の帳簿は元から行ごとなので、
+#    行を抜くのに列の詰め直しは要らない。落とさない場合、短い行が長い行に
+#    最後まで付き合って前進計算と KV を占め続ける。
+#
+# 3. 新しい要求。**走行中のバッチには入れない (closed batch)。**次のバッチの
+#    編成は、走行中のバッチが空になった時点で行う。走行中に入れるには、
+#    新入りの KV を走行中の物理列数に左詰めで揃え、MTP の priming 窓も
+#    揃えた上で軸 0 に連結する必要がある (`compact()` が作る形と同じ形に
+#    寄せれば筋は通るが、`ArraysCache` の内部オフセットと priming 窓の
+#    整合は実機でしか確かめられない)。GPU を使わない今回の範囲では検証
+#    できないので入れていない。今の直列キュー (1 リクエストずつ) と比べれば
+#    待ち時間は決して増えない -- 増えるのは同時到着の並列度だけ。
+#
+# 4. メモリ。下の `plan_batch` を参照。上限は 3 つの積み重ねで、どれも
+#    設定値ではなくモデルの形から計算する。
+#
+# ## B=1 は既存の単独経路のまま
+#
+# 待ち行列に 1 本しか無いときは `BatchSpecGenerator` を使わず、
+# `FlashSpecRunner.generate` (= `FlashSpecEngine.generate_stream`) をそのまま
+# 呼ぶ。単独経路には楽観パイプライン・次ラウンドの draft 先行投入・適応的
+# depth・チャンク prefill が乗っていて、バッチ経路にはどれも無い。単独
+# リクエストをバッチ経路に流すと、それだけで短 decode が落ちる
+# (`bench/batch_b1_gate.py` が固定している線)。同時到着を拾うために、
+# 1 本しか無いときだけ `wait_ms` (既定 15ms) だけ相方を待つ -- 待つのは
+# TTFT の手前だけで、decode の ms/token には入らない。
+
+import queue as _queue
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+
+def spec_batchable(model, prompt_len: int, max_tokens: int, depth: int) -> bool:
+    """この要求をバッチ x 投機に入れてよいか。
+
+    条件は QSA (indexer) が最後まで活性化しないこと。`ragged_attention` は
+    QSA を通さず `NotImplementedError` で止める (モジュール docstring の
+    「indexer / QSA はバッチ対象外」) ので、**物理列数**が `indexer_budget`
+    を超えない保証が要る。物理列は論理長より速く伸びるが、
+    `BatchSpecGenerator.maybe_compact` が境界の手前で必ず詰めるので、
+    「論理長 + 次のラウンドで足す depth+1 列」が境界に収まれば足りる。
+
+    プロンプトが 2 トークン未満のものも弾く (priming に 1 対要る)。
+    """
+
+    if prompt_len < 2 or max_tokens < 1:
+        return False
+    budget = _archmod.indexer_budget(model)
+    if budget is None:
+        # QSA を持たない族。この機構自体が qwen4_exp 向けなのでここには
+        # 来ない想定だが、来たら長さの上限は無いものとして扱う
+        return True
+    return prompt_len + max_tokens + depth + 1 <= budget
+
+
+def kv_bytes_per_token(model) -> int | None:
+    """1 行 1 トークンあたりの KV バイト数 (full attention の k/v + indexer)。
+
+    再帰系 (GDN/PLE/n-gram) はトークン数に依らない固定サイズなので含めない。
+    """
+
+    t = getattr(getattr(model, "args", None), "text", None)
+    types = getattr(t, "layer_types", None)
+    if not types:
+        return None
+    n_full = sum(1 for lt in types if lt == "full_attention")
+    elem = 2  # bf16 / fp16
+    kv = n_full * t.num_key_value_heads * t.head_dim * 2 * elem
+    idx = n_full * getattr(t, "indexer_kv_heads", 0) * getattr(t, "indexer_head_dim", 0) * elem
+    return kv + idx
+
+
+def capture_bytes_per_token(model) -> int | None:
+    """検証フォワード 1 位置ぶんの `states_all` (fp32) の総バイト数 (1 行)。
+
+    `mlxturbo.spec_flash.capture` が rollback のために層ごとに確保する
+    (B, T, Hv, Dv, Dk) fp32 のこと。KV と違って**ラウンドごとに作り直す**
+    一時領域だが、1 位置あたりが KV の数千倍あるので、同時に何行流せるかを
+    決めているのは実際にはこちら (capture の docstring 参照)。
+    """
+
+    t = getattr(getattr(model, "args", None), "text", None)
+    types = getattr(t, "layer_types", None)
+    if not types:
+        return None
+    n_lin = sum(1 for lt in types if lt != "full_attention")
+    return (
+        n_lin
+        * t.linear_num_value_heads
+        * t.linear_value_head_dim
+        * t.linear_key_head_dim
+        * 4
+    )
+
+
+def free_bytes(reserve: float = 0.10) -> int | None:
+    """今この瞬間に使ってよい残りバイト数の見積もり。
+
+    Metal の推奨作業セット上限から、モデルの重みを含む現在の常駐量を引く。
+    `reserve` は MoE の一時活性など、ここで数えていないものへの取り置き。
+    """
+
+    try:
+        rec = mx.metal.device_info()["max_recommended_working_set_size"]
+    except Exception:  # noqa: BLE001  Metal が無い環境では上限を掛けない
+        return None
+    return int(rec * (1.0 - reserve)) - mx.get_active_memory()
+
+
+def plan_batch(
+    model,
+    lengths: list[int],
+    max_tokens: list[int],
+    depth: int,
+    max_batch: int,
+    prefill_token_budget: int,
+) -> int:
+    """先頭から何行までを 1 つのバッチに入れてよいかを返す (1 以上)。
+
+    上限は 3 つ。いずれも設定値ではなくモデルの形と実際の空きから計算する。
+
+    1. ``max_batch`` (--max-batch-spec)。運用者が置く硬い上限。
+    2. prefill の幅。バッチの prefill は `(B, 右パディング後の最長)` を 1 回で
+       流す。単独経路が 1 チャンクで流している幅は `PREFILL_STEP_SIZE`
+       (2048) で、そこは実測が乗っている安全な水準なので、その 2 倍を
+       ``prefill_token_budget`` の既定に置いた (`B * L <= budget`)。
+    3. 常駐と一時。`B * (KV + capture)` が `free_bytes()` に収まること。
+       KV は行の最終的な長さ (プロンプト + max_tokens) で、capture は
+       1 ラウンドぶん (depth+1 位置) で数える。
+
+    実機 (128GB、重み 91GB) では 3 が効くのは B が数十のときで、実際に効く
+    のは 1 と 2 -- それでも式に書いてあるのは、`indexer_budget` の制約が
+    将来外れて長い要求が入るようになったときに、黙って落ちる代わりにここで
+    止まるようにしておくため。
+    """
+
+    n = min(len(lengths), max(1, max_batch))
+    # 2. prefill の幅
+    while n > 1 and n * max(lengths[:n]) > prefill_token_budget:
+        n -= 1
+    # 3. 常駐と一時
+    kv_per_tok = kv_bytes_per_token(model)
+    cap_per_tok = capture_bytes_per_token(model)
+    room = free_bytes()
+    if kv_per_tok is not None and cap_per_tok is not None and room is not None:
+        while n > 1:
+            final_len = max(lengths[i] + max_tokens[i] for i in range(n))
+            need = n * (final_len * kv_per_tok + (depth + 1) * cap_per_tok)
+            if need <= room:
+                break
+            n -= 1
+    return n
+
+
+@dataclass
+class SpecAdmission:
+    """バッチ x 投機の待ち行列に入っている 1 リクエスト。
+
+    ``on_tokens`` / ``on_done`` / ``future`` の約束は
+    ``mlxturbo.batch.Admission`` と同一 (server.py の
+    ``_build_streaming_pipeline`` が作る 3 点セットをそのまま受ける)。
+    ``sampling`` は ``FlashSpecRunner.generate`` にそのまま渡す辞書で、単独
+    経路に落ちたときはこれが丸ごと使われる。
+    """
+
+    prompt_ids: list[int]
+    max_tokens: int
+    temp: float
+    sampling: dict
+    eos_ids: set
+    on_tokens: Callable[[list[int]], None] | None
+    on_done: Callable[[str, Any], None] | None
+    cancel_event: "threading.Event | None"
+    future: "Any"  # concurrent.futures.Future
+    tokens: list = field(default_factory=list)
+    t0: float | None = None
+    ttft: float | None = None
+    steps: int = 0
+    done: bool = False
+
+
+class BatchSpecCoordinator:
+    """バッチ x 投機のスケジューラ。
+
+    上の「決めたこと 4 点」がこのクラスの中身。走行中は executor を占有する
+    ので、駆動ループは仕事が無くなったら必ず抜ける (`mlxturbo.batch.
+    BatchCoordinator` と同じ約束)。
+    """
+
+    def __init__(
+        self,
+        runner,
+        executor,
+        max_batch: int,
+        eos_ids,
+        wait_ms: int = 15,
+        max_ratio: float = 1.5,
+        prefill_token_budget: int = 4096,
+    ):
+        self.runner = runner
+        self.engine = runner.engine
+        self.model = runner.engine.model
+        self.executor = executor
+        self.max_batch = max(1, max_batch)
+        self.eos_ids = set(eos_ids)
+        self.wait_ms = max(0, wait_ms)
+        self.max_ratio = max_ratio
+        self.prefill_token_budget = prefill_token_budget
+        self._inbox: "_queue.SimpleQueue[SpecAdmission]" = _queue.SimpleQueue()
+        self._guard = threading.Lock()
+        self._active = False
+
+    # ---- 受付 (任意のスレッドから) --------------------------------------
+
+    def submit(self, admission: SpecAdmission) -> None:
+        self._inbox.put(admission)
+        with self._guard:
+            if not self._active:
+                self._active = True
+                self.executor.submit(self._drive)
+
+    # ---- 以下は全て単一の MLX ワーカースレッド上 --------------------------
+
+    def _complete(self, adm: SpecAdmission, res=None, cancelled=False, error=None) -> None:
+        """`mlxturbo.batch.BatchCoordinator._complete` と同じ約束。"""
+        if adm.done:
+            return
+        adm.done = True
+        if adm.on_done is not None:
+            if error is not None:
+                adm.on_done("error", error)
+            elif cancelled:
+                adm.on_done("cancelled", None)
+            else:
+                adm.on_done("done", res)
+            adm.future.set_result(res)
+        else:
+            if error is not None:
+                adm.future.set_exception(error)
+            else:
+                adm.future.set_result(res)
+
+    def _build_res(self, adm: SpecAdmission) -> dict:
+        decode_time = 0.0
+        if adm.t0 is not None and adm.ttft is not None:
+            decode_time = max(0.0, time.perf_counter() - adm.t0 - adm.ttft)
+        n_decode = max(len(adm.tokens) - 1, 0)
+        return {
+            "tokens": adm.tokens,
+            "ttft_s": adm.ttft or 0.0,
+            "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
+            # バッチ経路はセッションを持たない (毎回まっさらな prefill)。
+            # mlxturbo/batch.py の継続バッチングと同じ割り切り
+            "prefill_reused": 0,
+            "prefill_new": len(adm.prompt_ids),
+            # 定義は mlxturbo.spec.SpecEngine / FlashSpecSession と同じ
+            # (n_decode / この行が参加したラウンド数)
+            "tokens_per_step": (n_decode / adm.steps) if adm.steps else 0.0,
+        }
+
+    def _cancelled(self, adm: SpecAdmission) -> bool:
+        return adm.cancel_event is not None and adm.cancel_event.is_set()
+
+    def _deliver(self, adm: SpecAdmission, toks: list[int]) -> None:
+        if not toks:
+            return
+        if adm.ttft is None:
+            adm.ttft = time.perf_counter() - (adm.t0 or time.perf_counter())
+        adm.tokens.extend(toks)
+        if adm.on_tokens is not None:
+            adm.on_tokens(toks)
+
+    @staticmethod
+    def _sampling_key(adm: SpecAdmission):
+        """同じバッチに入れてよいサンプリング設定か (全行で 1 回の呼び出しに
+        まとめるため、揃っている必要がある)。``seed`` 指定つきは常に単独。"""
+        s = adm.sampling
+        if s.get("seed") is not None:
+            return None  # 常に単独 (プロセス全体の乱数状態を動かすため)
+        bias = s.get("logit_bias") or {}
+        return (
+            round(adm.temp, 6),
+            round(float(s.get("top_p") or 0.0), 6),
+            int(s.get("top_k") or 0),
+            round(float(s.get("min_p") or 0.0), 6),
+            tuple(sorted((int(k), float(v)) for k, v in bias.items())),
+        )
+
+    def _drive(self) -> None:
+        pending: list[SpecAdmission] = []
+        try:
+            while True:
+                self._drain(pending)
+                if len(pending) == 1 and self.wait_ms:
+                    # 同時到着を拾うための待ち。1 本しか無いときだけで、
+                    # decode ではなく TTFT の手前に乗る
+                    self._wait_for_company(pending)
+                pending = [a for a in pending if not self._reject_if_dead(a)]
+                if not pending:
+                    self._drain(pending)
+                    if not pending:
+                        break
+                    continue
+                group = self._take_group(pending)
+                if len(group) == 1:
+                    self._run_solo(group[0])
+                else:
+                    self._run_batch(group)
+        except BaseException as exc:  # noqa: BLE001 - 内部の不具合で Future を宙吊りにしない
+            for adm in pending:
+                self._complete(adm, error=exc)
+        finally:
+            with self._guard:
+                self._active = False
+            # 空判定と _active を落とす間に届いた要求が取り残されないよう、
+            # 錠の中で見直す (mlxturbo/batch.py と同じ)
+            if not self._inbox.empty():
+                with self._guard:
+                    if not self._active:
+                        self._active = True
+                        self.executor.submit(self._drive)
+
+    def _drain(self, pending: list) -> None:
+        while True:
+            try:
+                pending.append(self._inbox.get_nowait())
+            except _queue.Empty:
+                return
+
+    def _wait_for_company(self, pending: list) -> None:
+        deadline = time.perf_counter() + self.wait_ms / 1000.0
+        while True:
+            left = deadline - time.perf_counter()
+            if left <= 0:
+                return
+            try:
+                pending.append(self._inbox.get(timeout=left))
+            except _queue.Empty:
+                return
+            self._drain(pending)
+            if len(pending) >= self.max_batch:
+                return
+
+    def _reject_if_dead(self, adm: SpecAdmission) -> bool:
+        if self._cancelled(adm):
+            self._complete(adm, cancelled=True)
+            return True
+        return False
+
+    def _take_group(self, pending: list) -> list:
+        """先頭 (最古) の要求を必ず含む 1 バッチぶんを `pending` から抜き取る。
+
+        最古を軸にするのは飢餓を作らないため -- `bucket_batches` は長さ順に
+        詰めるので、それだけに任せると短い要求ばかりが選ばれ続けうる。
+        """
+        head = pending[0]
+        key = self._sampling_key(head)
+        if key is None:
+            pending.pop(0)
+            return [head]
+        cand = [a for a in pending if self._sampling_key(a) == key]
+        buckets = bucket_batches(
+            [len(a.prompt_ids) for a in cand], self.max_batch, self.max_ratio
+        )
+        chosen = next(b for b in buckets if 0 in b)
+        # 到着順に戻してから、入るところまでを取る
+        rows = [cand[i] for i in sorted(chosen)]
+        n = plan_batch(
+            self.model,
+            [len(a.prompt_ids) for a in rows],
+            [a.max_tokens for a in rows],
+            self.engine.depth,
+            self.max_batch,
+            self.prefill_token_budget,
+        )
+        rows = rows[:n]
+        for a in rows:
+            pending.remove(a)
+        return rows
+
+    # ---- 単独 (B=1) -----------------------------------------------------
+
+    def _run_solo(self, adm: SpecAdmission) -> None:
+        """既存の単独経路をそのまま呼ぶ。`_start_generation` の worker()
+        (server.py) と同じ 3 分岐で結果を返す。session は渡さない --
+        バッチ経路と揃えた割り切りで、`mlxturbo/batch.py` の継続バッチングも
+        同じ (毎回まっさらな prefill)。"""
+        adm.t0 = time.perf_counter()
+        try:
+            res = self.runner.generate(
+                adm.prompt_ids,
+                max_tokens=adm.max_tokens,
+                temp=adm.temp,
+                eos_ids=adm.eos_ids,
+                on_tokens=adm.on_tokens,
+                session=None,
+                **adm.sampling,
+            )
+        except BaseException as exc:  # noqa: BLE001 - on_tokens 由来の中断もここに来る
+            if self._cancelled(adm):
+                self._complete(adm, cancelled=True)
+            else:
+                self._complete(adm, error=exc)
+            return
+        self._complete(adm, res=res)
+
+    # ---- バッチ (B>=2) ---------------------------------------------------
+
+    def _run_batch(self, rows: list) -> None:
+        try:
+            head = rows[0]
+            sampler = _position_local_sampler_for(head)
+            gen = BatchSpecGenerator(
+                self.engine,
+                [list(a.prompt_ids) for a in rows],
+                temp=head.temp,
+                sampler=sampler,
+            )
+            now = time.perf_counter()
+            for a in rows:
+                a.t0 = now
+            gen.prefill()
+            # prefill が出す 1 個目は単独経路と同じくラウンドに数えない
+            # (tokens_per_step の定義が n_decode / decode ラウンド数のため)
+            rows = self._after_round(gen, rows, [o[-1:] for o in gen.out], count_step=False)
+            budget = _archmod.indexer_budget(self.model)
+            while rows:
+                new = gen.step(
+                    truncate=lambda b, toks, r=rows: self._truncate(r[b], toks)
+                )
+                rows = self._after_round(gen, rows, new)
+                if rows:
+                    gen.maybe_compact(hard_limit=budget)
+        except BaseException as exc:  # noqa: BLE001 - 1 行の失敗でも全行の Future を必ず閉じる
+            for a in rows:
+                self._complete(a, cancelled=self._cancelled(a),
+                               error=None if self._cancelled(a) else exc)
+
+    def _truncate(self, adm: SpecAdmission, toks: list[int]) -> int:
+        """このラウンドで行 b が受け取ってよい個数。単独経路の
+        `generate_stream` が eos (`cut`) と残り (`remaining`) で `vals` を
+        切り詰めるのと同じ判定。"""
+        cut = next((i for i, t in enumerate(toks) if t in self.eos_ids), None)
+        n = len(toks) if cut is None else cut + 1
+        return max(1, min(n, adm.max_tokens - len(adm.tokens)))
+
+    def _after_round(self, gen, rows: list, new: list, count_step: bool = True) -> list:
+        """1 ラウンドぶんを配り、終わった行を落として残りを返す。"""
+        keep: list[int] = []
+        for b, adm in enumerate(rows):
+            if count_step:
+                adm.steps += 1
+            try:
+                self._deliver(adm, new[b])
+            except BaseException as exc:  # noqa: BLE001 - 1 行のコールバック失敗を他の行に伝染させない
+                cancelled = self._cancelled(adm)
+                self._complete(adm, cancelled=cancelled, error=None if cancelled else exc)
+                continue
+            finished = (
+                len(adm.tokens) >= adm.max_tokens
+                or (new[b] and new[b][-1] in self.eos_ids)
+                or self._cancelled(adm)
+            )
+            if finished:
+                if self._cancelled(adm):
+                    self._complete(adm, cancelled=True)
+                else:
+                    self._complete(adm, res=self._build_res(adm))
+                continue
+            keep.append(b)
+        if len(keep) != len(rows):
+            gen.retire(keep)
+        return [rows[b] for b in keep]
+
+
+def _position_local_sampler_for(adm: SpecAdmission):
+    """行が共有する位置局所サンプラー。`FlashSpecRunner.generate` が組むものと
+    同じ (`mlxturbo.runner._position_local_sampler`) -- 単独経路とバッチ経路で
+    サンプリングの形をずらさないため。"""
+    from .runner import _position_local_sampler
+
+    s = adm.sampling
+    return _position_local_sampler(
+        adm.temp,
+        float(s.get("top_p") or 0.0),
+        int(s.get("top_k") or 0),
+        float(s.get("min_p") or 0.0),
+        s.get("logit_bias"),
+    )
 
 
 __all__ = [
@@ -698,4 +1383,8 @@ __all__ = [
     "batched_rollback",
     "BatchSpecGenerator",
     "bucket_batches",
+    "BatchSpecCoordinator",
+    "SpecAdmission",
+    "spec_batchable",
+    "plan_batch",
 ]

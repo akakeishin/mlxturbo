@@ -47,8 +47,14 @@ tools/verify_batch_cache.py が単体で確認済みの float32 丸め幅 (1.5e-
 - indexer / QSA はバッチ対象外 (mlxturbo/batch_spec.py の docstring 参照)。
   この検証では indexer_budget を kv 長より十分大きく取って、そもそも
   QSA が発火しない構成だけを見ている。
-- サーバー配線・admission・スケジューラはここには無い (依頼どおり)。
 - 温度 > 0 のサンプリングは検証していない (貪欲のみ)。
+
+## スケジューラ (追記 2026-09-01)
+
+末尾の ``check_coordinator`` が ``BatchSpecCoordinator`` (--max-batch-spec の
+中身) まで見る。同時 3 本を 1 バッチで回して行ごとの eos / max_tokens で
+順に抜けさせ、残った行の出力が素の貪欲継続と一致すること、および 1 本しか
+無いときに単独経路 (``FlashSpecRunner.generate``) へ落ちて同じ列を返すこと。
 """
 
 from __future__ import annotations
@@ -355,6 +361,71 @@ def check_generator(model) -> bool:
     return ok
 
 
+def check_coordinator(model) -> bool:
+    """`BatchSpecCoordinator` (サーバー配線側のスケジューラ) の検査。
+
+    見るのは 3 つ。どれも「貪欲の投機は出力を変えない」ことを使って、
+    素の貪欲継続 (oracle) と突き合わせる。
+
+    1. 同時に来た複数の要求が同じバッチで回り、それぞれ正しい列を返す。
+    2. max_tokens と eos が行ごとに効き、先に終わった行が落ちても
+       (`BatchSpecGenerator.retire`) 残りの行の出力が変わらない。
+    3. 1 本しか無いときは単独経路 (`FlashSpecRunner.generate`) に落ちる。
+    """
+    import concurrent.futures
+
+    from mlxturbo.batch_spec import BatchSpecCoordinator
+    from mlxturbo.mtp_flash import FlashMTPModule
+    from mlxturbo.runner import FlashSpecRunner, start_batched_spec_generation
+    from mlxturbo.spec_flash import FlashSpecEngine
+
+    mx.random.seed(0)
+    mtp = FlashMTPModule(model.args.text, variant="lane")
+    mx.eval(mtp.parameters())
+    runner = FlashSpecRunner(FlashSpecEngine(model, mtp))
+
+    prompts = [[3, 11, 27, 5, 9, 41, 8], [7, 2, 19, 33, 4], [12, 45, 6]]
+    n = 16
+    oracle = [oracle_continue(model, mx.array(p)[None], n) for p in prompts]
+    # 行 0 が 6 個目で止まるように eos を選ぶ (行ごとに止まる位置が違う状態を
+    # 作って、先に終わった行の retire を踏ませる)
+    eos = {oracle[0][5]}
+
+    def expected(seq, max_tokens):
+        out = []
+        for t in seq[:max_tokens]:
+            out.append(t)
+            if t in eos:
+                break
+        return out
+
+    print("\n--- BatchSpecCoordinator ---")
+    ok = True
+    for label, max_tokens_list in (("同時 3 本", [12, 7, 12]), ("単独 1 本", [9])):
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            coord = BatchSpecCoordinator(
+                runner, executor, max_batch=4, eos_ids=eos, wait_ms=200
+            )
+            futures = [
+                start_batched_spec_generation(
+                    coord, prompts[b], mt, 0.0, eos, None, None, None
+                )
+                for b, mt in enumerate(max_tokens_list)
+            ]
+            got = [f.result(timeout=300)["tokens"] for f in futures]
+        finally:
+            executor.shutdown(wait=True)
+        for b, mt in enumerate(max_tokens_list):
+            want = expected(oracle[b], mt)
+            same = got[b] == want
+            ok &= same
+            print(f"  {'OK' if same else 'NG'} {label} row{b}: {len(got[b])} トークン")
+            if not same:
+                print(f"     want={want}\n     got ={got[b]}")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpu", action="store_true")
@@ -419,6 +490,7 @@ def main():
                     ok &= _report(f"layer{i} ngram.ctx", c_solo[3], c_batch[3][b : b + 1])
 
     ok &= check_generator(model)
+    ok &= check_coordinator(model)
 
     print("\n=== 全ケース一致 ===" if ok else "\n=== 不一致あり ===")
     return 0 if ok else 1

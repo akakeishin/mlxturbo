@@ -231,10 +231,14 @@ Claude Code 側が「まだ十分空きがある」と判断したのに mlxturb
 ## 制約
 
 - **既定はリクエストを直列処理。** `mlxturbo-serve` は 91GB 級のモデルを 128GB 機に載せている前提で、既定
-  (`--max-batch` 省略時 = 1) は 1 リクエスト = 1 生成に直列化する。`--max-batch N` で継続バッチングを
-  有効にできるが、投機経路 (spec/flash_spec) は対象外で、`FallbackRunner` に載るリクエストだけがまとめ
-  られる (README.md の「制約」節、`mlxturbo/batch.py` 参照)。複数クライアントを同時に繋ぐ場合、直列処理
-  のままなら後着のリクエストは先着の生成が終わるまで待たされる (`--max-queue` を超えると 503)。
+  (`--max-batch` / `--max-batch-spec` 省略時 = 1) は 1 リクエスト = 1 生成に直列化する。まとめたい場合の
+  フラグは対象ごとに 2 つある。`--max-batch N` は継続バッチング (投機なし) で、`FallbackRunner` に載る
+  リクエストだけがまとめられる (`mlxturbo/batch.py`)。`--max-batch-spec N` はバッチ x 投機で、Flash-Next +
+  MTP (`FlashSpecRunner`) のまま同時要求をまとめる (`mlxturbo/batch_spec.py`)。後者がまとめられるのは
+  「サンプリング設定が同じ」「プロンプト長 + max_tokens が `indexer_budget` (2048) に収まる」「長さの比が
+  1.5 倍以内」の 3 条件を満たす要求で、外れたものは従来どおり直列に流れる。走行中のバッチに後から入れる
+  ことはせず、次のバッチまで待たせる。どちらも指定しなければ、後着のリクエストは先着の生成が終わるまで
+  待たされる (`--max-queue` を超えると 503)。
 - **token logprobs は未対応。** Chat/Completions/Responses のレスポンス中の `logprobs` は `null` または空配列
   で、リクエストの `logprobs` / `top_logprobs` を計算しない。候補のrerank・信頼度表示・評価用途で必要な
   クライアントは、値が返る前提で使わないこと。

@@ -379,6 +379,8 @@ def _install_state(runner, tokenizer=None, **overrides) -> server.ModelState:
         max_stored_responses=overrides.get("max_stored_responses", 50),
         batch_coordinator=overrides.get("batch_coordinator"),
         max_batch=overrides.get("max_batch", 1),
+        spec_batch_coordinator=overrides.get("spec_batch_coordinator"),
+        max_batch_spec=overrides.get("max_batch_spec", 1),
     )
     server.STATE = state
     return state
@@ -7876,7 +7878,7 @@ def test_completions_legacy_logprobs_validation_error_over_20(client):
 # test in this file uses FakeRunner because it does not need real MLX
 # compute; this is the one corner that does, by construction.
 #
-# What is and is not covered here: the gating logic (_resolve_batch_tier /
+# What is and is not covered here: the gating logic (_resolve_batch_route /
 # maybe_build_batch_coordinator) is tested directly (fast, deterministic).
 # The coordinator's actual concurrency/tier-isolation behavior is tested by
 # calling server._run_generate_batched / server._start_batched_generation
@@ -7986,7 +7988,7 @@ def batch_env():
         mx.metal.is_available = prev_metal_available
 
 
-def test_resolve_batch_tier_default_off():
+def test_resolve_batch_route_default_off():
     """--max-batch unset (the default) -> STATE.batch_coordinator is None
     -> every request routes through the pre-existing STATE.lock path,
     unconditionally. This is what makes the default behavior provably
@@ -7994,10 +7996,10 @@ def test_resolve_batch_tier_default_off():
 
     _install_state(FakeRunner([10]))
     assert server.STATE.batch_coordinator is None
-    assert server._resolve_batch_tier(server.STATE.runner, [1, 2, 3], 8) is None
+    assert server._resolve_batch_route(server.STATE.runner, [1, 2, 3], 8) is None
 
 
-def test_resolve_batch_tier_excludes_non_fallback_runner(batch_env):
+def test_resolve_batch_route_excludes_non_fallback_runner(batch_env):
     """Even with a coordinator built, only a plain FallbackRunner is
     eligible — SpecRunner/FlashSpecRunner/DraftSpecRunner/LookupSpecRunner
     keep going through the unchanged STATE.lock path (see
@@ -8005,32 +8007,32 @@ def test_resolve_batch_tier_excludes_non_fallback_runner(batch_env):
     runner.py)."""
 
     _install_state(FakeRunner([10]), batch_coordinator=batch_env.coordinator, max_batch=4)
-    assert server._resolve_batch_tier(FakeRunner([10]), [1, 2, 3], 8) is None
-    assert server._resolve_batch_tier(FakeSpecRunner([10]), [1, 2, 3], 8) is None
-    assert server._resolve_batch_tier(batch_env.runner, [1, 2, 3], 8) is not None
+    assert server._resolve_batch_route(FakeRunner([10]), [1, 2, 3], 8) is None
+    assert server._resolve_batch_route(FakeSpecRunner([10]), [1, 2, 3], 8) is None
+    assert server._resolve_batch_route(batch_env.runner, [1, 2, 3], 8) is not None
 
 
-def test_resolve_batch_tier_excludes_logprobs(batch_env):
+def test_resolve_batch_route_excludes_logprobs(batch_env):
     _install_state(batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4)
     assert (
-        server._resolve_batch_tier(batch_env.runner, [1, 2, 3], 8, logprobs_requested=True)
+        server._resolve_batch_route(batch_env.runner, [1, 2, 3], 8, logprobs_requested=True)
         is None
     )
     assert (
-        server._resolve_batch_tier(batch_env.runner, [1, 2, 3], 8, logprobs_requested=False)
+        server._resolve_batch_route(batch_env.runner, [1, 2, 3], 8, logprobs_requested=False)
         is not None
     )
 
 
-def test_resolve_batch_tier_pool_vs_solo(batch_env):
+def test_resolve_batch_route_pool_vs_solo(batch_env):
     """indexer_budget=8 for this fixture's model. A request whose prompt +
     max_tokens stays at or under budget can never trigger QSA ("pool");
     one that could cross it is always "solo", regardless of how the current
     live batch happens to look (see mlxturbo/batch.py's classify docstring)."""
 
     _install_state(batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4)
-    assert server._resolve_batch_tier(batch_env.runner, [1, 2, 3], 4) == "pool"  # 3+4=7 <= 8
-    assert server._resolve_batch_tier(batch_env.runner, [1] * 6, 4) == "solo"  # 6+4=10 > 8
+    assert server._resolve_batch_route(batch_env.runner, [1, 2, 3], 4)[1] == "pool"  # 3+4=7 <= 8
+    assert server._resolve_batch_route(batch_env.runner, [1] * 6, 4)[1] == "solo"  # 6+4=10 > 8
 
 
 def test_maybe_build_batch_coordinator_gating(batch_env):
@@ -8062,10 +8064,12 @@ def test_two_concurrent_batched_requests_complete(batch_env):
 
     _install_state(batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4)
 
+    route = (batch_env.coordinator, "pool")
+
     async def run():
         return await asyncio.gather(
-            server._run_generate_batched([1, 2, 3, 4], 5, 0.0),
-            server._run_generate_batched([5, 6, 7, 8], 5, 0.0),
+            server._run_generate_batched(route, [1, 2, 3, 4], 5, 0.0),
+            server._run_generate_batched(route, [5, 6, 7, 8], 5, 0.0),
         )
 
     res1, res2 = asyncio.run(run())
@@ -8083,7 +8087,7 @@ def test_batched_streaming_end_to_end(batch_env):
 
     _install_state(batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4)
     q, future, cancel_event, raw_token_count = server._start_batched_generation(
-        [1, 2, 3], 4, 0.0, None
+        (batch_env.coordinator, "pool"), [1, 2, 3], 4, 0.0, None
     )
     events = []
     while True:
@@ -8118,12 +8122,15 @@ def test_batched_solo_tier_never_overlaps_pool_tier(batch_env):
     async def run():
         await asyncio.gather(
             server._run_generate_batched(
+                (batch_env.coordinator, "solo"),
                 [1] * 6, 6, 0.0, on_tokens=make_on_tokens(solo_ts)  # 6+6=12 > 8 budget -> solo
             ),
             server._run_generate_batched(
+                (batch_env.coordinator, "pool"),
                 [1, 2, 3], 4, 0.0, on_tokens=make_on_tokens(pool1_ts)  # 3+4=7 <= 8 -> pool
             ),
             server._run_generate_batched(
+                (batch_env.coordinator, "pool"),
                 [1, 2], 4, 0.0, on_tokens=make_on_tokens(pool2_ts)  # 2+4=6 <= 8 -> pool
             ),
         )
@@ -8166,6 +8173,80 @@ def test_batched_admission_cancelled_before_start_resolves_cleanly(batch_env):
     )
     batch_env.coordinator.submit(admission)
     assert fut.result(timeout=5) is None
+
+
+# ---------------------------------------------------------- バッチ x 投機
+#
+# --max-batch-spec (mlxturbo/batch_spec.py の coordinator 節)。ここで見るのは
+# 「どの要求をまとめてよいか」の判定だけ。実際にラウンドを回す側 (retire /
+# 行別の打ち切り / 単独への落とし込み) は合成モデルが要るので
+# tools/verify_batch_spec.py (CPU) が持っている -- 上の継続バッチングと違い、
+# あちらは投機エンジン (MTP ヘッド) まで要るのでこのファイルには置かない。
+
+
+def test_spec_batch_default_off():
+    """--max-batch-spec 未指定 (既定) -> spec_batch_coordinator は None ->
+    どの要求も従来どおり STATE.lock を通る。既定の挙動が変わらない根拠。"""
+
+    _install_state(FakeSpecRunner([10]))
+    assert server.STATE.spec_batch_coordinator is None
+    assert server._resolve_batch_route(server.STATE.runner, [1, 2, 3], 8) is None
+
+
+def test_maybe_build_batch_spec_coordinator_gating():
+    from mlxturbo.runner import maybe_build_batch_spec_coordinator
+
+    # --max-batch-spec 省略/1 -> runner の種類によらず off
+    assert maybe_build_batch_spec_coordinator(FakeSpecRunner([10]), None, 1, [99]) is None
+    # FlashSpecRunner 以外 -> --max-batch-spec によらず off
+    assert maybe_build_batch_spec_coordinator(FakeRunner([10]), None, 4, [99]) is None
+    assert maybe_build_batch_spec_coordinator(FakeSpecRunner([10]), None, 4, [99]) is None
+
+
+def test_spec_batchable_length_condition():
+    """QSA (indexer) が最後まで活性化しない要求だけを入れる。境界は
+    「プロンプト長 + max_tokens + depth+1 <= indexer_budget」-- 物理列は
+    論理長より速く伸びるが、maybe_compact が境界の手前で必ず詰めるので
+    次のラウンドぶんの余白があれば足りる (mlxturbo/batch_spec.py 参照)。"""
+
+    from mlxturbo.batch_spec import spec_batchable
+
+    model = SimpleNamespace(args=SimpleNamespace(text=SimpleNamespace(indexer_budget=100)))
+    assert spec_batchable(model, 50, 47, depth=2)  # 50+47+3 = 100
+    assert not spec_batchable(model, 50, 48, depth=2)  # 101
+    assert not spec_batchable(model, 1, 10, depth=2)  # priming に 1 対要る
+    assert not spec_batchable(model, 10, 0, depth=2)
+
+
+def test_bucket_batches_splits_on_length_ratio():
+    """右パディングの無駄は行あたり max_len - len 列なので、長さの比が開いた
+    ものは別バッチに割る (既定 1.5 倍)。"""
+
+    from mlxturbo.batch_spec import bucket_batches
+
+    assert bucket_batches([10, 12, 100], 4) == [[0, 1], [2]]
+    assert bucket_batches([10, 11, 12, 13, 14], 2) == [[0, 1], [2, 3], [4]]
+
+
+def test_spec_batch_sampling_key_isolates_seeded_and_differing_requests():
+    """1 回の呼び出しで全行ぶんのサンプルを引くので、サンプリング設定が違う
+    要求を同じバッチに入れてはいけない。seed 付きは常に単独 (mx.random.seed が
+    プロセス全体の状態を動かすため)。"""
+
+    from mlxturbo.batch_spec import BatchSpecCoordinator, SpecAdmission
+
+    def adm(temp, **sampling):
+        return SpecAdmission(
+            prompt_ids=[1, 2, 3], max_tokens=4, temp=temp, sampling=sampling,
+            eos_ids=set(), on_tokens=None, on_done=None, cancel_event=None, future=None,
+        )
+
+    key = BatchSpecCoordinator._sampling_key
+    assert key(adm(0.7, top_p=0.9)) == key(adm(0.7, top_p=0.9))
+    assert key(adm(0.7, top_p=0.9)) != key(adm(0.7, top_p=0.8))
+    assert key(adm(0.0)) != key(adm(0.7))
+    # None = 「相方を探さない」印。_take_group がこれを見て 1 本だけ取る
+    assert key(adm(0.7, seed=1)) is None
 
 
 def test_gather_attention_guard_switches_on_context_length():
