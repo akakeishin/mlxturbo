@@ -166,6 +166,50 @@ running top-k)。
 **判定**: ms/token と tok/round の両方。tok/round が落ちるなら疑いは本物。
 **反転条件**: tok/round が 3 プロンプト平均で 2% 以上落ちたら既定 off のまま。
 
+### 相手の GDN を読んだ (2026-09-01、`~/dev/mlx-serve`)
+
+**連結射影そのものは差ではなかった。**相手も既定は qkv/z/b/a を別々に
+`qmatmul` で叩いている (`transformer.zig:16016-16018`, `16558-16559`)。
+段 4 の掃引は「うちだけが損している」の検証ではなく、単独で得かどうかの検証。
+
+**差は前後の融合で、しかも桁が違う。**
+
+| | うち | mlx-serve |
+|---|---|---|
+| 再帰カーネル本体 | mlx_lm の移植 | 同じものの移植 + 特化 4 変種 |
+| 前処理 | conv1d / silu / rms_norm x2 / スケール x2 / g / beta = **8 dispatch** | **1 カーネル** (`gdnPreworkFused`, `transformer.zig:21969-22165`、既定 on) |
+| 後処理 | RMSNormGated 3 op 未融合 (専用カーネルは空振りで off) | **1 カーネル** (`gdnNormGateFused`, `transformer.zig:22279-22370`、既定 on) |
+| 状態 dtype | fp32 強制 (`kernels/gated_delta_states.py:239`) | **bf16** (`transformer.zig:16209`) |
+| conv1d | MLX 標準 op | decode 幅では prework 内に 4 タップ手書きで吸収、**op ごと消える** |
+| decode/prefill の経路 | 同一 | 分岐 (`gdnBlockedEligible`: seq>=64 かつ Dk==128 で blocked-seq。**decode 幅は非該当**) |
+
+再帰本体を除いて、うちは 11-12 dispatch/層、相手は 3。それが 36 層。
+`mlxturbo/fused.py` 自身が「Flash-Next の decode は dispatch 律速」と書いて
+いる前提に照らすと、GDN が下限の 50% に留まる相当部分はこれで説明が付く。
+
+**RMSNormGated の「空振り」は読み直しが要る。**うちの `enable_rms_norm_gated()`
+は 3 op を 1 に畳む**単独差し替え**で、実測で空振りだった
+(`runner.py:1156-1157`)。相手の同等機能は**単独では発火しない** — prework 融合
+が成立したときだけ動く (`transformer.zig:16345-16350`)。前後に 9 dispatch が
+残ったまま 3 を 1 にしても効かないのは、dispatch 律速の系では自然。
+記録は「この融合は無意味」ではなく「**単独では足りない**」と読み替える。
+
+**状態 dtype は速度と品質の両方に触る。**fp32 3.1MB/層 → bf16 1.55MB/層。
+再帰カーネルは毎ラウンド state_in/state_out を全読み全書きするので、36 層 x 2 で
+~223MB/ラウンドが ~112MB になる (393GB/s なら 0.28ms/ラウンド)。ただし
+**再帰の累積器を bf16 に落とす**話なので、KLD を測らずに入れない
+(受け入れ幅 +0.0005)。相手がやっているから安全、とは言わない。
+
+**やること (dispatch を削る側が先。取り分が桁で大きい)**:
+
+1. GDN 前処理の融合カーネル (conv1d + silu + q/k の rms_norm + スケール +
+   conv 状態更新 + g + beta を 1 つに)。decode 幅限定でよい
+2. 1 が入った状態で RMSNormGated を再測 (空振りの再審査)
+3. 状態 bf16 は速度 A/B と KLD をセットで。1・2 とは独立に測る
+
+**反転条件**: 1 を入れて in-model の GDN 部品時間が 10% 以上縮まなければ、
+「dispatch 律速」という前提そのものを疑い直す (xctrace で泡を見る)。
+
 ### 段 5. MoE の診断 (取り分 6.0ms、コスト 数日〜)
 
 **カーネルから入らない。**3 敗 (moe_glu v1-v3、共有タイル v2、moe_route) は
@@ -250,6 +294,22 @@ GPU->CPU の同期点**で、decode の毎トークン・毎層で発生する�
 そのうえで `--knob stage-every` を回す (実装済み、コスト 30 分)。掃引が
 16→2 で単調改善のまま端点で打ち切られていて **1 が未測**、しかも短 decode の
 probe でしか測っておらず 17k は未測。
+
+**HC の 23% の内訳が読めた (2026-09-01、相手のソース読解)。**読み側は既に融合
+済みで相手と同格 (うち 2 カーネル `kernels/hyper_connection.py:183-368` 既定 on、
+相手 3 カーネル `transformer.zig:23951-24127`)。**手を付けていないのは書き戻し側。**
+`DecoderLayer._combine` (`_vendor/qwen4_exp.py:1299-1304`) は
+`hyper + (x[..., None, :] * inject[..., None]).reshape(...)` を生の mx 演算で
+呼んでいるだけで、`mx.compile` も専用カーネルも無い。attn/mlp で層あたり 2 回、
+**96 回 x 2 op**。相手は `compiled_hc_write` の 1 カーネルにしたうえ、
+decode/verify 幅 (<= 16 行、`HC_FUSED_MAX_ROWS`) では**書き込み自体を遅延**して
+次の `hcRead` の N カーネルに畳み込み、**書き戻しの dispatch を 0 にしている**
+(`transformer.zig:11538-11549`, `23979-23988`)。
+
+**やること**: まず `_combine` を 1 カーネル化する (`mx.compile` で足りるか、
+`hyper_connection.py` に 3 本目を足すか)。遅延畳み込みはその次。
+**反転条件**: 1 カーネル化して in-model が動かなければ、96 回という回数自体が
+効いていないということなので、HC は 23% のまま畳む。
 
 **HC と lm_head もここに関係する。**どちらも下限の 23% / 46% で、合わせて
 4.2ms が卓上にある。lm_head は「M=3 で 164GB/s、fast_qmm が適格なのに
