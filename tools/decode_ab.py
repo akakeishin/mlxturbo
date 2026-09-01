@@ -236,6 +236,52 @@ def _knob_depth(ctx):
     return apply
 
 
+
+def _knob_rms_norm_gated(ctx):
+    """A = 融合カーネル / C = 機構だけ (eligible まで評価して素へ) / B = 素 (既定)。
+
+    `RMSNormGated.__call__` は素で 6 op、GDN を持つ 36 層で 1 回ずつ。
+    `runner.py` には「実測で空振り」と記録されているが、**その測定は機構の
+    費用を含んでいる。**2026-09-01 に `gdn_prework` が一度も発火しないまま
+    長文脈で +5.3% 遅いことが分かり、原因が `eligible()` の評価だと判明した。
+    C を挟めば A-C (カーネルの取り分) と C-B (機構の費用) に分けられる。
+
+    カーネルはビット一致 (量子化重みを読まず、gate は fp32 のまま)。
+    合格条件: 出力一致 (対照)。
+    """
+    from mlxturbo import fused
+
+    def apply(variant):
+        fused.disable_rms_norm_gated()
+        if variant == "A":
+            fused.enable_rms_norm_gated()
+        elif variant == "C":
+            fused.enable_rms_norm_gated_nofuse()
+
+    return apply
+
+
+def _knob_moe_route(ctx):
+    """A = ルーティング融合 / C = 機構だけ / B = 素 (既定)。
+
+    `SparseMoeBlock.__call__` の top-k と softmax は素で 7 op、48 層すべてで
+    走る。`docs/BACKLOG.md` に「やって純損 (+0.34ms)」と記録されているが、
+    **その +0.34ms が機構の費用と同じ桁**なので、分けて測り直す。
+
+    ビット一致はしない (加算順が変わる)。合格条件は出力一致を要求しない。
+    """
+    from mlxturbo import fused
+
+    def apply(variant):
+        fused.disable_moe_route()
+        if variant == "A":
+            fused.enable_moe_route()
+        elif variant == "C":
+            fused.enable_moe_route_nofuse()
+
+    return apply
+
+
 def _knob_indexer_cache(ctx):
     """A = 確保方式 (現行) / B = 毎更新 concat (2026-09-01 以前)。
 
@@ -493,6 +539,8 @@ KNOBS = {
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
     "gdn-prework": (_knob_gdn_prework, ["A", "B"], False, "B"),
     "hc-write": (_knob_hc_write, ["A", "C", "B"], True, "B"),
+    "rms-norm-gated": (_knob_rms_norm_gated, ["A", "C", "B"], True, "B"),
+    "moe-route": (_knob_moe_route, ["A", "C", "B"], False, "B"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),

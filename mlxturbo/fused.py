@@ -296,6 +296,68 @@ def enable_moe_route() -> None:
     Q.SparseMoeBlock.__call__ = patched
 
 
+
+def enable_rms_norm_gated_nofuse() -> None:
+    """`enable_rms_norm_gated` と**同じ機構だけ**を入れる対照。カーネルは呼ばない。
+
+    差し替えたメソッドの中で `eligible()` まで評価し、そのうえで必ず素の実装へ
+    落とす。A (融合) と C (これ) の差がカーネルの取り分、C と B (素) の差が
+    差し替えと適格判定の費用。
+
+    この対照が要る理由: 2026-09-01 に `gdn_prework` が**一度も発火していないのに
+    長文脈で +5.3% 遅い**ことが分かった。原因は `eligible()` の評価そのもので、
+    層ごと・フォワードごとに走る。この関数の「空振り」という記録
+    (`runner.py`) も、同じ費用に取り分が埋もれた結果かもしれない。
+    """
+
+    global _ORIG_RNG
+    import mlx_lm.models.qwen4_exp as Q
+
+    from .kernels import rms_norm_gated as rng
+
+    if _ORIG_RNG is not None:
+        return
+    _ORIG_RNG = Q.RMSNormGated.__call__
+    orig = _ORIG_RNG
+
+    def patched(self, x, gate=None):
+        w = self.weight
+        rng.eligible(x, w, gate)  # 評価だけして結果は使わない (対照)
+        return orig(self, x, gate)
+
+    Q.RMSNormGated.__call__ = patched
+
+
+def enable_moe_route_nofuse() -> None:
+    """`enable_moe_route` と**同じ機構だけ**を入れる対照。ルーティングのカーネルは
+    呼ばない。
+
+    `gate` の matmul と `eligible()` まで同じように走らせ、そのうえで必ず素の
+    実装へ落とす。**gate の出力は MLX が遅延評価なので捨てても実行されない**
+    (本体の `patched` が同じ理屈で捨てているのと同じ)。
+
+    対照が要る理由は `enable_rms_norm_gated_nofuse` の docstring を参照。
+    """
+
+    global _ORIG_MOE
+    import mlx.core as mx
+    import mlx_lm.models.qwen4_exp as Q
+
+    from .kernels import moe_route as mr
+
+    if _ORIG_MOE is not None:
+        return
+    _ORIG_MOE = Q.SparseMoeBlock.__call__
+    orig = _ORIG_MOE
+
+    def patched(self, x):
+        logits = self.gate(x.astype(mx.float32))
+        mr.eligible(logits, self.top_k)  # 評価だけして結果は使わない (対照)
+        return orig(self, x)
+
+    Q.SparseMoeBlock.__call__ = patched
+
+
 def disable_moe_route() -> None:
     global _ORIG_MOE
     if _ORIG_MOE is None:
@@ -966,5 +1028,7 @@ __all__ = [
     "enable_hyper_connection",
     "enable_hyper_connection_kernel",
     "enable_moe_route",
+    "enable_moe_route_nofuse",
     "enable_rms_norm_gated",
+    "enable_rms_norm_gated_nofuse",
 ]
