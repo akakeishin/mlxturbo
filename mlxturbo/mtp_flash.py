@@ -78,14 +78,12 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
+# spec_flash.py / batch_spec.py と 3 重定義されていたヘルパーを
+# mlxturbo/arch.py に一本化 (qwen4_exp 固有のままにしてある -- 詳細は
+# arch.py のモジュール docstring 参照)。
+from .arch import qwen4_arch as _arch
+
 VARIANTS = ("lane", "mean")
-
-
-def _arch():
-    """Return the vendored qwen4_exp (the site-packages copy after install-arch)."""
-    import mlx_lm.models.qwen4_exp as Q
-
-    return Q
 
 
 class FlashMTPModule(nn.Module):

@@ -71,11 +71,8 @@ from contextlib import contextmanager
 
 import mlx.core as mx
 
-
-def _arch():
-    import mlx_lm.models.qwen4_exp as Q
-
-    return Q
+from . import arch as _archmod
+from .arch import qwen4_arch as _arch
 
 
 # --------------------------------------------------------------- ledger
@@ -333,37 +330,30 @@ def batched_capture(model):
 # -------------------------------------------------------------- rollback
 
 
-def _take_rows(arr: mx.array, starts: mx.array, width: int) -> mx.array:
-    """``arr`` の axis=1 から、行 b ごとに ``[starts[b], starts[b]+width)`` を
-    切り出す。``mlxturbo.spec_flash.rollback`` の単一行スライス
-    (``x[:, keep:keep+w, :]`` 系) を行別に一般化した共通部品 -- GDN の
-    conv window、GDN の状態 (width=1)、PLE の conv window、n-gram の文脈が
-    全てこの形に落ちる。
-    """
-    idx = starts[:, None] + mx.arange(width)[None, :]  # (B, width)
-    shape = [idx.shape[0], width] + [1] * (arr.ndim - 2)
-    return mx.take_along_axis(arr, idx.reshape(shape), axis=1)
-
-
 def snapshot_pre_ctx(model, caches) -> list:
-    """検証フォワードの**前**に、n-gram 文脈 (``cache[3]``) をレイヤーごとに
-    控えておく。``mlxturbo.spec_flash.snapshot_pre`` の相当品だが、こちらは
-    attention 側 (``pre["kv"]``) を持たない -- 行別 trim をしない設計なので
-    KV 側に「戻すために控える」ものが無いため。
+    """検証フォワードの**前**に、n-gram 文脈をレイヤーごとに控えておく。
+    ``mlxturbo.spec_flash.snapshot_pre`` の相当品だが、こちらは attention 側
+    (``pre["kv"]``) を持たない -- 行別 trim をしない設計なので KV 側に
+    「戻すために控える」ものが無いため。
+
+    スロットの取り出しは直添字 (``c[3]``) ではなく ``arch.recurrent_layers``
+    の名前付き ``ngram`` スロット経由 (mlxturbo/arch.py 参照)。
     """
-    return [
-        (None if layer.layer_type == "full_attention" else c[3])
-        for layer, c in zip(model.model.layers, caches)
-    ]
+    slots = {rl.index: rl for rl in _archmod.recurrent_layers(model)}
+    out = []
+    for i, c in enumerate(caches):
+        rl = slots.get(i)
+        out.append(c[rl.ngram] if (rl is not None and rl.ngram is not None) else None)
+    return out
 
 
 def batched_rollback(model, caches, cap, keeps: list[int], pre_ctx=None, pair=None) -> None:
     """(B, T+1) の verify 後、GDN/PLE/n-gram 系キャッシュを行別 keep に戻す。
 
-    ``mlxturbo.spec_flash.rollback`` が単一行に対してやっている 4 対象
-    (GDN 状態・GDN conv window・PLE conv window・n-gram 文脈) を、
-    ``keeps[b]`` (行 b の受理数、1..total) ごとに ``_take_rows`` で一般化した
-    だけ。attention 側は一切触らない -- dead slot として ``RaggedLedger`` が
+    実体は ``mlxturbo/arch.py`` の ``rollback_recurrent_rows`` -- 単一行版
+    ``mlxturbo.spec_flash.rollback`` との共通部分 (再帰状態・conv window・
+    PLE conv window・n-gram 文脈) を名前付きスロット経由の共通部品に畳んで
+    ある。attention 側は一切触らない -- dead slot として ``RaggedLedger`` が
     扱う設計そのものなので、呼び出し側で別途 ``ledger.commit_round(keeps,
     total)`` を呼ぶこと (ここでは呼ばない: このモジュールの他の部品と同じく
     「1 つのことだけをする」ほうを選んだ)。
@@ -372,29 +362,9 @@ def batched_rollback(model, caches, cap, keeps: list[int], pre_ctx=None, pair=No
     (``mlxturbo.spec_flash.rollback`` が ``ids_kept=None`` のとき ``c[3]`` を
     更新しないのと同じ扱い)。
     """
-    keep_arr = mx.array(keeps)
-    for layer, c in zip(model.model.layers, caches):
-        if layer.layer_type == "full_attention":
-            continue
-        la = layer.linear_attn
-        conv_input, states_all = cap.gdn[id(la)]
-        win = la.conv_kernel_size - 1
-        c[0] = _take_rows(conv_input, keep_arr, win)
-        c[1] = _take_rows(states_all, keep_arr - 1, 1)[:, 0]
-        if layer.ple is not None:
-            full = cap.ple.get(id(layer.ple))
-            if full is not None:
-                n = layer.ple.short_conv_state_len
-                c[2] = _take_rows(full, keep_arr, n)
-
-    if pre_ctx is None or pair is None:
-        return
-    ctx_len = model.args.text.ngram_size - 1
-    for layer, c, ctx in zip(model.model.layers, caches, pre_ctx):
-        if layer.layer_type == "full_attention" or ctx is None:
-            continue
-        cat = mx.concatenate([ctx, pair], axis=1)
-        c[3] = _take_rows(cat, keep_arr, ctx_len)
+    _archmod.rollback_recurrent_rows(
+        model, caches, cap, keeps, ngram_ctx=pre_ctx, pair=pair
+    )
 
 
 __all__ = [

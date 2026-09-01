@@ -58,6 +58,8 @@ import mlx.nn as nn
 # spec.py is only read, never modified.
 from .spec import CHECKPOINT_RETENTION, PREFILL_STEP_SIZE, snapshot_untrimmable_caches
 from .prefill_common import split_and_checkpoint_tail
+from . import arch as _archmod
+from .arch import qwen4_arch as _arch
 
 
 # How many trailing prompt positions are fed to the MTP head before decoding
@@ -101,12 +103,6 @@ MTP_DEPTH = 2
 # depth1 を 14% 上回り受理率も 2.27 を維持 (docs/DECODE-ANATOMY)。既定は
 # 実質無効 (モデルの文脈上限)。env で戻せる。
 DEPTH_CONTEXT_LIMIT = int(os.environ.get("MLXTURBO_DEPTH_CTX_LIMIT", "262144"))
-
-
-def _arch():
-    import mlx_lm.models.qwen4_exp as Q
-
-    return Q
 
 
 class Capture:
@@ -403,9 +399,16 @@ def _pipeline_restore(model, caches, mtp_cache, st) -> None:
 
 
 def snapshot_pre(model, caches) -> dict:
-    """**Before** the forward, note down what capture cannot restore."""
+    """**Before** the forward, note down what capture cannot restore.
+
+    n-gram context の取り出しは、直添字 (``c[3]``) ではなく
+    ``arch.recurrent_layers`` の名前付き ``ngram`` スロットを経由する
+    (mlxturbo/arch.py 参照 -- 族が変わってもスロット番号を汎用コード側に
+    ハードコードしないため)。
+    """
+    slots = {rl.index: rl for rl in _archmod.recurrent_layers(model)}
     pre = {"kv": [], "ctx": []}
-    for layer, c in zip(model.model.layers, caches):
+    for i, (layer, c) in enumerate(zip(model.model.layers, caches)):
         if layer.layer_type == "full_attention":
             # _AttnCache derives from KVCache and is not an ArraysCache (it has no .cache)
             keys = c.indexer.keys
@@ -413,7 +416,8 @@ def snapshot_pre(model, caches) -> dict:
             pre["ctx"].append(None)
         else:
             pre["kv"].append(None)
-            pre["ctx"].append(c[3])
+            rl = slots.get(i)
+            pre["ctx"].append(c[rl.ngram] if (rl is not None and rl.ngram is not None) else None)
     return pre
 
 
@@ -430,32 +434,24 @@ def rollback(model, caches, cap: Capture, pre: dict, keep: int, total: int,
     if keep == total:
         return
     drop = total - keep
-    for i, (layer, c) in enumerate(zip(model.model.layers, caches)):
-        if layer.layer_type == "full_attention":
-            c.trim(drop)
-            if c.indexer.keys is not None:
-                old_len = pre["kv"][i][1] or 0
-                c.indexer.keys = c.indexer.keys[:, : old_len + keep]
+    # full attention 側の trim/indexer は族ごとに有無が違う別能力
+    # (arch.has_indexer) なので、再帰状態の巻き戻し (arch.rollback_recurrent)
+    # には混ぜない -- ここで直接扱う。
+    for i, layer in enumerate(model.model.layers):
+        if layer.layer_type != "full_attention":
             continue
-        la = layer.linear_attn
-        conv_input, states_all = cap.gdn[id(la)]
-        k = la.conv_kernel_size
-        # conv window after processing keep tokens = conv_input[:, keep : keep+k-1]
-        c[0] = mx.contiguous(conv_input[:, keep : keep + k - 1, :])
-        c[1] = states_all[:, keep - 1] if keep > 0 else None
-        if layer.ple is not None:
-            full = cap.ple.get(id(layer.ple))
-            if full is not None:
-                n = layer.ple.short_conv_state_len
-                c[2] = mx.contiguous(full[:, keep : keep + n, :])
+        c = caches[i]
+        c.trim(drop)
+        if _archmod.has_indexer(c):
+            old_len = pre["kv"][i][1] or 0
+            c.indexer.keys = c.indexer.keys[:, : old_len + keep]
 
-    if ids_kept is None:
-        return
-    ctx_len = model.args.text.ngram_size - 1
-    for layer, c, ctx in zip(model.model.layers, caches, pre["ctx"]):
-        if layer.layer_type == "full_attention" or ctx is None:
-            continue
-        c[3] = mx.concatenate([ctx, ids_kept], axis=1)[:, -ctx_len:]
+    # GDN 状態・conv 窓・PLE conv・n-gram 文脈の巻き戻しは
+    # mlxturbo/arch.py の名前付きスロット経由の共通部品に畳んである
+    # (batch_spec.batched_rollback と共有)。
+    _archmod.rollback_recurrent(
+        model, caches, cap, keep, ngram_ctx=pre["ctx"], ids_kept=ids_kept
+    )
 
 
 def trim_attn_cache(cache, keep: int) -> None:
