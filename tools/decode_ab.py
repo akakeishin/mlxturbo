@@ -23,6 +23,14 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              修正なので遅くても戻さない) が、tok/round の相対低下が 5% を
              超えたら代償として目立つ形で報告する。
              結果 (2026-09-01): tok/round +2.1%、ms/token は符号が揃わず。
+             結果 (moe-verify, 2026-09-01): 短 decode 3 本とも +46〜52% 遅く、
+             既定 off で据え置き。
+
+`depth`      MTP 投機の深さ (spec_flash.MTP_DEPTH、既定 2)。1/2/3 を回文順で
+             回す。貪欲なので品質は不変、判定は ms/token だけで行う。
+             合格条件: 既定 2 より速い深さがあれば、短・長の両方で改善して
+             いることを確かめてから既定を動かす。片方だけなら文脈長で
+             切り替える話になるので、その場で決めない。
 
 `moe-verify` 共有タイル gather v2 (MLXTURBO_MOE_VERIFY、既定 off)。
              verify 幅の MoE だけを差し替える。
@@ -63,7 +71,7 @@ SHORT_PROMPTS = [
 ]
 
 
-def _knob_qsa_tail():
+def _knob_qsa_tail(ctx):
     """A = 現行 (因果性で切る) / B = 修正前 (端数を常に可視)。
 
     B は `QSAIndexer.__call__` の返り値の端数列を True に戻す薄い包みで作る。
@@ -91,7 +99,7 @@ def _knob_qsa_tail():
     return apply
 
 
-def _knob_moe_verify():
+def _knob_moe_verify(ctx):
     """A = 共有タイル gather v2 on / B = off (既定)。"""
     import os
 
@@ -108,10 +116,29 @@ def _knob_moe_verify():
     return apply
 
 
+def _knob_depth(ctx):
+    """MTP 投機の深さ。既定は 2 (spec_flash.MTP_DEPTH)。
+
+    値は 2 つに限らないので、順序バイアスは 1,2,3,3,2,1 の回文で相殺する。
+    貪欲なので深さを変えても出力トークン列は原則変わらない (verify は本体の
+    argmax と一致したときだけ受理する)。よって品質は不変で、判定は速度だけ。
+    厳密一致は要求しない -- 深さが変わると verify の幅が変わり、
+    `mx.quantized_matmul` の幅依存の丸めで argmax がまれに割れる
+    (spec_flash の注記と同じ性質)。
+    """
+
+    def apply(variant):
+        ctx["eng"].depth = int(variant)
+
+    return apply
+
+
 KNOBS = {
-    # name: (setup -> apply(variant), 短文脈で A/B 出力の一致を要求するか)
-    "qsa-tail": (_knob_qsa_tail, True),
-    "moe-verify": (_knob_moe_verify, False),
+    # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
+    #        まとめで基準にする variant)
+    "qsa-tail": (_knob_qsa_tail, ["A", "B"], True, "B"),
+    "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
+    "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
 }
 
 
@@ -198,8 +225,9 @@ def main() -> int:
     cases = [("short", to_ids(p)) for p in SHORT_PROMPTS]
     cases += [("long", to_ids(p)) for p in longs]
 
-    setup, control_identical = KNOBS[args.knob]
-    set_variant = setup()
+    setup, variants, control_identical, baseline = KNOBS[args.knob]
+    set_variant = setup({"eng": eng})
+    order = variants + variants[::-1]
 
     print(f"knob={args.knob}  判定基準はモジュール docstring のとおり"
           " (測る前に宣言済み)。")
@@ -209,21 +237,18 @@ def main() -> int:
     # 温め: 最初の 1 本は必ず遅いので、計測に混ぜず先に捨てる。短文脈だけ
     # 温めても長文脈の初回は重みのページインで 2 倍かかる (73s vs 35s の実測)
     # ので、長い方も 1 本捨てる
-    set_variant("A")
-    for kind, ids in cases:
-        if kind == "short":
-            run_once(eng, ids, 32, eos_ids)
-            break
-    for kind, ids in cases:
-        if kind == "long":
-            run_once(eng, ids, 32, eos_ids)
-            break
+    set_variant(variants[0])
+    for want in ("short", "long"):
+        for kind, ids in cases:
+            if kind == want:
+                run_once(eng, ids, 32, eos_ids)
+                break
 
     rows = []
     for kind, ids in cases:
         n = ids.shape[1]
         print(f"--- {kind} ctx={n} ---", flush=True)
-        for v in ("A", "B", "B", "A"):
+        for v in order:
             set_variant(v)
             out, tp, td, acc, rounds = run_once(eng, ids, args.tokens, eos_ids)
             ms = td / max(len(out), 1) * 1000
@@ -245,25 +270,31 @@ def main() -> int:
         if not sub:
             continue
         for metric in ("ms_per_tok", "tok_per_round"):
-            a = [r[metric] for r in sub if r["variant"] == "A"]
-            b = [r[metric] for r in sub if r["variant"] == "B"]
-            ma, mb = sum(a) / len(a), sum(b) / len(b)
-            d = (ma - mb) / mb * 100
-            print(f"  {kind:5s} {metric:14s} A={ma:8.3f}  B={mb:8.3f}  "
-                  f"({d:+.2f}% vs 修正前)")
-            if kind == "long" and metric == "tok_per_round" and d < -5:
-                print("    ** tok/round が 5% 超落ちた。代償として報告する **")
+            means = {}
+            for v in variants:
+                vals = [r[metric] for r in sub if r["variant"] == v]
+                means[v] = sum(vals) / len(vals)
+            base = means[baseline]
+            cells = "  ".join(
+                f"{v}={means[v]:8.3f}({(means[v] - base) / base * 100:+5.1f}%)"
+                for v in variants
+            )
+            print(f"  {kind:5s} {metric:14s} {cells}   [基準 {baseline}]")
+            if kind == "long" and metric == "tok_per_round":
+                worst = min((means[v] - base) / base * 100 for v in variants)
+                if worst < -5:
+                    print("    ** tok/round が 5% 超落ちた条件がある **")
 
     if control_identical:
         # 対照: 短文脈は A と B で出力が完全一致するはず
-        for ctx in sorted({r["ctx"] for r in rows if r["kind"] == "short"}):
-            sub = [r for r in rows if r["ctx"] == ctx]
+        for c in sorted({r["ctx"] for r in rows if r["kind"] == "short"}):
+            sub = [r for r in rows if r["ctx"] == c]
             if len({tuple(r["head"]) for r in sub}) != 1:
                 ok = False
-                print(f"  対照 NG: ctx={ctx} で A/B の出力が食い違う"
+                print(f"  対照 NG: ctx={c} で条件間の出力が食い違う"
                       " (一致するはずの領域。測定は無効)")
         if ok:
-            print("  対照 OK: 短文脈は A/B で出力が一致")
+            print("  対照 OK: 短文脈は条件間で出力が一致")
 
     if args.out:
         Path(args.out).write_text(json.dumps(rows, ensure_ascii=False, indent=1))
