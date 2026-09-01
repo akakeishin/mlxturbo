@@ -128,7 +128,14 @@ def _knob_depth(ctx):
     """
 
     def apply(variant):
-        ctx["eng"].depth = int(variant)
+        eng = ctx["eng"]
+        eng.depth = int(variant)
+        # 既定では文脈長が indexer_budget を超えると engine 自身が depth 1 に
+        # 落とす (spec_flash._depth_ctx_limit)。掃引でそれを効かせると、境界の
+        # 向こう側では全条件が depth 1 になって**同じものを測ってしまう**
+        # (実際 2.6k で 1 と 2 の tok/round が 3 桁一致して気づいた)。
+        # ここでは自動切り替えを外し、指定した深さそのものを測る。
+        eng.depth_ctx_limit = 1 << 30
 
     return apply
 

@@ -619,7 +619,7 @@ class FlashSpecEngine:
         trim_attn_cache(cache, keep)
         return drafts
 
-    def _verify(self, cap, lg, drafts, temp, precomputed=None):
+    def _verify(self, cap, lg, drafts, temp, precomputed=None, sampler=None):
         """検証フォワードの結果から、採用するトークンと hyper を取り出す。
 
         ``pair`` は [cur, d1, ..., dk]。位置 j の logits は pair[j] の次の
@@ -627,16 +627,27 @@ class FlashSpecEngine:
         打ち切ってその位置のトークンを代わりに出す。最後まで当たれば k+1 個出る。
         """
         if not drafts:
-            toks = [self._sample(lg[:, 0], temp)]
+            toks = [self._sample(lg[:, 0], temp, sampler)]
             return toks, [cap.hyper[:, 0:1]], 0
-        if temp > 0:
+        if temp > 0 or sampler is not None:
             # 位置 j のサンプルは lg[:, j] にしか依存しない (j-1 の採否は
             # 「どこで打ち切るか」を決めるだけ) ので、全位置を先に引いて
             # 一致プレフィックスだけ採用しても分布は逐次版と同一。
-            # 同期が位置ごと (最大 depth+1 回) から 1 回になる
+            # 同期が位置ごと (最大 depth+1 回) から 1 回になる。
+            #
+            # **この独立性はサンプラーの形に依らない。**top_p / top_k / min_p /
+            # logit_bias はどれも「その位置の logits だけを見る変換」なので、
+            # 受理判定 (samples[0..j-1] にしか依存しない) で条件付けても位置 j の
+            # 分布は歪まない。よって投機ありでも逐次サンプリングと厳密一致する。
+            # 履歴依存のもの (repetition_penalty / presence / frequency) は
+            # この形では正しく載らないので、サーバー側で非投機に降ろしてある
+            # (mlxturbo/runner.py の FlashSpecRunner を参照)。
             k = len(drafts)
-            samp = mx.random.categorical(
-                lg.astype(mx.float32) / temp).reshape(1, k + 1)
+            if sampler is not None:
+                samp = sampler(lg.reshape(k + 1, -1)).reshape(1, k + 1)
+            else:
+                samp = mx.random.categorical(
+                    lg.astype(mx.float32) / temp).reshape(1, k + 1)
             dv = mx.concatenate(drafts, axis=1)
             mx.eval(samp, dv)
             vals = samp[0].tolist()
@@ -759,7 +770,7 @@ class FlashSpecEngine:
     # we chose to accept a little duplication over rewriting existing methods.
 
     @staticmethod
-    def _sample(logits_row: mx.array, temp: float) -> mx.array:
+    def _sample(logits_row: mx.array, temp: float, sampler=None) -> mx.array:
         """Choose the next token from one position's worth of logits ((1, vocab)).
 
         temp<=0 is greedy (argmax, numerically identical to the existing
@@ -768,7 +779,16 @@ class FlashSpecEngine:
         as sampling from the verification-side logits goes there is no
         approximation in the correctness of the distribution -- the draft stays
         greedy). Returns (1, 1).
+
+        ``sampler`` (省略可) は「1 位置の生 logits (N, vocab) を受けてトークン
+        (N,) を返す」関数。top_p/top_k/min_p/logit_bias のような**位置局所な
+        変換**を載せるための口で、渡されたときだけこちらを使う (省略時は既存の
+        経路が 1 ビットも変わらない)。履歴依存のもの (repetition_penalty 系) は
+        ここに載せてはいけない -- 下の `_verify` が全位置を先に引くため、
+        位置 j のペナルティが「j-1 までを含む履歴」で計算できない。
         """
+        if sampler is not None:
+            return sampler(logits_row).reshape(1, 1)
         if temp > 0:
             return mx.random.categorical(logits_row.astype(mx.float32) / temp).reshape(1, 1)
         return mx.argmax(logits_row, axis=-1).reshape(1, 1)
@@ -783,6 +803,7 @@ class FlashSpecEngine:
         checkpoints: list | None = None,
         base_pos: int = 0,
         resume: tuple | None = None,
+        sampler=None,
     ):
         """The token-by-token version of ``generate()`` (for mlxturbo-serve's
         streaming).
@@ -1031,7 +1052,7 @@ class FlashSpecEngine:
             return 0, 0, (logits_tail, hyper_tail0, mtp_snap)
 
         hyper_prev = hyper_tail0
-        cur = self._sample(logits_tail, temp)
+        cur = self._sample(logits_tail, temp, sampler)
 
         first = int(cur.item())
         out = [first]
@@ -1114,7 +1135,7 @@ class FlashSpecEngine:
             if timers:
                 phase["verify"] += time.perf_counter() - ts
                 ts = time.perf_counter()
-            toks, hypers, hit = self._verify(cap, lg, drafts, temp,
+            toks, hypers, hit = self._verify(cap, lg, drafts, temp, sampler=sampler,
                                              precomputed=(nxt_all, dv))
             accepted += hit
 

@@ -2062,12 +2062,14 @@ def _resolve_runner_for_request(
             STATE.runner,
             None,
             f"this model is served via the '{kind}' runner, which does not support "
-            f"non-default values for: {', '.join(non_identity)}. The speculative-decoding "
-            "runner only supports 'seed' (plus identity values that leave the sampling "
+            f"non-default values for: {', '.join(non_identity)}. This runner supports "
+            f"{sorted(supported)} (plus identity values that leave the sampling "
             "distribution unchanged, e.g. top_p=1.0 or frequency_penalty=0.0) among the "
-            "extended sampling parameters, because its correctness guarantee (rejection "
-            "sampling against the exact target distribution) assumes temperature-only "
-            "sampling; changing the base distribution would silently break that guarantee.",
+            "extended sampling parameters. Position-local logits transforms (top_p / "
+            "top_k / min_p / logit_bias) compose exactly with speculative verification, "
+            "but history-dependent ones (repetition/presence/frequency penalty) do not: "
+            "the verifier samples every position of a round up front, so a penalty for "
+            "position j could not see the tokens accepted at j-1.",
         )
     # Everything left here is a key that "the runner does not support but that
     # is an identity value". It does not change the distribution, so it is not

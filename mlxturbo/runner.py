@@ -133,6 +133,42 @@ class SpecRunner:
         )
 
 
+def _position_local_sampler(temp, top_p, top_k, min_p, logit_bias):
+    """位置ごとの logits だけで決まるサンプラーを組む。恒等なら None を返す
+    (呼び手は既存経路をそのまま通り、1 ビットも変わらない)。
+
+    返す関数は「生 logits (N, vocab) -> トークン (N,)」。mlx_lm の
+    ``make_sampler`` は log 確率を受ける約束なので、ここで正規化してから渡す。
+    ``logit_bias`` は語彙長のベクトルに畳んで加算する (位置に依らない定数なので
+    位置局所の条件を満たす)。
+    """
+    if temp <= 0:
+        return None
+    if not (
+        (0 < top_p < 1.0) or top_k > 0 or min_p != 0.0 or logit_bias
+    ):
+        return None
+
+    from mlx_lm.sample_utils import make_sampler
+
+    base = make_sampler(temp=temp, top_p=top_p, top_k=top_k, min_p=min_p)
+    bias_idx = bias_val = None
+    if logit_bias:
+        bias_idx = mx.array([int(k) for k in logit_bias])
+        bias_val = mx.array([float(v) for v in logit_bias.values()])
+
+    def sampler(logits: mx.array) -> mx.array:
+        x = logits.astype(mx.float32)
+        if bias_idx is not None:
+            add = mx.zeros(x.shape[-1], dtype=mx.float32)
+            add[bias_idx] = bias_val
+            x = x + add
+        logprobs = x - mx.logsumexp(x, axis=-1, keepdims=True)
+        return base(logprobs)
+
+    return sampler
+
+
 class FlashSpecRunner:
     """Speculative decoding path for Qwen3.8-Flash-Next (``qwen4_exp``).
 
@@ -171,33 +207,49 @@ class FlashSpecRunner:
     (``ChatSession if KIND == "spec" else FallbackSession``) is unchanged
     here and still picks ``FallbackSession``.
 
-    ``SUPPORTED_SAMPLING_PARAMS``: declares only ``seed``, for the same
-    reason as ``SpecRunner``. temperature>0 is already handled, in the form
-    of ``FlashSpecEngine.generate_stream`` sampling directly from the logits
-    at positions 0/1 of the verification forward, but rewriting the logits
-    with top_p/top_k/repetition_penalty and the like changes the target
-    distribution itself, which no longer squares with the premise this path's
-    temperature sampling rests on: "sample from the raw
-    softmax(logits/temp)". As with ``SpecRunner``, the re-derivation needed
-    to support them was judged out of scope for this task, so option (b):
-    server.py rejects them with a 400. ``generate_stream`` itself also has a
-    fixed signature with no ``**extra``, so if an unsupported key ever did
-    slip through to here it would fail with a TypeError (defense in depth,
-    the same shape as ``SpecRunner``).
+    ``SUPPORTED_SAMPLING_PARAMS``: ``seed`` に加えて **位置局所な logits 変換**
+    (top_p / top_k / min_p / logit_bias) を受ける。**履歴依存のもの
+    (repetition_penalty / presence_penalty / frequency_penalty) は受けない。**
+    線引きの理由は param 名ではなく形にある:
+
+    ``FlashSpecEngine._verify`` は 1 ラウンドで検証フォワードの全位置を先に
+    サンプルし、draft と一致したプレフィックスだけ採用する。位置 j の
+    サンプルは ``lg[:, j]`` にしか依存せず、受理判定は samples[0..j-1] にしか
+    依存しないので、条件付けても位置 j の分布は歪まない。**この独立性は
+    サンプラーの形に依らない**ので、位置局所な変換なら投機ありでも逐次
+    サンプリングと厳密一致する (近似ではない)。
+
+    一方ペナルティ系は「それまでに出たトークン列」に依存するため、全位置を
+    先に引く形では位置 j のペナルティを j-1 までの履歴で計算できない。載せると
+    静かに分布が変わるので、これらは従来どおり server.py が非投機に降ろす。
+
+    2026-09-01 以前はここが ``seed`` だけで、top_p が付いたリクエストは
+    まるごと非投機に降格していた。実クライアント (opencode、OpenAI SDK) は
+    top_p を既定で送るので、**実トラフィックのほぼ全部が投機の 1.26-1.44x を
+    静かに捨てていた**。降格は理論の壁ではなく実装の穴だった。
+
+    ``logprobs`` は今も降格の引き金として残る (検証側 logits から出せる
+    見込みはあるが未実装 -- docs/research/IMPROVEMENT-QUEUE.md の D1)。
     """
 
     KIND = "flash_spec"
-    SUPPORTED_SAMPLING_PARAMS = frozenset({"seed"})
+    # 位置局所な変換だけ。履歴依存 (repetition/presence/frequency) は入れない
+    SUPPORTED_SAMPLING_PARAMS = frozenset(
+        {"seed", "top_p", "top_k", "min_p", "logit_bias"}
+    )
 
     def __init__(self, engine):
         self.engine = engine
         self.fallback_reason = None
 
     def generate(
-        self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, seed=None, **extra
+        self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session,
+        seed=None, top_p: float = 0.0, top_k: int = 0, min_p: float = 0.0,
+        logit_bias: dict | None = None, **extra
     ):
         if seed is not None:
             mx.random.seed(seed)
+        sampler = _position_local_sampler(temp, top_p, top_k, min_p, logit_bias)
 
         # The same LCP (longest common prefix) contract as
         # FallbackRunner.generate: this function itself only looks for "the
@@ -272,6 +324,7 @@ class FlashSpecRunner:
             checkpoints=checkpoints,
             base_pos=reused,
             resume=resume,
+            sampler=sampler,
             **extra,
         )
         try:

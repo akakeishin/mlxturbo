@@ -544,22 +544,27 @@ def test_spec_runner_allows_seed(client, monkeypatch):
     assert seeded == [7]
 
 
-# ---------- 2c. FlashSpecRunner (Qwen3.8-Flash-Next) 経路も seed 以外を 400 で弾く ----------
+# ---------- 2c. FlashSpecRunner (Qwen3.8-Flash-Next) 経路のサンプリング契約 ----------
+#
+# 2026-09-01 に線引きが変わった。位置局所な logits 変換 (top_p / top_k /
+# min_p / logit_bias) は投機の検証と厳密に噛み合う (位置 j のサンプルは
+# lg[:, j] にしか依存せず、受理判定は samples[0..j-1] にしか依存しないので、
+# 条件付けても分布が歪まない) ので投機経路がそのまま受ける。履歴依存の
+# ペナルティ系は、全位置を先に引く形では位置 j のペナルティを j-1 までの
+# 履歴で計算できないため、従来どおり弾く/降ろす。
 
 
 @pytest.mark.parametrize(
     "params",
     [
-        {"top_p": 0.9},
-        {"top_k": 10},
-        {"min_p": 0.1},
         {"repetition_penalty": 1.1},
         {"presence_penalty": 0.1},
         {"frequency_penalty": 0.1},
-        {"logit_bias": {"1": 1.0}},
     ],
 )
-def test_flash_spec_runner_rejects_unsupported_sampling_params(client, params):
+def test_flash_spec_runner_rejects_history_dependent_sampling_params(client, params):
+    """履歴依存のペナルティ系は弾く (降格先が無い構成なので 400)。"""
+
     runner = FakeFlashSpecRunner(tokens_to_emit=[10])
     _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
 
@@ -567,6 +572,41 @@ def test_flash_spec_runner_rejects_unsupported_sampling_params(client, params):
     resp = client.post("/v1/chat/completions", json=body)
     assert resp.status_code == 400, resp.text
     assert not runner.calls
+
+
+@pytest.mark.parametrize(
+    ("params", "key", "value"),
+    [
+        ({"top_p": 0.9}, "top_p", 0.9),
+        ({"top_k": 10}, "top_k", 10),
+        ({"min_p": 0.1}, "min_p", 0.1),
+        # server 側でキーは int に正規化されてから runner に渡る
+        ({"logit_bias": {"1": 1.0}}, "logit_bias", {1: 1.0}),
+    ],
+)
+def test_flash_spec_runner_takes_position_local_sampling_params(
+    client, params, key, value
+):
+    """位置局所な変換は投機経路がそのまま受ける (降格しない)。
+
+    これが降格していた頃は、top_p を既定で送る実クライアント
+    (opencode / OpenAI SDK) のトラフィックがまるごと非投機に落ちていた。
+    """
+
+    runner = FakeFlashSpecRunner(tokens_to_emit=[10])
+    downgrade = FakeRunner(tokens_to_emit=[11])
+    _install_state(
+        runner, tokenizer=FakeTokenizer(vocab={10: "x", 11: "y"}),
+        downgrade_runner=downgrade,
+    )
+
+    body = {"messages": [{"role": "user", "content": "hi"}], **params}
+    resp = client.post("/v1/chat/completions", json=body)
+    assert resp.status_code == 200, resp.text
+    # 投機経路が呼ばれ、値がそのまま渡っていること (降格していない)
+    assert len(runner.calls) == 1
+    assert not downgrade.calls
+    assert runner.calls[0][key] == value
 
 
 def test_flash_spec_runner_allows_seed(client, monkeypatch):
@@ -765,10 +805,11 @@ def test_spec_runner_error_lists_only_non_identity_params(client):
     )
     assert resp.status_code == 400, resp.text
     message = resp.json()["error"]["message"]
-    # 「non-default values for: <listed>. The speculative-decoding runner ...」
-    # の <listed> 部分だけを見る — 説明文中の例示 (top_p=1.0 等) を誤検出
-    # しないように、リスト部分を切り出してから判定する。
-    listed = message.split("non-default values for: ", 1)[1].split(". The speculative-decoding", 1)[0]
+    # 「non-default values for: <listed>. <説明文>」の <listed> だけを見る —
+    # 説明文中の例示 (top_p=1.0 等) を誤検出しないように切り出してから判定する。
+    # 区切りは最初の "." だけに頼る (パラメータ名に "." は入らない)。説明文の
+    # 文言に依存させると、文言を直すたびにここが落ちる。
+    listed = message.split("non-default values for: ", 1)[1].split(".", 1)[0]
     assert listed == "presence_penalty"
     assert not runner.calls
 
@@ -6634,13 +6675,15 @@ def test_flash_spec_runner_downgrades_on_anthropic_route_too(client):
             "model": "test-model",
             "max_tokens": 16,
             "messages": [{"role": "user", "content": "hi"}],
-            "top_k": 5,
+            # 履歴依存のもの。位置局所な top_k は 2026-09-01 から投機経路が
+            # 受けるので、降格の確認にはもう使えない
+            "frequency_penalty": 0.5,
         },
     )
     assert resp.status_code == 200, resp.text
     assert not primary.calls
     assert len(downgrade.calls) == 1
-    assert downgrade.calls[0]["top_k"] == 5
+    assert downgrade.calls[0]["frequency_penalty"] == 0.5
 
 
 def test_spec_runner_still_400s_without_a_downgrade_runner(client):
