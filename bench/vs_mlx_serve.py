@@ -9,6 +9,13 @@
 (TTFT = 最初の content delta まで、decode = 以降のチャンク数 / 経過秒)、
 サーバーは 1 つずつ順に起動 (同時に載せない -- 128GB に 91GB を 2 つは載らない)。
 
+**冷たい TTFT と温かい TTFT の両方を取る。**実クライアントは毎ターン
+「前のやり取り + 新しい発言」をまるごと送るので、2 ターン目は前回の
+プロンプトが接頭辞になる。そこを再利用できるかが温 TTFT で、うちは
+checkpoint 復帰と BPE 末尾分割がここに乗っている (追記ターン 16k で
+6.14s -> 1.1s の修正)。**冷えた TTFT だけ測ると、その仕事が 1 ミリも
+見えない。**
+
 揃わない: **重みが違う。**それぞれの推奨構成どうしの比較で、同一重みの比較では
 ない (`docs/VS-MLX-SERVE.md` の注記と同じ)。
 
@@ -68,11 +75,19 @@ def wait_ready(port: int, timeout: float = 900.0) -> bool:
     return False
 
 
-def stream_once(port: int, prompt: str, n_tokens: int) -> tuple[float, float, int]:
-    """SSE で 1 本流し、(TTFT 秒, decode 秒, チャンク数) を返す。"""
+def stream_once(port: int, messages: list, n_tokens: int):
+    """SSE で 1 本流し、(TTFT 秒, decode 秒, チャンク数, 本文) を返す。
+
+    本文を返すのは**追記ターン (warm TTFT) を作るため**。実クライアントは
+    「前のやり取り + 新しい発言」を毎回まるごと送るので、2 ターン目は
+    前回のプロンプトが接頭辞になる。そこを再利用できるかが warm TTFT で、
+    うちは checkpoint 復帰と BPE 末尾分割がここに乗っている
+    (追記ターン 16k で 6.14s -> 1.1s の修正)。**冷えた TTFT だけ測ると、
+    その仕事が 1 ミリも見えない。**
+    """
     body = json.dumps({
         "model": "x",
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "max_tokens": n_tokens,
         "temperature": 0,
         "stream": True,
@@ -83,6 +98,7 @@ def stream_once(port: int, prompt: str, n_tokens: int) -> tuple[float, float, in
     t0 = time.perf_counter()
     ttft = None
     n = 0
+    parts = []
     with urllib.request.urlopen(req, timeout=1800) as r:
         for raw in r:
             line = raw.decode("utf-8", "ignore").strip()
@@ -101,9 +117,10 @@ def stream_once(port: int, prompt: str, n_tokens: int) -> tuple[float, float, in
                     ttft = time.perf_counter() - t0
                     t_dec = time.perf_counter()
                 n += 1
+                parts.append(delta["content"])
     if ttft is None:
-        return float("nan"), float("nan"), 0
-    return ttft, time.perf_counter() - t_dec, n
+        return float("nan"), float("nan"), 0, ""
+    return ttft, time.perf_counter() - t_dec, n, "".join(parts)
 
 
 class Server:
@@ -181,25 +198,36 @@ def main() -> int:
         cls, argv, port = sides[name]
         with cls(name, argv, port):
             for c in ctxs:
-                stream_once(port, prompts[c], 8)  # 温め (捨てる)
-                ttft, dec, n = stream_once(port, prompts[c], args.tokens)
+                msgs = [{"role": "user", "content": prompts[c]}]
+                stream_once(port, msgs, 8)  # 温め (捨てる)
+                ttft, dec, n, reply = stream_once(port, msgs, args.tokens)
                 tps = (n - 1) / dec if dec > 0 and n > 1 else 0.0
+                # 追記ターン: 実クライアントと同じく履歴をまるごと送り直す。
+                # 前ターンのプロンプトが接頭辞になるので、再利用が効けば
+                # TTFT が落ちる
+                msgs2 = msgs + [{"role": "assistant", "content": reply},
+                                {"role": "user", "content": "続けてください。"}]
+                w_ttft, _, _, _ = stream_once(port, msgs2, 8)
                 rows.append(dict(engine=name, ctx=c, ttft_s=ttft,
-                                 decode_tps=tps, tokens=n))
-                print(f"  {name:10s} ctx={c:6d}  TTFT {ttft:7.2f}s  "
-                      f"decode {tps:6.1f} tok/s ({n} tok)", flush=True)
+                                 warm_ttft_s=w_ttft, decode_tps=tps, tokens=n))
+                print(f"  {name:10s} ctx={c:6d}  冷 TTFT {ttft:7.2f}s  "
+                      f"温 TTFT {w_ttft:6.2f}s  decode {tps:6.1f} tok/s"
+                      f" ({n} tok)", flush=True)
 
     print("\n=== まとめ (2 本の平均) ===")
-    print(f"{'文脈':>7s} {'mlx-serve TTFT':>15s} {'mlxturbo TTFT':>14s} "
-          f"{'mlx-serve tok/s':>16s} {'mlxturbo tok/s':>15s}")
+    hdr = ("文脈", "冷TTFT serve", "冷TTFT turbo", "温TTFT serve",
+           "温TTFT turbo", "tok/s serve", "tok/s turbo")
+    print("".join(f"{h:>14s}" for h in hdr))
     for c in ctxs:
         def avg(engine, key):
-            v = [r[key] for r in rows if r["engine"] == engine and r["ctx"] == c]
+            v = [r[key] for r in rows
+                 if r["engine"] == engine and r["ctx"] == c
+                 and r[key] == r[key]]  # NaN を除く
             return statistics.mean(v) if v else float("nan")
-        print(f"{c:7d} {avg('mlx-serve', 'ttft_s'):15.2f} "
-              f"{avg('mlxturbo', 'ttft_s'):14.2f} "
-              f"{avg('mlx-serve', 'decode_tps'):16.1f} "
-              f"{avg('mlxturbo', 'decode_tps'):15.1f}")
+        vals = (avg("mlx-serve", "ttft_s"), avg("mlxturbo", "ttft_s"),
+                avg("mlx-serve", "warm_ttft_s"), avg("mlxturbo", "warm_ttft_s"),
+                avg("mlx-serve", "decode_tps"), avg("mlxturbo", "decode_tps"))
+        print(f"{c:>14d}" + "".join(f"{v:14.2f}" for v in vals))
     Path(args.out).write_text(json.dumps(rows, ensure_ascii=False, indent=1))
     print(f"\n書き出し: {args.out}")
     return 0
