@@ -104,7 +104,10 @@ def bench_chain(make, n: int = 8, reps: int = 5) -> float:
 def load_shape(model_path: Path) -> dict:
     """config.json から MoE の形状と量子化設定を取る (ハードコードしない)。"""
     cfg = json.loads((model_path / "config.json").read_text())
+    # Flash-Next (qwen4_exp) は形状を text_config に入れ子で持つ。
+    # 量子化設定は最上位にある
     q = cfg.get("quantization") or {}
+    cfg = cfg.get("text_config", cfg)
     # 一律量子化 (bake.py の "default" レシピ) を想定。エキスパート専用の
     # 上書きキーがあれば拾い、無ければ全体設定にフォールバック
     # (tools/probe_lm_head_bw.py の `.get("lm_head", ...)` と同じ形)
