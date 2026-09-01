@@ -282,6 +282,28 @@ def _knob_moe_route(ctx):
     return apply
 
 
+
+def _knob_null(ctx):
+    """A も B も**何もしない**。ハーネス自身のばらつきを測るための対照。
+
+    2026-09-01 に、一度も発火していない `gdn-prework` を 2 回測って
+    **-0.9% と +5.3%** が出た。中身が同じものが 6 ポイント振れたことになる。
+    `eligible()` の費用も測ったが、17k decode 全体で 1.4ms + 0.8ms (0.01%) で
+    説明にならない。
+
+    **つまりハーネスの雑音が疑わしい。**この knob は差し替えを一切せず、
+    回文順・温め捨て・prefill 使い回しまで本番の A/B とまったく同じ手順を
+    踏む。ここで出る差が、**今日のすべての判定の下限**になる。
+
+    合格条件: 出力一致 (対照)。ここが一致しないならハーネス自体が壊れている。
+    """
+
+    def apply(variant):
+        return
+
+    return apply
+
+
 def _knob_indexer_cache(ctx):
     """A = 確保方式 (現行) / B = 毎更新 concat (2026-09-01 以前)。
 
@@ -541,6 +563,7 @@ KNOBS = {
     "hc-write": (_knob_hc_write, ["A", "C", "B"], True, "B"),
     "rms-norm-gated": (_knob_rms_norm_gated, ["A", "C", "B"], True, "B"),
     "moe-route": (_knob_moe_route, ["A", "C", "B"], False, "B"),
+    "null": (_knob_null, ["A", "B"], True, "B"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),
