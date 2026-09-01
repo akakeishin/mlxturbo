@@ -787,6 +787,21 @@ def main() -> int:
             shared = (caches, snap, resume)
             print(f"  prefill 1 回だけ流した ({time.perf_counter() - t0:.1f}s)。"
                   " 以降はここから decode のみ", flush=True)
+        # **文脈グループごとに 1 本捨てる。**冒頭の温めは kind ごとに 1 回、
+        # しかも最初のケースにしか当たっていなかった。グループが変わると
+        # キャッシュを組み直すので 1 本目だけ一回きりの費用を払い、
+        # **回文順 (A,B,B,A) はそれを相殺できない** -- 位置 1 の段差は
+        # 線形のドリフトではないうえ、A が必ず位置 1 に来るため。
+        #
+        # 2026-09-01 に null knob (A も B も何もしない) で長文脈 +5.6% が出て
+        # 判明した。実際の並びは 13.90 / 12.58 / 12.64 / 12.6x で、1 本目だけ
+        # 段差になっている。**この日の長文脈の A/B は全部 A 側に約 5% の
+        # 下駄を履かせていた。**
+        set_variant(baseline)
+        if shared is None:
+            run_once(eng, ids, 32, eos_ids)
+        else:
+            run_resumed(eng, *shared, base_pos=n, n_tokens=32, eos_ids=eos_ids)
         for v in order:
             set_variant(v)
             # カーネルの発火回数を条件ごとに数え直す。適格判定は条件を外すと
