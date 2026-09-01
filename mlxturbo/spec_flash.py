@@ -126,6 +126,37 @@ DEPTH_CONTEXT_LIMIT = int(os.environ.get("MLXTURBO_DEPTH_CTX_LIMIT", "0")) or No
 _DEPTH_CTX_LIMIT_FALLBACK = 262144
 
 
+def choose_depth(
+    pos: int,
+    depth: int,
+    ctx_limit: int,
+    *,
+    accepted: int | None = None,
+    rounds: int | None = None,
+    batch_size: int = 1,
+) -> int:
+    """このラウンドで引くドラフト数を決める**純関数**。
+
+    今の政策は「文脈長が境界 (既定 = indexer_budget) を超えたら 1」だけ。
+    足す予定のものが 2 つあり、どちらもここに閉じる:
+
+    - **テキスト連動**: 同じ文脈長でも tok/round は 1.6-3.4 と振れる (実測)。
+      直近ラウンドの受理率 (``accepted``/``rounds``) が高ければ深く、低ければ
+      浅く。遅行指標なので、静的既定に勝てるかは実測で決める (分散が大きい
+      ことは「オラクルなら勝てる」ことしか意味しない)。
+    - **負荷連動**: バッチでは 1 位置足す限界費用が B に比例して上がるので、
+      ``batch_size`` が増えたら浅く。
+
+    引数で全部受け取る形にしてあるのは、バッチの同期ラウンドが (B, T+1) の
+    一様幅で**行ごとの depth が構造的に存在できない**ため。行別の受理信号を
+    「ラウンド共有の T 1 つ」に集約するのはスケジューラの仕事で、そこから
+    この関数を呼ぶ。呼び出し点が engine 側に散っていても政策はここだけ。
+    """
+    if pos >= ctx_limit:
+        return 1
+    return depth
+
+
 def _depth_ctx_limit(model) -> int:
     """このモデルで depth を 1 に落とす文脈長。
 
@@ -311,6 +342,17 @@ def _staged_forward(model, ids, caches):
 # MoE 部分時間 18.4 -> 14.9s)。gather_qmm は行独立で、BM=32/64 をまたぐ
 # 分割でもビット一致 (micro 確認済み) — 出力はトークン列まで不変が要件。
 _PREFILL_GROUP = int(os.environ.get("MLXTURBO_PREFILL_GROUP", "4") or 0)
+
+# group prefill を当てない末尾チャンク数。ここはチャンク主導のままなので
+# checkpoint が step (2048) 粒度で立つ。グループの内側では checkpoint を刻めない
+# -- レイヤー主導では「チャンク k を全層通した状態」がどの瞬間にも存在しないので、
+# これは構造的な制約であって実装の手抜きではない。
+#
+# 2 ターン目の LCP は末尾に落ちやすいので、ここを広げると追記ターンの再 prefill が
+# 減りうる (代償は prefill の MoE バッチ効率)。既定 1 は従来の挙動そのもの。
+# 掃引するときは「17k TTFT の悪化 2% 以内」を反転条件にする
+# (docs/research/IMPROVEMENT-QUEUE.md B2)。
+_PREFILL_TAIL_CHUNKS = int(os.environ.get("MLXTURBO_PREFILL_TAIL_CHUNKS", "1"))
 
 if _PREFILL_GROUP > 1 and os.environ.get("MLXTURBO_PREFILL_CHUNK"):
     # MLXTURBO_PREFILL_CHUNK を立てると big != step になり、下の group 経路の
@@ -605,8 +647,9 @@ class FlashSpecEngine:
 
     def _effective_depth(self, pos: int) -> int:
         """この位置で引くドラフト数。長い文脈では 1 に落とす
-        (DEPTH_CONTEXT_LIMIT の注記を参照)。"""
-        return 1 if pos >= self.depth_ctx_limit else self.depth
+        (DEPTH_CONTEXT_LIMIT の注記を参照)。政策そのものは
+        `choose_depth` (純関数) に閉じてある。"""
+        return choose_depth(pos, self.depth, self.depth_ctx_limit)
 
     def _draft_chain(self, cur, hyper_prev, cache, depth: int):
         """``self.depth`` トークンをまとめて引く。
@@ -960,8 +1003,11 @@ class FlashSpecEngine:
                 # 末尾側 (端数チャンクと最終チャンク) は従来経路のまま —
                 # checkpoint の粒度が要るのは分岐が起きやすい末尾だから。
                 # MLXTURBO_PREFILL_CHUNK 指定時は旧 knob を優先して無効化。
-                if _PREFILL_GROUP > 1 and big == step and remaining - step >= 2 * step:
-                    g = min(_PREFILL_GROUP, (remaining - step) // step)
+                g = min(
+                    _PREFILL_GROUP,
+                    (remaining - _PREFILL_TAIL_CHUNKS * step) // step,
+                )
+                if _PREFILL_GROUP > 1 and big == step and g >= 2:
                     group_chunks = [
                         ids[:, i + k * step : i + (k + 1) * step] for k in range(g)
                     ]
