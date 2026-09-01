@@ -8178,8 +8178,9 @@ def test_batched_admission_cancelled_before_start_resolves_cleanly(batch_env):
 # ---------------------------------------------------------- バッチ x 投機
 #
 # --max-batch-spec (mlxturbo/batch_spec.py の coordinator 節)。ここで見るのは
-# 「どの要求をまとめてよいか」の判定だけ。実際にラウンドを回す側 (retire /
-# 行別の打ち切り / 単独への落とし込み) は合成モデルが要るので
+# 「どの要求をまとめてよいか」と 1 ステップの割り当ての算数だけ。実際に
+# ラウンドを回す側 (chunked prefill / 走行中の join / retire / 行別の打ち切り /
+# 退避と復帰 / 単独への落とし込み) は合成モデルが要るので
 # tools/verify_batch_spec.py (CPU) が持っている -- 上の継続バッチングと違い、
 # あちらは投機エンジン (MTP ヘッド) まで要るのでこのファイルには置かない。
 
@@ -8218,14 +8219,83 @@ def test_spec_batchable_length_condition():
     assert not spec_batchable(model, 10, 0, depth=2)
 
 
-def test_bucket_batches_splits_on_length_ratio():
-    """右パディングの無駄は行あたり max_len - len 列なので、長さの比が開いた
-    ものは別バッチに割る (既定 1.5 倍)。"""
+def test_spec_round_depth_respects_rectangle_and_budget():
+    """1 ラウンドのドラフト数 k は、矩形 B*(1+k) <= 8 と残りのトークン予算の
+    両方に収める。どちらにも収まらなければ 0 (素の decode) -- 小さい予算を
+    投機で食い潰さない、が依頼の条件。"""
 
-    from mlxturbo.batch_spec import bucket_batches
+    from mlxturbo.batch_spec import BatchSpecCoordinator
 
-    assert bucket_batches([10, 12, 100], 4) == [[0, 1], [2]]
-    assert bucket_batches([10, 11, 12, 13, 14], 2) == [[0, 1], [2, 3], [4]]
+    coord = BatchSpecCoordinator.__new__(BatchSpecCoordinator)
+    coord.engine = SimpleNamespace(depth=3)
+
+    # 予算が潤沢なら矩形の上限だけが効く (B*(1+k) <= 8)
+    assert coord._round_depth(1, 2048) == 3  # engine.depth が上限
+    assert coord._round_depth(2, 2048) == 3  # 2*4 = 8
+    assert coord._round_depth(4, 2048) == 1  # 4*2 = 8
+    assert coord._round_depth(8, 2048) == 0  # 8*1 = 8
+    assert coord._round_depth(16, 2048) == 0
+    # 予算が細ると k から削る
+    assert coord._round_depth(2, 4) == 1
+    assert coord._round_depth(2, 1) == 0
+    assert coord._round_depth(0, 2048) == 0
+
+
+def test_spec_rows_fit_counts_only_new_bytes():
+    """メモリの判定は「これから増える分」だけを数える (free_bytes は
+    書き終わった KV を含む現在の常駐を既に引いている)。数えられない環境では
+    上限を掛けない。"""
+
+    from mlxturbo.batch_spec import rows_fit
+
+    model = SimpleNamespace(
+        args=SimpleNamespace(
+            text=SimpleNamespace(
+                layer_types=["full_attention", "linear_attention"],
+                num_key_value_heads=2,
+                head_dim=64,
+                indexer_kv_heads=0,
+                indexer_head_dim=0,
+                linear_num_value_heads=4,
+                linear_value_head_dim=32,
+                linear_key_head_dim=32,
+            )
+        )
+    )
+    # KV = 1 層 * 2 head * 64 dim * 2 (k/v) * 2 byte = 512 byte/token
+    # capture = 1 層 * 4 * 32 * 32 * 4 byte = 16384 byte/位置
+    need_100 = 100 * 512 + 1 * 3 * 16384
+    assert rows_fit(model, [100], depth=2, room=need_100)
+    assert not rows_fit(model, [100], depth=2, room=need_100 - 1)
+    # 形が取れないモデルは上限を掛けない
+    assert rows_fit(SimpleNamespace(), [10 ** 9], depth=2, room=1)
+
+
+def test_spec_preempt_keeps_length_condition():
+    """退避は `spec_batchable` の条件を動かさないこと。
+
+    退避した行は「プロンプト + 生成済み」を新しいプロンプトとして戻り、
+    残り max_tokens は生成済みのぶん減る。合計が動かないので、2048 の上限
+    (QSA が発火しない保証) は退避の前後で同じ判定になる -- ここが崩れると
+    復帰した行が `ragged_attention` の NotImplementedError で落ちる。
+    """
+
+    from mlxturbo.batch_spec import BatchSpecCoordinator, SpecAdmission, spec_batchable
+
+    model = SimpleNamespace(args=SimpleNamespace(text=SimpleNamespace(indexer_budget=100)))
+    adm = SpecAdmission(
+        prompt_ids=list(range(40)), max_tokens=57, temp=0.0, sampling={},
+        eos_ids=set(), on_tokens=None, on_done=None, cancel_event=None, future=None,
+    )
+    assert spec_batchable(model, len(adm.prompt_ids), adm.max_tokens, depth=2)
+
+    coord = BatchSpecCoordinator.__new__(BatchSpecCoordinator)
+    adm.tokens = [1, 2, 3, 4, 5]  # 5 個出したところで退避されたとする
+    prompt = coord._effective_prompt(adm)
+    assert len(prompt) == 45
+    assert coord._remaining(adm) == 52
+    assert len(prompt) + coord._remaining(adm) == 97  # 退避前と同じ
+    assert spec_batchable(model, len(prompt), coord._remaining(adm), depth=2)
 
 
 def test_spec_batch_sampling_key_isolates_seeded_and_differing_requests():

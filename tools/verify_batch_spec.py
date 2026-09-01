@@ -49,18 +49,37 @@ tools/verify_batch_cache.py が単体で確認済みの float32 丸め幅 (1.5e-
   QSA が発火しない構成だけを見ている。
 - 温度 > 0 のサンプリングは検証していない (貪欲のみ)。
 
-## スケジューラ (追記 2026-09-01)
+## スケジューラ (追記 2026-09-02、chunked prefill に組み替え)
 
-末尾の ``check_coordinator`` が ``BatchSpecCoordinator`` (--max-batch-spec の
-中身) まで見る。同時 3 本を 1 バッチで回して行ごとの eos / max_tokens で
-順に抜けさせ、残った行の出力が素の貪欲継続と一致すること、および 1 本しか
-無いときに単独経路 (``FlashSpecRunner.generate``) へ落ちて同じ列を返すこと。
+末尾の 4 つがスケジューラ側を見る。どれも「貪欲の投機は出力を変えない」ことを
+使って、素の貪欲継続 (oracle) と突き合わせる。
+
+- ``check_chunked_prefill``: プロンプトを chunk 幅 2/3/一括で流して、どれでも
+  同じ列が出ること。2 回目以降のチャンクは「生きている過去 + 新規列の因果」の
+  マスクで走るので、ここが合えば刻んだ prefill の帳簿・再帰状態の持ち越し・
+  priming 窓の尻尾がそろっている。
+- ``check_join_midflight``: 走行中のバッチに後から行を足しても両方が正しい列を
+  出すこと (0 ラウンド後と 3 ラウンド後 = dead slot が溜まった状態の両方)。
+  **前回「実機でしか確かめられない」として見送った箇所がここ** -- 新入りの KV を
+  走行中の物理列数へ左詰めで揃えたときの RoPE の角度とマスクの整合、再帰系の
+  バッチ軸連結、priming 窓の幅が行ごとに違う場合。
+- ``check_coordinator``: 同時 3 本 (chunk 512 と 2 の両方) と、走行中に 3 本目を
+  投げる場合。行ごとの eos / max_tokens で順に抜けること、走行中の join が
+  実際に起きていること (``coord.joins``)、1 本しか無いときは単独経路
+  (``FlashSpecRunner.generate``) へ落ちること (``coord.solo_runs``)。
+- ``check_preemption``: 空きの見積もりを差し替えて退避を起こし、生成済みを
+  保持したまま復帰した列が oracle と一致すること。
+
+### 実行結果 (記録、2026-09-02、CPU)
+
+全ケース一致。退避は 2 回発生し、退避後の列も oracle と一致した。
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import mlx.core as mx
@@ -361,6 +380,152 @@ def check_generator(model) -> bool:
     return ok
 
 
+def _engine(model):
+    from mlxturbo.mtp_flash import FlashMTPModule
+    from mlxturbo.spec_flash import FlashSpecEngine
+
+    mx.random.seed(0)
+    mtp = FlashMTPModule(model.args.text, variant="lane")
+    mx.eval(mtp.parameters())
+    return FlashSpecEngine(model, mtp)
+
+
+def check_chunked_prefill(model) -> bool:
+    """prefill を刻んでも、一括で流したのと同じ列が出ること。
+
+    `SpecPrefillLane` を chunk 幅 2 で回し、1 個目のトークンと、そこから
+    `BatchSpecGenerator` で続けた列を素の貪欲継続 (oracle) と突き合わせる。
+    2 回目以降のチャンクは「生きている過去 + 新規列の因果」のマスクで走る
+    (`RaggedLedger.next_round_mask`) ので、ここが合っていれば刻んだ prefill の
+    帳簿・再帰状態の持ち越し・priming 窓の尻尾が全部そろっていることになる。
+    """
+    from mlxturbo.batch_spec import BatchSpecGenerator, SpecPrefillLane
+
+    eng = _engine(model)
+    prompt = [3, 11, 27, 5, 9, 41, 8, 17, 2]
+    n = 10
+    ref = oracle_continue(model, mx.array(prompt)[None], n)
+
+    print("\n--- chunked prefill ---")
+    ok = True
+    for chunk in (2, 3, len(prompt)):
+        lane = SpecPrefillLane(eng, prompt)
+        steps = 0
+        while not lane.finished:
+            lane.advance(min(chunk, lane.remaining))
+            steps += 1
+        gen = BatchSpecGenerator.from_prefilled(eng, [lane.result()])
+        while len(gen.out[0]) < n:
+            gen.step()
+        got = gen.out[0][:n]
+        same = got == ref
+        ok &= same
+        print(f"  {'OK' if same else 'NG'} chunk={chunk} ({steps} 回に分割): {n} トークン")
+        if not same:
+            print(f"     want={ref}\n     got ={got}")
+    return ok
+
+
+def check_join_midflight(model) -> bool:
+    """走行中のバッチに後から行を足しても、両方の行が正しい列を出すこと。
+
+    行 0 を数ラウンド走らせてから (物理列が dead slot を含む状態にしてから)
+    行 1 を join する。ここが前回「実機でしか確かめられない」として見送った
+    箇所で、確かめるのは 3 点:
+
+    - 新入りの KV を走行中の物理列数へ左詰めで揃えたときに、RoPE の角度と
+      マスクが食い違わないこと (食い違えば出力がずれる)。
+    - 再帰系 (GDN/PLE/n-gram) をバッチ軸に連結しただけで正しいこと。
+    - priming 窓の幅が行ごとに違っても、MTP のドラフトが壊れないこと
+      (壊れても出力は変わらないが、`_pad` の帳簿が壊れていれば `trim` の
+      基準がずれて落ちる)。
+    """
+    from mlxturbo.batch_spec import BatchSpecGenerator, SpecPrefillLane
+
+    eng = _engine(model)
+    # 長さをわざと変える (priming 窓の幅と物理列数の両方がずれる)
+    prompts = [[3, 11, 27, 5, 9, 41, 8], [7, 2, 19, 33, 4, 15, 22, 6, 31, 12, 45]]
+    n = 12
+    ref = [oracle_continue(model, mx.array(p)[None], n) for p in prompts]
+
+    print("\n--- 走行中の join ---")
+    ok = True
+    for after in (0, 3):
+        lane0 = SpecPrefillLane(eng, prompts[0])
+        while not lane0.finished:
+            lane0.advance(4)
+        gen = BatchSpecGenerator.from_prefilled(eng, [lane0.result()])
+        for _ in range(after):
+            gen.step()
+        lane1 = SpecPrefillLane(eng, prompts[1])
+        while not lane1.finished:
+            lane1.advance(4)
+        gen.join([lane1.result()])
+        while min(len(o) for o in gen.out) < n:
+            gen.step()
+        for b in range(2):
+            got = gen.out[b][:n]
+            same = got == ref[b][:n]
+            ok &= same
+            print(
+                f"  {'OK' if same else 'NG'} {after} ラウンド後に join row{b}:"
+                f" {n} トークン"
+            )
+            if not same:
+                print(f"     want={ref[b][:n]}\n     got ={got}")
+    return ok
+
+
+def check_preemption(model) -> bool:
+    """メモリが足りなくなったら退避し、生成済みを保持したまま復帰すること。
+
+    空きの見積もり (`_free_bytes`) を差し替えて、走り出してから足りなくなる
+    状況を作る。退避された行は「プロンプト + 生成済み」で prefill をやり直す
+    ので、貪欲なら列は変わらないはず -- これが崩れると、退避が「静かに別の
+    文章になる」形で出る。
+    """
+    import concurrent.futures
+
+    from mlxturbo.batch_spec import BatchSpecCoordinator
+    from mlxturbo.runner import FlashSpecRunner, start_batched_spec_generation
+
+    eng = _engine(model)
+    runner = FlashSpecRunner(eng)
+    prompts = [[3, 11, 27, 5, 9, 41, 8], [7, 2, 19, 33, 4, 15, 22]]
+    n = 14
+    ref = [oracle_continue(model, mx.array(p)[None], n) for p in prompts]
+
+    print("\n--- preemption ---")
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        coord = BatchSpecCoordinator(runner, executor, max_batch=4, eos_ids=set(),
+                                     wait_ms=200)
+        calls = [0]
+
+        def room():
+            # 最初は 2 行とも通し、走り出してから 1 行ぶんしか無いことにする
+            calls[0] += 1
+            return 10 ** 12 if calls[0] <= 4 else 1
+        coord._free_bytes = room
+        futures = [
+            start_batched_spec_generation(coord, p, n, 0.0, set(), None, None, None)
+            for p in prompts
+        ]
+        got = [f.result(timeout=300)["tokens"] for f in futures]
+    finally:
+        executor.shutdown(wait=True)
+
+    ok = coord.preemptions > 0
+    print(f"  {'OK' if ok else 'NG'} 退避が起きた: {coord.preemptions} 回")
+    for b in range(2):
+        same = got[b] == ref[b]
+        ok &= same
+        print(f"  {'OK' if same else 'NG'} row{b}: {len(got[b])} トークン")
+        if not same:
+            print(f"     want={ref[b]}\n     got ={got[b]}")
+    return ok
+
+
 def check_coordinator(model) -> bool:
     """`BatchSpecCoordinator` (サーバー配線側のスケジューラ) の検査。
 
@@ -401,19 +566,35 @@ def check_coordinator(model) -> bool:
 
     print("\n--- BatchSpecCoordinator ---")
     ok = True
-    for label, max_tokens_list in (("同時 3 本", [12, 7, 12]), ("単独 1 本", [9])):
+    cases = (
+        # (ラベル, max_tokens, 3 本目を後から投げるか, chunk 幅)
+        ("同時 3 本", [12, 7, 12], False, 512),
+        ("同時 3 本 (chunk 2)", [12, 7, 12], False, 2),
+        ("走行中に 3 本目", [12, 7, 12], True, 2),
+        ("単独 1 本", [9], False, 512),
+    )
+    for label, max_tokens_list, staggered, chunk in cases:
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
             coord = BatchSpecCoordinator(
-                runner, executor, max_batch=4, eos_ids=eos, wait_ms=200
+                runner, executor, max_batch=4, eos_ids=eos, wait_ms=200,
+                prefill_chunk=chunk,
             )
-            futures = [
-                start_batched_spec_generation(
-                    coord, prompts[b], mt, 0.0, eos, None, None, None
+
+            def submit(b):
+                return start_batched_spec_generation(
+                    coord, prompts[b], max_tokens_list[b], 0.0, eos, None, None, None
                 )
-                for b, mt in enumerate(max_tokens_list)
-            ]
+
+            n_first = len(max_tokens_list) - 1 if staggered else len(max_tokens_list)
+            futures = [submit(b) for b in range(n_first)]
+            if staggered:
+                # 先の 2 本が走り出したところに 3 本目を入れる。join に間に
+                # 合わなければ次のバッチで走るだけで、出す列は変わらない
+                time.sleep(0.05)
+                futures.append(submit(len(max_tokens_list) - 1))
             got = [f.result(timeout=300)["tokens"] for f in futures]
+            joins, solos = coord.joins, coord.solo_runs
         finally:
             executor.shutdown(wait=True)
         for b, mt in enumerate(max_tokens_list):
@@ -423,6 +604,12 @@ def check_coordinator(model) -> bool:
             print(f"  {'OK' if same else 'NG'} {label} row{b}: {len(got[b])} トークン")
             if not same:
                 print(f"     want={want}\n     got ={got[b]}")
+        print(f"     走行中の join {joins} 回 / 単独経路 {solos} 回")
+        if len(max_tokens_list) == 1:
+            # 1 本しか無いときはバッチ機構に触らせない (B=1 無劣化の線)
+            ok &= joins == 0 and solos == 1
+        else:
+            ok &= joins > 0
     return ok
 
 
@@ -490,7 +677,10 @@ def main():
                     ok &= _report(f"layer{i} ngram.ctx", c_solo[3], c_batch[3][b : b + 1])
 
     ok &= check_generator(model)
+    ok &= check_chunked_prefill(model)
+    ok &= check_join_midflight(model)
     ok &= check_coordinator(model)
+    ok &= check_preemption(model)
 
     print("\n=== 全ケース一致 ===" if ok else "\n=== 不一致あり ===")
     return 0 if ok else 1

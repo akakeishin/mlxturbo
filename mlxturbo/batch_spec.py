@@ -54,8 +54,9 @@ QSA のブロック選択は絶対列位置で切られる。dead slot を挟ん
 ## サーバー配線
 
 このファイルの末尾「coordinator」節にある (``--max-batch-spec``)。admission と
-スケジューラの決めごと 4 点はそこに書いてある。走行中のバッチに後から行を
-足すことだけはやっていない (理由も同じ節)。
+スケジューラの決めごとはそこに書いてある。スケジューラは 1 ステップに
+トークン予算を 1 つ持つ chunked prefill 方式で、走行中のバッチにも後から行を
+足す (``SpecPrefillLane`` -> ``BatchSpecGenerator.join``)。
 
 ## 未対応 (このモジュールの範囲外)
 
@@ -147,7 +148,7 @@ class RaggedLedger:
         位置は ``valid_len + arange(T)``) と mask 生成の両方に使う。"""
         return mx.array(self._valid_len)
 
-    def next_round_mask(self, T: int) -> mx.array:
+    def next_round_mask(self, T: int, lens: "mx.array | None" = None) -> mx.array:
         """次に足す T 列を含めた bool マスク (B, 1, T, L+T) を返す。
         True = 見える。
 
@@ -156,6 +157,11 @@ class RaggedLedger:
             ラウンドをまたいで恒久的に不可視)
           - 今回の新規 T 列: 通常の因果マスク (verify 対象の T+1 列同士は
             まだ受理/棄却が決まっていないので、単純な下三角)
+
+        ``lens`` を渡すと、新規 T 列のうち行 b の実長 ``lens[b]`` より後ろも
+        落とす (右パディングで流す prefill 用)。過去のブロックは同じ式のまま
+        なので、**チャンクに刻んだ prefill** (2 回目以降は過去がある) も
+        この 1 本で表せる。
         """
         B, L = self.B, self.L
         if L:
@@ -163,15 +169,20 @@ class RaggedLedger:
             prev = mx.broadcast_to(prev[:, None, :], (B, T, L))
         else:
             prev = mx.zeros((B, T, 0), dtype=mx.bool_)
-        causal = mx.arange(T)[None, :] <= mx.arange(T)[:, None]  # (T, T)
-        new = mx.broadcast_to(causal[None], (B, T, T))
+        cols = mx.arange(T)
+        causal = cols[None, :] <= cols[:, None]  # (T, T)
+        if lens is None:
+            new = mx.broadcast_to(causal[None], (B, T, T))
+        else:
+            valid = cols[None, :] < lens[:, None]  # (B, T)
+            new = causal[None] & valid[:, None, :]
         return mx.concatenate([prev, new], axis=-1)[:, None]
 
     def round_mask(self, T: int) -> mx.array:
         """このラウンドのフォワードに渡す bool マスク (B, 1, T, L+T)。
 
-        prefill 中 (``prefill_lengths`` が立っている) は、まだ過去が無く、
-        右パディングを隠す必要があるので「因果 かつ 実長より手前」。
+        prefill 中 (``prefill_lengths`` が立っている) は右パディングを隠す
+        必要があるので「生きている過去 かつ (因果 かつ 実長より手前)」。
         それ以外は ``next_round_mask``。
 
         同じラウンドの中では帳簿が動かないので、T ごとに 1 回だけ作って
@@ -183,11 +194,7 @@ class RaggedLedger:
         if self._prefill_lengths is None:
             out = self.next_round_mask(T)
         else:
-            lens = mx.array(self._prefill_lengths)
-            cols = mx.arange(T)
-            causal = cols[None, :] <= cols[:, None]  # (T, T)
-            valid = cols[None, :] < lens[:, None]  # (B, T)
-            out = (causal[None] & valid[:, None, :])[:, None]
+            out = self.next_round_mask(T, mx.array(self._prefill_lengths))
         self._mask_memo[T] = out
         return out
 
@@ -203,6 +210,34 @@ class RaggedLedger:
             self._alive[b].extend([True] * keep + [False] * (total - keep))
             self._valid_len[b] += keep
         self.L += total
+        self._invalidate()
+
+    def extend_rows(self, new_valid: list[int], new_L: int) -> None:
+        """走行中のバッチに行を足す (帳簿側)。
+
+        物理列数を ``new_L`` にそろえてから、論理長 ``new_valid[j]`` の行を
+        末尾に足す。足りない列は**左側**に dead として付ける -- ``compact()``
+        が作る形 (``[False]*(new_L - valid) + [True]*valid``) と同じなので、
+        キャッシュ側も左詰めのゼロ埋めで揃えればよい (``RaggedAttnCache.
+        extend_rows``)。既存の行も ``new_L`` に届かなければ左に伸ばす
+        (新入りの方が長いとき)。
+
+        RoPE の位置は ``_valid_len`` から引くので、左に何列足しても回転は
+        動かない -- 物理列の番号は attention の可視性にしか使っていない。
+        """
+        grow = new_L - self.L
+        if grow < 0:
+            raise ValueError(f"new_L={new_L} は現在の L={self.L} より小さい")
+        if grow:
+            for b in range(self.B):
+                self._alive[b] = [False] * grow + self._alive[b]
+        for v in new_valid:
+            if not 0 <= v <= new_L:
+                raise ValueError(f"論理長 {v} が物理列数 {new_L} に収まらない")
+            self._alive.append([False] * (new_L - v) + [True] * v)
+            self._valid_len.append(v)
+        self.L = new_L
+        self.B = len(self._alive)
         self._invalidate()
 
     def compact(self, model, caches) -> None:
@@ -310,6 +345,47 @@ class RaggedAttnCache:
         if self.indexer.keys is not None:
             self.indexer.keys = mx.contiguous(self.indexer.keys[idx])
 
+    def extend_rows(self, others: list["RaggedAttnCache"], new_L: int) -> None:
+        """``others`` の行を軸 0 に足す。列は ``new_L`` へ**左詰め**で揃える。
+
+        新入りの KV は自分の実位置で回転済みなので、左にゼロ列を足しても
+        回転は動かない。足したゼロ列は帳簿側が dead として恒久的に隠す
+        (``RaggedLedger.extend_rows``) ので、値そのものは読まれない。
+        列位置に意味を持たせているのは QSA だけで、そちらはこのモジュールの
+        対象外 (``ragged_attention`` が ``NotImplementedError`` で止める)。
+        """
+        self.keys = _cat_left_padded([self] + others, "keys", new_L, axis=2)
+        self.values = _cat_left_padded([self] + others, "values", new_L, axis=2)
+        idx = [c.indexer for c in [self] + others]
+        if any(c.keys is not None for c in idx):
+            self.indexer.keys = _cat_left_padded(idx, "keys", new_L, axis=1)
+
+
+def _pad_left(arr: mx.array, pad: int, axis: int) -> mx.array:
+    if pad <= 0:
+        return arr
+    spec = [(0, 0)] * arr.ndim
+    spec[axis] = (pad, 0)
+    return mx.pad(arr, spec)
+
+
+def _cat_left_padded(caches: list, attr: str, width: int, axis: int) -> mx.array:
+    """``caches`` の ``attr`` を ``axis`` 方向に ``width`` 列へ左詰めしてから
+    軸 0 で連結する。
+
+    片方だけ空のキャッシュは受けない -- 同じモデルで prefill を通った行なら
+    埋まっているかどうかは必ずそろうので、そろっていなければ帳簿とキャッシュ
+    のどちらかが壊れている。黙ってゼロで埋めると、そのずれが「たまに品質が
+    落ちる」形で出て追えなくなる。
+    """
+    parts = []
+    for c in caches:
+        arr = getattr(c, attr)
+        if arr is None:
+            raise ValueError(f"join する行の {attr} が空 (キャッシュの不整合)")
+        parts.append(_pad_left(arr, width - arr.shape[axis], axis))
+    return mx.contiguous(mx.concatenate(parts, axis=0))
+
 
 class RaggedDraftCache:
     """MTP ドラフト用のバッチ KV キャッシュ。行ごとの論理位置を持つ。
@@ -334,6 +410,12 @@ class RaggedDraftCache:
         # そろうので、行ごとのずれは生じない。配列で持つのは
         # `Attention._positions` のシームが (B,) を期待するからで、
         # 単一系列と同じ角度になる。
+        #
+        # 走行中の join (`extend_rows`) だけは、priming 窓の幅が行ごとに違う
+        # ので列数がそろわない。そのときは短い側を**左**にゼロで詰め、
+        # 詰めた列数を `_pad` に持って mask で隠す。base は `-pad` になるので
+        # 論理位置 (offset) は詰める前と同じまま。
+        self._pad = [0] * batch_size
         self._base = mx.zeros(batch_size, dtype=mx.int32)
         self.indexer = _arch()._IndexerCache()
 
@@ -353,14 +435,23 @@ class RaggedDraftCache:
         return self._base + self.size()
 
     def round_mask(self, T: int):
-        """全列が実データなので、必要なのは新規 T 列どうしの因果性だけ。
-        T==1 (ドラフトは 1 段ずつ) なら mask 自体が要らない。"""
-        if T == 1:
+        """必要なのは新規 T 列どうしの因果性と、join で左に詰めた列を隠すこと。
+
+        詰めていない (`_pad` が全部 0) ときは全列が実データなので、T==1
+        (ドラフトは 1 段ずつ) なら mask 自体が要らない -- join を使わない
+        経路では以前と 1 ビットも変わらない。
+        """
+        padded = any(self._pad)
+        if T == 1 and not padded:
             return None
         total = self.size()
         cols = mx.arange(total)
         q = total - T + mx.arange(T)
-        return (cols[None, :] <= q[:, None])[None, None]
+        causal = cols[None, :] <= q[:, None]  # (T, total)
+        if not padded:
+            return causal[None, None]
+        live = cols[None, :] >= mx.array(self._pad)[:, None]  # (B, total)
+        return (causal[None] & live[:, None, :])[:, None]
 
     def trim(self, n: int) -> int:
         """末尾 n 列を落とす。
@@ -390,7 +481,56 @@ class RaggedDraftCache:
             self.values = mx.contiguous(self.values[idx])
         if self.indexer.keys is not None:
             self.indexer.keys = mx.contiguous(self.indexer.keys[idx])
+        rows = idx.tolist()
+        self._pad = [self._pad[b] for b in rows]
         self._base = self._base[idx]
+
+    def extend_rows(self, others: list["RaggedDraftCache"]) -> None:
+        """``others`` の行を軸 0 に足す (走行中の join)。
+
+        列数は行ごとに「priming 窓 + 消化したラウンド数」なので、新入りと
+        走行中でそろわない。長い方に合わせて短い方を**左**にゼロで詰め、
+        詰めた列数を ``_pad`` に足して mask で隠す。位置は詰める前のまま
+        (base を同じだけ下げる) なので、ヘッドから見た角度は動かない。
+
+        ここが多少ずれても**出力は変わらない** -- このキャッシュはドラフトを
+        引くためだけのもので、出すトークンは本体の検証フォワードの logits から
+        来る (`FlashSpecEngine._prime_draft_cache` の注記)。ずれるのは受理率
+        だけ。それでも隠すのは、ゼロ列を見に行かせる理由が無いから。
+        """
+        caches = [self] + list(others)
+        sizes = [c.size() for c in caches]
+        n = max(sizes)
+        # 詰める列数は「連結する前」の列数から決める (self は下で書き換わる)
+        pads = [
+            [p + (n - s) for p in c._pad] for c, s in zip(caches, sizes)
+        ]
+        if n:
+            self.keys = _cat_left_padded(caches, "keys", n, axis=2)
+            self.values = _cat_left_padded(caches, "values", n, axis=2)
+            idx = [c.indexer for c in caches]
+            if any(c.keys is not None for c in idx):
+                self.indexer.keys = _cat_left_padded(idx, "keys", n, axis=1)
+        self._pad = [p for row in pads for p in row]
+        self._base = mx.array([-p for p in self._pad], dtype=mx.int32)
+
+
+def _extend_arrays_rows(dst, srcs: list) -> None:
+    """``ArraysCache`` (GDN/PLE/n-gram) の行を軸 0 に足す。
+
+    ``ArraysCache.extend`` を使わないのは、あちらが空スロットをゼロで埋める
+    ため -- ここでは埋まり方がそろっていないこと自体が不整合なので、
+    ``_cat_left_padded`` と同じ理由で黙って通さない。列を持たない固定サイズの
+    状態 (GDN の再帰状態と conv 窓、PLE の conv 窓、n-gram の直前文脈) だけ
+    なので、そろえる作業は要らない。
+    """
+    for j in range(len(dst.cache)):
+        parts = [dst.cache[j]] + [s.cache[j] for s in srcs]
+        if all(p is None for p in parts):
+            continue
+        if any(p is None for p in parts):
+            raise ValueError(f"join する行の再帰状態 slot{j} がそろっていない")
+        dst.cache[j] = mx.contiguous(mx.concatenate(parts, axis=0))
 
 
 def make_ragged_cache(model, batch_size: int):
@@ -546,43 +686,59 @@ def batched_rollback(model, caches, cap, keeps: list[int], pre_ctx=None, pair=No
     )
 
 
-# ------------------------------------------------------------ admission
-
-
-def bucket_batches(
-    lengths: list[int], max_batch: int, max_ratio: float = 1.5
-) -> list[list[int]]:
-    """待っているリクエストを、長さの近いものだけでバッチにまとめる。
-
-    右パディングの無駄は行ごとに ``max_len - len`` 列で、そこは dead slot と
-    同じく**計算はするが使わない**。長さ比が開くほど無駄が増えるので、
-    バッチ内の最長/最短が ``max_ratio`` を超えるものは別バッチに割る。
-
-    引数は長さのリスト、返り値は元の添字のリストのリスト (入力順は保つ)。
-    長さでソートしてから詰めるので、隣り合う長さが同じバッチに入る。
-
-    ``max_ratio`` の既定 1.5 は**未測**。無駄列の割合の上限がおよそ
-    1 - 1/1.5 = 33% になる値として置いた。スループットを測ってから詰める。
-    """
-    if max_batch < 1:
-        raise ValueError("max_batch は 1 以上")
-    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
-    out: list[list[int]] = []
-    cur: list[int] = []
-    for i in order:
-        if cur and (
-            len(cur) >= max_batch
-            or lengths[i] > lengths[cur[0]] * max_ratio
-        ):
-            out.append(cur)
-            cur = []
-        cur.append(i)
-    if cur:
-        out.append(cur)
-    return out
-
-
 # ------------------------------------------------------------ generator
+
+
+def sample_positions(lg: mx.array, temp: float, sampler) -> mx.array:
+    """logits (B, S, vocab) から各位置のトークン (B, S) を引く。
+
+    ``FlashSpecEngine._verify`` / ``_sample`` の B 行版。貪欲のときは以前と
+    同じ ``mx.argmax`` をそのまま通る。**バッチ内の全行が同じサンプラーを
+    共有する**前提 (1 回の呼び出しで全行ぶんを引く) なので、パラメータの
+    違う要求を同じバッチに入れてはいけない -- admission 側の責務
+    (``BatchSpecCoordinator._sampling_key``)。
+
+    chunked prefill の車線 (``SpecPrefillLane``) も 1 個目のトークンをこれで
+    引く -- 単独経路とバッチ経路でサンプリングの形をずらさないため。
+    """
+    if sampler is None and temp <= 0:
+        return mx.argmax(lg, axis=-1)
+    b, s, v = lg.shape
+    flat = lg.reshape(b * s, v)
+    if sampler is not None:
+        return sampler(flat).reshape(b, s)
+    return mx.random.categorical(flat.astype(mx.float32) / temp).reshape(b, s)
+
+
+def prime_draft_rows(eng, ids: mx.array, hyper: mx.array, lengths: list[int], w: int):
+    """MTP ヘッドに各行の末尾 w 対を流した ``RaggedDraftCache`` を返す。
+
+    ``ids`` (B, L) と ``hyper`` (B, L, H) は同じ位置をそろえて渡すこと。
+    行 b が使うのはトークン位置 ``n_b-w .. n_b-1`` と、その 1 つ前の hyper
+    (``FlashSpecEngine._prime_draft_cache`` の対の取り方と同じ)。幅 w は全行
+    そろえる -- MTP ヘッドの位置は priming 窓の先頭からの相対なので、幅が
+    そろえば行の意味もそろう。
+    """
+    B = len(lengths)
+    cache = RaggedDraftCache(B)
+    if w < 1:
+        return cache
+    tok_idx = [[n - w + j for j in range(w)] for n in lengths]
+    hyp_idx = [[n - w - 1 + j for j in range(w)] for n in lengths]
+    toks = mx.take_along_axis(ids, mx.array(tok_idx), axis=1)
+    hy = mx.take_along_axis(
+        hyper,
+        mx.broadcast_to(mx.array(hyp_idx)[..., None], (B, w, hyper.shape[2])),
+        axis=1,
+    )
+    embeds = eng.model.model.embed_tokens(toks)
+    with ragged_attention():
+        # mask は渡さない。`ragged_attention` の `_final_mask` が
+        # `cache.round_mask` で組み直すので、ここで作っても捨てられる
+        # (しかも update_and_fetch の前なので列数が 0 の壊れた形になる)
+        out = eng.mtp(embeds, hy, eng.rope, None, cache, cache.indexer)
+        mx.eval(out)
+    return cache
 
 
 class BatchSpecGenerator:
@@ -661,18 +817,8 @@ class BatchSpecGenerator:
         self._mtp_cache = None
 
     def _sample_rows(self, lg: mx.array) -> mx.array:
-        """検証フォワードの logits (B, S, vocab) から各位置のトークン (B, S)。
-
-        ``FlashSpecEngine._verify`` / ``_sample`` の B 行版。貪欲のときは
-        以前と同じ ``mx.argmax`` をそのまま通る。
-        """
-        if self.sampler is None and self.temp <= 0:
-            return mx.argmax(lg, axis=-1)
-        b, s, v = lg.shape
-        flat = lg.reshape(b * s, v)
-        if self.sampler is not None:
-            return self.sampler(flat).reshape(b, s)
-        return mx.random.categorical(flat.astype(mx.float32) / self.temp).reshape(b, s)
+        """検証フォワードの logits (B, S, vocab) から各位置のトークン (B, S)。"""
+        return sample_positions(lg, self.temp, self.sampler)
 
     # ---- prefill ----------------------------------------------------
 
@@ -716,34 +862,93 @@ class BatchSpecGenerator:
 
     def _prime(self, hyper: mx.array) -> None:
         """MTP ヘッドに各行の末尾 w 対を流す (幅は全行そろえる)。"""
-        w = self.prime_window
-        cache = RaggedDraftCache(self.B)
-        if w < 1:
-            self._mtp_cache = cache
-            return
-        # 行 b: トークン位置 n_b-w .. n_b-1 と、その 1 つ前の hyper
-        tok_idx = [[n - w + j for j in range(w)] for n in self.lengths]
-        hyp_idx = [[n - w - 1 + j for j in range(w)] for n in self.lengths]
-        toks = mx.take_along_axis(self.ids, mx.array(tok_idx), axis=1)
-        hy = mx.take_along_axis(
-            hyper,
-            mx.broadcast_to(mx.array(hyp_idx)[..., None], (self.B, w, hyper.shape[2])),
-            axis=1,
+        self._mtp_cache = prime_draft_rows(
+            self.eng, self.ids, hyper, self.lengths, self.prime_window
         )
-        embeds = self.model.model.embed_tokens(toks)
-        with ragged_attention():
-            # mask は渡さない。`ragged_attention` の `_final_mask` が
-            # `cache.round_mask` で組み直すので、ここで作っても捨てられる
-            # (しかも update_and_fetch の前なので列数が 0 の壊れた形になる)
-            out = self.eng.mtp(
-                embeds, hy, self.eng.rope, None, cache, cache.indexer
-            )
-            mx.eval(out)
-        self._mtp_cache = cache
+
+    # ---- 走行中の join -----------------------------------------------
+
+    @classmethod
+    def from_prefilled(cls, engine, rows: list, temp: float = 0.0, sampler=None):
+        """chunked prefill を終えた行 (``PrefilledRow``) からバッチを起こす。
+
+        1 行目のキャッシュと帳簿を**そのまま引き取る** -- 車線
+        (``SpecPrefillLane``) は最初からこのクラスと同じ
+        ``make_ragged_cache`` で組んであるので、作り直す理由が無い。2 行目
+        以降は ``join`` に回す。
+        """
+        if not rows:
+            raise ValueError("rows が空")
+        first, rest = rows[0], rows[1:]
+        self = cls.__new__(cls)
+        self.eng = engine
+        self.model = engine.model
+        self.B = 1
+        self.depth = engine.depth
+        self.temp = float(temp)
+        self.sampler = sampler
+        self.lengths = [first.length]
+        self.L = first.length
+        self.ids = None  # 一括 prefill を通らないので持たない
+        self.caches, self.ledger = first.caches, first.ledger
+        self.prime_window = first.window
+        self.out = [[first.first_token]]
+        self.rounds = 0
+        self.accepted = 0
+        self._cur = first.cur
+        self._hyper_prev = first.hyper_prev
+        self._mtp_cache = first.mtp_cache
+        if rest:
+            self.join(rest)
+        return self
+
+    def join(self, rows: list) -> None:
+        """走行中のバッチに、prefill を終えた行を足す。
+
+        新入りの KV は自分の実位置で回転済みの ``(1, H, P, D)``、走行中は
+        ``(B, H, L, D)`` で、P と L はそろっていない。そろえ方は
+        ``compact()`` が作る形と同じ「**左詰め**、足りない列は dead」:
+
+        - 物理列数を ``max(L, max P)`` に取り、短い側を左にゼロで詰める
+          (``RaggedAttnCache.extend_rows``)。
+        - 帳簿は行ごとに ``[False]*(new_L - valid) + [True]*valid``
+          (``RaggedLedger.extend_rows``)。以後のマスクがゼロ列を隠す。
+        - RoPE の位置は ``_valid_len`` から引くので、左に何列足しても回転は
+          動かない。物理列の番号を見ているのは QSA だけで、そちらはこの
+          モジュールの対象外。
+        - 再帰系 (GDN/PLE/n-gram) は列を持たない固定サイズの状態なので、
+          バッチ軸に連結するだけ。
+        - MTP のドラフトキャッシュは列数がそろわないので、同じく左詰め
+          (``RaggedDraftCache.extend_rows``)。
+
+        先に ``compact()`` を通して dead slot を落としてから足す。新入りに
+        走行中の無駄を相続させない、というだけでなく、``new_L`` が小さくなる
+        ぶん join そのものの pad も減る。
+        """
+        if not rows:
+            return
+        if self.ledger.L > self.ledger.max_valid_len():
+            self.ledger.compact(self.model, self.caches)
+        new_L = max([self.ledger.L] + [r.length for r in rows])
+        for i, layer in enumerate(self.model.model.layers):
+            src = [r.caches[i] for r in rows]
+            if layer.layer_type == "full_attention":
+                self.caches[i].extend_rows(src, new_L)
+            else:
+                _extend_arrays_rows(self.caches[i], src)
+        self.ledger.extend_rows([r.length for r in rows], new_L)
+        self._mtp_cache.extend_rows([r.mtp_cache for r in rows])
+        self._cur = mx.concatenate([self._cur] + [r.cur for r in rows], axis=0)
+        self._hyper_prev = mx.concatenate(
+            [self._hyper_prev] + [r.hyper_prev for r in rows], axis=0
+        )
+        self.lengths = self.lengths + [r.length for r in rows]
+        self.out = self.out + [[r.first_token] for r in rows]
+        self.B = len(self.out)
 
     # ---- rounds -----------------------------------------------------
 
-    def step(self, truncate=None) -> list[list[int]]:
+    def step(self, truncate=None, depth: int | None = None) -> list[list[int]]:
         """1 ラウンド進めて、行ごとの新規トークンを返す。
 
         ``truncate`` (省略可) は ``(b, toks) -> 残す個数 (1 以上)``。eos や
@@ -752,15 +957,26 @@ class BatchSpecGenerator:
         で ``vals`` を切り詰めてから ``rollback(keep=len(vals))`` を呼ぶのと
         同じ形 -- 打ち切った分は受理しなかったことにするので、キャッシュと
         出力が食い違わない。
+
+        ``depth`` (省略可) はこのラウンドだけのドラフト数。スケジューラが
+        矩形 ``B*(1+k)`` とトークン予算に合わせて毎ラウンド決める
+        (``BatchSpecCoordinator._round_depth``)。``0`` を渡すとドラフトを
+        引かない素の decode になる -- そのラウンドはドラフトキャッシュに
+        1 列も足さないので、ヘッドから見た履歴に穴が 1 つ空く。受理率が
+        少し動くだけで、出す**トークンは変わらない** (出力は本体の検証
+        フォワードの logits から来る)。
         """
         from .spec_flash import _staged_forward
 
         eng = self.eng
-        with ragged_attention():
-            drafts = eng._draft_chain(
-                self._cur, self._hyper_prev, self._mtp_cache, self.depth
-            )
-        pair = mx.concatenate([self._cur] + drafts, axis=1)
+        d = self.depth if depth is None else max(0, depth)
+        drafts = []
+        if d:
+            with ragged_attention():
+                drafts = eng._draft_chain(
+                    self._cur, self._hyper_prev, self._mtp_cache, d
+                )
+        pair = mx.concatenate([self._cur] + drafts, axis=1) if drafts else self._cur
         total = pair.shape[1]
         pre_ctx = snapshot_pre_ctx(self.model, self.caches)
         with batched_capture(self.model) as cap:
@@ -770,11 +986,15 @@ class BatchSpecGenerator:
             # 単独に負ける (実測 0.82x)。計算内容は同じ。
             lg = _staged_forward(self.model, pair, self.caches)
             nxt = self._sample_rows(lg)            # (B, T+1)
-            dv = mx.concatenate(drafts, axis=1)   # (B, T)
-            mx.eval(nxt, dv, cap.hyper)
+            dv = mx.concatenate(drafts, axis=1) if drafts else None  # (B, T)
+            if dv is None:
+                mx.eval(nxt, cap.hyper)
+            else:
+                mx.eval(nxt, dv, cap.hyper)
         self.rounds += 1
 
-        nxt_l, dv_l = nxt.tolist(), dv.tolist()
+        nxt_l = nxt.tolist()
+        dv_l = dv.tolist() if dv is not None else [[]] * self.B
         keeps, new = [], []
         for b in range(self.B):
             hit = 0
@@ -809,7 +1029,9 @@ class BatchSpecGenerator:
         """
         if len(rows) == self.B:
             return
-        idx = mx.array(rows)
+        # 空の list をそのまま渡すと float32 の配列になって gather が落ちる
+        # (全行が同じラウンドで終わる / 最後の 1 行を退避する場合に通る)
+        idx = mx.array(rows, dtype=mx.int32)
         for c in self.caches:
             if hasattr(c, "ledger"):
                 c.filter_rows(idx)
@@ -826,7 +1048,12 @@ class BatchSpecGenerator:
         self._hyper_prev = self._hyper_prev[idx]
         self.B = len(rows)
 
-    def maybe_compact(self, hard_limit: int | None = None, waste_ratio: float = 1.5) -> bool:
+    def maybe_compact(
+        self,
+        hard_limit: int | None = None,
+        waste_ratio: float = 1.5,
+        depth: int | None = None,
+    ) -> bool:
         """dead slot が溜まってきたら詰める。詰めたら True。
 
         2 つの理由で呼ぶ:
@@ -842,9 +1069,10 @@ class BatchSpecGenerator:
           丸ごと無駄になる。
         """
         valid = self.ledger.max_valid_len()
+        d = self.depth if depth is None else max(0, depth)
         need = (
             hard_limit is not None
-            and self.ledger.L + self.depth + 1 > hard_limit
+            and self.ledger.L + d + 1 > hard_limit
         ) or (valid and self.ledger.L > valid * waste_ratio)
         if not need or self.ledger.L <= valid:
             return False
@@ -859,6 +1087,145 @@ class BatchSpecGenerator:
         return [o[:max_tokens] for o in self.out]
 
 
+# ------------------------------------------------------- chunked prefill
+
+
+class PrefilledRow:
+    """prefill を終えて、走行中のバッチに入れる用意ができた 1 行。
+
+    ``BatchSpecGenerator.join`` / ``from_prefilled`` がそのまま受ける形で、
+    中身は「1 行ぶんのキャッシュ一式 + 1 個目のトークン + 直前の hyper +
+    priming 済みの MTP ドラフトキャッシュ」。
+    """
+
+    __slots__ = (
+        "caches", "ledger", "length", "window",
+        "first_token", "cur", "hyper_prev", "mtp_cache",
+    )
+
+    def __init__(self, caches, ledger, length, window, first_token, cur,
+                 hyper_prev, mtp_cache):
+        self.caches = caches
+        self.ledger = ledger
+        self.length = length
+        self.window = window
+        self.first_token = first_token
+        self.cur = cur
+        self.hyper_prev = hyper_prev
+        self.mtp_cache = mtp_cache
+
+
+class SpecPrefillLane:
+    """1 本の要求のプロンプトを刻んで流す prefill 車線 (chunked prefill)。
+
+    スケジューラは 1 ステップのトークン予算を、走行中の decode ラウンドと
+    この車線で分け合う (``BatchSpecCoordinator._step``)。**フェーズを分けない**
+    のが要点で、prefill が終わるまで decode を止めない代わりに、prefill も
+    1 ステップで食う量が ``chunk`` に抑えられる。
+
+    ## 1 行ずつなのはなぜか
+
+    行を並べて刻む (B_p 行 x chunk の矩形) 形にはしていない。MLX のフォワードは
+    矩形なので、1 ステップに違うトークン数の行を混ぜると全行が最大幅ぶんの
+    計算を払う -- decode の行 (1+k 列) を 512 列の prefill と同じ矩形に入れた
+    時点で、decode が 512 列ぶんを払う。だから 1 ステップは「decode の矩形」と
+    「prefill の矩形」の 2 回に分かれ、prefill 側を複数行にしても
+    (右パディングの無駄を別にすれば) FLOP は減らない。減るのはディスパッチ
+    回数だけで、prefill は元から計算律速なので取り分が無い。1 行なら右
+    パディングも dead slot も生じないので、帳簿は「全列 alive」のまま済む。
+
+    ## 刻んでも結果が変わらない根拠
+
+    2 回目以降のチャンクのマスクは「生きている過去 + 新規 T 列の因果」で、
+    これは ``RaggedLedger.next_round_mask`` そのもの。再帰系は元から状態を
+    持ち越して進む (単独経路の ``generate_stream`` も
+    ``PREFILL_STEP_SIZE`` 幅で刻んでいる)。チャンク境界で変わるのは浮動小数の
+    まとめ方だけ。
+    """
+
+    def __init__(self, engine, prompt_ids: list[int], temp: float = 0.0, sampler=None):
+        from .spec_flash import PRIME_WINDOW
+
+        if len(prompt_ids) < 2:
+            raise ValueError("プロンプトは 2 トークン以上 (priming に 1 対要る)")
+        self.eng = engine
+        self.model = engine.model
+        self.ids = list(prompt_ids)
+        self.pos = 0
+        self.temp = float(temp)
+        self.sampler = sampler
+        self.caches, self.ledger = make_ragged_cache(self.model, 1)
+        # priming に要るのは末尾 w+1 対だけ。チャンクをまたいで hyper の
+        # 尻尾だけを持ち回る (単独経路の HYPER_KEEP_CHUNKS と同じ狙い)
+        self._keep = min(PRIME_WINDOW + 1, len(self.ids))
+        self._hyper_tail = None
+        self._row = None
+
+    @property
+    def remaining(self) -> int:
+        return len(self.ids) - self.pos
+
+    @property
+    def finished(self) -> bool:
+        return self._row is not None
+
+    def result(self) -> PrefilledRow:
+        if self._row is None:
+            raise RuntimeError("まだ prefill が終わっていない")
+        return self._row
+
+    def advance(self, n: int) -> None:
+        """次の ``n`` トークンを流す。最後のチャンクなら ``result()`` が揃う。"""
+        from .spec_flash import capture
+
+        n = max(1, min(int(n), self.remaining))
+        last = self.remaining == n
+        chunk = mx.array(self.ids[self.pos : self.pos + n])[None]
+        logits = None
+        # light=True: 幅がチャンク幅まで伸びるので、rollback 用の states_all を
+        # 取ると macOS の memorystatus killer に消される (capture の docstring)
+        with ragged_attention(), capture(self.model, light=True) as cap:
+            if last:
+                logits = self.model(chunk, cache=self.caches)
+                mx.eval(logits, cap.hyper)
+            else:
+                # 途中のチャンクは lm_head を通す理由が無い (単独経路の
+                # generate_stream も同じ切り方)
+                mx.eval(self.model.model(chunk, cache=self.caches), cap.hyper)
+        self.ledger.commit_round([n], n)
+        self.pos += n
+        self._push_hyper(cap.hyper)
+        if last:
+            self._finish(logits)
+
+    def _push_hyper(self, hyper: mx.array) -> None:
+        if self._hyper_tail is None:
+            self._hyper_tail = hyper
+        else:
+            self._hyper_tail = mx.concatenate([self._hyper_tail, hyper], axis=1)
+        if self._hyper_tail.shape[1] > self._keep:
+            self._hyper_tail = mx.contiguous(self._hyper_tail[:, -self._keep :])
+
+    def _finish(self, logits: mx.array) -> None:
+        first = sample_positions(logits[:, -1:], self.temp, self.sampler)
+        mx.eval(first)
+        m = self._hyper_tail.shape[1]
+        toks = mx.array(self.ids[-m:])[None]
+        # w は一括 prefill 側と同じ式 (min(PRIME_WINDOW, プロンプト長-1))。
+        # 尻尾を w+1 対ぶん持っているので m-1 がそれに一致する
+        mtp = prime_draft_rows(self.eng, toks, self._hyper_tail, [m], m - 1)
+        self._row = PrefilledRow(
+            caches=self.caches,
+            ledger=self.ledger,
+            length=len(self.ids),
+            window=m - 1,
+            first_token=int(first[0, 0].item()),
+            cur=first,
+            hyper_prev=mx.contiguous(self._hyper_tail[:, -1:]),
+            mtp_cache=mtp,
+        )
+
+
 # ------------------------------------------------------------- coordinator
 #
 # 上の部品をサーバーに配線する層 (--max-batch-spec)。形は
@@ -868,44 +1235,88 @@ class BatchSpecGenerator:
 # だけ -- あちらは mlx_lm の BatchGenerator (投機なし)、こちらは上の
 # BatchSpecGenerator (MTP 投機つき)。
 #
-# ## 決めたこと 4 点 (依頼の admission / スケジューラの論点)
+# ## スケジューラ: 1 ステップに予算 1 つ (chunked prefill)
 #
-# 1. まとめる条件。同じ**サンプリング設定**を持ち、長さが近いものだけを
-#    まとめる。長さは `bucket_batches` (既存) に任せる -- 右パディングの無駄は
-#    行あたり `max_len - len` 列で、比が開くほど丸ごと捨てる計算が増えるため。
-#    サンプリングを揃えるのは、`BatchSpecGenerator._sample_rows` が全行ぶんを
-#    1 回の呼び出しで引くから (行ごとに違うサンプラーを混ぜると分布が壊れる)。
-#    seed 指定つきの要求は混ぜない (`mx.random.seed` はプロセス全体の状態で、
-#    同居する他の行の乱数まで動かしてしまうため) -- 直列経路に回す。
+# フェーズを分けない。1 ステップは「トークン予算」を 1 つ持ち、
+#
+#   1. 先に RUNNING を進める。decode の準備ができた行 (残り 1 トークン) は
+#      MTP の投機ラウンドで `1+k` トークン、prefill の途中の行は
+#      `min(残り, chunk, 予算)` トークン。
+#   2. 予算とスロットが余っていれば WAITING を許容する。許容した行はその場で
+#      最初のチャンクを流すので、短いプロンプトなら 1 ステップで prefill を
+#      終えて走行中のバッチに join する。
+#
+# prefill を刻むから、走行中に join できる。「まとめて 1 回の prefill」だと
+# 途中参加のたびにバッチ全体が止まるので、閉じたバッチにするしかなかった
+# (docs/BACKLOG.md の A-3)。**A-1 (2048 の上限) は別原因**で、そちらは
+# `prompt + max_tokens <= indexer_budget` を残したまま (`spec_batchable`)。
+# 刻んでも KV は伸びるので、刻んだことでは解けない。
+#
+# ## 1 ステップが 2 回のフォワードに割れること (MLX 側の制約)
+#
+# vLLM-V1 は 1 ステップを 1 回の varlen フォワードで流すが、MLX のフォワードは
+# 矩形で、この族の再帰系 (GDN/PLE/n-gram) も (B, S, ...) の矩形しか受けない。
+# 行ごとにトークン数が違うと、全行が最大幅ぶんの計算を払う -- decode の行を
+# 512 列の prefill と同じ矩形に入れた瞬間に decode が 512 列ぶんを払う。
+# そこで**トークン数の同じ行だけを 1 つの矩形にまとめる**。実際には
+# 「decode の矩形 (`B*(1+k)`)」と「prefill の矩形 (chunk)」の 2 回になる。
+# 予算はその合計に掛かるので、スケジューラの意味論 (フェーズを分けない、
+# 1 ステップの総トークン数を抑える) はそのまま。
+#
+# ## 決めたこと (admission / スケジューラの論点)
+#
+# 1. まとめる条件。同じ**サンプリング設定**であること。
+#    `BatchSpecGenerator._sample_rows` が全行ぶんを 1 回の呼び出しで引くので、
+#    行ごとに違うサンプラーを混ぜると分布が壊れる。seed 指定つきの要求は
+#    混ぜない (`mx.random.seed` はプロセス全体の状態で、同居する他の行の乱数
+#    まで動かしてしまうため) -- 直列経路に回す。待ち行列は**先頭だけ**を
+#    許容の候補にする (FIFO)。設定の合う要求を先に拾うと、合わない要求が
+#    いつまでも進まないため。
+#
+#    長さの比では割らなくなった (`bucket_batches` は削除)。まとめて 1 回の
+#    prefill をしないので、右パディングの矩形がそもそも立たない。残るのは
+#    「長い行と短い行が同じ物理列数を共有する」ぶんの attention で、これは
+#    `maybe_compact` が論理長の最大まで詰めるところまでが上限
+#    (`mlxturbo/batch.py` の左パディングと同じ性質のコスト)。
 #
 # 2. 途中で終わった列。終わった行はその場で完了させ、`retire()` で物理的に
 #    落とす (バッチ軸のスライス)。dead slot の帳簿は元から行ごとなので、
 #    行を抜くのに列の詰め直しは要らない。落とさない場合、短い行が長い行に
 #    最後まで付き合って前進計算と KV を占め続ける。
 #
-# 3. 新しい要求。**走行中のバッチには入れない (closed batch)。**次のバッチの
-#    編成は、走行中のバッチが空になった時点で行う。走行中に入れるには、
-#    新入りの KV を走行中の物理列数に左詰めで揃え、MTP の priming 窓も
-#    揃えた上で軸 0 に連結する必要がある (`compact()` が作る形と同じ形に
-#    寄せれば筋は通るが、`ArraysCache` の内部オフセットと priming 窓の
-#    整合は実機でしか確かめられない)。GPU を使わない今回の範囲では検証
-#    できないので入れていない。今の直列キュー (1 リクエストずつ) と比べれば
-#    待ち時間は決して増えない -- 増えるのは同時到着の並列度だけ。
+# 3. 新しい要求。**走行中のバッチに入れる。**車線 (`SpecPrefillLane`) で
+#    prefill を終えた行を `BatchSpecGenerator.join` が軸 0 に連結する。
+#    KV のそろえ方は `compact()` が作る形と同じ左詰めで、詰めた列は帳簿が
+#    dead として隠す。RoPE の位置は帳簿の論理長から引くので、左に何列足しても
+#    回転は動かない。MTP の priming 窓も同じく左詰め (`RaggedDraftCache.
+#    extend_rows`)。正しさは `tools/verify_batch_spec.py` (合成モデル、CPU) が
+#    見る -- 一括 prefill と刻んだ prefill、join の前後で、出力が 1 本ずつの
+#    貪欲デコードと一致すること。
 #
-# 4. メモリ。下の `plan_batch` を参照。上限は 3 つの積み重ねで、どれも
-#    設定値ではなくモデルの形から計算する。
+# 4. メモリと preemption。`rows_fit` が「この行たちが最後まで走るのに要る
+#    追加バイト数」を空きと比べる。足りなければ**優先度最低 = 最若手**の行を
+#    退避する: 生成済みのトークンは保持したまま、`プロンプト + 生成済み` を
+#    新しいプロンプトとして待ち行列の**先頭**へ戻す (vLLM の recompute 型)。
+#    残り max_tokens は同じだけ減るので、`spec_batchable` の条件
+#    (`prompt + max_tokens <= indexer_budget`) は退避の前後で動かない。
 #
 # ## B=1 は既存の単独経路のまま
 #
-# 待ち行列に 1 本しか無いときは `BatchSpecGenerator` を使わず、
-# `FlashSpecRunner.generate` (= `FlashSpecEngine.generate_stream`) をそのまま
-# 呼ぶ。単独経路には楽観パイプライン・次ラウンドの draft 先行投入・適応的
-# depth・チャンク prefill が乗っていて、バッチ経路にはどれも無い。単独
-# リクエストをバッチ経路に流すと、それだけで短 decode が落ちる
-# (`bench/batch_b1_gate.py` が固定している線)。同時到着を拾うために、
-# 1 本しか無いときだけ `wait_ms` (既定 15ms) だけ相方を待つ -- 待つのは
-# TTFT の手前だけで、decode の ms/token には入らない。
-
+# 走行中のバッチも車線も空で、待ち行列に 1 本しか無いときは
+# `BatchSpecGenerator` を使わず、`FlashSpecRunner.generate`
+# (= `FlashSpecEngine.generate_stream`) をそのまま呼ぶ。単独経路には楽観
+# パイプライン・次ラウンドの draft 先行投入・適応的 depth が乗っていて、
+# バッチ経路にはどれも無い。単独リクエストをバッチ経路に流すと、それだけで
+# 短 decode が落ちる (`bench/batch_b1_gate.py` が固定している線)。同時到着を
+# 拾うために、1 本しか無いときだけ `wait_ms` (既定 15ms) だけ相方を待つ --
+# 待つのは TTFT の手前だけで、decode の ms/token には入らない。
+#
+# 逆に言うと、**単独で走り出した要求に後から join はできない**。単独経路は
+# 走り切るまで executor を占有し、その途中のキャッシュを外から触る口が無い。
+# 走行中の join が効くのは「2 本以上でバッチが立ったあと」で、そこから先は
+# 何本でも途中参加できる。単独で走っている間に来た要求を拾うには、単独側を
+# preemption と同じ形で打ち切って (生成済みを保持して) バッチに組み直す
+# ことになるが、それは B=1 の経路に手を入れる話なのでここではやらない。
 import queue as _queue
 import threading
 import time
@@ -990,49 +1401,39 @@ def free_bytes(reserve: float = 0.10) -> int | None:
     return int(rec * (1.0 - reserve)) - mx.get_active_memory()
 
 
-def plan_batch(
-    model,
-    lengths: list[int],
-    max_tokens: list[int],
-    depth: int,
-    max_batch: int,
-    prefill_token_budget: int,
-) -> int:
-    """先頭から何行までを 1 つのバッチに入れてよいかを返す (1 以上)。
+def rows_fit(model, remaining: list[int], depth: int, room: "int | None" = None) -> bool:
+    """この行たちが最後まで走るのに要る**追加**バイト数が、いま空いているか。
 
-    上限は 3 つ。いずれも設定値ではなくモデルの形と実際の空きから計算する。
+    ``remaining`` は行ごとの残り生成トークン数 (max_tokens - 出した数)。
+    ここから先に新しく確保するのは 2 つだけで、どちらも設定値ではなく
+    モデルの形から計算する。
 
-    1. ``max_batch`` (--max-batch-spec)。運用者が置く硬い上限。
-    2. prefill の幅。バッチの prefill は `(B, 右パディング後の最長)` を 1 回で
-       流す。単独経路が 1 チャンクで流している幅は `PREFILL_STEP_SIZE`
-       (2048) で、そこは実測が乗っている安全な水準なので、その 2 倍を
-       ``prefill_token_budget`` の既定に置いた (`B * L <= budget`)。
-    3. 常駐と一時。`B * (KV + capture)` が `free_bytes()` に収まること。
-       KV は行の最終的な長さ (プロンプト + max_tokens) で、capture は
-       1 ラウンドぶん (depth+1 位置) で数える。
+    1. KV。残りトークンぶんの full attention の k/v (+ indexer)。物理列は
+       論理長より速く伸びるが、``maybe_compact`` が論理長の最大まで詰めるので
+       上限はこれで足りる。
+    2. capture。検証フォワードが 1 ラウンドぶん確保する ``states_all``
+       (行あたり depth+1 位置)。1 位置あたりが KV の数千倍あるので、同時に
+       何行流せるかを実際に決めているのはこちら (``capture`` の docstring)。
 
-    実機 (128GB、重み 91GB) では 3 が効くのは B が数十のときで、実際に効く
-    のは 1 と 2 -- それでも式に書いてあるのは、`indexer_budget` の制約が
-    将来外れて長い要求が入るようになったときに、黙って落ちる代わりにここで
-    止まるようにしておくため。
+    ``free_bytes()`` は現在の常駐 (書き終わった KV を含む) を引いた値なので、
+    ここで数えるのは**これから増える分**だけ。数えられない環境
+    (Metal が無い等) では ``True`` -- 上限を掛けない、が以前からの扱い。
+
+    実機 (128GB、重み 91GB) でここが効くのは B が数十のときで、通常は
+    ``--max-batch-spec`` が先に効く。それでも式を持っているのは、
+    ``indexer_budget`` の制約が将来外れて長い要求が入るようになったときに、
+    黙って落ちる代わりにここで preemption に倒すため。
     """
 
-    n = min(len(lengths), max(1, max_batch))
-    # 2. prefill の幅
-    while n > 1 and n * max(lengths[:n]) > prefill_token_budget:
-        n -= 1
-    # 3. 常駐と一時
     kv_per_tok = kv_bytes_per_token(model)
     cap_per_tok = capture_bytes_per_token(model)
-    room = free_bytes()
-    if kv_per_tok is not None and cap_per_tok is not None and room is not None:
-        while n > 1:
-            final_len = max(lengths[i] + max_tokens[i] for i in range(n))
-            need = n * (final_len * kv_per_tok + (depth + 1) * cap_per_tok)
-            if need <= room:
-                break
-            n -= 1
-    return n
+    if room is None:
+        room = free_bytes()
+    if kv_per_tok is None or cap_per_tok is None or room is None:
+        return True
+    need = sum(max(0, r) for r in remaining) * kv_per_tok
+    need += len(remaining) * (depth + 1) * cap_per_tok
+    return need <= room
 
 
 @dataclass
@@ -1060,13 +1461,31 @@ class SpecAdmission:
     ttft: float | None = None
     steps: int = 0
     done: bool = False
+    # 到着順の通し番号。preemption の「優先度最低 = 最若手」の判定に使う。
+    # 付けるのは駆動スレッド (`BatchSpecCoordinator._drain`)
+    seq: int = 0
+    # 退避された回数。退避のたびに「プロンプト + 生成済み」で prefill を
+    # やり直すので、TTFT の意味が変わることを /health 等から見えるようにする
+    preempted: int = 0
+
+
+# 1 ステップのトークン予算。decode の矩形と prefill のチャンクで分け合う
+TOKEN_BUDGET = 2048
+# prefill を 1 ステップで進める上限。走行中の decode を止める長さの上限でも
+# ある (長いプロンプトはこの幅で刻まれ、間に decode ラウンドが挟まる)
+PREFILL_CHUNK = 512
+# 1 ステップで許容を検討する待ち行列の長さ。これを超えた分は次のステップに
+# 回るだけで、捨てはしない (サーバー側の上限は --max-queue)
+MAX_WAITING = 64
+# 検証フォワードの矩形 B*(1+k) の上限。B が増えたら depth を削る
+RECT_LIMIT = 8
 
 
 class BatchSpecCoordinator:
-    """バッチ x 投機のスケジューラ。
+    """バッチ x 投機のスケジューラ (chunked prefill)。
 
-    上の「決めたこと 4 点」がこのクラスの中身。走行中は executor を占有する
-    ので、駆動ループは仕事が無くなったら必ず抜ける (`mlxturbo.batch.
+    上の「スケジューラ」節がこのクラスの中身。走行中は executor を占有するので、
+    駆動ループは仕事が無くなったら必ず抜ける (`mlxturbo.batch.
     BatchCoordinator` と同じ約束)。
     """
 
@@ -1077,8 +1496,9 @@ class BatchSpecCoordinator:
         max_batch: int,
         eos_ids,
         wait_ms: int = 15,
-        max_ratio: float = 1.5,
-        prefill_token_budget: int = 4096,
+        token_budget: int = TOKEN_BUDGET,
+        prefill_chunk: int = PREFILL_CHUNK,
+        max_waiting: int = MAX_WAITING,
     ):
         self.runner = runner
         self.engine = runner.engine
@@ -1087,11 +1507,28 @@ class BatchSpecCoordinator:
         self.max_batch = max(1, max_batch)
         self.eos_ids = set(eos_ids)
         self.wait_ms = max(0, wait_ms)
-        self.max_ratio = max_ratio
-        self.prefill_token_budget = prefill_token_budget
+        self.token_budget = max(1, token_budget)
+        self.prefill_chunk = max(1, prefill_chunk)
+        self.max_waiting = max(1, max_waiting)
         self._inbox: "_queue.SimpleQueue[SpecAdmission]" = _queue.SimpleQueue()
         self._guard = threading.Lock()
         self._active = False
+        # 空きの見積もり。テストから差し替えられるように属性で持つ
+        self._free_bytes = free_bytes
+        # 観測用 (bench / tools/verify_batch_spec.py が見る)
+        self.joins = 0
+        self.preemptions = 0
+        self.solo_runs = 0
+        # 以下は駆動スレッドだけが触るスケジューラの状態
+        self._waiting: list[SpecAdmission] = []
+        self._gen = None
+        self._rows: list[SpecAdmission] = []
+        self._lane = None
+        self._lane_adm: "SpecAdmission | None" = None
+        self._temp = 0.0
+        self._sampler = None
+        self._seq = 0
+        self._col_limit = None
 
     # ---- 受付 (任意のスレッドから) --------------------------------------
 
@@ -1169,30 +1606,50 @@ class BatchSpecCoordinator:
             tuple(sorted((int(k), float(v)) for k, v in bias.items())),
         )
 
+    # ---- 駆動ループ -----------------------------------------------------
+
     def _drive(self) -> None:
-        pending: list[SpecAdmission] = []
+        self._waiting = []
+        self._gen = None
+        self._rows = []
+        self._lane = None
+        self._lane_adm = None
+        self._col_limit = _archmod.indexer_budget(self.model)
         try:
             while True:
-                self._drain(pending)
-                if len(pending) == 1 and self.wait_ms:
-                    # 同時到着を拾うための待ち。1 本しか無いときだけで、
-                    # decode ではなく TTFT の手前に乗る
-                    self._wait_for_company(pending)
-                pending = [a for a in pending if not self._reject_if_dead(a)]
-                if not pending:
-                    self._drain(pending)
-                    if not pending:
+                self._drain()
+                self._waiting = [
+                    a for a in self._waiting if not self._reject_if_dead(a)
+                ]
+                if self._idle():
+                    if not self._waiting:
                         break
-                    continue
-                group = self._take_group(pending)
-                if len(group) == 1:
-                    self._run_solo(group[0])
-                else:
-                    self._run_batch(group)
+                    if self.wait_ms and len(self._waiting) == 1:
+                        # 同時到着を拾うための待ち。1 本しか無いときだけで、
+                        # decode ではなく TTFT の手前に乗る
+                        self._wait_for_company()
+                        self._waiting = [
+                            a for a in self._waiting if not self._reject_if_dead(a)
+                        ]
+                    if not self._waiting:
+                        continue
+                    if len(self._waiting) == 1 or self._sampling_key(
+                        self._waiting[0]
+                    ) is None:
+                        # 1 本だけ / seed 付き -> 単独経路。B=1 無劣化の線
+                        self._run_solo(self._waiting.pop(0))
+                        continue
+                progressed = self._step()
+                if not progressed and self._idle() and self._waiting:
+                    # 許容が通らないまま空回りしない (メモリが足りない等)。
+                    # 単独経路が一番何も抱えないので、そこへ落とす
+                    self._run_solo(self._waiting.pop(0))
         except BaseException as exc:  # noqa: BLE001 - 内部の不具合で Future を宙吊りにしない
-            for adm in pending:
+            for adm in self._live_admissions():
                 self._complete(adm, error=exc)
         finally:
+            self._gen = None
+            self._lane = None
             with self._guard:
                 self._active = False
             # 空判定と _active を落とす間に届いた要求が取り残されないよう、
@@ -1203,25 +1660,40 @@ class BatchSpecCoordinator:
                         self._active = True
                         self.executor.submit(self._drive)
 
-    def _drain(self, pending: list) -> None:
+    def _live_admissions(self) -> list:
+        out = list(self._rows) + list(self._waiting)
+        if self._lane_adm is not None:
+            out.append(self._lane_adm)
+        return out
+
+    def _idle(self) -> bool:
+        return self._gen is None and self._lane is None
+
+    def _drain(self) -> None:
         while True:
             try:
-                pending.append(self._inbox.get_nowait())
+                adm = self._inbox.get_nowait()
             except _queue.Empty:
                 return
+            self._seq += 1
+            adm.seq = self._seq
+            self._waiting.append(adm)
 
-    def _wait_for_company(self, pending: list) -> None:
+    def _wait_for_company(self) -> None:
         deadline = time.perf_counter() + self.wait_ms / 1000.0
         while True:
             left = deadline - time.perf_counter()
             if left <= 0:
                 return
             try:
-                pending.append(self._inbox.get(timeout=left))
+                adm = self._inbox.get(timeout=left)
             except _queue.Empty:
                 return
-            self._drain(pending)
-            if len(pending) >= self.max_batch:
+            self._seq += 1
+            adm.seq = self._seq
+            self._waiting.append(adm)
+            self._drain()
+            if len(self._waiting) >= self.max_batch:
                 return
 
     def _reject_if_dead(self, adm: SpecAdmission) -> bool:
@@ -1230,36 +1702,204 @@ class BatchSpecCoordinator:
             return True
         return False
 
-    def _take_group(self, pending: list) -> list:
-        """先頭 (最古) の要求を必ず含む 1 バッチぶんを `pending` から抜き取る。
+    # ---- 1 ステップ ------------------------------------------------------
 
-        最古を軸にするのは飢餓を作らないため -- `bucket_batches` は長さ順に
-        詰めるので、それだけに任せると短い要求ばかりが選ばれ続けうる。
+    def _step(self) -> bool:
+        """1 ステップ進める。何かしら前に進んだら True。
+
+        順序は「RUNNING が先、余った予算で WAITING を許容」。RUNNING を先に
+        するのは、走っている行を新入りの prefill で待たせないため。
         """
-        head = pending[0]
+        budget = self.token_budget
+        progressed = False
+
+        if self._gen is not None:
+            self._ensure_room()
+        if self._gen is not None:
+            depth = self._round_depth(len(self._rows), budget)
+            budget -= len(self._rows) * (1 + depth)
+            self._decode_round(depth)
+            progressed = True
+
+        # 車線 (chunked prefill)。1 要求に渡すのは 1 チャンクまでで、それが
+        # 終わって予算が残っていれば次の要求を許容する。短いプロンプトが
+        # 並んでいれば 1 ステップで何本も prefill を終えて join するし、
+        # 長いプロンプト 1 本なら 1 ステップに 1 チャンクずつ進む
+        while budget > 0:
+            if self._lane is not None and self._lane_adm is not None:
+                if self._reject_if_dead(self._lane_adm):
+                    self._lane = None
+                    self._lane_adm = None
+            if self._lane is None and not self._admit_next():
+                break
+            n = min(self._lane.remaining, self.prefill_chunk, budget)
+            budget -= n
+            self._lane.advance(n)
+            progressed = True
+            if not self._lane.finished:
+                # 1 ステップで 1 要求に渡すのは 1 チャンクまで。ここで回し
+                # 続けると、長いプロンプト 1 本が予算を丸ごと食って走行中の
+                # decode を止める -- 刻んだ意味が無くなる
+                break
+            self._join_lane()
+        return progressed
+
+    def _round_depth(self, n_rows: int, budget: int) -> int:
+        """このラウンドのドラフト数 k。
+
+        矩形の上限 ``B*(1+k) <= RECT_LIMIT`` と、残りのトークン予算の両方に
+        収める。どちらにも収まらなければ 0 (素の decode) -- 小さい予算を
+        投機で食い潰さない。走行中の行は必ず 1 トークンは進めるので、
+        予算が 0 でもラウンド自体は回す。
+        """
+        if n_rows <= 0:
+            return 0
+        d = min(self.engine.depth, max(0, RECT_LIMIT // n_rows - 1))
+        while d > 0 and n_rows * (1 + d) > budget:
+            d -= 1
+        return d
+
+    def _decode_round(self, depth: int) -> None:
+        gen = self._gen
+        rows = self._rows
+        new = gen.step(
+            truncate=lambda b, toks, r=rows: self._truncate(r[b], toks),
+            depth=depth,
+        )
+        self._settle(new)
+        if self._gen is not None:
+            self._gen.maybe_compact(hard_limit=self._col_limit, depth=depth)
+
+    def _settle(self, new: list, count_step: bool = True) -> None:
+        """1 ラウンドぶんを配り、終わった行を落とす。"""
+        self._rows = self._after_round(self._gen, self._rows, new, count_step)
+        if not self._rows:
+            self._gen = None
+
+    # ---- 許容と join -----------------------------------------------------
+
+    def _effective_prompt(self, adm: SpecAdmission) -> list[int]:
+        """prefill に流すトークン列。退避された行は生成済みを後ろに付ける。"""
+        return list(adm.prompt_ids) + list(adm.tokens)
+
+    def _remaining(self, adm: SpecAdmission) -> int:
+        return max(0, adm.max_tokens - len(adm.tokens))
+
+    def _batch_key(self):
+        """いまのバッチが決めているサンプリング設定 (無ければ None)。
+
+        持ち回さずに毎回引く。走行中の行が全部抜けたり退避されたりする経路が
+        複数あるので、覚えておくと必ずどれかで古くなる。
+        """
+        if self._rows:
+            return self._sampling_key(self._rows[0])
+        if self._lane_adm is not None:
+            return self._sampling_key(self._lane_adm)
+        return None
+
+    def _admit_next(self) -> bool:
+        """待ち行列の先頭を 1 本、車線に入れる。入れたら True。
+
+        候補にするのは**先頭だけ** (FIFO)。設定の合うものを探しに行くと、
+        合わない要求がいつまでも進まない。
+        """
+        self._drain()
+        while self._waiting and self._reject_if_dead(self._waiting[0]):
+            self._waiting.pop(0)
+        if not self._waiting:
+            return False
+        if len(self._rows) >= self.max_batch:
+            return False
+        head = self._waiting[0]
         key = self._sampling_key(head)
         if key is None:
-            pending.pop(0)
-            return [head]
-        cand = [a for a in pending if self._sampling_key(a) == key]
-        buckets = bucket_batches(
-            [len(a.prompt_ids) for a in cand], self.max_batch, self.max_ratio
+            # seed 付き。走行中が空くのを待って単独経路へ
+            return False
+        cur = self._batch_key()
+        if cur is not None and key != cur:
+            return False
+        remaining = [self._remaining(a) for a in self._rows]
+        remaining.append(self._remaining(head) + len(self._effective_prompt(head)))
+        if not self._fits(remaining):
+            return False
+        self._waiting.pop(0)
+        if cur is None:
+            # この行がバッチの設定を決める。以後 join できるのは同じ設定の
+            # 要求だけ (`_sample_rows` が全行ぶんを 1 回の呼び出しで引くため)
+            self._temp = head.temp
+            self._sampler = _position_local_sampler_for(head)
+        if head.t0 is None:
+            head.t0 = time.perf_counter()
+        self._lane_adm = head
+        self._lane = SpecPrefillLane(
+            self.engine,
+            self._effective_prompt(head),
+            temp=self._temp,
+            sampler=self._sampler,
         )
-        chosen = next(b for b in buckets if 0 in b)
-        # 到着順に戻してから、入るところまでを取る
-        rows = [cand[i] for i in sorted(chosen)]
-        n = plan_batch(
-            self.model,
-            [len(a.prompt_ids) for a in rows],
-            [a.max_tokens for a in rows],
-            self.engine.depth,
-            self.max_batch,
-            self.prefill_token_budget,
-        )
-        rows = rows[:n]
-        for a in rows:
-            pending.remove(a)
-        return rows
+        return True
+
+    def _join_lane(self) -> None:
+        """prefill を終えた行を走行中のバッチに入れる。"""
+        row = self._lane.result()
+        adm = self._lane_adm
+        self._lane = None
+        self._lane_adm = None
+        if self._gen is None:
+            self._gen = BatchSpecGenerator.from_prefilled(
+                self.engine, [row], temp=self._temp, sampler=self._sampler
+            )
+            self._rows = [adm]
+        else:
+            self._gen.join([row])
+            self._rows.append(adm)
+            self.joins += 1
+        # prefill が出す 1 個目は単独経路と同じくラウンドに数えない
+        # (tokens_per_step の定義が n_decode / decode ラウンド数のため)
+        new = [[] for _ in self._rows]
+        new[-1] = [row.first_token]
+        self._settle(new, count_step=False)
+
+    # ---- preemption ------------------------------------------------------
+
+    def _fits(self, remaining: list[int]) -> bool:
+        """空きの見積もりだけ差し替えられる形の `rows_fit` (テスト用)。"""
+        room = self._free_bytes()
+        if room is None:
+            return True  # 数えられない環境では上限を掛けない
+        return rows_fit(self.model, remaining, self.engine.depth, room=room)
+
+    def _ensure_room(self) -> None:
+        """走行中の行が最後まで走れないなら、入る所まで退避する。"""
+        while self._rows and not self._fits([self._remaining(a) for a in self._rows]):
+            if not self._preempt_one():
+                return
+
+    def _preempt_one(self) -> bool:
+        """優先度最低 = 最若手 (到着が最も新しい) の 1 行を退避する。
+
+        生成済みのトークンは**保持**したまま、`プロンプト + 生成済み` を
+        新しいプロンプトとして待ち行列の先頭に戻す (vLLM の recompute 型)。
+        KV は捨てるので、復帰時は prefill をやり直す -- 逆に言えば、退避に
+        必要な追加のメモリが無い。残り max_tokens は生成済みのぶん減るので、
+        `spec_batchable` の条件は退避の前後で動かない。
+
+        既に配ったトークンは `adm.tokens` に入ったままなので、復帰後に配る
+        のは続きだけ (`_deliver` は追記しかしない)。
+        """
+        if not self._rows:
+            return False
+        b = max(range(len(self._rows)), key=lambda i: self._rows[i].seq)
+        adm = self._rows[b]
+        keep = [i for i in range(len(self._rows)) if i != b]
+        self._gen.retire(keep)
+        self._rows = [self._rows[i] for i in keep]
+        if not self._rows:
+            self._gen = None
+        adm.preempted += 1
+        self.preemptions += 1
+        self._waiting.insert(0, adm)
+        return True
 
     # ---- 単独 (B=1) -----------------------------------------------------
 
@@ -1268,11 +1908,12 @@ class BatchSpecCoordinator:
         (server.py) と同じ 3 分岐で結果を返す。session は渡さない --
         バッチ経路と揃えた割り切りで、`mlxturbo/batch.py` の継続バッチングも
         同じ (毎回まっさらな prefill)。"""
+        self.solo_runs += 1
         adm.t0 = time.perf_counter()
         try:
             res = self.runner.generate(
-                adm.prompt_ids,
-                max_tokens=adm.max_tokens,
+                self._effective_prompt(adm),
+                max_tokens=self._remaining(adm),
                 temp=adm.temp,
                 eos_ids=adm.eos_ids,
                 on_tokens=adm.on_tokens,
@@ -1285,39 +1926,14 @@ class BatchSpecCoordinator:
             else:
                 self._complete(adm, error=exc)
             return
+        if adm.tokens:
+            # 退避から戻ってきた行。単独経路が返す列は続きぶんだけなので、
+            # 既に配った分の後ろに足して 1 本の結果に見せる
+            res = dict(res)
+            res["tokens"] = list(adm.tokens) + list(res.get("tokens") or [])
         self._complete(adm, res=res)
 
-    # ---- バッチ (B>=2) ---------------------------------------------------
-
-    def _run_batch(self, rows: list) -> None:
-        try:
-            head = rows[0]
-            sampler = _position_local_sampler_for(head)
-            gen = BatchSpecGenerator(
-                self.engine,
-                [list(a.prompt_ids) for a in rows],
-                temp=head.temp,
-                sampler=sampler,
-            )
-            now = time.perf_counter()
-            for a in rows:
-                a.t0 = now
-            gen.prefill()
-            # prefill が出す 1 個目は単独経路と同じくラウンドに数えない
-            # (tokens_per_step の定義が n_decode / decode ラウンド数のため)
-            rows = self._after_round(gen, rows, [o[-1:] for o in gen.out], count_step=False)
-            budget = _archmod.indexer_budget(self.model)
-            while rows:
-                new = gen.step(
-                    truncate=lambda b, toks, r=rows: self._truncate(r[b], toks)
-                )
-                rows = self._after_round(gen, rows, new)
-                if rows:
-                    gen.maybe_compact(hard_limit=budget)
-        except BaseException as exc:  # noqa: BLE001 - 1 行の失敗でも全行の Future を必ず閉じる
-            for a in rows:
-                self._complete(a, cancelled=self._cancelled(a),
-                               error=None if self._cancelled(a) else exc)
+    # ---- ラウンドの後始末 -------------------------------------------------
 
     def _truncate(self, adm: SpecAdmission, toks: list[int]) -> int:
         """このラウンドで行 b が受け取ってよい個数。単独経路の
@@ -1331,7 +1947,7 @@ class BatchSpecCoordinator:
         """1 ラウンドぶんを配り、終わった行を落として残りを返す。"""
         keep: list[int] = []
         for b, adm in enumerate(rows):
-            if count_step:
+            if count_step and new[b]:
                 adm.steps += 1
             try:
                 self._deliver(adm, new[b])
@@ -1382,9 +1998,12 @@ __all__ = [
     "snapshot_pre_ctx",
     "batched_rollback",
     "BatchSpecGenerator",
-    "bucket_batches",
+    "PrefilledRow",
+    "SpecPrefillLane",
+    "prime_draft_rows",
+    "sample_positions",
     "BatchSpecCoordinator",
     "SpecAdmission",
     "spec_batchable",
-    "plan_batch",
+    "rows_fit",
 ]
