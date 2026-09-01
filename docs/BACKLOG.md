@@ -94,6 +94,13 @@ fastmlx/mlxturbo 側の現状:
 
 ### 2026-09-01 追記: 横展開の方向 (ユーザー方針)
 
+**順序 (2026-09-01 ユーザー決定): Qwen3.8-27B の復帰が先、GLM はその後。**
+27B は spec.py の出発点で、BPE checkpoint 修正と段階投入の移植が済み次第、
+モデル取得 (4bit ~15GB) → compat_smoke → 投機検証 → 計測で復帰させる。
+GLM-5.3-Flash は 320B 級 (config 算術) で 4bit 165GB は 128GB に入らず、
+**2bit 主体の混合レシピ (~85-95GB) が前提**。一律 2bit は受理率ごと崩れる
+実測 (Flash-Next) があるので、層感度ベースのベイクとセットでのみ成立する。
+
 対応を広げるなら **MTP ヘッドを積んだモデル** (DeepSeek V4 Flash、
 GLM 5.3 Flash、**Gemma の MTP 版 — 出ているとユーザー指摘 2026-09-01**) が
 先で、dense は Qwen3.8-27B (spec.py の出発点) の復帰だけ。MTP 無しモデルへの
