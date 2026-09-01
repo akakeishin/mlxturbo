@@ -242,31 +242,17 @@ def _staged_forward(model, ids, caches):
     泡。docs/research/KERNEL-BRIEF-DECODE-BW.md 参照) GPU が遊ぶ。既定の
     `_STAGE_EVERY=2` (2 層ごと) で投入すれば GPU は先頭から走り出し、
     CPU は残りを組み続けられる。計算内容は Qwen4ExpModel.__call__ +
-    lm_head と完全に同一 (このファイルの capture と同様、写しであることが
-    正しさの根拠。本家を変えるときはここも変えること)。
+    lm_head と完全に同一。
+
+    前段 (mask 生成と PLE/n-gram の直前文脈) は本家の `_prelude` を呼ぶので
+    写しではない。写しなのは層ループの骨格だけで、そこが本物の差分
+    (2 層ごとの async_eval は本家に無い制御フロー)。
     """
-    Q = _arch()
     m = model.model
     h = m.embed_tokens(ids)
     cache = caches
 
-    full_idx = [i for i, l in enumerate(m.layers) if l.layer_type == "full_attention"]
-    attn_cache = cache[full_idx[0]] if full_idx else None
-    mask = Q.create_attention_mask(h, [attn_cache] if attn_cache is not None else None)
-    conv_mask = None
-
-    prev_ctx = None
-    if m.ple_layers:
-        ctx_len = m.args.ngram_size - 1
-        eos_id = m.args.eos_token_id
-        eos_id = eos_id[0] if isinstance(eos_id, list) else eos_id
-        pc = cache[m.ple_layers[0]]
-        prev = pc[3] if pc is not None else None
-        prev_ctx = (prev if prev is not None
-                    else mx.full((ids.shape[0], ctx_len), eos_id, ids.dtype))
-        if pc is not None:
-            tail = mx.concatenate([prev_ctx, ids], axis=1)[:, -ctx_len:]
-            pc[3] = tail
+    mask, conv_mask, prev_ctx = m._prelude(ids, h, cache)
 
     h = mx.tile(h, (1, 1, m.hc))
     step = _STAGE_EVERY

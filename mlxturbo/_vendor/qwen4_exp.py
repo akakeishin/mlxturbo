@@ -891,11 +891,13 @@ class Qwen4ExpModel(nn.Module):
         `GatedDeltaNet._store_conv_state` と同じ理由で切ってある。"""
         pc[3] = cat[:, -ctx_len:]
 
-    def __call__(self, ids: mx.array, cache=None, input_embeddings=None):
-        h = self.embed_tokens(ids) if input_embeddings is None else input_embeddings
-        if cache is None:
-            cache = [None] * len(self.layers)
+    def _prelude(self, ids, h, cache):
+        """層ループの前段。``(mask, conv_mask, prev_ctx)`` を返す。
 
+        `mlxturbo/spec_flash.py` の `_staged_forward` (2 層ごとに async_eval を
+        挟む段階投入版) と共有する。あちらの本物の差分はループ骨格だけで、
+        前段は本家と同一なので、ここから呼ばせる。
+        """
         mask, conv_mask = self._make_masks(h, cache)
 
         prev_ctx = None
@@ -914,6 +916,14 @@ class Qwen4ExpModel(nn.Module):
                 self._store_ngram_ctx(
                     pc, mx.concatenate([prev_ctx, ids], axis=1), ctx_len
                 )
+        return mask, conv_mask, prev_ctx
+
+    def __call__(self, ids: mx.array, cache=None, input_embeddings=None):
+        h = self.embed_tokens(ids) if input_embeddings is None else input_embeddings
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        mask, conv_mask, prev_ctx = self._prelude(ids, h, cache)
 
         h = mx.tile(h, (1, 1, self.hc))
         for layer, c in zip(self.layers, cache):

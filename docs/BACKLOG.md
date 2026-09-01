@@ -162,7 +162,7 @@ Flash-Next 独自として扱わないこと** — 線形注意/再帰系は Qwe
 
 | # | 写し (file:line) | 複製元 (file:line) | 内容 | 扱い |
 |---|---|---|---|---|
-| 1 | `mlxturbo/spec_flash.py:238` `_staged_forward` | `mlxturbo/_vendor/qwen4_exp.py` `Qwen4ExpModel.__call__` + lm_head | 段階投入。既定 2 層ごとに `mx.async_eval(h)` を挟み、グラフ構築中の GPU 泡 (7.3ms) を刈る | 段 4 で前段 (mask 生成・PLE prev_ctx 更新) を共有化予定。ループ骨格自体 (本家に無い制御フロー) は残す |
+| 1 | `mlxturbo/spec_flash.py:238` `_staged_forward` | `mlxturbo/_vendor/qwen4_exp.py` `Qwen4ExpModel.__call__` + lm_head | 段階投入。既定 2 層ごとに `mx.async_eval(h)` を挟み、グラフ構築中の GPU 泡 (7.3ms) を刈る | **段 4 済み**。前段 (mask 生成・PLE prev_ctx 更新) は本家の `_prelude` を呼ぶ形になり、写しはループ骨格だけになった。骨格は本家に無い制御フローなので残す |
 | 2 | `mlxturbo/spec_flash.py:296` `_group_prefill_forward` | 同上 | layer-major prefill。層主導 x G チャンクの二重ループで、MoE 行を concat して 1 回の GEMM にまとめる | 段 5 (保留)。pre_mlp/post_mlp 分解を検討中だが効果対リスク比が最悪、二重ループ自体は最適化の本体なので残す |
 | 3 | ~~`mlxturbo/batch.py:584` `model_call`~~ | 同上 `Qwen4ExpModel.__call__` | mask 生成・conv_mask 構築・n-gram prev_ctx 更新の 3 箇所がバッチ (左パディング) 対応版 | **解消済み (段 3)**。vendor に `_make_masks` / `_store_ngram_ctx` を切って解消 |
 | 4 | `mlxturbo/spec_flash.py:158` `capture()` 内 `gdn`/`ple_conv` | `mlxturbo/_vendor/qwen4_exp.py` `GatedDeltaNet.__call__` / `PLELayer._short_conv` | rollback 用に `states_all` 等を保持するための転記 (カーネル差し替えのみ、ロジック不変) | 対象外。「本家と一字一句同じ」が `tools/verify_prefill_bitident.py` のビット一致ゲートの根拠なので抽象化しない (本文の番号ラベルが唯一無い項目 -- 除外 3 項目リストの 3 番目 `capture の GDN 転記` が写し 1/2 と同じ並びで対応する、という消去法での再構成) |
@@ -261,13 +261,21 @@ vendor_fingerprint 一致) とも通過。
 どの列から取るか」の 3 種類に収まっており、フック仕様が内部構造に依存する
 兆候は出ていない。
 
-**段 4: 写し 1 の前段共有 (低リスク、単独でも価値がある)**
+**段 4: 写し 1 の前段共有 (低リスク、単独でも価値がある)** — **完了 (2026-09-01)**
 `_staged_forward` の前段 ~25 行 (mask 生成・PLE prev_ctx 更新) は本家と
 完全に同一。`_prelude` として括り出せば消え、残るのは「層ループ +
 async_eval 差し込み」という本物の差分だけになる。**ループ骨格自体は残す** —
 2 層ごとの async_eval は本家に無い制御フローで、これが +15% の実体
 (グラフ構築中の GPU 泡 7.3ms の刈り取り)。検査: ビット一致ゲート
 tools/verify_prefill_bitident.py + probe の出力一致。
+
+結果: 本家に `_prelude` (mask 2 種 + prev_ctx) を切り、`__call__` と
+`_staged_forward` の両方がそれを呼ぶ。写しから 22 行が消えた。
+`tools/vendor_fingerprint.py` に写し 2 つの検査を足してある
+(`_staged_forward` == `Model.__call__` はビット一致、
+`_group_prefill_forward` == chunk-major は許容差つき。後者は MoE の行を
+concat する以上 CPU 非量子化では累積順が動くため。実測 8.3e-7、実モデルでの
+ビット一致は verify_prefill_bitident が見る)。
 
 **段 5 (保留、B/C 群の手応えを見てから判断): 写し 2 の分解**
 `_group_prefill_forward` の二重ループ (レイヤー主導 x G チャンク) は
