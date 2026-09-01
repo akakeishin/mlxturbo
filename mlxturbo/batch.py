@@ -35,11 +35,12 @@ venv.
    hardcoded to `None`.
 
 5. The GDN convolution state, the PLE convolution state, and the n-gram context
-   all save their state by slicing off the "last k columns". During prefill with
-   right padding the tail is padding, so the recurrent state of a short sequence
-   gets filled with padding. `qwen3_next` avoids this by pointing at the right
-   position via `cache.lengths` (models/qwen3_next.py:263-269). `qwen4_exp` has
-   nothing of the sort.
+   all saved their state by slicing off the "last k columns". During prefill
+   with right padding the tail is padding, so the recurrent state of a short
+   sequence got filled with padding. `qwen3_next` avoids this by pointing at
+   the right position via `cache.lengths` (models/qwen3_next.py:263-269).
+   `qwen4_exp` had nothing of the sort — it does now (`_tail_window` in the
+   vendored module), so this module no longer patches anything for it.
 
 6. Rope positions are counted by column index. Prefill runs with right padding,
    so the keys are rotated by "the position within that sequence". Once finalize
@@ -59,9 +60,11 @@ Everything above used to be fixed by copying the forward passes of
 and editing a few lines. The copies drifted: fusions that landed in the
 vendored module (`_wide_qkv`, `_project_in`) never reached the batch path, and
 nothing said so out loud. The vendored module now carries the hooks instead
-(`Attention._positions` / `_final_mask`, `GatedDeltaNet._store_conv_state`,
-`PLELayer._store_short_conv_state`, `Qwen4ExpModel._make_masks` /
-`_store_ngram_ctx`), and this module replaces only those. The forward passes
+(`Attention._positions` / `_final_mask`, `Qwen4ExpModel._make_masks`), and
+this module replaces only those. The recurrent state windows needed no hook at
+all in the end: `_tail_window` in the vendored module reads `cache.lengths`
+itself, which is the upstream convention (`qwen3_next`) and is a no-op for a
+cache that has no per-row lengths. The forward passes
 themselves live in one place. `QSAIndexer.__call__` is still replaced whole:
 its left-padding differences run through the middle of the block-grid
 computation, so a hook would have to expose the internals.
@@ -499,40 +502,6 @@ def _install_model_patches(BatchAttnCache):
         neg = mx.finfo(dtype).min if hasattr(mx, "finfo") else -1e9
         return mx.where(mask & sparse, mx.array(0, dtype), mx.array(neg, dtype))
 
-    # ---- conv state: keep the columns that follow the real length ----
-    #
-    # Prefill runs with right padding, so the tail of a row is padding. The
-    # stock seams (`GatedDeltaNet._store_conv_state` /
-    # `PLELayer._store_short_conv_state`) take the last n columns, which under
-    # right padding are padding. Only the extraction differs; the forward pass
-    # itself stays in the vendored module, so batch keeps whatever fusions
-    # land there (`_project_in` / `_wide_qkv`).
-    def _tail_positions(cache, n_keep: int, span: int):
-        """(B, n_keep) index of the columns to carry over, per row. `None`
-        means the stock tail (no batch cache, i.e. no per-row length).
-        Callers indexing a 3-D array append a trailing axis."""
-        lengths = getattr(cache, "lengths", None)
-        if lengths is None:
-            return None
-        ends = mx.clip(lengths, 0, span)
-        return ends[:, None] + mx.arange(n_keep)
-
-    def store_conv_state(self, cache, conv_input):
-        n_keep = self.conv_kernel_size - 1
-        pos = _tail_positions(cache, n_keep, conv_input.shape[1] - n_keep)
-        if pos is None:
-            _ORIG["GatedDeltaNet._store_conv_state"](self, cache, conv_input)
-        else:
-            cache[0] = mx.take_along_axis(conv_input, pos[..., None], axis=1)
-
-    def store_short_conv_state(self, cache, full):
-        n = self.short_conv_state_len
-        pos = _tail_positions(cache, n, full.shape[1] - n)
-        if pos is None:
-            _ORIG["PLELayer._store_short_conv_state"](self, cache, full)
-        else:
-            cache[2] = mx.take_along_axis(full, pos[..., None], axis=1)
-
     # ---- Qwen4ExpModel: actually distribute the mask ------------------
     def make_masks(self, h, cache):
         full_idx = [
@@ -559,28 +528,15 @@ def _install_model_patches(BatchAttnCache):
             conv_mask = mx.arange(h.shape[1])[None] < lengths[:, None]
         return mask, conv_mask
 
-    def store_ngram_ctx(self, pc, cat, ctx_len):
-        pos = _tail_positions(pc, ctx_len, cat.shape[1] - ctx_len)
-        if pos is None:
-            _ORIG["Qwen4ExpModel._store_ngram_ctx"](self, pc, cat, ctx_len)
-        else:
-            pc[3] = mx.take_along_axis(cat, pos, axis=1)
-
     _ORIG["QSAIndexer"] = Q.QSAIndexer.__call__
     _ORIG["Attention._final_mask"] = Q.Attention._final_mask
     _ORIG["Attention._positions"] = Q.Attention._positions
-    _ORIG["GatedDeltaNet._store_conv_state"] = Q.GatedDeltaNet._store_conv_state
-    _ORIG["PLELayer._store_short_conv_state"] = Q.PLELayer._store_short_conv_state
     _ORIG["Qwen4ExpModel._make_masks"] = Q.Qwen4ExpModel._make_masks
-    _ORIG["Qwen4ExpModel._store_ngram_ctx"] = Q.Qwen4ExpModel._store_ngram_ctx
 
     Q.QSAIndexer.__call__ = indexer_call
     Q.Attention._positions = attn_positions
     Q.Attention._final_mask = attn_final_mask
-    Q.GatedDeltaNet._store_conv_state = store_conv_state
-    Q.PLELayer._store_short_conv_state = store_short_conv_state
     Q.Qwen4ExpModel._make_masks = make_masks
-    Q.Qwen4ExpModel._store_ngram_ctx = store_ngram_ctx
 
 
 # ------------------------------------------------------------------ activation
@@ -612,10 +568,7 @@ def disable_batch_cache() -> None:
     Q.QSAIndexer.__call__ = _ORIG["QSAIndexer"]
     Q.Attention._positions = _ORIG["Attention._positions"]
     Q.Attention._final_mask = _ORIG["Attention._final_mask"]
-    Q.GatedDeltaNet._store_conv_state = _ORIG["GatedDeltaNet._store_conv_state"]
-    Q.PLELayer._store_short_conv_state = _ORIG["PLELayer._store_short_conv_state"]
     Q.Qwen4ExpModel._make_masks = _ORIG["Qwen4ExpModel._make_masks"]
-    Q.Qwen4ExpModel._store_ngram_ctx = _ORIG["Qwen4ExpModel._store_ngram_ctx"]
     # Leaving `merge` in place would mean building indexer-carrying batch
     # caches while the forward pass has been restored to stock. Fall back to
     # the inherited one (KVCache.merge)

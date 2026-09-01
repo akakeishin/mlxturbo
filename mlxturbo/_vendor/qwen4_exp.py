@@ -427,6 +427,28 @@ class Attention(nn.Module):
 # ------------------------------------------------------------------- gated deltanet
 
 
+def _tail_window(cache, arr: mx.array, n_keep: int) -> mx.array:
+    """``arr`` の axis=1 から、次に持ち越す ``n_keep`` 列を取る。
+
+    既定は末尾。ただしバッチの prefill は右パディングで走るので末尾は
+    パディングであり、行ごとの実長 ``cache.lengths`` があればその直後の
+    ``n_keep`` 列を取る (上流の qwen3_next が同じことをしている)。
+    ``lengths`` を持たないキャッシュでは末尾を取る従来どおりの動きで、
+    単一系列の経路は 1 ビットも変わらない。
+
+    再帰系の状態はどれもこの形に落ちる: GDN の conv 窓、PLE の short conv 窓、
+    n-gram の直前文脈。3 階 (B, L, C) と 2 階 (B, L) の両方を受ける。
+    """
+    lengths = getattr(cache, "lengths", None)
+    if lengths is None:
+        return mx.contiguous(arr[:, -n_keep:])
+    ends = mx.clip(lengths, 0, arr.shape[1] - n_keep)
+    pos = ends[:, None] + mx.arange(n_keep)
+    if arr.ndim == 3:
+        pos = pos[..., None]
+    return mx.take_along_axis(arr, pos, axis=1)
+
+
 class GatedDeltaNet(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -474,13 +496,9 @@ class GatedDeltaNet(nn.Module):
         return out[..., :c1], out[..., c1:c2], out[..., c2:c3], out[..., c3:]
 
     def _store_conv_state(self, cache, conv_input) -> None:
-        """次ステップに持ち越す conv 状態 (末尾 K-1 列) を書く。
-
-        バッチ経路 (`mlxturbo/batch.py`) は右パディングで走るので末尾が
-        パディングになり、実長の直後 K-1 列を取る必要がある。そちらは
-        このメソッドだけを差し替える (`__call__` 本体は共有する)。
-        """
-        cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
+        """次ステップに持ち越す conv 状態 (K-1 列) を書く。窓の取り方は
+        `_tail_window` (右パディングのときは実長基準)。"""
+        cache[0] = _tail_window(cache, conv_input, self.conv_kernel_size - 1)
 
     def __call__(self, x, mask, cache) -> mx.array:
         B, S, _ = x.shape
@@ -804,9 +822,8 @@ class PLELayer(nn.Module):
         )
 
     def _store_short_conv_state(self, cache, full) -> None:
-        """PLE の short conv 状態を書く。GatedDeltaNet._store_conv_state と
-        同じ理由で切ってあるシーム (バッチ経路が差し替える)。"""
-        cache[2] = mx.contiguous(full[:, -self.short_conv_state_len :, :])
+        """PLE の short conv 状態を書く。窓の取り方は `_tail_window`。"""
+        cache[2] = _tail_window(cache, full, self.short_conv_state_len)
 
     def _short_conv(self, x: mx.array, cache) -> mx.array:
         S = x.shape[1]
@@ -926,9 +943,9 @@ class Qwen4ExpModel(nn.Module):
         return mask, None
 
     def _store_ngram_ctx(self, pc, cat, ctx_len: int) -> None:
-        """n-gram の直前文脈 (末尾 ctx_len トークン) を書くシーム。
-        `GatedDeltaNet._store_conv_state` と同じ理由で切ってある。"""
-        pc[3] = cat[:, -ctx_len:]
+        """n-gram の直前文脈 (ctx_len トークン) を書く。窓の取り方は
+        `_tail_window`。"""
+        pc[3] = _tail_window(pc, cat, ctx_len)
 
     def _prelude(self, ids, h, cache):
         """層ループの前段。``(mask, conv_mask, prev_ctx)`` を返す。
