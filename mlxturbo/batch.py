@@ -874,13 +874,25 @@ class BatchCoordinator:
         if adm.t0 is not None and adm.ttft is not None:
             decode_time = max(0.0, time.perf_counter() - adm.t0 - adm.ttft)
         n_decode = max(len(adm.tokens) - 1, 0)
+        # tokens_per_step は mlxturbo.spec.SpecEngine / FlashSpecSession と
+        # 同じ定義 (n_decode / steps) で運ぶ。今この Admission には steps を
+        # 数える者がいない — 現行の BatchCoordinator は FallbackRunner の
+        # continuous batching のみを駆動し (投機なし、1 トークン = 1
+        # ラウンド)、admission/スケジューリング側はこの変更の対象外なので
+        # ここでは増分しない。将来ここに投機エンジンを配線する変更が
+        # Admission に `steps` を足して forward パスのラウンドごとに
+        # 増分するようになれば、getattr 経由でそのまま実測の tok/step が
+        # 出るようになる。今は存在しないので 1.0 (= stock の 1 トークン/
+        # ラウンドと正しく一致する値) にフォールバックする。
+        steps = getattr(adm, "steps", None)
+        tokens_per_step = (n_decode / steps) if steps else 1.0
         return {
             "tokens": adm.tokens,
             "ttft_s": adm.ttft or 0.0,
             "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
             "prefill_reused": 0,
             "prefill_new": len(adm.prompt_ids),
-            "tokens_per_step": 1.0,
+            "tokens_per_step": tokens_per_step,
         }
 
     def _deliver_token(self, adm: "Admission", token: int) -> None:
