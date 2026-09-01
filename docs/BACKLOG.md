@@ -156,6 +156,38 @@ fastmlx/mlxturbo 側の現状:
 16. **A/B で `--prefill-once` を使い忘れると、17k の prefill を 12 回やり直す**
     (1 本あたり 7.6 分、実行時間の 37%)。decode の knob では必ず付ける。
 
+## n-gram サイドカーのレイアウト選択が 50k を殺していた (2026-09-02)
+
+**症状**: 50k のプロンプトが `[METAL] Command buffer execution failed:
+Insufficient Memory` で落ちる。サーバーは 200 を返してストリームを開き、
+31 秒後にエラーを流す (黙って固まりはしない)。17k までは通る。
+
+**原因**: サイドカーの `manifest.json` の `layout` で経路が決まる
+(`mlxturbo/ngram_stream.py:273` の `install`)。
+
+| layout | 経路 | RAM | 50k |
+|---|---|---|---|
+| `separate` (`~/models/ddalcu-ngram-sep`) | RAM 常駐 (`RamNGram`) | **32GB** | **落ちる** |
+| `interleaved` (`~/models/ddalcu-ngram`) | ディスク参照 (`StreamNGram`, pread) | **0** | **通る (実測)** |
+
+モデル 91GB + n-gram 32GB = 123GB / 128GB。残り 5GB に 50k の KV と活性が
+入らない。**性能ではなく構成の問題。**
+
+**記録の訂正**: 以前「`layout=separate` の RAM 常駐は設計どおりで設定ミスでは
+ない」と結論した。設計どおりなのは正しいが、**「だから問題ない」は誤り。**
+128GB の機体では長文脈が通らなくなる。
+
+**未決**: どちらを既定にするか。`separate` は gather 1 回で速いが 50k を殺す。
+`interleaved` は RAM 0 だが行ごとに pread する。**decode の差は未測。**
+モデルの宣言は 262144 トークンなので、50k で落ちる構成を推奨とは呼びにくい。
+
+**やること**:
+1. decode の差を測る (17k で `separate` と `interleaved`)。プロセスをまたぐ
+   比較になるので、差が数 % なら判定しない
+2. 差が小さいなら `interleaved` を既定にする
+3. 差が大きいなら、**要求の長さで選ぶか、起動時に「この構成では約 N トークン
+   まで」と警告する。**31 秒使ってから落ちるより先に言う方が親切
+
 ## 済み (BACKLOG から出たもの)
 
 - **tool calling** → 73e061a で実装。opencode / Codex / Claude Code の 3 クライアントで実機検証済み。懸念だった「モデルが構文を安定して出すか」は Qwen3.6 / Flash-Next とも問題なし
