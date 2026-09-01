@@ -104,9 +104,10 @@ def main() -> int:
         install(model, os.path.expanduser(args.ngram))
     enable_default_fusions(model, log_prefix="[anatomy]")
 
-    files = sorted(REPO_ROOT.glob("docs/**/*.md")) + [REPO_ROOT / "README.md"]
-    pool = tok.encode("\n\n".join(f.read_text() for f in files if f.exists()))
-    body = tok.decode(pool[: max(args.ctx - 200, 16)])
+    sys.path.insert(0, str(REPO_ROOT / "tools"))
+    from _bench_text import long_prompts
+
+    body = long_prompts(tok, args.ctx, ["上の文書の要点を 5 つに整理してください。"])[0]
     ids = mx.array(tok.apply_chat_template(
         [{"role": "user", "content": body}], add_generation_prompt=True))[None]
     n = ids.shape[1]

@@ -69,9 +69,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# 長文脈の素材: リポジトリの文書を並べた池から、互いに重ならない窓を 3 つ
-# 切る。繰り返し文字列で埋めると n-gram と MTP が当てすぎて受理率が嘘になる
-# ので、実文で長さを作る
+# 長文脈の素材は tools/_bench_text.py の池から切る (実文。繰り返し文字列で
+# 埋めると n-gram と MTP が当てすぎて受理率が嘘になる)
 LONG_QUESTIONS = [
     "上の文書の要点を、初めて読む人向けに 5 つに整理してください。",
     "上の文書から、判断の根拠になっている数字だけを抜き出して並べてください。",
@@ -291,18 +290,16 @@ def main() -> int:
     eos_ids = tuple(eos) if eos else ()
 
     # ---- プロンプトを組む -------------------------------------------
-    files = sorted(REPO_ROOT.glob("docs/**/*.md")) + [REPO_ROOT / "README.md"]
-    pool = "\n\n".join(f.read_text() for f in files if f.exists())
-    pool_ids = tok.encode(pool)
-    win = args.ctx - 200  # 質問文とテンプレートのぶんを空ける
-    longs = []
-    for i, qtext in enumerate(LONG_QUESTIONS if args.only != "short" else []):
-        lo = i * win
-        if lo + win > len(pool_ids):
-            print(f"素材が足りない (必要 {(i + 1) * win} tok, 手元 {len(pool_ids)})")
-            return 1
-        body = tok.decode(pool_ids[lo : lo + win])
-        longs.append(f"{body}\n\n---\n\n{qtext}")
+    from _bench_text import long_prompts
+
+    try:
+        longs = (
+            long_prompts(tok, args.ctx, LONG_QUESTIONS)
+            if args.only != "short" else []
+        )
+    except ValueError as e:
+        print(e)
+        return 1
 
     def to_ids(text):
         return mx.array(tok.apply_chat_template(
