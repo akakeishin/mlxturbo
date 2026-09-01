@@ -881,8 +881,9 @@ def spec_batch_eligible(
 ) -> bool:
     """この要求をバッチ x 投機のコーディネータに渡してよいか。
 
-    長さの条件は ``mlxturbo.batch_spec.spec_batchable`` (QSA が最後まで
-    活性化しないこと)。加えて履歴依存のサンプリングと logprobs を弾く
+    受付の条件は ``mlxturbo.batch_spec.spec_batchable`` (priming に要る
+    プロンプト 2 トークン以上。長さの上限は 2026-09-02 に外れた)。加えて
+    履歴依存のサンプリングと logprobs を弾く
     -- 前者は ``FlashSpecRunner`` が元から受けないので server.py が非投機へ
     降ろしており (そちらは継続バッチングの担当)、後者はバッチ側が検証
     logits の行を集めていないため。
@@ -962,17 +963,15 @@ def maybe_build_batch_spec_coordinator(
         return None
 
     from . import batch_spec as _bs
-    from .arch import indexer_budget
 
     coordinator = _bs.BatchSpecCoordinator(
         runner, executor, max_batch=max_batch_spec, eos_ids=eos_ids, wait_ms=wait_ms
     )
-    budget = indexer_budget(coordinator.model)
     print(
         f"{log_prefix} バッチ x 投機 有効 (--max-batch-spec {max_batch_spec},"
         f" FlashSpecRunner 限定, 相方待ち {wait_ms}ms)。"
-        f" プロンプト長 + max_tokens が {budget} (indexer_budget) に収まる要求だけを"
-        " まとめ、それ以外は従来どおり直列。スケジューラは 1 ステップに"
+        " 長さの上限は無い (QSA のブロック境界を行ごとに引き直したので、"
+        " indexer_budget を超える要求もまとめられる)。スケジューラは 1 ステップに"
         f" トークン予算 {coordinator.token_budget} を 1 つ持つ chunked prefill 方式で、"
         f" 新しい要求の prefill を {coordinator.prefill_chunk} トークンずつ刻んで"
         " 走行中の decode と同じステップに混ぜる (走行中のバッチに join する)。"

@@ -40,16 +40,23 @@ Attention 実装がまだ行別 (配列) offset を受け付けないから要�
 再利用せず独立に書いた)。他アーキテクチャに移植する際は、そちらの
 Attention 実装が同じフックを必要とするかどうかを個別に確認すること。
 
-## indexer / QSA はバッチ対象外 (既知の未対応)
+## indexer / QSA (2026-09-02 に対応。長さの上限は外れた)
 
-QSA のブロック選択は絶対列位置で切られる。dead slot を挟んだバッチ列で
-これを正しく動かすには、行ごとにブロック境界を作り直す必要があり
-(``mlxturbo/batch.py`` の "Remaining limitation" と同種の問題)、今回はやって
-いない。このモジュールは ``indexer_budget`` を kv 長が超えない構成でだけ
-正しく動く (超えた場合 ``ragged_attention()`` は ``NotImplementedError`` で
-落ちる -- 黙って間違った結果を返すよりはっきり止める方を選んだ)。
-``mlxturbo/batch.py`` の "solo tier" と同じ考え方で、QSA が活性化しうる
-リクエストは常にこの機構の対象外にすること。
+QSA のブロック選択は本家では**物理列**で切られる。dead slot を挟んだバッチ列
+でそれをやると、ブロックの平均に棄却済みの鍵が混ざり、pooled 鍵の rope 角が
+ずれ、top-k が dead slot を選ぶ。3 つとも「行ごとにどの列が生きているか」が
+違うことから来る (``mlxturbo/batch.py`` の "Remaining limitation" と同種)。
+
+そこで ``_ragged_indexer_call`` がブロック境界を**行の論理列** (その行の
+生きている列を並べ直したもの) の上で引き直す。dead slot は論理列に現れない
+ので、選ばれようがない。論理列の上ではブロック格子が全行そろうため、pooled の
+rope 角は本家と同じ 1 本で済み、行ごとに違うのは「何ブロックまで実在するか」
+だけになる。穴も右パディングも無いラウンドは本家をそのまま呼ぶ。
+
+**この結果、``spec_batchable`` の長さの上限は無くなった。**残る条件は
+プロンプト 2 トークン以上と max_tokens 1 以上だけ。段 3(b) の gather 経路
+(``MLXTURBO_GATHER_ATTN``、既定 off) だけは行別境界に未対応で、バッチ経路の
+間は通常経路 (加算マスク) に落ちる (``ragged_attention`` の項目 4)。
 
 ## サーバー配線
 
@@ -60,7 +67,7 @@ QSA のブロック選択は絶対列位置で切られる。dead slot を挟ん
 
 ## 未対応 (このモジュールの範囲外)
 
-- indexer / QSA (上記)。
+- 段 3(b) の gather 経路 (上記)。
 - サンプリング (温度 > 0) の分布保証は実測していない。全位置を先に引く形は
   spec_flash.py 側の議論 (位置ごとの分布は独立) がそのまま当てはまり、
   ``BatchSpecGenerator._sample_rows`` はその B 行版だが、KLD などで確かめた
@@ -74,6 +81,7 @@ QSA のブロック選択は絶対列位置で切られる。dead slot を挟ん
 
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
 
 import mlx.core as mx
@@ -112,9 +120,15 @@ class RaggedLedger:
         # (commit_round / compact / filter_rows / prefill_lengths の付け外し) が
         # 全て _invalidate を通る。
         self._mask_memo: dict[int, mx.array] = {}
+        # alive の (B, L) bool 配列と、QSA の論理列対応表の memo。どちらも
+        # 帳簿が動くまで不変なので _invalidate で一緒に捨てる。
+        self._alive_memo: mx.array | None = None
+        self._qsa_memo: dict[tuple[int, int], "_QSAMap"] = {}
 
     def _invalidate(self) -> None:
         self._mask_memo.clear()
+        self._alive_memo = None
+        self._qsa_memo.clear()
 
     @property
     def prefill_lengths(self) -> "list[int] | None":
@@ -165,8 +179,7 @@ class RaggedLedger:
         """
         B, L = self.B, self.L
         if L:
-            prev = mx.array(self._alive, dtype=mx.bool_)  # (B, L)
-            prev = mx.broadcast_to(prev[:, None, :], (B, T, L))
+            prev = mx.broadcast_to(self._alive_bool()[:, None, :], (B, T, L))
         else:
             prev = mx.zeros((B, T, 0), dtype=mx.bool_)
         cols = mx.arange(T)
@@ -196,6 +209,64 @@ class RaggedLedger:
         else:
             out = self.next_round_mask(T, mx.array(self._prefill_lengths))
         self._mask_memo[T] = out
+        return out
+
+    # --------------------------------------------------------- QSA 用
+
+    def _alive_bool(self) -> mx.array:
+        """帳簿の (B, L) bool 配列。Python リスト -> mx.array の変換は L に
+        比例するので、帳簿が動くまで使い回す (mask と QSA の両方が読む)。"""
+        if self._alive_memo is None:
+            self._alive_memo = mx.array(self._alive, dtype=mx.bool_)
+        return self._alive_memo
+
+    def _cur_lens(self, S: int) -> list[int]:
+        """このラウンドで行 b が実際に足す列数。右パディングで流す prefill の
+        間だけ行ごとに違い、それ以外は全行 S。"""
+        if self._prefill_lengths is None:
+            return [S] * self.B
+        return list(self._prefill_lengths)
+
+    def qsa_uniform(self, S: int) -> bool:
+        """dead slot も右パディングも 1 つも無いか。
+
+        True なら物理列と論理列が全行で一致するので、QSA は**本家のまま**
+        走らせてよい (`_ragged_indexer_call` の速い道)。判定は Python の
+        帳簿だけで済むので、QSA が働かない短い文脈でも GPU の仕事は増えない。
+        """
+        return all(v == self.L for v in self._valid_len) and all(
+            c == S for c in self._cur_lens(S)
+        )
+
+    def qsa_max_len(self, S: int, kv_phys: int) -> int:
+        """行ごとの論理 kv 長の最大。QSA を発火させるかの判定に使う
+        (単独実行なら行 b は kv 長 ``valid_len[b] + cur[b]`` で判定される
+        ので、その最大が budget 以下なら**どの行も**疎化が要らない)。"""
+        if not self._valid_len:
+            return 0
+        return max(v + c for v, c in zip(self._valid_len, self._cur_lens(S)))
+
+    def qsa_logical(self, S: int, kv_phys: int) -> "_QSAMap":
+        """物理列 <-> 論理列の対応表 (memo つき)。
+
+        論理列 = その行の生きている物理列を並べ直したもの。dead slot は
+        論理列に**現れない**ので、これを通した先ではブロックの内容にも
+        top-k の候補にも dead slot が混ざりようがない。
+        """
+        key = (S, kv_phys)
+        got = self._qsa_memo.get(key)
+        if got is not None:
+            return got
+        cur = self._cur_lens(S)
+        assert kv_phys == self.L + S, (kv_phys, self.L, S)
+        new = mx.arange(S)[None, :] < mx.array(cur)[:, None]  # (B, S)
+        alive = (
+            mx.concatenate([self._alive_bool(), new], axis=1)
+            if self.L
+            else new
+        )
+        out = _qsa_map_from_alive(alive, self.qsa_max_len(S, kv_phys))
+        self._qsa_memo[key] = out
         return out
 
     def commit_round(self, keeps: list[int], total: int) -> None:
@@ -289,6 +360,47 @@ def _gather_cols(arr: mx.array, idx: mx.array, axis: int) -> mx.array:
     return mx.take_along_axis(arr, idx.reshape(shape), axis=axis)
 
 
+# ------------------------------------------------------------- QSA の列対応
+
+
+class _QSAMap:
+    """QSA を行ごとに組み直すための列対応表。
+
+    - ``log2phys`` (B, max_len): 行 b の論理列 c が物理列のどこか。
+      その行の論理長より後ろは詰め物 (物理列 0 を指す)。
+    - ``phys2log`` (B, kv_phys): 物理列 p が論理列のどこか。dead slot と
+      右パディングは ``max_len`` (= sink) を指す。
+    - ``kv_lens`` (B,): 行ごとの論理 kv 長。
+    - ``max_len``: その最大 (Python int。配列の形を決めるのに要る)。
+    """
+
+    __slots__ = ("log2phys", "phys2log", "kv_lens", "max_len")
+
+    def __init__(self, log2phys, phys2log, kv_lens, max_len: int):
+        self.log2phys = log2phys
+        self.phys2log = phys2log
+        self.kv_lens = kv_lens
+        self.max_len = max_len
+
+
+def _qsa_map_from_alive(alive: mx.array, max_len: int) -> _QSAMap:
+    """(B, kv_phys) の alive bool から対応表を作る。
+
+    ``phys2log`` は「生きている列の通し番号」なので cumsum で出る。
+    ``log2phys`` はその逆写像で、単調なので並べ替え無しに散布で作れる
+    (sink 列を 1 本余分に用意して、そこへ捨てる)。どちらも 1 ラウンドに
+    1 回 (全 full attention 層で共有) しか作らない。
+    """
+    B, kv_phys = alive.shape
+    ranks = mx.cumsum(alive.astype(mx.int32), axis=1) - 1
+    phys2log = mx.where(alive, ranks, mx.array(max_len, mx.int32))
+    cols = mx.broadcast_to(mx.arange(kv_phys, dtype=mx.int32)[None], (B, kv_phys))
+    l2p = mx.zeros((B, max_len + 1), dtype=mx.int32)
+    l2p = mx.put_along_axis(l2p, phys2log, cols, axis=1)
+    kv_lens = mx.sum(alive.astype(mx.int32), axis=1)
+    return _QSAMap(l2p[:, :max_len], phys2log, kv_lens, max_len)
+
+
 # --------------------------------------------------------- attention cache
 
 
@@ -307,6 +419,11 @@ class RaggedAttnCache:
         self.values: mx.array | None = None
         self.ledger = ledger
         self.indexer = _arch()._IndexerCache()
+        # `Attention.__call__` が QSA に渡すのは KV キャッシュではなく
+        # この `_IndexerCache` なので、行別の列対応を引ける先をここに
+        # 挿しておく (`_wide_qkv` / `_gather_stats` と同じ属性注入の作法)。
+        # `_ragged_indexer_call` はこれが無ければ本家に素通しする。
+        self.indexer.qsa_owner = self
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         if self.keys is None:
@@ -324,6 +441,18 @@ class RaggedAttnCache:
         呼ばれる (MTP のドラフトキャッシュも同じ名前を持つので、Attention 側は
         キャッシュの種類を知らなくてよい)。"""
         return self.ledger.round_mask(T)
+
+    # QSA の列対応は帳簿がそのまま持っている (`_ragged_indexer_call` が読む)。
+    # ドラフトキャッシュも同名の 3 つを持つので、QSA 側はキャッシュの種類を
+    # 知らなくてよい。呼ばれ方は `__init__` の `qsa_owner` を参照。
+    def qsa_uniform(self, S: int) -> bool:
+        return self.ledger.qsa_uniform(S)
+
+    def qsa_max_len(self, S: int, kv_phys: int) -> int:
+        return self.ledger.qsa_max_len(S, kv_phys)
+
+    def qsa_logical(self, S: int, kv_phys: int) -> _QSAMap:
+        return self.ledger.qsa_logical(S, kv_phys)
 
     @property
     def offset(self) -> mx.array:
@@ -351,8 +480,8 @@ class RaggedAttnCache:
         新入りの KV は自分の実位置で回転済みなので、左にゼロ列を足しても
         回転は動かない。足したゼロ列は帳簿側が dead として恒久的に隠す
         (``RaggedLedger.extend_rows``) ので、値そのものは読まれない。
-        列位置に意味を持たせているのは QSA だけで、そちらはこのモジュールの
-        対象外 (``ragged_attention`` が ``NotImplementedError`` で止める)。
+        列位置に意味を持たせているのは QSA だけで、そちらは帳簿から論理列を
+        引き直すので (``_ragged_indexer_call``) 左詰めの影響を受けない。
         """
         self.keys = _cat_left_padded([self] + others, "keys", new_L, axis=2)
         self.values = _cat_left_padded([self] + others, "values", new_L, axis=2)
@@ -418,6 +547,11 @@ class RaggedDraftCache:
         self._pad = [0] * batch_size
         self._base = mx.zeros(batch_size, dtype=mx.int32)
         self.indexer = _arch()._IndexerCache()
+        # `Attention.__call__` が QSA に渡すのは KV キャッシュではなく
+        # この `_IndexerCache` なので、行別の列対応を引ける先をここに
+        # 挿しておく (`_wide_qkv` / `_gather_stats` と同じ属性注入の作法)。
+        # `_ragged_indexer_call` はこれが無ければ本家に素通しする。
+        self.indexer.qsa_owner = self
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         if self.keys is None:
@@ -452,6 +586,30 @@ class RaggedDraftCache:
             return causal[None, None]
         live = cols[None, :] >= mx.array(self._pad)[:, None]  # (B, total)
         return (causal[None] & live[:, None, :])[:, None]
+
+    # ---- QSA の列対応 (`RaggedAttnCache` と同じ 3 つ) ----------------
+    #
+    # こちらは穴が空かない (受理数が行ごとに違ってもドラフトの列は全行そろって
+    # 伸びる) ので、生きていない列は join で左に詰めたぶんだけ。よって
+    # 論理列 c は物理列 ``_pad[b] + c`` で、対応表は cumsum を経由せずに
+    # 直接書ける。プロンプトが長いと priming 窓が PRIME_WINDOW (= 2048、
+    # indexer_budget と同値) に達するので、**ここでも QSA は発火する**。
+    def qsa_uniform(self, S: int) -> bool:
+        return not any(self._pad)
+
+    def qsa_max_len(self, S: int, kv_phys: int) -> int:
+        return kv_phys - min(self._pad) if self._pad else 0
+
+    def qsa_logical(self, S: int, kv_phys: int) -> _QSAMap:
+        max_len = self.qsa_max_len(S, kv_phys)
+        pad = mx.array(self._pad, dtype=mx.int32)[:, None]
+        cols_p = mx.arange(kv_phys, dtype=mx.int32)[None]
+        phys2log = mx.where(cols_p >= pad, cols_p - pad, mx.array(max_len, mx.int32))
+        log2phys = mx.minimum(
+            mx.arange(max_len, dtype=mx.int32)[None] + pad, kv_phys - 1
+        )
+        kv_lens = mx.array([kv_phys - p for p in self._pad], dtype=mx.int32)
+        return _QSAMap(log2phys, phys2log, kv_lens, max_len)
 
     def trim(self, n: int) -> int:
         """末尾 n 列を落とす。
@@ -551,40 +709,178 @@ def make_ragged_cache(model, batch_size: int):
     return caches, ledger
 
 
+# ------------------------------------------------------------ QSA (indexer)
+
+
+def _ragged_indexer_call(self, x, rope, cache, offset, positions, orig):
+    """``QSAIndexer.__call__`` の行別版。ブロック境界を**行の論理列**の上で
+    引き直す。
+
+    本家はブロック格子を物理列で切る (``block_starts = arange(n) * cr``)。
+    dead slot を挟んだバッチ列でそれをやると 3 つ同時に壊れる:
+
+    1. **プーリングの中身**が壊れる。ブロックの平均に dead 列 (棄却された
+       ドラフトの鍵) が混ざる。混ざり方は行ごとに違う。
+    2. **rope の角度**がずれる。pooled 鍵は ``block_starts`` そのもので
+       回すが、行 b の物理列 i の本当の位置は i ではない。
+    3. **top-k が dead 列を選ぶ。**ブロックが選ばれた時点でその cr 列は
+       まるごと可視になるので、棄却したはずのトークンが見える。
+
+    直し方は「行 b の生きている列を並べ直した論理列」の上でブロックを
+    切ること (``_QSAMap``)。dead slot は論理列に現れないので、1 と 3 は
+    構成上起きない。2 は論理位置 = ``positions`` (帳簿の論理長 + s) で回す。
+    ブロック格子は論理列の上では**全行そろう** (どの行も論理 0 から cr 刻み)
+    ので、pooled の rope 角は本家と同じ 1 本で済む。
+
+    行ごとに違うのは「何ブロックまでが実在するか」(``kv_len // cr``) だけで、
+    そこから先の端数列は本家と同じく因果窓で見せる。行の論理 kv 長が
+    ``token_budget`` 以下なら、可視ブロックの数が ``block_topk`` 以下に
+    なるので top-k は全部を選び、結果は素の causal と同じになる --- 単独
+    実行のその行が疎化されない (``__call__`` が None を返す) のと一致する。
+
+    ``dead slot も右パディングも無いラウンド``では物理列と論理列が全行
+    一致するので、**本家をそのまま呼ぶ** (pooled の増分キャッシュもそのまま
+    効く)。判定は帳簿の Python 値だけなので、QSA が働かない短い文脈で
+    余計な仕事は増えない。
+    """
+    Q = _arch()
+    # ``cache`` は KV キャッシュではなく ``_IndexerCache``。行別の列対応は
+    # そこに挿してある ``qsa_owner`` (RaggedAttnCache / RaggedDraftCache) が持つ。
+    owner = getattr(cache, "qsa_owner", None) if cache is not None else None
+    if owner is None or positions is None or owner.qsa_uniform(x.shape[1]):
+        # ここは**キャッシュに触る前**でなければならない (触ってから本家に
+        # 渡すと update が二重に走る)
+        return orig(self, x, rope, cache, offset, positions)
+
+    B, S, _ = x.shape
+    cr = self.compress_ratio
+    qk = self.index_qk_proj(x)
+    split = self.n_heads * self.head_dim
+    q = qk[..., :split].reshape(B, S, self.n_heads, self.head_dim)
+    raw_k = qk[..., split:].reshape(B, S, self.head_dim)
+    raw_k = cache.update(raw_k)
+    kv_phys = raw_k.shape[1]
+
+    # 疎化が要るかは**行ごとの論理 kv 長**で決める (物理列数ではない)。
+    # どの行も budget に収まるなら本家と同じく None -- 呼び出し側の
+    # `final_mask` が帳簿のマスクだけで組む。
+    if owner.qsa_max_len(S, kv_phys) <= self.token_budget:
+        return None
+
+    m = owner.qsa_logical(S, kv_phys)
+    n_len = m.max_len
+    n_blocks = n_len // cr
+
+    # 論理順に並べ直した raw 鍵。dead slot はここで落ちる。
+    gidx = mx.broadcast_to(m.log2phys[:, :, None], (B, n_len, self.head_dim))
+    raw_log = mx.take_along_axis(raw_k, gidx, axis=1)
+
+    # pooled: 本家の非キャッシュ経路と同じ式 (増分キャッシュは使わない --
+    # あちらは物理ブロック番号で持つので論理格子と噛み合わない。ブロックを
+    # 毎ラウンド組み直す分だけ indexer が重くなるが、行別の論理 pooled を
+    # 持ち回るのは別の仕事なのでここではやらない)。
+    pooled = raw_log[:, : n_blocks * cr].reshape(B, n_blocks, cr, self.head_dim)
+    pooled = self.k_layernorm(
+        pooled.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
+    )
+    block_starts = mx.arange(n_blocks) * cr
+    cos_k, sin_k = rope(block_starts[None, :])
+    pooled = Q._rope_partial(pooled, cos_k, sin_k)
+
+    q_col = positions  # (B, S) 行ごとの論理位置
+    cos_q, sin_q = rope(q_col)
+    q = self.q_layernorm(q)
+    q = Q._rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
+
+    scores = mx.einsum(
+        "bshd,bnd->bsnh", q.astype(mx.float32), pooled.astype(mx.float32)
+    )
+    scores = mx.maximum(scores, 0).sum(axis=-1) / math.sqrt(self.head_dim)
+
+    # 候補は「そのクエリの過去に丸ごと収まっているブロック」かつ「その行に
+    # 実在するブロック」。後者は本家に無い条件で、行の論理 kv 長が短いぶん
+    # だけブロック数も少ないことを表す (実在しないブロックの pooled は
+    # 詰め物から作られた値なので、候補に入れてはいけない)。
+    block_end = block_starts + cr - 1
+    row_blocks = m.kv_lens // cr  # (B,)
+    visible = (block_end[None, None, :] <= q_col[:, :, None]) & (
+        mx.arange(n_blocks)[None, None, :] < row_blocks[:, None, None]
+    )
+    scores = mx.where(visible, scores, -mx.inf)
+
+    k = min(self.block_topk, n_blocks)
+    top = mx.argpartition(-scores, k - 1, axis=-1)[..., :k]
+    keep_block = mx.zeros((B, S, n_blocks + 1), dtype=mx.bool_)
+    top = mx.where(mx.take_along_axis(visible, top, axis=-1), top, n_blocks)
+    keep_block = mx.put_along_axis(keep_block, top, mx.array(True), axis=-1)[
+        ..., :n_blocks
+    ]
+
+    # ブロック -> 論理トークン列。行 b の ``row_blocks[b] * cr`` から後ろは
+    # その行の端数 (ブロック格子の外) なので、本家と同じく因果窓で見せる。
+    # 行によってその境目が違うのがここの肝。
+    keep_log = mx.repeat(keep_block, cr, axis=-1)  # (B, S, n_blocks*cr)
+    pad = n_len - n_blocks * cr
+    if pad:
+        keep_log = mx.concatenate(
+            [keep_log, mx.zeros((B, S, pad), dtype=mx.bool_)], axis=-1
+        )
+    cols = mx.arange(n_len)
+    causal = cols[None, None, :] <= q_col[:, :, None]
+    in_block = cols[None, None, :] < (row_blocks * cr)[:, None, None]
+    # 可視ブロックが 1 つも無い行の救済 (本家 `__call__` 末尾と同じ)。
+    # sparse が非 None のとき Attention は causal を捨てる規約なので、
+    # ここで開けないとその行の mask が全面 -inf になって未来まで見える。
+    need = (q_col < cr - 1)[:, :, None]
+    keep_log = mx.where(in_block & ~need, keep_log, causal)
+    keep_log = keep_log & (cols[None, None, :] < m.kv_lens[:, None, None])
+
+    # 論理 -> 物理。dead slot と右パディングは sink 列 (常に False) を指す。
+    keep_log = mx.concatenate(
+        [keep_log, mx.zeros((B, S, 1), dtype=mx.bool_)], axis=-1
+    )
+    pidx = mx.broadcast_to(m.phys2log[:, None, :], (B, S, kv_phys))
+    keep = mx.take_along_axis(keep_log, pidx, axis=-1)
+    return keep[:, None]  # (B, 1, S, kv_phys)
+
+
 # ------------------------------------------------------------ attention hook
 
 
 @contextmanager
 def ragged_attention():
-    """このラウンドの検証フォワード限定で ``Attention`` の 2 つのシームを
-    差し替える。フォワード本体は本家 (``mlxturbo/_vendor/qwen4_exp.py``) の
-    ままで、違うのは次の 2 点だけ。
+    """このラウンドの検証フォワード限定で ``Attention`` の 2 つのシームと
+    ``QSAIndexer`` の 2 つを差し替える。フォワード本体は本家
+    (``mlxturbo/_vendor/qwen4_exp.py``) のままで、違うのは次の 4 点だけ。
 
-    1. RoPE の位置 (``_positions``): ``cache.offset`` を (B,) の論理位置として
-       扱う (本家は python int の物理列位置)。``RaggedAttnCache.offset`` が
-       ``RaggedLedger.valid_len_array()`` を返すので、ここでは
-       ``offset[:, None] + arange(S)`` を常に使うだけでよい。QSA に渡す列位置は
-       ``cache.size()`` (物理列数) のまま。
-    2. mask (``_final_mask``): ``Qwen4ExpModel.__call__`` が渡す ``mask`` 引数は
-       ``create_attention_mask(h, [attn_cache])`` の結果で、単一キャッシュで
-       はなくリストを渡すため必ず "causal"/None に潰れる
+    1. RoPE の位置 (``Attention._positions``): ``cache.offset`` を (B,) の
+       論理位置として扱う (本家は python int の物理列位置)。
+       ``RaggedAttnCache.offset`` が ``RaggedLedger.valid_len_array()`` を
+       返すので、ここでは ``offset[:, None] + arange(S)`` を常に使うだけで
+       よい。QSA に渡す列位置は ``cache.size()`` (物理列数) のまま。
+    2. mask (``Attention._final_mask``): ``Qwen4ExpModel.__call__`` が渡す
+       ``mask`` 引数は ``create_attention_mask(h, [attn_cache])`` の結果で、
+       単一キャッシュではなくリストを渡すため必ず "causal"/None に潰れる
        (mlxturbo/batch.py の docstring 項目 4 と同じ理由)。dead slot を
        知っているのは ``cache.ledger`` だけなので、渡された mask は無視して
-       ``cache.ledger.next_round_mask(S)`` で組み直す。
-
-    QSA (indexer) は本家のまま素通しする。このモジュールが対象にする構成は
-    kv 長が ``indexer_budget`` を超えないことが前提 (モジュール docstring の
-    "indexer / QSA はバッチ対象外" を参照) で、その前提の下では
-    ``QSAIndexer.__call__`` は必ず ``None`` を返す (早期 return は
-    ``raw_k.shape[1]`` だけで決まり、offset の型に依存しない)。前提が破れて
-    ``sparse`` が None でなくなった場合は、黙って間違えるより
-    ``NotImplementedError`` で止める。
+       ``cache.round_mask(S)`` で組み直す。QSA が活性なら、そこへ
+       ``sparse`` を連言で重ねる (本家の「sparse があれば causal を捨てる」
+       規約は使えない -- dead slot を知っているのは帳簿側だけなので)。
+    3. QSA (``QSAIndexer.__call__``): ブロック境界を行の論理列で引き直す
+       (``_ragged_indexer_call``)。
+    4. ``QSAIndexer.select_blocks``: 常に None を返す。段 3(b) の gather 経路
+       (``MLXTURBO_GATHER_ATTN=1``、既定 off) は物理列でブロックを集めるので
+       行別の境界に対応していない。``Attention._gather_forward`` は None を
+       受けると通常経路 (加算マスク) に落ちるので、黙って間違えることは無い
+       (キャッシュにも触らずに返すので二重更新も起きない)。
     """
 
     Q = _arch()
     orig_positions = Q.Attention._positions
     orig_final_mask = Q.Attention._final_mask
     orig_make_masks = Q.Qwen4ExpModel._make_masks
+    orig_indexer_call = Q.QSAIndexer.__call__
+    orig_select_blocks = Q.QSAIndexer.select_blocks
 
     def make_masks(self, h, cache):
         """prefill (右パディング) の間だけ conv_mask を立てる。
@@ -607,22 +903,35 @@ def ragged_attention():
         return cache.size(), cache.offset[:, None] + mx.arange(S)[None, :]
 
     def final_mask(self, mask, sparse, cache, S, dtype):
-        if sparse is not None:
-            raise NotImplementedError(
-                "QSA (indexer) はこのモジュールの対象外 -- indexer_budget を "
-                "kv 長が超えない構成でのみ使うこと (モジュール docstring参照)"
-            )
-        return cache.round_mask(S)
+        # 帳簿のマスクが「生きている過去 + 因果」で、sparse が QSA の
+        # ブロック選択。dead slot は帳簿側にしか出てこないので、本家のように
+        # sparse だけを見ることはできない。
+        led = cache.round_mask(S)
+        if sparse is None:
+            return led
+        return sparse if led is None else (led & sparse)
+
+    def indexer_call(self, x, rope, cache, offset, positions=None):
+        return _ragged_indexer_call(
+            self, x, rope, cache, offset, positions, orig_indexer_call
+        )
+
+    def select_blocks(self, x, rope, cache, offset, positions=None):
+        return None
 
     Q.Attention._positions = positions
     Q.Attention._final_mask = final_mask
     Q.Qwen4ExpModel._make_masks = make_masks
+    Q.QSAIndexer.__call__ = indexer_call
+    Q.QSAIndexer.select_blocks = select_blocks
     try:
         yield
     finally:
         Q.Attention._positions = orig_positions
         Q.Attention._final_mask = orig_final_mask
         Q.Qwen4ExpModel._make_masks = orig_make_masks
+        Q.QSAIndexer.__call__ = orig_indexer_call
+        Q.QSAIndexer.select_blocks = orig_select_blocks
 
 
 @contextmanager
@@ -764,9 +1073,8 @@ class BatchSpecGenerator:
 
     ## 対象外
 
-    QSA (indexer)。kv 長が ``indexer_budget`` を超える構成では
-    ``ragged_attention`` が ``NotImplementedError`` で止まる (モジュール
-    docstring 参照)。呼び手は長いリクエストをバッチから外すこと。
+    段 3(b) の gather 経路 (``MLXTURBO_GATHER_ATTN``)。QSA そのものは
+    行ごとにブロック境界を引き直して対応済み (モジュール docstring 参照)。
 
     ## サンプリング
 
@@ -914,8 +1222,8 @@ class BatchSpecGenerator:
         - 帳簿は行ごとに ``[False]*(new_L - valid) + [True]*valid``
           (``RaggedLedger.extend_rows``)。以後のマスクがゼロ列を隠す。
         - RoPE の位置は ``_valid_len`` から引くので、左に何列足しても回転は
-          動かない。物理列の番号を見ているのは QSA だけで、そちらはこの
-          モジュールの対象外。
+          動かない。物理列の番号を見ているのは QSA だけで、そちらは帳簿から
+          論理列を引き直す。
         - 再帰系 (GDN/PLE/n-gram) は列を持たない固定サイズの状態なので、
           バッチ軸に連結するだけ。
         - MTP のドラフトキャッシュは列数がそろわないので、同じく左詰め
@@ -1048,32 +1356,22 @@ class BatchSpecGenerator:
         self._hyper_prev = self._hyper_prev[idx]
         self.B = len(rows)
 
-    def maybe_compact(
-        self,
-        hard_limit: int | None = None,
-        waste_ratio: float = 1.5,
-        depth: int | None = None,
-    ) -> bool:
+    def maybe_compact(self, waste_ratio: float = 1.5) -> bool:
         """dead slot が溜まってきたら詰める。詰めたら True。
 
-        2 つの理由で呼ぶ:
+        理由は無駄の 1 つだけ: 物理列が論理長の ``waste_ratio`` 倍を超えたら
+        詰める。受理率が 1.6 tok/round 程度なので、詰めないと物理列は論理長の
+        およそ ``(depth+1)/1.6`` 倍で伸び続け、attention の費用がそのぶん
+        丸ごと無駄になる。
 
-        - 硬い上限 (``hard_limit``): 物理列数が QSA の境界 (``indexer_budget``)
-          に届くと ``ragged_attention`` が ``NotImplementedError`` で止まる。
-          次のラウンドで足す ``depth+1`` 列を含めて境界の手前に収まるよう、
-          越えそうなら必ず詰める。論理長がこの境界より短いことは admission が
-          保証しているので (``spec_batchable``)、詰めれば必ず収まる。
-        - 無駄 (``waste_ratio``): 物理列が論理長の ``waste_ratio`` 倍を超えたら
-          詰める。受理率が 1.6 tok/round 程度なので、詰めないと物理列は論理長の
-          およそ ``(depth+1)/1.6`` 倍で伸び続け、attention の費用がそのぶん
-          丸ごと無駄になる。
+        以前はもう 1 つ「硬い上限」があった。物理列数が ``indexer_budget`` に
+        届くと QSA が発火して ``ragged_attention`` が止まったので、境界の手前で
+        必ず詰めていた。QSA を行ごとに引き直した今 (``_ragged_indexer_call``)
+        物理列数に上限は無く、逆に境界で毎ラウンド詰めると長文で丸損になる
+        (17k の物理列を毎ラウンド gather することになる) ので外した。
         """
         valid = self.ledger.max_valid_len()
-        d = self.depth if depth is None else max(0, depth)
-        need = (
-            hard_limit is not None
-            and self.ledger.L + d + 1 > hard_limit
-        ) or (valid and self.ledger.L > valid * waste_ratio)
+        need = bool(valid) and self.ledger.L > valid * waste_ratio
         if not need or self.ledger.L <= valid:
             return False
         self.ledger.compact(self.model, self.caches)
@@ -1248,9 +1546,9 @@ class SpecPrefillLane:
 #
 # prefill を刻むから、走行中に join できる。「まとめて 1 回の prefill」だと
 # 途中参加のたびにバッチ全体が止まるので、閉じたバッチにするしかなかった
-# (docs/BACKLOG.md の A-3)。**A-1 (2048 の上限) は別原因**で、そちらは
-# `prompt + max_tokens <= indexer_budget` を残したまま (`spec_batchable`)。
-# 刻んでも KV は伸びるので、刻んだことでは解けない。
+# (docs/BACKLOG.md の A-3)。**A-1 (2048 の上限) は別原因**だった -- 刻んでも
+# KV は伸びるので、刻んだことでは解けない。そちらは QSA のブロック境界を
+# 行ごとに引き直して外した (2026-09-02、`_ragged_indexer_call`)。
 #
 # ## 1 ステップが 2 回のフォワードに割れること (MLX 側の制約)
 #
@@ -1297,8 +1595,8 @@ class SpecPrefillLane:
 #    追加バイト数」を空きと比べる。足りなければ**優先度最低 = 最若手**の行を
 #    退避する: 生成済みのトークンは保持したまま、`プロンプト + 生成済み` を
 #    新しいプロンプトとして待ち行列の**先頭**へ戻す (vLLM の recompute 型)。
-#    残り max_tokens は同じだけ減るので、`spec_batchable` の条件
-#    (`prompt + max_tokens <= indexer_budget`) は退避の前後で動かない。
+#    残り max_tokens は同じだけ減るので、`spec_batchable` の条件は退避の
+#    前後で動かない (長さの上限が外れた今はそもそも長さを見ていない)。
 #
 # ## B=1 は既存の単独経路のまま (二重に守る)
 #
@@ -1336,24 +1634,24 @@ from typing import Any, Callable
 def spec_batchable(model, prompt_len: int, max_tokens: int, depth: int) -> bool:
     """この要求をバッチ x 投機に入れてよいか。
 
-    条件は QSA (indexer) が最後まで活性化しないこと。`ragged_attention` は
-    QSA を通さず `NotImplementedError` で止める (モジュール docstring の
-    「indexer / QSA はバッチ対象外」) ので、**物理列数**が `indexer_budget`
-    を超えない保証が要る。物理列は論理長より速く伸びるが、
-    `BatchSpecGenerator.maybe_compact` が境界の手前で必ず詰めるので、
-    「論理長 + 次のラウンドで足す depth+1 列」が境界に収まれば足りる。
+    **長さの上限は無い (2026-09-02)。**以前は「`prompt_len + max_tokens +
+    depth+1 <= indexer_budget`」を要求していた。QSA が活性化すると
+    `ragged_attention` が `NotImplementedError` で止まったためで、実運用の
+    要求 (プロンプト 2000 + 生成 128 = 2130 > 2048) が 1 本も通らなかった
+    (`docs/BACKLOG.md`「同時実行の比較は A-1 が外れるまで測れない」)。
+    QSA のブロック境界を行ごとに引き直したので (`_ragged_indexer_call`)、
+    この上限は外れた。物理列数が境界を超えてもよい -- dead slot は論理列に
+    現れないので、ブロック選択に混ざらない。
 
-    プロンプトが 2 トークン未満のものも弾く (priming に 1 対要る)。
+    残る条件は 2 つだけ。プロンプトが 2 トークン以上あること (priming に
+    1 対要る) と、生成が 1 トークン以上あること。メモリの余裕は別口
+    (`rows_fit` / `BatchSpecCoordinator._ensure_room`) で見る。
+
+    ``model`` と ``depth`` は呼び出し側の互換のために残してある (長さの
+    判定に使わなくなった)。
     """
 
-    if prompt_len < 2 or max_tokens < 1:
-        return False
-    budget = _archmod.indexer_budget(model)
-    if budget is None:
-        # QSA を持たない族。この機構自体が qwen4_exp 向けなのでここには
-        # 来ない想定だが、来たら長さの上限は無いものとして扱う
-        return True
-    return prompt_len + max_tokens + depth + 1 <= budget
+    return prompt_len >= 2 and max_tokens >= 1
 
 
 def kv_bytes_per_token(model) -> int | None:
@@ -1428,10 +1726,10 @@ def rows_fit(model, remaining: list[int], depth: int, room: "int | None" = None)
     ここで数えるのは**これから増える分**だけ。数えられない環境
     (Metal が無い等) では ``True`` -- 上限を掛けない、が以前からの扱い。
 
-    実機 (128GB、重み 91GB) でここが効くのは B が数十のときで、通常は
-    ``--max-batch-spec`` が先に効く。それでも式を持っているのは、
-    ``indexer_budget`` の制約が将来外れて長い要求が入るようになったときに、
-    黙って落ちる代わりにここで preemption に倒すため。
+    実機 (128GB、重み 91GB) でここが効くのは B が数十のときだったが、
+    ``indexer_budget`` の長さ制約が外れて 17k 級の要求が入るようになったので
+    (2026-09-02)、B が小さくてもここが効く。黙って落ちる代わりに preemption へ
+    倒すのがこの式の役目。
     """
 
     kv_per_tok = kv_bytes_per_token(model)
@@ -1537,7 +1835,6 @@ class BatchSpecCoordinator:
         self._temp = 0.0
         self._sampler = None
         self._seq = 0
-        self._col_limit = None
 
     # ---- 受付 (任意のスレッドから) --------------------------------------
 
@@ -1623,7 +1920,6 @@ class BatchSpecCoordinator:
         self._rows = []
         self._lane = None
         self._lane_adm = None
-        self._col_limit = _archmod.indexer_budget(self.model)
         try:
             while True:
                 self._drain()
@@ -1804,7 +2100,7 @@ class BatchSpecCoordinator:
         )
         self._settle(new)
         if self._gen is not None:
-            self._gen.maybe_compact(hard_limit=self._col_limit, depth=depth)
+            self._gen.maybe_compact()
 
     def _settle(self, new: list, count_step: bool = True) -> None:
         """1 ラウンドぶんを配り、終わった行を落とす。"""

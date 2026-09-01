@@ -8205,16 +8205,21 @@ def test_maybe_build_batch_spec_coordinator_gating():
 
 
 def test_spec_batchable_length_condition():
-    """QSA (indexer) が最後まで活性化しない要求だけを入れる。境界は
-    「プロンプト長 + max_tokens + depth+1 <= indexer_budget」-- 物理列は
-    論理長より速く伸びるが、maybe_compact が境界の手前で必ず詰めるので
-    次のラウンドぶんの余白があれば足りる (mlxturbo/batch_spec.py 参照)。"""
+    """**長さの上限は無い** (2026-09-02)。
+
+    以前は「プロンプト長 + max_tokens + depth+1 <= indexer_budget」を要求して
+    いた。QSA が活性化すると ragged_attention が NotImplementedError で止まった
+    ためで、実運用の要求 (プロンプト 2000 + 生成 128) が 1 本も通らなかった。
+    QSA のブロック境界を行ごとに引き直したので (mlxturbo/batch_spec.py の
+    `_ragged_indexer_call`)、この条件は外れた。残るのは priming に 1 対要る
+    ことと、生成が 1 トークン以上あることだけ。"""
 
     from mlxturbo.batch_spec import spec_batchable
 
     model = SimpleNamespace(args=SimpleNamespace(text=SimpleNamespace(indexer_budget=100)))
-    assert spec_batchable(model, 50, 47, depth=2)  # 50+47+3 = 100
-    assert not spec_batchable(model, 50, 48, depth=2)  # 101
+    assert spec_batchable(model, 50, 47, depth=2)
+    assert spec_batchable(model, 50, 48, depth=2)  # 以前はここで落ちていた
+    assert spec_batchable(model, 2000, 128, depth=2)  # 実運用の形 (2130 列)
     assert not spec_batchable(model, 1, 10, depth=2)  # priming に 1 対要る
     assert not spec_batchable(model, 10, 0, depth=2)
 
