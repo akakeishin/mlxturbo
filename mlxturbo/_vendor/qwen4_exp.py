@@ -632,6 +632,31 @@ class Attention(nn.Module):
         if offset + S <= self.indexer.token_budget or offset < cr - 1:
             return None
 
+        # 集めるだけの価値があるかを**ホスト側の算数だけ**で見る。
+        # **キャッシュに触る前に判定すること** -- ここから先の
+        # `select_blocks` と `_qkv` はどちらもキャッシュを進めるので、
+        # 触ったあとに None を返すと呼び手のフォールバックが二重に更新する
+        # (実際にやってみて `verify_gather_attn` が max|diff|=0.33 で落ちた)。
+        #
+        # union <= T*block_topk という上限は、T が小さい (decode の 2-4 行)
+        # ときしか締まっていない。prefill のタイル (128-2048 行) では上限が
+        # n_blocks を軽く超えるので「比 100%」としか言えない。実際の union は
+        # ブロックが強く重なるので遥かに小さい (合成モデルで 1.00 -> 0.27、
+        # 実機の掃引でも tile=256 が prefill -1.5%)。
+        # よって**上限が締まっていて、かつそれでも比が大きいときだけ**弾く。
+        #
+        # 比の既定 0.20 は M3 Max の実測 (17k/25k/50k、幅 2 で
+        # 比 24%/16%/8% -> +1.1%/-6.7%/-15.4%、ゼロ交差 23%) から安全側に
+        # 倒した値。**マシン依存**なので `MLXTURBO_GATHER_MAX_RATIO` で
+        # 上書きでき、測り直し方は docs/research/KERNEL-PROGRAM.md の段 C。
+        kv_len = offset + S
+        n_blocks = kv_len // cr
+        tile = getattr(self, "_gather_attn_tile", 0)
+        rows = tile if 0 < tile < S else S
+        bound = rows * (self.indexer.token_budget // cr)
+        if bound < n_blocks and bound * cr > _GATHER_MAX_RATIO * kv_len:
+            return None
+
         # 集めるだけの価値があるかを**ホスト側の算数だけ**で判定する。
         #
         # タイルごとの union はクエリ行数 T と block_topk の積で上に抑えられる
@@ -663,23 +688,6 @@ class Attention(nn.Module):
         q, k, v, gate = self._qkv(x, positions, rope, cache)
         B = x.shape[0]
 
-        # **上限が意味を持つのは行数が少ないときだけ。**union <= T*block_topk は
-        # T が小さい (decode の 2-4 行) ときは締まっているが、prefill の
-        # タイル (128-2048 行) では上限が n_blocks を軽く超えてしまい、
-        # 「比 100%」としか言えなくなる。実際の union はブロックが強く重なる
-        # ので遥かに小さい (合成モデルで 1.00 -> 0.27)。
-        #
-        # よってここでは**上限で確実に勝つと分かる場合だけ**早く抜ける。
-        # 上限では判断できないときは、タイルごとに実際の union を数えてから
-        # 決める (`_gather_tile_attn` 側)。union を数える費用は any 縮約 1 回で、
-        # どのみち gather に要る計算。
-        tile = getattr(self, "_gather_attn_tile", 0)
-        rows = tile if 0 < tile < S else S
-        kv_len = offset + S
-        bound = rows * (self.indexer.token_budget // cr)
-        if bound < blocks.n_blocks and bound * cr > _GATHER_MAX_RATIO * kv_len:
-            # 上限が締まっていて、しかもそれでも比が大きい -> 集める価値が無い
-            return None
 
         if tile <= 0 or S <= tile:
             tile = S  # 従来どおり S 全体を 1 タイルとして 1 回で処理する
