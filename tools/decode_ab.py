@@ -45,6 +45,10 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              **prefill_s** で見る (decode には効かない)。代償は checkpoint
              粒度が粗くなること。
 
+`bool-mask`  sdpa に渡す疎マスクを bool にする (現行は fp32 の加算マスク)。
+             **集合が同じなので品質は変わらない**。合格条件: 17k の ms/token が
+             改善すること。改善したら既定を bool に変える。
+
 `moe-verify` 共有タイル gather v2 (MLXTURBO_MOE_VERIFY、既定 off)。
              verify 幅の MoE だけを差し替える。
              合格条件: **ms/token が短・長の両方で改善すること。**
@@ -257,6 +261,40 @@ def _knob_wide(ctx):
     return apply
 
 
+def _knob_bool_mask(ctx):
+    """A = bool マスク / B = 加算マスク (現行)。
+
+    `Attention._final_mask` はいま `where(sparse, 0, -inf)` で fp32 の加算
+    マスクを作って sdpa に渡している。MLX の sdpa は **bool マスクも取れる**
+    (`mx.fast.scaled_dot_product_attention` の docstring: "If the mask is an
+    array it can be a boolean or additive mask")。
+
+    **集合はまったく同じなので品質は変わらない。**変わるのはマスクの表現だけ。
+    17k で attention が帯域下限の 25% しか出ていない理由が「加算マスクを
+    実体化して渡すと融合経路から落ちる」なら、これだけで戻る。
+
+    QSA を切る実験 (`--knob qsa`) と同じ「マスクが重いのか」を測るが、
+    こちらは**品質が動かないのでそのまま採用できる**。
+    """
+    import mlx.core as mx
+    import mlx_lm.models.qwen4_exp as Q
+
+    orig = Q.Attention._final_mask
+
+    def bool_mask(self, mask, sparse, cache, S, dtype):
+        if sparse is None:
+            return mask
+        if mask is None or isinstance(mask, str):
+            return sparse
+        # 左パディング等の bool マスクが来たら連言。加算に落とさない
+        return mask & sparse
+
+    def apply(variant):
+        Q.Attention._final_mask = bool_mask if variant == "A" else orig
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
@@ -266,6 +304,7 @@ KNOBS = {
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),
     "prefill-group": (_knob_prefill_group, ["2", "4", "8"], True, "4"),
     "qsa": (_knob_qsa, ["A", "B"], False, "A"),
+    "bool-mask": (_knob_bool_mask, ["A", "B"], False, "B"),
     "wide": (_knob_wide, ["A", "B"], False, "B"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
 }
