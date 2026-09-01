@@ -188,6 +188,52 @@ Insufficient Memory` で落ちる。サーバーは 200 を返してストリー
 3. 差が大きいなら、**要求の長さで選ぶか、起動時に「この構成では約 N トークン
    まで」と警告する。**31 秒使ってから落ちるより先に言う方が親切
 
+## Gemma 4 対応の下調べ (2026-09-02、読解のみ・未実行)
+
+### mlxturbo は無改造でどこまで動くか
+
+| | 状態 | 根拠 |
+|---|---|---|
+| `mlx_lm` の gemma4 | **完備** | `gemma4.py` (VLM ラッパ) + `gemma4_text.py`。MoE は `enable_moe_block`、`Router` (117-143) + `Experts`/`SwitchGLU` (153-173)。GQA + sliding window (4:1)、KV は標準の `KVCache`/`RotatingKVCache` |
+| ランナー選択 | **`FallbackRunner` に落ちる** | `runner.py:1649` の `model_type == "qwen4_exp"` に入らず、`SpecEngine` の契約検証 (`_mlx_compat.py:120-176`) が qwen3_5 の GDN 専用属性を要求して失敗 → `runner.py:1785-1791` の except で捕捉。**コード読解による推論で、実行では未確認** |
+| 投機 | **無い** | `FallbackRunner` は `stream_generate` を直接呼ぶだけ (`runner.py:540-604`)。`LookupSpecRunner` / `DraftSpecRunner` への配線を書く必要がある |
+| `--max-batch` | **効く** | `can_batch` (`runner.py:761-764`) が `FallbackRunner` 限定。`batch.py` のパッチは qwen4_exp のキャッシュ専用なので Gemma4 は対象外 (パッチが要らない側) |
+| `server.py` のアーキ分岐 | **実行時はゼロ** | `qwen4_exp`/`qwen3_5` のヒット 6 箇所は全部コメント・ヘルプ・ログ |
+| `bench/quant_eval.py` | **移る** | docstring に「モデル非依存」、Flash-Next 固有の前提は無い |
+| `tools/bake.py` / `convert_flash.py` / `convert.py` | **移らない** | 前者 2 つは qwen4_exp のテンソルパス、後者は 27B (qwen3_5) 専用 |
+
+**未確認**: Gemma4 の `previous_kvs` (KV 共有層) が `BatchGenerator` の
+merge/filter/extract と整合するか。26B-A4B-it は `num_kv_shared_layers: 0`
+なので当面は影響しない見込みだが未検証。
+
+### モデルの実態 (`google/gemma-4-26B-A4B-it` の config)
+
+総 25.2B / アクティブ 3.8B、30 層、**128 専門家 top-8 + 共有 dense 1**、
+hidden 2816、**moe_intermediate 704**、head_dim 256 (full attention 層は
+global_head_dim 512)、sliding_window 1024、文脈 256K、vocab 262144。
+MLX 変換済みが `mlx-community/gemma-4-26b-a4b-it-{4bit..bf16, mxfp4, nvfp4}`
+と QAT 4bit まで既にある。
+
+**`moe_intermediate = 704` も 512 の倍数ではない。**うちの 640 と同じ形だが、
+2026-09-02 の実測で「K による差は無い」と決着済みなので、ここは問題にしない。
+
+### リーダーボード (yukon.org/mlxfast) は別物だった
+
+**mlxturbo で参加するものではない。**対象は Swift/MLX の別エンジン
+(`Layr-Labs/mlxfast-gemma4-26b-a4b-engine`、`mlx-swift` をベンダリング)。
+提出は `yukon` CLI でのソース差分で、編集できるのは 93 エントリ
+(Swift のランタイムとベンダリング済み Metal カーネル)。
+
+**量子化は固定** (`mlx-community/gemma-4-26B-A4B-it-qat-4bit` の指定
+リビジョン、affine group_size=64 の 4bit)。再量子化は明示的に禁止で、
+例外は投機ヘッドのみ。**うちのベイクのレーンも使えない。**
+
+採点は `prefill_gain^0.25 * decode_gain^0.75`、**バッチ 8 固定**、
+draft depth は上限 3。締切の記載は見つからなかった。
+
+**持ち込めるのは知識だけで、コードも量子化も持ち込めない。**参加するなら
+Swift と Metal を書く別レーンとして立てること。
+
 ## 済み (BACKLOG から出たもの)
 
 - **tool calling** → 73e061a で実装。opencode / Codex / Claude Code の 3 クライアントで実機検証済み。懸念だった「モデルが構文を安定して出すか」は Qwen3.6 / Flash-Next とも問題なし
