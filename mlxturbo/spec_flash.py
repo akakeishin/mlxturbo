@@ -98,11 +98,45 @@ MTP_DEPTH = 2
 #   48k      30.8       —        17.6
 #
 # 反転は 6k と 8k の間。勝っている側の内側を採って 6144 (= 3 チャンク) に置く。
-# 2026-09-01 再較正: 6144 は sdpa の 32 行の壁 (qL>=3 が未融合経路に落ちる)
-# を避けるための遺物だった。壁は 2 行分割で解消済みで、17k 実測は depth2 が
-# depth1 を 14% 上回り受理率も 2.27 を維持 (docs/DECODE-ANATOMY)。既定は
-# 実質無効 (モデルの文脈上限)。env で戻せる。
-DEPTH_CONTEXT_LIMIT = int(os.environ.get("MLXTURBO_DEPTH_CTX_LIMIT", "262144"))
+#
+# 2026-09-01 再較正 (1): 6144 は sdpa の 32 行の壁 (qL>=3 が未融合経路に
+# 落ちる) を避けるための遺物と判断し、いったん実質無効 (262144) に置いた。
+#
+# 2026-09-01 再較正 (2、こちらが現行): 複数プロンプト x 512 の回文順掃引で
+# 測り直したところ、**長文では depth 1 が勝つ**とはっきり出た
+# (tools/decode_ab.py --knob depth、bench/results/depth-*.json)。
+# ms/token、depth 2 を基準にした差:
+#
+#   文脈    depth 1   depth 2   depth 3
+#    65 tok  +5.6%     基準     +11.7%
+#   900      +5.1%     基準      +2.6%
+#   2.6k     -3.3%     基準      +9.9%
+#   4k       -3.1%     基準      +8.2%
+#   17k     -10.9%     基準      +3.2%
+#
+# 反転は 900 と 2.6k の間にあり、そこには QSA が働き始める境界
+# (indexer_budget = 2048) がある。機構としても符合する — QSA が活性だと
+# 検証フォワードに 1 位置足す費用にブロック選択と疎マスクが乗り、受理が
+# 増えるぶんを償却しなくなる。tok/round は深いほど上がり続ける (17k で
+# 1.64 / 1.97 / 2.33) のに壁時計は逆、というのがこの現象の形。
+#
+# よって既定はモデルの indexer_budget にする (下の _depth_ctx_limit)。
+# 定数を持たない族では境界が無いので切り替えない。env で上書きできる。
+DEPTH_CONTEXT_LIMIT = int(os.environ.get("MLXTURBO_DEPTH_CTX_LIMIT", "0")) or None
+_DEPTH_CTX_LIMIT_FALLBACK = 262144
+
+
+def _depth_ctx_limit(model) -> int:
+    """このモデルで depth を 1 に落とす文脈長。
+
+    env の指定が最優先。無ければ疎注意の境界 (indexer_budget) を使う。
+    境界を持たない族では切り替えない (モデルの文脈上限に置く)。
+    """
+    if DEPTH_CONTEXT_LIMIT:
+        return DEPTH_CONTEXT_LIMIT
+    from .arch import indexer_budget
+
+    return indexer_budget(model) or _DEPTH_CTX_LIMIT_FALLBACK
 
 
 class Capture:
@@ -496,6 +530,7 @@ class FlashSpecEngine:
         self.mtp = mtp
         self.rope = model.model.rope
         self.depth = max(1, int(depth))
+        self.depth_ctx_limit = _depth_ctx_limit(model)
         # draft-rerank (mlx-serve の設計の移植): trunk lm_head の 2bit 再量子化で
         # 全語彙を粗く読み、正確な top-32 だけを trunk のヘッドの行で再採点する。
         # 粗い top-32 に真の argmax が入っている限り draft は trunk と一致し、
@@ -548,7 +583,7 @@ class FlashSpecEngine:
     def _effective_depth(self, pos: int) -> int:
         """この位置で引くドラフト数。長い文脈では 1 に落とす
         (DEPTH_CONTEXT_LIMIT の注記を参照)。"""
-        return 1 if pos >= DEPTH_CONTEXT_LIMIT else self.depth
+        return 1 if pos >= self.depth_ctx_limit else self.depth
 
     def _draft_chain(self, cur, hyper_prev, cache, depth: int):
         """``self.depth`` トークンをまとめて引く。

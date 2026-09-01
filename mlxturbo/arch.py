@@ -142,6 +142,19 @@ def has_indexer(cache_entry) -> bool:
     return indexer is not None and getattr(indexer, "keys", None) is not None
 
 
+def indexer_budget(model) -> int | None:
+    """疎注意 (QSA) が働き始める kv 長。持たない族では None。
+
+    「kv がこれを超えると 1 位置あたりの検証費用が跳ねる」という境界なので、
+    バッチの solo tier 判定 (`mlxturbo/batch.py`) と投機の深さ切り替え
+    (`mlxturbo/spec_flash.py`) が同じ値を見る。
+    """
+    try:
+        return model.args.text.indexer_budget
+    except AttributeError:
+        return None
+
+
 def _take_rows(arr: mx.array, starts: mx.array, width: int) -> mx.array:
     """`arr` の axis=1 から、行 b ごとに `[starts[b], starts[b]+width)` を
     切り出す。単一行の `x[:, keep:keep+w, :]` 系スライスを行別に一般化した
@@ -267,6 +280,7 @@ __all__ = [
     "recurrent_layers",
     "attention_layers",
     "has_indexer",
+    "indexer_budget",
     "rollback_recurrent",
     "rollback_recurrent_rows",
 ]

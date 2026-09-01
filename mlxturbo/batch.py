@@ -686,10 +686,9 @@ def _indexer_budget(model) -> int | None:
     """None means "this architecture has no QSA / no such notion" (anything
     other than qwen4_exp) — every request is then always poolable."""
 
-    try:
-        return model.args.text.indexer_budget
-    except AttributeError:
-        return None
+    from .arch import indexer_budget
+
+    return indexer_budget(model)
 
 
 def classify(model, prompt_len: int, max_tokens: int) -> str:

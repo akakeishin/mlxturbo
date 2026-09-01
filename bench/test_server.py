@@ -4503,13 +4503,17 @@ def test_flash_spec_depth_drops_to_one_past_the_context_limit():
     深くすると検証フォワードの位置数が増え、その費用は文脈長に比例するので、
     長文では利得を食い潰して逆に遅くなる (v-l 実測: 48k で depth 3 は
     depth 1 の 17.6 対 30.8 tok/s)。DEPTH_CONTEXT_LIMIT の注記を参照。
+
+    2026-09-01: 境界の既定はモデルの indexer_budget (疎注意が働き始める
+    kv 長) になった。engine が自分で決めるので、engine 側の値を見る。
     """
 
     import mlxturbo.spec_flash as spec_flash_module
 
     model, mtp = _build_tiny_qwen4_exp()
     engine = spec_flash_module.FlashSpecEngine(model, mtp, depth=3)
-    limit = spec_flash_module.DEPTH_CONTEXT_LIMIT
+    limit = engine.depth_ctx_limit
+    assert limit == model.args.text.indexer_budget
 
     assert engine._effective_depth(0) == 3
     assert engine._effective_depth(limit - 1) == 3
