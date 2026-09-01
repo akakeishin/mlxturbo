@@ -319,8 +319,22 @@ class SpecEngine:
 
     # ---------- main-model forward ----------
 
-    def _hidden_forward(self, tokens: mx.array, caches, capture: bool):
-        """tokens: (S,). Returns: (hidden before the final norm (1,S,D), rollback info for the linear layers)"""
+    def _hidden_forward(self, tokens: mx.array, caches, capture: bool,
+                        staged: bool = False):
+        """tokens: (S,). Returns: (hidden before the final norm (1,S,D), rollback info for the linear layers)
+
+        ``staged=True`` (capture=False のときだけ意味を持つ) は層ループを
+        `mlxturbo/staged.py` の段階投入版に差し替える。値は変わらず
+        スケジューリングだけが変わる (2 層ごとに mx.async_eval を挟んで
+        グラフ構築中の GPU 遊休を刈る)。**呼び手は staged_forward を直接
+        呼ばずここを通すこと** -- フォワードの入口が 1 つでないと、差し替えて
+        検査する側 (bench/test_spec_phase0.py の _FakeEngine) が経路を
+        押さえられなくなる。
+        """
+        if staged and not capture:
+            return staged_forward(
+                self.inner, tokens[None], caches, every=_STAGE_EVERY
+            ), []
         if capture and any(
             layer.is_linear and layer.linear_attn.sharding_group is not None
             for layer in self.inner.layers
@@ -819,13 +833,35 @@ class SpecEngine:
                 # So MTP is carried over only when session.mtp_valid, and
                 # otherwise the use_mtp block below naturally falls into the same
                 # path as "no session reuse" (rebuilding from prompt[1:]).
-                caches = session.caches
-                checkpoints = session.checkpoints
-                reused = lcp
-                if session.mtp_valid:
-                    mtp_cache = session.mtp_cache
-                    reused_h_last = session.h_last
-                reused_tail = session.tail
+                if (
+                    use_mtp
+                    and not session.mtp_valid
+                    and lcp > 0
+                    and session.h_last is not None
+                ):
+                    # MTP を切ったターンのあとに戻したケース。KV だけ引き継ぐと
+                    # MTP の履歴を作り直せない -- 下の use_mtp ブロックは
+                    # 「今回のフォワードで出た hidden」からしか履歴を積めず、
+                    # 引き継いだ lcp 個ぶんの hidden はもう手元に無い。結果
+                    # MTP キャッシュが空のままドラフトを引くことになり、
+                    # ラウンドごとの rope 位置が本当の位置とずれる。ここは
+                    # KV の再利用ごと捨ててプロンプト全体を流し直す。
+                    #
+                    # ``h_last is not None`` で checkpoint 復元と区別している。
+                    # あちらは server.py が h_last/mtp_cache を落として
+                    # mtp_valid を下ろすので h_last が None で、**再利用こそが
+                    # 目的** (追記ターンの TTFT がここに乗っている)。off->on の
+                    # 遷移は本番では起きない (サーバーは MTP 常時 on) ので、
+                    # 再 prefill の代償を払う側に倒してよい。
+                    session.invalidate()
+                else:
+                    caches = session.caches
+                    checkpoints = session.checkpoints
+                    reused = lcp
+                    if session.mtp_valid:
+                        mtp_cache = session.mtp_cache
+                        reused_h_last = session.h_last
+                    reused_tail = session.tail
                 # The local variables now own these mutable caches.  Any error,
                 # including KeyboardInterrupt or a callback failure, leaves the
                 # public session invalid instead of half-published.
@@ -1056,8 +1092,9 @@ class SpecEngine:
                 # 値を変えずスケジューリングだけを変えるので計算内容は
                 # _hidden_forward(capture=False) と同一 -- sink は capture=False
                 # のときこれまでも常に空だったので [] のままで変わらない。
-                hs = staged_forward(self.inner, window[None], caches, every=_STAGE_EVERY)
-                sink = []
+                hs, sink = self._hidden_forward(
+                    window, caches, capture=False, staged=True
+                )
             logits = self._head(hs, self.inner.norm)
             accepted_eos = None
             ent_l = None

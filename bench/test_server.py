@@ -4187,7 +4187,9 @@ def test_checkpoint_restore_end_to_end_matches_full_rebuild_with_mtp():
         session=sess,
     )
     assert sess.mtp_valid is True  # 実運用の通常状態を再現できていることの確認
-    assert [pos for pos, _ in sess.checkpoints] == [3, 6, 9, 12]
+    # 3,6,9 はチャンク境界。11 は BPE 末尾分割 (prefill_common の
+    # split_and_checkpoint_tail を dense 経路へ移植したぶん)、12 が全体。
+    assert [pos for pos, _ in sess.checkpoints] == [3, 6, 9, 11, 12]
 
     full_history = turn1_prompt + r1["tokens"]
     turn2_prompt = full_history[:-2] + [40, 41]  # 末尾 2 トークンだけ違う
@@ -4360,7 +4362,7 @@ def test_flash_spec_exact_repeat_reuses_prefill_fully_and_matches_fresh_run(monk
     engine = spec_flash_module.FlashSpecEngine(model, mtp)
     runner = FlashSpecRunner(engine)
 
-    turn1_prompt = list(range(1, 13))  # 12 トークン、step=3 で境界 3,6,9,12
+    turn1_prompt = list(range(1, 13))  # 12 トークン、step=3
 
     session = FallbackSession()
     r1 = runner.generate(
@@ -4630,7 +4632,7 @@ def test_flash_spec_checkpoint_reuse_matches_full_rebuild_with_tail_mismatch(mon
     engine = spec_flash_module.FlashSpecEngine(model, mtp)
     runner = FlashSpecRunner(engine)
 
-    turn1_prompt = list(range(1, 13))  # 12 トークン、step=3 で境界 3,6,9,12
+    turn1_prompt = list(range(1, 13))  # 12 トークン、step=3
 
     session = FallbackSession()
     r1 = runner.generate(
@@ -4641,7 +4643,13 @@ def test_flash_spec_checkpoint_reuse_matches_full_rebuild_with_tail_mismatch(mon
         on_tokens=None,
         session=session,
     )
-    assert [pos for pos, _ in session.checkpoints] == [3, 6, 9, 12]
+    # チャンク主導なら 3,6,9,12 に立つが、layer-major prefill
+    # (MLXTURBO_PREFILL_GROUP=4) は前方チャンクをまとめて流すので、境界は
+    # グループの出口 (9) だけになる。**グループ内で刻むのは構造的に不可能** --
+    # レイヤー主導では「チャンク k を全層通した状態」がどの瞬間にも存在しない
+    # (docs/research/IMPROVEMENT-QUEUE.md B2)。末尾側は従来経路なので、
+    # BPE 末尾分割の 11 と全体の 12 が続く。
+    assert [pos for pos, _ in session.checkpoints] == [9, 11, 12]
 
     # FlashSpecRunner の不変条件 (6a0cd27): 最後の cur はまだ cache に
     # feed されていないので、publish されるのは tokens[:-1] まで。
@@ -4702,7 +4710,7 @@ def test_flash_spec_checkpoint_reuse_disabled_when_prompt_fits_one_chunk(monkeyp
     runner = FlashSpecRunner(engine)
 
     turn1_prompt = list(range(1, 9))  # 8 トークン、既定 PREFILL_STEP_SIZE の
-    # 下では 1 チャンク (境界はプロンプト末尾の 1 個だけ)
+    # 下では 1 チャンク
 
     session = FallbackSession()
     runner.generate(
@@ -4713,10 +4721,15 @@ def test_flash_spec_checkpoint_reuse_disabled_when_prompt_fits_one_chunk(monkeyp
         on_tokens=None,
         session=session,
     )
-    assert [pos for pos, _ in session.checkpoints] == [8]
+    # 末尾の 2 個。プロンプト全体 (8) に加えて、その 1 つ手前 (7) にも立つ --
+    # BPE 末尾マージ対策 (prefill_common.split_and_checkpoint_tail)。2 ターン目に
+    # retemplate されると最終トークンが後続の文字と合体して化け、LCP が
+    # ちょうど 1 トークン手前で止まるので、そこに checkpoint が無いと
+    # 再 prefill になる (実測で追記ターン 16k の TTFT が 6.14s -> 1.1s)。
+    assert [pos for pos, _ in session.checkpoints] == [7, 8]
 
-    turn2_prompt = [1, 2, 20, 21]  # 位置 2 で分岐 -- 唯一のチェックポイント
-    # (位置 8) より手前なので使えない
+    turn2_prompt = [1, 2, 20, 21]  # 位置 2 で分岐 -- どの checkpoint (7, 8)
+    # より手前なので使えない
 
     cp_pos = server._try_checkpoint_restore_session_cache(session, lcp=2)
     assert cp_pos is None

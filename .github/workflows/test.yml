@@ -11,10 +11,15 @@ name: test
 # bench/test_qmm_skinny_mma_static.py は、カーネル側の作業が
 # 未完了のため一時的に外している。
 #
-# continue-on-error にしているのは、CI 環境の Metal/GPU 挙動がローカルの
-# 開発機と異なる可能性があり、経験が無いため。緑を装うためではなく、
-# 「壊れたら気づける」を優先し、失敗してもジョブ自体は赤にしないことで
-# しばらく様子を見る運用にしている。
+# 2026-09-01 に continue-on-error を外した。これを入れていた理由は 2 つで、
+# どちらも解消した:
+#   1. 既知の失敗が 15 件あった (フィクスチャが本番既定に追随していなかった)。
+#      全部直した -- うち 2 件は本物のバグだった (tie_word_embeddings の
+#      パックでエンジンが構築時に落ちる / MTP を off から on に戻すと
+#      不整合な MTP キャッシュを引き継ぐ)。
+#   2. CI 環境の Metal/GPU 挙動が読めなかった。
+# 2 が理由で赤くなったら、そのテストを個別に外すこと。**ジョブ全体を
+# continue-on-error に戻さない** -- 1 件でも落ちたら気づけなくなる。
 
 on:
   push:
@@ -24,7 +29,6 @@ on:
 jobs:
   test:
     runs-on: macos-14
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 

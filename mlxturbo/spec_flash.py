@@ -312,6 +312,15 @@ def _staged_forward(model, ids, caches):
 # 分割でもビット一致 (micro 確認済み) — 出力はトークン列まで不変が要件。
 _PREFILL_GROUP = int(os.environ.get("MLXTURBO_PREFILL_GROUP", "4") or 0)
 
+if _PREFILL_GROUP > 1 and os.environ.get("MLXTURBO_PREFILL_CHUNK"):
+    # MLXTURBO_PREFILL_CHUNK を立てると big != step になり、下の group 経路の
+    # 条件が外れて layer-major prefill が**黙って無効化**される。チャンク幅の
+    # 棄却記録 (-2%) は layer-major 以前のものなので、将来これを再測する人が
+    # 気づかずに layer-major を落とし、偽の負けを記録する罠になっていた。
+    print("[mlxturbo] 警告: MLXTURBO_PREFILL_CHUNK を立てたので layer-major"
+          " prefill (MLXTURBO_PREFILL_GROUP) は無効になる。チャンク幅を測るなら"
+          " その前提で読むこと (docs/research/IMPROVEMENT-QUEUE.md D2)。")
+
 
 def _group_prefill_forward(model, chunks, caches):
     """中間 prefill チャンクのグループをレイヤー主導で流す。
@@ -543,9 +552,23 @@ class FlashSpecEngine:
     RERANK_BITS = 2
     RERANK_TOP = 32
 
+    def _head(self, x: mx.array) -> mx.array:
+        """hidden から logits。``tie_word_embeddings`` のパックには
+        ``lm_head`` が無く、``embed_tokens.as_linear`` が代わりになる
+        (``generate`` / ``_staged_forward`` と同じ規約)。以前ここが
+        ``self.model.lm_head`` 直参照で、**tie されたパックはエンジンの構築
+        時点で AttributeError になっていた**。
+        """
+        lm = getattr(self.model, "lm_head", None)
+        if lm is not None:
+            return lm(x)
+        return self.model.model.embed_tokens.as_linear(x)
+
     def _build_rerank(self) -> None:
-        lm = self.model.lm_head
-        if not hasattr(lm, "scales"):
+        lm = getattr(self.model, "lm_head", None)
+        if lm is None or not hasattr(lm, "scales"):
+            # tie されたパック (lm_head 無し) と非量子化パックでは粗ヘッドを
+            # 作れない。rerank 無しで動く (draft は trunk の argmax)。
             return
         w = mx.dequantize(lm.weight, lm.scales, lm.biases,
                           group_size=lm.group_size, bits=lm.bits)
@@ -564,10 +587,10 @@ class FlashSpecEngine:
         rerank あり: 2bit 粗ヘッドで全語彙 -> top-32 -> trunk の該当行を
         逆量子化して再採点 -> argmax。無し: trunk ヘッドで argmax。
         """
-        lm = self.model.lm_head
-        row = out[:, -1]
         if self._rerank is None:
-            return mx.argmax(lm(out)[:, -1], axis=-1).reshape(1, 1)
+            return mx.argmax(self._head(out)[:, -1], axis=-1).reshape(1, 1)
+        lm = self.model.lm_head  # _rerank があるなら lm_head も必ずある
+        row = out[:, -1]
         cw, cs, cb = self._rerank
         coarse = mx.quantized_matmul(
             row, cw, scales=cs, biases=cb, transpose=True,

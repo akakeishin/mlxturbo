@@ -100,9 +100,13 @@ class _FakeEngine(SpecEngine):
 
     def __init__(self, *, eos_token: int | None = None, fail_forward: bool = False):
         # generate() は _head の引数として self.inner.norm を評価するため、
-        # _head をオーバーライドしていても属性自体は必要になる。
-        self.inner = SimpleNamespace(norm=None)
-        self.mtp = SimpleNamespace(norm=None)
+        # _head をオーバーライドしていても属性自体は必要になる。さらに
+        # _mtp_base (base_hidden_variant=post_norm、bench/results/mtp-2x2-*.json
+        # で決着) が self.inner.norm を**呼ぶ**ので、None ではなく恒等関数に
+        # する。このフェイクの意味 (次トークン = token+1) は正規化と独立なので、
+        # 恒等で本番の経路をそのまま踏める。
+        self.inner = SimpleNamespace(norm=lambda x: x)
+        self.mtp = SimpleNamespace(norm=lambda x: x)
         self.hidden_calls: list[tuple[list[int], bool]] = []
         self.mtp_calls: list[list[int]] = []
         self.head_calls = 0
@@ -114,7 +118,10 @@ class _FakeEngine(SpecEngine):
 
         self.text = SimpleNamespace(make_cache=make_cache)
 
-    def _hidden_forward(self, tokens, caches, capture: bool):
+    def _hidden_forward(self, tokens, caches, capture: bool, staged: bool = False):
+        # ``staged`` は段階投入 (mlxturbo/staged.py) を使うかどうかで、値は
+        # 変わらずスケジューリングだけが変わる。このフェイクは層ループを
+        # 持たないので区別する意味が無く、受け取って無視する。
         token_ids = _as_ints(tokens)
         self.hidden_calls.append((token_ids, capture))
         if self.fail_forward and not capture:
