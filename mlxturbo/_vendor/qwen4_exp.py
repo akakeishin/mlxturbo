@@ -722,10 +722,19 @@ class Attention(nn.Module):
         #
         # union <= T*block_topk という上限は、T が小さい (decode の 2-4 行)
         # ときしか締まっていない。prefill のタイル (128-2048 行) では上限が
-        # n_blocks を軽く超えるので「比 100%」としか言えない。実際の union は
-        # ブロックが強く重なるので遥かに小さい (合成モデルで 1.00 -> 0.27、
-        # 実機の掃引でも tile=256 が prefill -1.5%)。
-        # よって**上限が締まっていて、かつそれでも比が大きいときだけ**弾く。
+        # n_blocks を軽く超えるので「比 100%」になる。
+        #
+        # **2026-09-02 に修正。**以前ここには `bound < n_blocks and` が付いていて、
+        # 「上限が締まっているときだけ弾く」形になっていた。つまり prefill 幅では
+        # **絶対に辞退しない。**段 P0 の解剖で、実際に union が 100% のまま
+        # K/V を丸ごと複製し (chunk 7 で 400MB)、(1,2048,16384) の bool マスクを
+        # 作ってから結局密の sdpa を回していることが分かった。**刈り込みはゼロ。**
+        # 17k の実測でも gather on が prefill +1.2% / tok/round -0.5% で、
+        # 3 択 (off / tile=256 / タイル無し) の中でタイル無しが最悪だった。
+        # 比のガードは正しく「17k では辞退」と言っていたのに黙らせていた。
+        #
+        # **反転条件**: 50k の prefill は未測。そこで gather が勝つなら、
+        # 長さで分ける (比のしきい値そのものは既に kv_len に依存している)。
         #
         # 比の既定 0.20 は M3 Max の実測 (17k/25k/50k、幅 2 で
         # 比 24%/16%/8% -> +1.1%/-6.7%/-15.4%、ゼロ交差 23%) から安全側に
@@ -736,7 +745,7 @@ class Attention(nn.Module):
         tile = getattr(self, "_gather_attn_tile", 0)
         rows = tile if 0 < tile < S else S
         bound = rows * (self.indexer.token_budget // cr)
-        if bound < n_blocks and bound * cr > _gather_max_ratio(self.head_dim) * kv_len:
+        if bound * cr > _gather_max_ratio(self.head_dim) * kv_len:
             return None
 
         # 集めるだけの価値があるかを**ホスト側の算数だけ**で判定する。
