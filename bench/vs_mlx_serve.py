@@ -163,7 +163,6 @@ def main() -> int:
     ap.add_argument("--out", default="bench/results/vs-mlx-serve.json")
     args = ap.parse_args()
 
-    from mlx_lm.tokenizer_utils import load_tokenizer  # noqa: F401
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(os.path.expanduser(args.model))
