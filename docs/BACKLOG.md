@@ -94,9 +94,13 @@ fastmlx/mlxturbo 側の現状:
 
 ### 2026-09-01 追記: 横展開の方向 (ユーザー方針)
 
-対応を広げるなら **MTP ヘッドを積んだ Flash 系ファミリー** (DeepSeek V4
-Flash、GLM 5.3 Flash) が先で、dense は Qwen3.8-27B (spec.py の出発点) の
-復帰だけ。MTP 無し dense (Gemma/llama) は投機の取り分が細く llama.cpp の
-土俵なので追わない。**バッチ x 投機の機構 (同期ラウンド・dead-slot マスク・
+対応を広げるなら **MTP ヘッドを積んだモデル** (DeepSeek V4 Flash、
+GLM 5.3 Flash、**Gemma の MTP 版 — 出ているとユーザー指摘 2026-09-01**) が
+先で、dense は Qwen3.8-27B (spec.py の出発点) の復帰だけ。MTP 無しモデルへの
+持ち札は、(1) n-gram / lookup 投機 (ヘッド不要、ngram_stream + lookup_spec)、
+(2) 段階投入 (_staged_forward のグラフ泡刈り、アーキテクチャ非依存の手法)、
+(3) 継続バッチング (B=6-8 で合計 2-2.5x)、の 3 つで、qwen4 特化カーネルは
+運べない。素の単発 decode で llama.cpp に大差を付ける材料は無いことは
+正直に書いておく。**バッチ x 投機の機構 (同期ラウンド・dead-slot マスク・
 admission) はアーキテクチャ非依存に書くこと** — qwen4 固有なのは GDN の
 行別 take だけで、汎用に切っておけば横展開時にバッチ x MTP ごと運べる。
