@@ -41,6 +41,10 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              スケジューリングだけが変わるので、対照 (出力一致) が効く。
              合格条件: 短・長の両方で ms/token が改善すること。
 
+`prefill-group` layer-major prefill のグループ幅 (既定 4)。判定は
+             **prefill_s** で見る (decode には効かない)。代償は checkpoint
+             粒度が粗くなること。
+
 `moe-verify` 共有タイル gather v2 (MLXTURBO_MOE_VERIFY、既定 off)。
              verify 幅の MoE だけを差し替える。
              合格条件: **ms/token が短・長の両方で改善すること。**
@@ -186,6 +190,22 @@ def _knob_stage_every(ctx):
     return apply
 
 
+def _knob_prefill_group(ctx):
+    """layer-major prefill のグループ幅 (`spec_flash._PREFILL_GROUP`)。既定 4。
+
+    gather_qmm の効率は行数/expert に単調 (r=40/80/160 で 7.5/8.9/9.8 TFLOPS、
+    密上限 11.2) なので、G を上げると MoE の効率は上がりうる。代償は
+    checkpoint 粒度が g*2048 に粗くなること (2 ターン目の再 prefill が増える)。
+    判定は **prefill_s** で見ること (decode には効かない)。
+    """
+    import mlxturbo.spec_flash as SF
+
+    def apply(variant):
+        SF._PREFILL_GROUP = int(variant)
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
@@ -193,6 +213,7 @@ KNOBS = {
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),
+    "prefill-group": (_knob_prefill_group, ["2", "4", "8"], True, "4"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
 }
 
@@ -341,7 +362,7 @@ def main() -> int:
         sub = [r for r in rows if r["kind"] == kind]
         if not sub:
             continue
-        for metric in ("ms_per_tok", "tok_per_round"):
+        for metric in ("ms_per_tok", "tok_per_round", "prefill_s"):
             means = {}
             for v in variants:
                 vals = [r[metric] for r in sub if r["variant"] == v]
