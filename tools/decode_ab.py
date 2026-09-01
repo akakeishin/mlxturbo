@@ -374,6 +374,22 @@ def _knob_gather_tile(ctx):
     return apply
 
 
+def _knob_prefill_pipeline(ctx):
+    """group prefill の境界同期を非同期にする (段 D5)。A = 非同期 / B = 現行。
+
+    グループ境界の `mx.eval` + `clear_cache` が完全同期で、次のグループの
+    グラフ構築中に GPU が遊ぶ。全部使うグラフなので「作って捨てる」禁則には
+    当たらない。**2 グループぶんの中間が同時に生きるので OOM 側の危険がある。**
+    判定は prefill_s。
+    """
+    import mlxturbo.spec_flash as SF
+
+    def apply(variant):
+        SF._PREFILL_PIPELINE = variant == "A"
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
@@ -383,6 +399,7 @@ KNOBS = {
     "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),
     "prefill-group": (_knob_prefill_group, ["2", "4", "8"], True, "4"),
+    "prefill-pipeline": (_knob_prefill_pipeline, ["A", "B"], True, "B"),
     "qsa": (_knob_qsa, ["A", "B"], False, "A"),
     "bool-mask": (_knob_bool_mask, ["A", "B"], False, "B"),
     "gather-attn": (_knob_gather_attn, ["A", "B"], False, "B"),
