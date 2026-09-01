@@ -72,6 +72,13 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
 
     tools/biglock.sh .venv/bin/python tools/decode_ab.py --knob moe-verify \\
         --model ~/models/ddalcu-mlxlm --ngram ~/models/ddalcu-ngram-sep
+
+`hc-write`   hyper-connection の書き戻し (`DecoderLayer._combine`、
+             MLXTURBO_HC_WRITE、既定 off) を mx.compile で 1 kernel に畳む。
+             読み側 (`enable_hyper_connection_kernel`) とは別のディスパッチで、
+             層あたり 2 回、48 層で計 96 回。演算順を変えないのでビット同一。
+             合格条件: 出力一致 (対照) に加え、短・長の両方で ms/token が
+             改善すること。
 """
 
 from __future__ import annotations
@@ -142,6 +149,26 @@ def _knob_moe_verify(ctx):
             fused.enable_moe_verify_gather()
         else:
             fused.disable_moe_verify_gather()
+
+    return apply
+
+
+def _knob_hc_write(ctx):
+    """A = hyper-connection の書き戻し (_combine) を mx.compile で融合 / B = off (既定)。
+
+    `DecoderLayer._combine` (`hyper + (x を inject で配ったもの)`) は素の
+    まま層あたり 2 回、48 層で計 96 回呼ばれる (読み側の
+    `enable_hyper_connection_kernel` とは別のディスパッチ)。融合は
+    multiply→add をまとめるだけで演算順を変えないのでビット同一になる。
+    合格条件: 出力一致 (対照)。
+    """
+    from mlxturbo import fused
+
+    def apply(variant):
+        if variant == "A":
+            fused.enable_hc_write()
+        else:
+            fused.disable_hc_write()
 
     return apply
 
@@ -395,6 +422,7 @@ KNOBS = {
     #        まとめで基準にする variant)
     "qsa-tail": (_knob_qsa_tail, ["A", "B"], True, "B"),
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
+    "hc-write": (_knob_hc_write, ["A", "B"], True, "B"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),

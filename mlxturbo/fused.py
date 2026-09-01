@@ -42,9 +42,11 @@ from __future__ import annotations
 
 _ORIG_HC = None
 _ORIG_HC_KERNEL = None
+_ORIG_HC_COMBINE = None
 _ORIG_RNG = None
 _ORIG_MOE = None
 _COMPILED = {}
+_COMBINE_COMPILED = {}
 
 
 def _build(hc: int, d: int, eps: float, use_combine: bool):
@@ -323,6 +325,85 @@ def disable_hyper_connection() -> None:
     _ORIG_HC = None
 
 
+# --------------------------------------------------- hyper-connection の書き戻し
+#
+# `enable_hyper_connection_kernel` が畳んでいるのは「読み」側 (GatedResidual.
+# __call__、hyper -> mixed/inject)。「書き戻し」側 (DecoderLayer._combine、
+# mixed/inject を hyper へ書き戻す) は手つかずのまま素の mx 演算で、層あたり
+# 2 回 (attn 用 / mlp 用)、48 層で計 96 回呼ばれる
+# (`_vendor/qwen4_exp.py:DecoderLayer._combine`)。
+#
+#     hyper + (x[..., None, :] * inject[..., None]).reshape(*x.shape[:-1], -1)
+#
+# reshape と None インデックス (ExpandDims) はどちらも contiguous な末尾軸の
+# 分割/結合なので view のまま (copy_shared_buffer、カーネル起動を持たない —
+# mlx/backend/common/common.cpp の ExpandDims::eval、
+# mlx/backend/metal/copy.cpp の reshape_gpu の copy_necessary 分岐)。実際に
+# 起動するのは multiply と add の 2 個で、どちらも mx.compile の
+# is_fusable() (unary/binary/ternary/broadcast) に入るため 1 個の Compiled
+# カーネルに畳める (mlx/backend/metal/compiled.cpp の Compiled::eval_gpu は
+# get_kernel + dispatch がそれぞれ 1 回だけ)。matmul を挟まないぶん
+# GatedResidual より単純で、専用 Metal カーネルを書くまでもなく mx.compile
+# だけで 1 ディスパッチに畳める。
+
+
+def _build_combine(hc: int, d: int):
+    """`DecoderLayer._combine` を 1 kernel に畳む。(hc, d) ごとに 1 回だけ compile する。"""
+
+    import mlx.core as mx
+
+    key = (hc, d)
+    fn = _COMBINE_COMPILED.get(key)
+    if fn is not None:
+        return fn
+
+    def core(hyper, x, inject):
+        lead = x.shape[:-1]
+        hyper_r = hyper.reshape(*lead, hc, d)
+        mixed = hyper_r + x[..., None, :] * inject[..., None]
+        return mixed.reshape(*lead, hc * d)
+
+    compiled = mx.compile(core)
+    _COMBINE_COMPILED[key] = compiled
+    return compiled
+
+
+def enable_hc_write() -> None:
+    """`DecoderLayer._combine` (hyper-connection の書き戻し) を mx.compile で畳む。
+
+    素の実装と op 単位で完全に同じ計算 (multiply → add) を、呼び出す順序を
+    変えずにまとめて 1 kernel にするだけなので、丸めの入る余地が無くビット
+    同一になる。既定 off、``MLXTURBO_HC_WRITE=1`` で
+    `runner.enable_default_fusions` から呼ばれる。decode 幅 (S=1..4) でも
+    prefill 幅 (S=2048) でも同じ compiled 関数を使う (mx.compile 側が
+    shape ごとに自分でキャッシュする)。
+    """
+
+    global _ORIG_HC_COMBINE
+    import mlx_lm.models.qwen4_exp as Q
+
+    if _ORIG_HC_COMBINE is not None:
+        return
+    _ORIG_HC_COMBINE = Q.DecoderLayer._combine
+
+    def patched(hyper, x, inject):
+        hc = inject.shape[-1]
+        d = x.shape[-1]
+        fn = _build_combine(hc, d)
+        return fn(hyper, x, inject)
+
+    Q.DecoderLayer._combine = staticmethod(patched)
+
+
+def disable_hc_write() -> None:
+    global _ORIG_HC_COMBINE
+    if _ORIG_HC_COMBINE is None:
+        return
+    import mlx_lm.models.qwen4_exp as Q
+
+    Q.DecoderLayer._combine = staticmethod(_ORIG_HC_COMBINE)
+    _ORIG_HC_COMBINE = None
+
 
 # ------------------------------------------------------------ wide projections
 #
@@ -597,17 +678,21 @@ def _ensure_moe_dispatch_installed() -> None:
             return None
         K = x.shape[-1]
         H = gp.scales.shape[-2]
+        # S (1 verify ラウンドのトークン数) は形状だけから決まる静的な値。
+        # gather_gate_up/gather_down 側の同期なしセグメント計算 (`_max_seg_bound`)
+        # がこれを使ってセグメント長の静的上限を出す (実データは読まない)。
+        S = indices.shape[-2]
         xx = mx.expand_dims(x, (-2, -3))
         xx, idx, inv_order = SL._gather_sort(xx, indices)
         x_sorted = xx.reshape(-1, K)
         act = mvg.gather_gate_up(
             x_sorted, idx, gp.weight, gp.scales, gp.biases,
-            up.weight, up.scales, up.biases, K, H,
+            up.weight, up.scales, up.biases, K, H, S,
         )
         # down カーネルは (P, H) の2次元で返る。gather_qmm 経由の素の実装は
         # M=1 の中間次元を挟むが、自作カーネルは最初から持たないので
         # [:, None, :] や squeeze(-2) は不要 (挟むと形が壊れる)
-        out = mvg.gather_down(act, idx, dp.weight, dp.scales, dp.biases, H, K)
+        out = mvg.gather_down(act, idx, dp.weight, dp.scales, dp.biases, H, K, S)
         out = SL._scatter_unsort(out, inv_order, indices.shape)
         return out
 
@@ -775,11 +860,13 @@ __all__ = [
     "enable_moe_shared_fold",
     "enable_moe_verify_gather",
     "enable_wide_projections",
+    "disable_hc_write",
     "disable_hyper_connection",
     "disable_hyper_connection_kernel",
     "disable_moe_route",
     "disable_moe_verify_gather",
     "disable_rms_norm_gated",
+    "enable_hc_write",
     "enable_hyper_connection",
     "enable_hyper_connection_kernel",
     "enable_moe_route",

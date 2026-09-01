@@ -1133,8 +1133,8 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
     (既定 16) が入らないまま測っていた。同一ハーネス内の相対比較なら符号は
     生き残るが、閾値や交差点は構成で動く。
 
-    env で切り替わるもの (MLXTURBO_HC / _WIDE / _SORT_MIN / _MOE_GLU /
-    _MOE_VERIFY / _FAST_QMM) の既定はここが唯一の出どころ。
+    env で切り替わるもの (MLXTURBO_HC / _HC_WRITE / _WIDE / _SORT_MIN /
+    _MOE_GLU / _MOE_VERIFY / _FAST_QMM) の既定はここが唯一の出どころ。
     """
     from . import fused
 
@@ -1155,6 +1155,11 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
             fused.enable_hyper_connection_kernel()
             print(f"{log_prefix} hyper-connections 融合カーネル有効 (moe_route/rms_norm_gated は実測で"
                   " 空振りのため無効のまま)")
+        # 書き戻し側 (DecoderLayer._combine) は読み側と別のゲート。既定 off、
+        # 採否は in-model A/B (tools/decode_ab.py --knob hc-write) で決める。
+        if os.environ.get("MLXTURBO_HC_WRITE") == "1":
+            fused.enable_hc_write()
+            print(f"{log_prefix} hyper-connections 書き戻し (_combine) 融合有効 (MLXTURBO_HC_WRITE=1)")
         # enable_moe_shared_fold は実測で逆効果 (verify +1.8ms) につき呼ばない。
         # 連結射影も既定 OFF: 連結で N が変わると qmv のカーネル変種が変わり、
         # 加算順の違いが最終 ulp を動かす疑いがある (tok/step 2.44 -> 2.23 の
