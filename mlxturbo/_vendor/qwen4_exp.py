@@ -278,12 +278,33 @@ class QSAIndexer(nn.Module):
             ..., :n_blocks
         ]
 
-        # remap block -> tokens; the incomplete tail is always visible
+        # remap block -> tokens; the incomplete tail is visible as far as
+        # causality allows.
+        #
+        # The port this file came from marks the tail `ones` ("always
+        # visible"). But when `sparse` is not None, Attention throws the causal
+        # mask away and goes by `sparse` alone, so those up-to
+        # compress_ratio-1 trailing columns become visible to *every* query in
+        # the call, including the ones that sit before them. Complete blocks
+        # are screened by `visible` above, so the tail was the only place the
+        # future leaked. It shows wherever S > 1 with QSA active: prefill
+        # chunks whose kv length is not a multiple of compress_ratio, and
+        # speculative verify rounds (there a draft token sees the drafts that
+        # follow it). Synthetic probe: logits move by ~9e-2 with the stock
+        # `ones`, exactly 0 with this.
         keep = mx.repeat(keep_block, self.compress_ratio, axis=-1)
         tail = kv_len - n_blocks * self.compress_ratio
         if tail:
+            tail_col = n_blocks * self.compress_ratio + mx.arange(tail)
             keep = mx.concatenate(
-                [keep, mx.ones((B, S, tail), dtype=mx.bool_)], axis=-1
+                [
+                    keep,
+                    mx.broadcast_to(
+                        tail_col[None, None, :] <= q_col[None, :, None],
+                        (B, S, tail),
+                    ),
+                ],
+                axis=-1,
             )
         return keep[:, None]  # (B, 1, S, kv_len)
 

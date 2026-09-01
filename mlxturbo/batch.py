@@ -77,15 +77,14 @@ as in the stock implementation. Both the mask construction and the indexer's
 visibility test are written so that if `left_padding` is all zeros they are
 character-for-character identical to stock.
 
-## What was changed on purpose (output differs from stock)
+## What used to be changed here on purpose
 
-QSA's "the sub-block tail is always visible" was made causal (there is a comment
-at the relevant spot in `indexer_call`). In the stock implementation this region
-is visible to every query, so the output changes depending on how prefill is
-split. `BatchGenerator` always splits the prompt into (n-1, 1), and on top of
-that it advances each sequence in `prefill_step_size` increments, so the split
-cannot be pinned down. This is why it is not enabled by default (only a process
-that calls `enable_batch_cache()` is affected).
+QSA's "the sub-block tail is always visible" was made causal in this module
+first, because `BatchGenerator` splits the prompt into (n-1, 1) and then
+advances in `prefill_step_size` increments, which made the leak visible as an
+output that moved with the split. That fix now lives in the vendored module,
+where every path gets it. What is left here is the left-padding half of
+`indexer_call`.
 
 ## Remaining limitation
 
@@ -451,14 +450,9 @@ def _install_model_patches(BatchAttnCache):
         keep = mx.repeat(keep_block, self.compress_ratio, axis=-1)
         tail = kv_len - n_blocks * self.compress_ratio
         if tail:
-            # The stock implementation sets this to `ones` (always visible). The
-            # intent is that the sub-block tail is "always visible", but when
-            # `sparse` is non-None, Attention throws away the causal mask and
-            # uses only `sparse` (qwen4_exp.py:313-318), so up to
-            # compress_ratio-1 trailing columns become visible to every query.
-            # That is why splitting prefill as 19+1 changes the output — and
-            # BatchGenerator always splits as (n-1, 1). Fold causality in here
-            # so that `sparse` is causal on its own.
+            # Same as the vendored module: the incomplete tail is visible only
+            # as far as causality allows (see the comment there for why the
+            # stock `ones` leaks the future).
             tail_col = n_blocks * self.compress_ratio + mx.arange(tail)
             keep = mx.concatenate(
                 [keep, mx.broadcast_to(

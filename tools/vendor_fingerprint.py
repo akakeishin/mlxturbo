@@ -12,8 +12,9 @@ md5 を出す。シーム化のように**挙動を変えないはずの変更**
 
 QSA (indexer) の活性/不活性と prefill の割り方を変えた 4 通りの指紋に加えて、
 `mlxturbo/spec_flash.py` の写し 2 つ (`_staged_forward` / `_group_prefill_forward`)
-が本家と一致することも見る (写しを触ったときの一次検査。実モデルでの本番
-ゲートは `tools/verify_prefill_bitident.py`)。
+が本家と一致すること、そして 1 回の呼び出しの中で未来のトークンが手前の位置に
+漏れないことを見る (写しを触ったときの一次検査。実モデルでの本番ゲートは
+`tools/verify_prefill_bitident.py`)。
 budget=8 の chunk=4 と chunk=19 は**互いに食い違う**構成。QSA のブロック
 格子は kv 長で決まるので、prefill の割り方が変われば選ばれるブロックも
 変わる (端数ブロックの因果性を直しても、これは残る)。この道具が見るのは
@@ -154,11 +155,42 @@ def check_copies() -> bool:
     return staged_ok and group_ok
 
 
+def check_causal() -> bool:
+    """呼び出し内の未来トークンが手前の位置に漏れないことを見る。
+
+    本番と同じ形にする: QSA が効き始めるのは kv 長が budget を超えてから
+    なので、まず budget ぶんを QSA 不活性で流し、続く 1 回を QSA 活性で流す。
+    その 1 回の末尾トークンだけ差し替えて、1 つ手前の位置の logits が
+    動かないことを確認する。kv 長が compress_ratio の倍数でないとき
+    (端数ブロックが立つとき) だけ壊れるので、端数の有無を両方踏む。
+    """
+    budget = 8
+    model = build(budget)
+    head = [(i * 7 + 3) % TINY["vocab_size"] for i in range(budget)]
+    ok = True
+    for seg_len in (3, 5, 6, 7):
+        def run(last):
+            cache = model.make_cache()
+            model(mx.array(head)[None], cache=cache)  # kv == budget: QSA off
+            seg = [(i * 13 + 5) % TINY["vocab_size"] for i in range(seg_len)]
+            seg[-1] = last
+            return model(mx.array(seg)[None], cache=cache)  # kv > budget: on
+
+        a, b = run(11), run(112)
+        mx.eval(a, b)
+        d = float(mx.max(mx.abs(a[0, seg_len - 2] - b[0, seg_len - 2])))
+        ok &= d == 0.0
+        print(f"causal (seg_len={seg_len}): 未来の影響 max|diff|={d:.3e}")
+    return ok
+
+
 def main() -> int:
     for budget, chunk, plen in CASES:
         d, out = digest(budget, chunk, plen)
         print(f"budget={budget} chunk={chunk} plen={plen}  {d}  {out}")
-    return 0 if check_copies() else 1
+    ok = check_copies()
+    ok &= check_causal()
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
