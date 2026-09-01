@@ -178,6 +178,8 @@ def main() -> int:
     ap.add_argument("--out", default=None, help="結果 JSON の書き出し先")
     ap.add_argument("--only", choices=("both", "short", "long"), default="both",
                     help="長さの片方だけ回す (交差点探しで短文脈を省くため)")
+    ap.add_argument("--variants", default=None,
+                    help="knob の値をカンマ区切りで絞る (既定は KNOBS の全部)")
     args = ap.parse_args()
 
     if args.ngram:
@@ -237,6 +239,10 @@ def main() -> int:
         cases += [("long", to_ids(p)) for p in longs]
 
     setup, variants, control_identical, baseline = KNOBS[args.knob]
+    if args.variants:
+        variants = [v.strip() for v in args.variants.split(",")]
+        if baseline not in variants:
+            baseline = variants[0]
     set_variant = setup({"eng": eng})
     order = variants + variants[::-1]
 
