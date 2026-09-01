@@ -357,6 +357,36 @@ def _cat_quantized(lins):
     return w, sc, bi, gs, bits
 
 
+def disable_wide_projections(model, mtp=None) -> int:
+    """`enable_wide_projections` を打ち消す。戻り値は外した数。
+
+    連結した重みは ``_wide_in`` / ``_wide_qkv`` という属性に置いてあり、
+    `_project_in` と `Attention.__call__` は「無ければ素の 4 本 / 3 本」に
+    落ちる (本家 `_vendor/qwen4_exp.py` 参照)。属性を消せば素に戻る。
+    A/B で交互に測るために要る。
+    """
+    n = 0
+
+    def each_layer():
+        for layer in model.model.layers:
+            yield layer
+        if mtp is not None:
+            for layer in mtp.layers:
+                yield layer
+
+    for layer in each_layer():
+        for mod, attr in (
+            (getattr(layer, "linear_attn", None), "_wide_in"),
+            (getattr(layer, "self_attn", None), "_wide_qkv"),
+            (getattr(layer, "mlp", None), "_wide_shared"),
+            (getattr(layer, "mlp", None), "_wide_experts"),
+        ):
+            if mod is not None and getattr(mod, attr, None) is not None:
+                setattr(mod, attr, None)
+                n += 1
+    return n
+
+
 def enable_wide_projections(model, mtp=None) -> dict:
     """読み込み済みモデルに連結射影を仕込む。戻り値は種類別の適用層数。"""
     import mlx.core as mx

@@ -205,6 +205,58 @@ def _knob_prefill_group(ctx):
     return apply
 
 
+def _knob_qsa(ctx):
+    """A = QSA 有効 (既定) / B = 無効 (素の causal)。
+
+    17k の解剖で indexer が 3.80ms (ラウンドの 9.3%、長文ペナルティの 43%) と
+    出た。しかも sdpa は加算マスクを渡されても**全 KV を読んで全スコアを
+    計算する**ので、QSA の疎性は sdpa 側の節約になっていない疑いがある。
+    だとすると長文の QSA は「費用だけ払って得をしていない」ことになる。
+
+    B は `indexer_budget` を巨大にして `QSAIndexer.__call__` の早期 return に
+    落とす (kv 長が budget 以下なら None を返す = 素の causal)。**出力は
+    変わる** (QSA は full attention の近似で、切ると近似が外れる方向) ので、
+    速度が勝っても採否は品質 (KLD) を測ってから。
+    """
+    eng = ctx["eng"]
+    args_text = eng.model.args.text
+    real = args_text.indexer_budget
+
+    def apply(variant):
+        args_text.indexer_budget = real if variant == "A" else 1 << 30
+        for layer in eng.model.model.layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None:
+                attn.indexer.token_budget = args_text.indexer_budget
+
+    return apply
+
+
+def _knob_wide(ctx):
+    """A = 連結射影 on / B = off (既定)。
+
+    GDN が帯域下限の 50% しか出ていない (実測 6.56ms / 下限 3.25ms)。
+    連結射影は射影 4 本を 1 本の qmm にまとめる。既定 off の理由は
+    「連結で N が変わると qmv のカーネル変種が変わり、加算順の違いが
+    最終 ulp を動かす疑い (tok/step 2.44 -> 2.23 の低下と時期が一致)」で、
+    **単独 A/B の記録は無い**。出力が変わりうるので対照は要求しない。
+    """
+    from mlxturbo import fused
+
+    eng = ctx["eng"]
+    applied = {"on": False}
+
+    def apply(variant):
+        if variant == "A" and not applied["on"]:
+            fused.enable_wide_projections(eng.model)
+            applied["on"] = True
+        elif variant == "B" and applied["on"]:
+            fused.disable_wide_projections(eng.model)
+            applied["on"] = False
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
@@ -213,6 +265,8 @@ KNOBS = {
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),
     "prefill-group": (_knob_prefill_group, ["2", "4", "8"], True, "4"),
+    "qsa": (_knob_qsa, ["A", "B"], False, "A"),
+    "wide": (_knob_wide, ["A", "B"], False, "B"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
 }
 
