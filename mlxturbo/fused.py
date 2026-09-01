@@ -611,14 +611,81 @@ def enable_moe_glu() -> None:
 
     SL.SwitchGLU.__call__ = patched
 
+
+_ORIG_SWITCH_GLU_VERIFY = None
+
+
+def enable_moe_verify_gather() -> None:
+    """SwitchGLU を kernels/moe_verify_gather.py の v2 (gate+up 融合 + down) に
+    差し替える。verify (decode) 幅だけが対象で、既定は off。
+
+    実験的なカーネルなので、この関数を呼ぶだけでは何も起きない —
+    環境変数 `MLXTURBO_MOE_VERIFY=1` が立っているときだけパッチが入る
+    (呼び出し側が env var を忘れても既定 off が保たれるように、ゲートを
+    関数自身の中に持たせている)。indices.size >= 64 (mlx_lm 自身のソート
+    閾値、enable_moe_glu と同じ基準) は prefill 幅とみなして素の経路のまま。
+    """
+    global _ORIG_SWITCH_GLU_VERIFY
+    import os
+
+    if os.environ.get("MLXTURBO_MOE_VERIFY") != "1":
+        return
+
+    import mlx.core as mx
+    import mlx_lm.models.switch_layers as SL
+
+    from .kernels import moe_verify_gather as mvg
+
+    if _ORIG_SWITCH_GLU_VERIFY is not None:
+        return
+    _ORIG_SWITCH_GLU_VERIFY = SL.SwitchGLU.__call__
+    orig = _ORIG_SWITCH_GLU_VERIFY
+
+    def patched(self, x, indices):
+        if indices.size >= 64:
+            return orig(self, x, indices)
+        gp, up, dp = self.gate_proj, self.up_proj, self.down_proj
+        if not (mvg.eligible_gate_up(gp, up) and mvg.eligible_down(dp)):
+            return orig(self, x, indices)
+        K = x.shape[-1]
+        H = gp.scales.shape[-2]
+        xx = mx.expand_dims(x, (-2, -3))
+        xx, idx, inv_order = SL._gather_sort(xx, indices)
+        x_sorted = xx.reshape(-1, K)
+        act = mvg.gather_gate_up(
+            x_sorted, idx, gp.weight, gp.scales, gp.biases,
+            up.weight, up.scales, up.biases, K, H,
+        )
+        # down カーネルは (P, H) の2次元で返る。gather_qmm 経由の素の実装は
+        # M=1 の中間次元を挟むが、自作カーネルは最初から持たないので
+        # [:, None, :] や squeeze(-2) は不要 (挟むと形が壊れる)
+        out = mvg.gather_down(act, idx, dp.weight, dp.scales, dp.biases, H, K)
+        out = SL._scatter_unsort(out, inv_order, indices.shape)
+        return out
+
+    SL.SwitchGLU.__call__ = patched
+
+
+def disable_moe_verify_gather() -> None:
+    global _ORIG_SWITCH_GLU_VERIFY
+    if _ORIG_SWITCH_GLU_VERIFY is None:
+        return
+    import mlx_lm.models.switch_layers as SL
+
+    SL.SwitchGLU.__call__ = _ORIG_SWITCH_GLU_VERIFY
+    _ORIG_SWITCH_GLU_VERIFY = None
+
+
 __all__ = [
     "enable_gather_sort",
     "enable_moe_glu",
     "enable_moe_shared_fold",
+    "enable_moe_verify_gather",
     "enable_wide_projections",
     "disable_hyper_connection",
     "disable_hyper_connection_kernel",
     "disable_moe_route",
+    "disable_moe_verify_gather",
     "disable_rms_norm_gated",
     "enable_hyper_connection",
     "enable_hyper_connection_kernel",
