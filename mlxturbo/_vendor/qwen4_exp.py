@@ -655,11 +655,6 @@ class Attention(nn.Module):
         # `MLXTURBO_GATHER_MAX_RATIO` で上書きし、
         # `tools/decode_ab.py --knob gather-attn` を文脈長を振って掃引して
         # 直線が 0 と交わる比を取り直すこと (実測は M3 Max のみ)。
-        tile = getattr(self, "_gather_attn_tile", 0)
-        rows = tile if 0 < tile < S else S
-        kv_len = offset + S
-        if rows * self.indexer.token_budget > _GATHER_MAX_RATIO * kv_len:
-            return None
 
         blocks = self.indexer.select_blocks(x, rope, idx_cache, offset, positions)
         if blocks is None:
@@ -668,7 +663,24 @@ class Attention(nn.Module):
         q, k, v, gate = self._qkv(x, positions, rope, cache)
         B = x.shape[0]
 
+        # **上限が意味を持つのは行数が少ないときだけ。**union <= T*block_topk は
+        # T が小さい (decode の 2-4 行) ときは締まっているが、prefill の
+        # タイル (128-2048 行) では上限が n_blocks を軽く超えてしまい、
+        # 「比 100%」としか言えなくなる。実際の union はブロックが強く重なる
+        # ので遥かに小さい (合成モデルで 1.00 -> 0.27)。
+        #
+        # よってここでは**上限で確実に勝つと分かる場合だけ**早く抜ける。
+        # 上限では判断できないときは、タイルごとに実際の union を数えてから
+        # 決める (`_gather_tile_attn` 側)。union を数える費用は any 縮約 1 回で、
+        # どのみち gather に要る計算。
         tile = getattr(self, "_gather_attn_tile", 0)
+        rows = tile if 0 < tile < S else S
+        kv_len = offset + S
+        bound = rows * (self.indexer.token_budget // cr)
+        if bound < blocks.n_blocks and bound * cr > _GATHER_MAX_RATIO * kv_len:
+            # 上限が締まっていて、しかもそれでも比が大きい -> 集める価値が無い
+            return None
+
         if tile <= 0 or S <= tile:
             tile = S  # 従来どおり S 全体を 1 タイルとして 1 回で処理する
 
