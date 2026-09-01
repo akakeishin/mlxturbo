@@ -181,3 +181,46 @@ prefill の残差 -17% の解剖: layer-major 後の MoE は ~9.9s で、密天�
 1+2+3 が全部予算どおりでも短 ~60-62 / 長 ~44-46。**短は際どく、長は届かない
 可能性が高い。**長を締めるには T=2 経路 (depth1) の同じ融合と、indexer の
 ブロックプーリングをラウンド間でキャッシュする改修が追加で要る。
+
+## 2026-09-01 夕: 残弾の棚卸しと解剖の決着 (advisor 監査込み)
+
+**prefill「残り 8.6s」は解剖済み。**部品和 41.2s vs 壁 42.7s (3.6% 以内、
+帰属ゴーストなし)。eval 障壁つき部品時間 (17k, layer-major 有効):
+moe=15.0 / gdn=9.4 / attn=9.0 / **hc=5.5** / ple=2.3。**MTP priming は 0.12s
+で容疑消滅。**HC は kernel/eager とも M=2048 で 3.8ms/call と同格で、帯域
+理論値 (~0.3-0.6ms) の約 10 倍遅い — ここが**カーネル面④** (取り分 ~3s、
+elementwise + 低ランク matmul の融合で、attention/GDN より書きやすい)。
+
+**H (相手の lossy フラグ) は測る前に決着。**ddalcu パックは attention も
+U32 (4bit 済み) で、--decode-attn-quant は dense attention 専用ゆえ no-op。
+--ane-prefill は opt-in 未使用。**彼らのカーネルは同じ量子化重みで本当に
+速い** — カーネルレーンの正当性は本物。品質を売って追わない方針は不変。
+
+**decode 共有タイルの取り分上限を実測。**verify 3 トークンの top-10 union は
+21.1-22.5/30 (重み読み -25〜30%)。素の経路は gather_qmv(_fast) で行ごとに
+重みをフルストリームしており共有ゼロ (ディスパッチ特定は
+mlxturbo/kernels/moe_verify_gather.py の docstring)。v1 (gate 単体) は micro
+互角 — 極小サイズでは帯域でなく占有率律速の疑い。勝敗は in-model でのみ判定。
+
+**warm TTFT (2 ターン目追記) は 4〜8 倍負けで実在。**1k: 2.66s vs 0.66s、
+16k: 6.14s vs 0.73s。完全再送 (diff-0) は 0.36s vs 0.18s で小差。修正レーン
+進行中 (照合破れ vs checkpoint 粒度の診断から)。
+
+### 進行中 / 待ちのキュー
+
+1. Sonnet ①: warm TTFT の診断と最小修正 (目標: 追記ターン 1s 未満)
+2. Sonnet ②: 共有タイル v2 (gate+up 融合 + down K=640 対応 +
+   MLXTURBO_MOE_VERIFY 実験配線、既定 off)
+3. bf16 (Qwen/Qwen3.8-Flash-Next, 360GB) を外付けへ再取得中 — 完了後に
+   tools/bake.py で lm_head 4bit を真 bf16 から焼く (rebit head=4 の
+   二重量子化 +0.0054 KLD を解消し、17k decode +3.4 tok/s 相当を無償化)
+4. ダウンロード完了後のクリーン計測: v2 の in-model A/B、warm TTFT 修正の
+   確定値、depth 再掃引 (verify が安くなったら depth3 の損益が反転しうる。
+   tok/s と KLD を同じ表に出す)
+5. ユーザー判断待ち 2 件: (a) 勝利条件の宣言 — 素の速度か品質正規化後か。
+   (b) バッチ x 投機の共存 — FallbackRunner 限定バッチで妥協するか、共存を
+   本気でやるか (中間は無い、advisor 判断)
+
+### 計測中のダウンロード並走は禁止 (再掲)
+
+いま 360GB 再取得が走っている。完走まで時間計測の結論を出さない。
