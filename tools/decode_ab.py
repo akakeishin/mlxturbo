@@ -810,10 +810,27 @@ def main() -> int:
                 run_once(eng, ids, 32, eos_ids)
                 break
 
-    if args.prefill_once and args.knob in (
-        "prefill-group", "stage-every", "gdn-blocked",
-    ):
-        print("この knob は prefill に効くので --prefill-once は使えない")
+    # **ホワイトリストにすること。**`--prefill-once` は共有 prefill を
+    # `variants[0]` で 1 回だけ組み、他の変種はそこから decode を再開する。
+    # **prefill に影響する knob では比較が成立しない** (別の変種で組んだ
+    # キャッシュから再開することになる)。
+    #
+    # 以前はブラックリストで、`wide` が漏れていた。その結果 **段 4 が
+    # 「ms/round +495%」という嘘の数字を出していた** (2026-09-02 に再測して
+    # 発覚。基準そのものが 4 倍ずれていた: 199.8 vs 48.2 ms/round)。
+    # **漏れても誰も気づかない形なので、許可する側を列挙する。**
+    #
+    # ここに足すときは「その knob が prefill 幅で何もしないこと」をコードで
+    # 確かめること。`gdn-prework` は S<=9 の適格判定があるので prefill 幅では
+    # 発火しない。`depth` / `null` は生成の設定だけ。
+    DECODE_ONLY_KNOBS = {
+        "hc-write", "moe-verify", "gdn-prework", "depth", "null",
+        "rms-norm-gated", "moe-route",
+    }
+    if args.prefill_once and args.knob not in DECODE_ONLY_KNOBS:
+        print(f"knob={args.knob} は prefill に影響しうるので --prefill-once は"
+              f"使えない (decode 専用と確認済みなのは"
+              f" {sorted(DECODE_ONLY_KNOBS)})")
         return 1
 
     rows = []
