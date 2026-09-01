@@ -20,7 +20,10 @@ per-row 一般化。attention 側と違って「巻き戻し」そのものは�
 
 ## アーキテクチャ非依存の切り方 (docs/BACKLOG.md 2026-09-01 追記)
 
-qwen4_exp 固有なのは GDN の行別 take だけ、というのが方針。このモジュールの
+GDN (Gated DeltaNet) は Flash-Next 独自ではない — 線形注意/再帰系は
+Qwen3.8-27B のハイブリッドにも GLM-5.3-Flash の KDA にもあり、今後の主流側。
+そこで「再帰状態を持つ層を行別 take で戻す」は族として汎用の部品として書き、
+qwen4_exp に閉じるのは状態テンソルの形とフックの当て先だけにする。このモジュールの
 ``RaggedLedger``/``batched_rollback`` は「trimmable な KV」と「untrimmable な
 ArraysCache (行ごとに take できる状態を持つキャッシュ)」という一般的な
 キャッシュ種別に対する操作として書いてあり、qwen4_exp のクラス名や

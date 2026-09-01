@@ -75,8 +75,15 @@ mlx-serve main ソースの先行知見)。Flash-Next レーンで確立した�
 - 運べる: 段階投入 (staged)、BPE 境界 checkpoint、warm TTFT 系、layer-major
   prefill (MoE 持ちのみ)、共有タイル gather の設計 (バッチ設計点)、
   n-gram/lookup 投機、計測規律一式。
-- 運べない: qwen4_exp 特化カーネル (HC 融合、GDN カーネル)、
-  Flash-Next の MTP 契約判定。
+- 運べない: qwen4_exp 特化カーネル (HC 融合)、Flash-Next の MTP 契約判定。
+- **GDN (Gated DeltaNet) を Flash-Next 独自扱いしないこと** (2026-09-01
+  ユーザー指摘): 線形注意/再帰系は Qwen3.8-27B のハイブリッド
+  (linear:full 3:1)、GLM-5.3-Flash の KDA (4:1) にも入っており、今後の
+  主流側。GDN 由来の資産 (再帰状態の行別 take、gated_delta_states カーネル、
+  状態を跨ぐ投機 rollback、再帰層を含む layer-major prefill) は**族として
+  運べる部品**と見なし、族ごとに違う「状態テンソルの形」だけを差し替える
+  形に切ること。GDN カーネル自体も、状態の形が合えば KDA 等へ流用の目が
+  ある (未確認)。
 - 順序の私見 (確定は着手時に advisor を通す): GLM-5.3-Flash (同族 + 空白地帯)
   → Gemma 26B-A4B (ユーザー層 + SWA カーネルの伸びしろ) → DeepSeek V4 Flash
   (移植量と depth 経済の渋さで最後)。
