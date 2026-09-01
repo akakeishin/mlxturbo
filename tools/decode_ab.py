@@ -322,6 +322,29 @@ def _knob_gather_attn(ctx):
     return apply
 
 
+def _knob_gather_tile(ctx):
+    """gather attention のタイル幅 (段 P1)。0 = タイルなし (= 従来の 1 回)。
+
+    prefill (S=2048) は untiled だと union がほぼ全ブロックになって効かない。
+    クエリ行をタイルに切ると、隣接クエリの選択が相関するぶん union が縮む。
+    代償はタイルごとの K/V 重複読み。**判定は prefill の壁時計**で、
+    union 比 (`_gather_stats`) は理由を読むためだけに使う。
+
+    gather 経路そのものも一緒に有効化する (タイルは gather の中の話なので)。
+    """
+    from mlxturbo.gather_attn import disable_gather_attn, enable_gather_attn
+
+    model = ctx["eng"].model
+
+    def apply(variant):
+        disable_gather_attn(model)
+        t = int(variant)
+        if t >= 0:
+            enable_gather_attn(model, tile=t)
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
@@ -333,6 +356,8 @@ KNOBS = {
     "qsa": (_knob_qsa, ["A", "B"], False, "A"),
     "bool-mask": (_knob_bool_mask, ["A", "B"], False, "B"),
     "gather-attn": (_knob_gather_attn, ["A", "B"], False, "B"),
+    # -1 は gather 自体を切る (現行既定)。0 はタイルなしの gather
+    "gather-tile": (_knob_gather_tile, ["-1", "0", "256"], False, "-1"),
     "wide": (_knob_wide, ["A", "B"], False, "B"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
 }
