@@ -91,3 +91,12 @@ fastmlx/mlxturbo 側の現状:
 - **公開の前提** → `fastmlx` から `mlxturbo` へ改名 (PyPI/GitHub の `fastmlx` は競合の既存プロジェクト)、MIT ライセンス、README の書き直し (「汎用高速推論ランタイム」とは名乗らない)、docs の整理、CI、運用手引き、個人パスの除去、コメントの英語化。手順は `docs/RELEASE.md`
 - **プロトコル層の穴** → 非恒等サンプリングの 400 をリクエスト単位の非投機降格に変更 (実クライアントは `top_p` を既定で送るので、看板構成が最初の 1 発で 400 を返していた)、`response_format` の 400 明示、stop の早期打ち切り (ストリームで 11 倍)、Responses の `store`/`previous_response_id`、Anthropic の usage キャッシュ量、`/v1/embeddings` の 501 明示
 - **サーバーの配布準備** → 認証・キュー上限・SSE keepalive・graceful shutdown・文脈長ガード・prompt cache 再利用・MTP 自動発見・`--require-runner`。接続手順は `docs/SERVER.md`
+
+### 2026-09-01 追記: 横展開の方向 (ユーザー方針)
+
+対応を広げるなら **MTP ヘッドを積んだ Flash 系ファミリー** (DeepSeek V4
+Flash、GLM 5.3 Flash) が先で、dense は Qwen3.8-27B (spec.py の出発点) の
+復帰だけ。MTP 無し dense (Gemma/llama) は投機の取り分が細く llama.cpp の
+土俵なので追わない。**バッチ x 投機の機構 (同期ラウンド・dead-slot マスク・
+admission) はアーキテクチャ非依存に書くこと** — qwen4 固有なのは GDN の
+行別 take だけで、汎用に切っておけば横展開時にバッチ x MTP ごと運べる。
