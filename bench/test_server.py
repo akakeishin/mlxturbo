@@ -8166,3 +8166,42 @@ def test_batched_admission_cancelled_before_start_resolves_cleanly(batch_env):
     )
     batch_env.coordinator.submit(admission)
     assert fut.result(timeout=5) is None
+
+
+def test_gather_attention_guard_switches_on_context_length():
+    """gather は「集める列の割合」で自動的に入り切りすること。
+
+    既定 on にしたので、**短い文脈で勝手に集めに行かない**ことが要件になる。
+    判定はホスト側の算数だけ (kv 長・タイル幅・token_budget・compress_ratio)
+    で、GPU の仕事は無い。閾値 0.20 は M3 Max の実測 (集める割合 23% で
+    ゼロ交差) から安全側に倒した値。
+
+    ここは**式そのもの**を固定する。実装 (`Attention._gather_forward` の入口)
+    と同じ式を書いてあるので、片方を変えたらここが落ちる。定数は本番のパック
+    (indexer_budget=2048、compress_ratio=4) に合わせる -- 合成モデルは budget が
+    小さすぎて境界が実運用と別物になる。
+    """
+
+    import mlx_lm.models.qwen4_exp as Q
+
+    budget, cr = 2048, 4
+    ratio = Q._GATHER_MAX_RATIO
+
+    def keeps_gather(kv_len, rows):
+        n_blocks = kv_len // cr
+        bound = rows * (budget // cr)
+        return not (bound < n_blocks and bound * cr > ratio * kv_len)
+
+    # decode 幅 (2 行) は集める列が 2*2048=4096。割合が 0.20 を割るのは
+    # kv > 20480 のとき
+    assert not keeps_gather(16852, 2), "17k で集めに行っている (実測 +1.1%)"
+    assert not keeps_gather(20000, 2), "20k で集めに行っている"
+    assert keeps_gather(25000, 2), "25k で集めていない (実測 -6.7%)"
+    assert keeps_gather(49867, 2), "50k で集めていない (実測 -15.4%)"
+
+    # prefill 幅 (タイル 256 行): 上限 256*512=131072 が n_blocks=4213 を超える
+    # ので、上限は何も言っていない -> 判定を諦めて通す。ここで弾くと prefill の
+    # 取り分 (実測 tile=256 で -1.5%) が消える
+    assert keeps_gather(16852, 256), "prefill のタイルを弾いている"
+    # タイル無しの prefill (2048 行) も同じ理由で通る
+    assert keeps_gather(16852, 2048), "タイル無しの prefill を弾いている"

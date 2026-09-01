@@ -1191,20 +1191,33 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
             fast_qmm.M_MIN = int(os.environ.get("MLXTURBO_QMM_M_MIN", "3"))
             fast_qmm.enable()
             print(f"{log_prefix} fast_qmm 有効 (M={fast_qmm.M_MIN}..8 を MMA タイルへ)")
-        if os.environ.get("MLXTURBO_GATHER_ATTN") == "1":
+        if os.environ.get("MLXTURBO_GATHER_ATTN", "1") == "1":
             # 段 3(b) (KERNEL-PROGRAM.md): 選ばれたブロックだけ集めてから
-            # マスク無し sdpa に渡す。出力はビット不一致で、採否は
-            # KLD / tok-step の in-model 計測がまだ (このコミット時点では
-            # 実装と合成モデルでの正しさ確認のみ)。
+            # マスク無し sdpa に渡す。**既定 on。**
+            #
+            # 常に集めるわけではない -- `Attention._gather_forward` の入口に
+            # 「集める列が kv 長の何割になるか」の判定があり、割が合わない
+            # 呼び出し (= 短い文脈) は従来の加算マスク経路にそのまま落ちる。
+            # よって既定 on にしても短い文脈の挙動は変わらない。
+            #
+            # 実測 (M3 Max、幅 2、ms/round): 17k +1.1% / 25k -6.7% /
+            # 32k -8.9% / 50k -15.4%。ゼロ交差は集める割合 23% で、判定の
+            # 閾値はそこから安全側に倒した 0.20
+            # (`MLXTURBO_GATHER_MAX_RATIO`、マシン依存)。
+            #
+            # 出力はビット不一致 (注意する集合は同じで加算順だけが変わる。
+            # 合成モデルで max|diff|=1.8e-7)。
+            #
             # 段 P1a: MLXTURBO_GATHER_TILE (既定 0 = 従来どおり S 全体で 1 回)
-            # で prefill 幅のクエリ行をタイルに割る。採否は段 P1b (実 17k/50k
-            # でタイル幅 {0, 128, 256, 512} を掃引し、prefill 壁時計で判定)。
+            # で prefill 幅のクエリ行をタイルに割る。実 17k の掃引では
+            # tile=256 が prefill -1.5%、tile なしは +0.3%。
             from . import gather_attn
 
             tile = int(os.environ.get("MLXTURBO_GATHER_TILE", "0"))
             n = gather_attn.enable_gather_attn(model, tile=tile)
             print(f"{log_prefix} gather attention 有効 (段 3(b)、{n} 層、"
-                  f"tile={tile or 'off'}。出力はビット不一致、採否は未計測)")
+                  f"tile={tile or 'off'}、集める割合の上限 "
+                  f"{os.environ.get('MLXTURBO_GATHER_MAX_RATIO', '0.20')})")
 
 
 
