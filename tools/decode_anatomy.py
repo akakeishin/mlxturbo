@@ -24,6 +24,14 @@ offset を控えておけば付け替えで完全に戻せる (`spec_flash._pipe
 **部品和 ≈ 壁時計 (数 % 以内) を必ず確認すること** (CLAUDE.md の作法)。
 合わなければ、見えていない項目があるということで、その差自体が結論になる。
 
+壁時計は**本番と同じ経路** (段階投入 `_staged_forward` あり) で測る。
+`model(...)` を直接呼ぶと隙間が本番より大きく出る。比較のため段階投入なしも
+併記して、その取り分自体も出す。
+
+**残差の読み方**: 部品和 < 壁時計 の差は 2 通りの説明があり、この道具では
+区別できない -- (1) カーネル間の隙間、(2) 単体計測が本番の重なりを再現できて
+いない。区別するには xctrace の GPU タイムラインが要る。
+
     tools/biglock.sh .venv/bin/python tools/decode_anatomy.py \\
         --model ~/models/ddalcu-mlxlm --ngram ~/models/ddalcu-ngram-sep --ctx 17000
 """
@@ -174,7 +182,19 @@ def main() -> int:
         lambda: model.lm_head(mx.zeros((1, W, model.args.text.hidden_size),
                                        dtype=mx.bfloat16)))
 
+    # 壁時計は**本番と同じ経路**で測る。本番の decode は段階投入
+    # (`spec_flash._staged_forward`、2 層ごとに async_eval) を通るので、
+    # `model(...)` を直接呼ぶと隙間が本番より大きく出る。
+    from mlxturbo.spec_flash import _staged_forward
+
     def whole():
+        st = snapshot(cache)
+        out = _staged_forward(model, chunk, cache)
+        mx.eval(out)
+        restore(cache, st)
+        return out
+
+    def whole_plain():
         st = snapshot(cache)
         out = model(chunk, cache=cache)
         mx.eval(out)
@@ -182,6 +202,7 @@ def main() -> int:
         return out
 
     total = med_ms(whole)
+    plain = med_ms(whole_plain)
 
     print()
     order = ["moe", "gdn", "attn", "idx", "hc", "lm_head"]
@@ -191,7 +212,9 @@ def main() -> int:
     for k in order:
         print(f"  {label[k]:32s} {res[k]:7.2f} ms  ({res[k] / total * 100:5.1f}%)")
     print(f"  {'部品和 (indexer は attn に含む)':32s} {parts:7.2f} ms")
-    print(f"  {'壁時計 (フォワード 1 回)':32s} {total:7.2f} ms")
+    print(f"  {'壁時計 (段階投入あり = 本番経路)':32s} {total:7.2f} ms")
+    print(f"  {'壁時計 (段階投入なし)':32s} {plain:7.2f} ms"
+          f"  [段階投入の取り分 {plain - total:+.2f} ms]")
     gap = (parts - total) / total * 100
     print(f"\n  部品和 - 壁時計 = {parts - total:+.2f} ms ({gap:+.1f}%)")
     if abs(gap) > 10:
