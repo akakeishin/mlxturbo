@@ -52,6 +52,12 @@ N=1 は `run_batch` が 1 要求だけを `stream_once` で流すのと同じで
 
 `mlxturbo/batch_spec.py` (バッチ x MTP 投機) は**サーバーに配線されていない**
 (`docs/BACKLOG.md` の「サーバー配線・admission・スケジューラは書いていない」)。
+**2026-09-02 更新: 投機経路にもバッチが配線された** (`--max-batch-spec N`、
+chunked prefill 方式、走行中 join つき)。実測で同時 4 本のスループットが
+43.0 → 51.4 tok/s (+19%)、B=1 は +0.04% で無傷。**以下の「効かない」という
+記述は `--max-batch` (非投機) についてのもので、`--max-batch-spec` には
+当てはまらない。**
+
 サーバーが実際に持つ継続バッチングは `mlxturbo/batch.py` (`--max-batch N`) だけで、
 これは **`FallbackRunner` 限定** (`spec`/`flash_spec` ランナーは対象外、
 `docs/OPERATIONS.md` 「制約」節)。推奨構成 (Flash-Next + MTP) は `flash_spec` で
@@ -180,6 +186,11 @@ def main() -> int:
              "FallbackRunner 限定で spec/flash_spec には効かない"
              " (モジュール docstring の「同時実行機構についての注意」参照)。"
              "省略時は渡さない (既定 = 直列)")
+    ap.add_argument(
+        "--turbo-max-batch-spec", type=int, default=None,
+        help="mlxturbo 側に --max-batch-spec を渡す (バッチ x 投機)。"
+             "**2026-09-02 に配線されたので、推奨構成 (Flash-Next + MTP) の"
+             "同時要求はこちらでまとまる。**省略時は渡さない (既定 = 直列)")
     ap.add_argument("--ns", default="1,2,4,8", help="同時要求数を振る値 (カンマ区切り)")
     ap.add_argument("--rounds", type=int, default=1,
                     help="各 N を何ラウンド繰り返すか (増やすと分布の標本が増える)")
@@ -210,6 +221,8 @@ def main() -> int:
         turbo_argv += ["--mtp", os.path.expanduser(args.mtp)]
     if args.turbo_max_batch:
         turbo_argv += ["--max-batch", str(args.turbo_max_batch)]
+    if args.turbo_max_batch_spec:
+        turbo_argv += ["--max-batch-spec", str(args.turbo_max_batch_spec)]
 
     sides = {
         "mlx-serve": (Server, serve_argv, args.serve_port),
