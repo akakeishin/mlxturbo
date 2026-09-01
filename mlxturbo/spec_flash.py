@@ -928,6 +928,38 @@ class FlashSpecEngine:
                     j = n
                 chunk = ids[:, i:j]
                 if j == n:
+                    # 直前 1 トークンを切り離し、その手前にも checkpoint を
+                    # 1 つ追加で残す (checkpoints が有効なときだけ)。次ターンの
+                    # 会話は末尾がここで retemplate される (例: 直前ターンの
+                    # thinking 内容がプレースホルダに畳まれる) ため、この
+                    # プロンプト末尾の最終トークン自体が周辺文字とのマージで
+                    # 別トークンに化けることがある (BPE は末尾かどうかで
+                    # マージ結果が変わりうる)。その場合 LCP はここでちょうど
+                    # 1 トークン手前に留まり、末尾ぴったりの checkpoint だけでは
+                    # 拾えず、セッション全体が使い捨てになる (実測: 診断で
+                    # 確認)。手前にもう 1 点残しておけば、この 1 トークンの
+                    # ズレだけは確実に吸収できる。注意: 分割は正しい計算だが
+                    # 一括処理とビット一致とは限らない (チャンク割りが変わると
+                    # 丸めが動くのは既知の性質)。checkpoints 有効時 = サーバー
+                    # 経路だけの挙動で、generate() や検証プローブは通らない。
+                    # 副次効果として最終チャンクの lm_head が 1 トークン分に
+                    # 縮む (従来はチャンク全幅の logits を作って末尾だけ使っていた)。
+                    tail_split = checkpoints is not None and chunk.shape[1] > 1
+                    if tail_split:
+                        head = chunk[:, :-1]
+                        with capture(model, light=True) as cap0:
+                            h0 = model.model(head, cache=caches)
+                            mx.eval(h0)
+                        for c in caches:
+                            state = getattr(c, "state", None)
+                            if state is not None:
+                                mx.eval(state)
+                        mx.clear_cache()
+                        checkpoints.append(
+                            (base_pos + i + head.shape[1], snapshot_untrimmable_caches(caches))
+                        )
+                        del checkpoints[:-CHECKPOINT_RETENTION]
+                        chunk = chunk[:, -1:]
                     # light=True: this chunk uses only cap.hyper[:, -1:]
                     # (referenced right below). Full capture (cap.gdn/cap.ple)
                     # unconditionally allocated memory proportional to T (this
@@ -939,6 +971,8 @@ class FlashSpecEngine:
                     with capture(model, light=True) as cap:
                         logits = model(chunk, cache=caches)
                         mx.eval(logits)
+                    if tail_split:
+                        cap.hyper = mx.concatenate([cap0.hyper, cap.hyper], axis=1)
                 else:
                     # light=True (added for MTP priming): only the cheap
                     # GatedResidual hook runs, so this branch's computation and
