@@ -312,6 +312,49 @@ def _report(label, a, b, atol=1e-4):
     return ok
 
 
+def check_generator(model) -> bool:
+    """`BatchSpecGenerator` の出力が、1 本ずつの貪欲デコードと一致するか。
+
+    **貪欲の投機は出力を変えない**のが最も強い検査になる -- verify は本体の
+    argmax と一致したときだけ受理するので、ドラフトの当たり外れに関係なく
+    出力は素の貪欲デコードと同じ列になる。ここが割れたら、dead slot の
+    マスク・行別 rollback・右パディングのどれかが壊れている。
+
+    プロンプト長は「そろっている」と「不揃い」の両方を見る。不揃いは
+    右パディングを踏み、再帰系の窓 (`_tail_window`) と入力マスク
+    (`conv_mask`) の両方が効いていないと合わない。
+    """
+    from mlxturbo.batch_spec import BatchSpecGenerator
+    from mlxturbo.mtp_flash import FlashMTPModule
+    from mlxturbo.spec_flash import FlashSpecEngine
+
+    mx.random.seed(0)
+    mtp = FlashMTPModule(model.args.text, variant="lane")
+    mx.eval(mtp.parameters())
+    eng = FlashSpecEngine(model, mtp)
+    n = 12
+    cases = {
+        "そろい": [[3, 11, 27, 5, 9, 41, 8], [7, 2, 19, 33, 4, 15, 22]],
+        "不揃い": [[3, 11, 27, 5, 9, 41, 8], [7, 2, 19, 33, 4], [12, 45, 6]],
+    }
+    ok = True
+    print("\n--- BatchSpecGenerator == 1 本ずつの貪欲 ---")
+    for name, prompts in cases.items():
+        ref = [
+            oracle_continue(model, mx.array(p)[None], n)[:n] for p in prompts
+        ]
+        gen = BatchSpecGenerator(eng, prompts)
+        got = gen.generate(n)
+        for b, (r, g) in enumerate(zip(ref, got)):
+            same = r == g
+            ok &= same
+            head = next((i for i, (x, y) in enumerate(zip(r, g)) if x != y), n)
+            print(f"  {'OK' if same else 'NG'} {name} row{b}: 先頭一致 {head}/{n}")
+            if not same:
+                print(f"     solo ={r}\n     batch={g}")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpu", action="store_true")
@@ -374,6 +417,8 @@ def main():
                     ok &= _report(f"layer{i} ple.conv", c_solo[2], c_batch[2][b : b + 1])
                 if c_solo[3] is not None:
                     ok &= _report(f"layer{i} ngram.ctx", c_solo[3], c_batch[3][b : b + 1])
+
+    ok &= check_generator(model)
 
     print("\n=== 全ケース一致 ===" if ok else "\n=== 不一致あり ===")
     return 0 if ok else 1

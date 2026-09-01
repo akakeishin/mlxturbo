@@ -543,8 +543,14 @@ def rollback(model, caches, cap: Capture, pre: dict, keep: int, total: int,
 
 
 def trim_attn_cache(cache, keep: int) -> None:
-    """MTP のドラフトキャッシュを先頭 ``keep`` 件まで縮める。"""
-    drop = cache.offset - keep
+    """MTP のドラフトキャッシュを先頭 ``keep`` 件まで縮める。
+
+    基準は**物理列数** (``size()``)。単一系列の ``KVCache`` では
+    ``size() == offset`` なので従来と同じだが、バッチ版のドラフトキャッシュ
+    (`mlxturbo/batch_spec.py`) は ``offset`` が行ごとの論理位置 (B,) の配列に
+    なるので、そちらでも同じコードが通るようにしてある。
+    """
+    drop = cache.size() - keep
     if drop <= 0:
         return
     cache.trim(drop)
@@ -649,10 +655,12 @@ class FlashSpecEngine:
         逆量子化して再採点 -> argmax。無し: trunk ヘッドで argmax。
         """
         if self._rerank is None:
-            return mx.argmax(self._head(out)[:, -1], axis=-1).reshape(1, 1)
+            return mx.argmax(self._head(out)[:, -1], axis=-1).reshape(-1, 1)
         lm = self.model.lm_head  # _rerank があるなら lm_head も必ずある
         row = out[:, -1]
         cw, cs, cb = self._rerank
+        if row.shape[0] > 1:
+            return self._draft_argmax_rows(row, lm, cw, cs, cb)
         coarse = mx.quantized_matmul(
             row, cw, scales=cs, biases=cb, transpose=True,
             group_size=64, bits=self.RERANK_BITS)
@@ -661,6 +669,25 @@ class FlashSpecEngine:
             lm.weight[top[0]], lm.scales[top[0]], lm.biases[top[0]],
             group_size=lm.group_size, bits=lm.bits)
         scores = (row.astype(rows.dtype) @ rows.T)
+        best = mx.argmax(scores, axis=-1, keepdims=True)
+        return mx.take_along_axis(top, best, axis=-1)
+
+    def _draft_argmax_rows(self, row, lm, cw, cs, cb) -> mx.array:
+        """`_draft_argmax` の rerank 経路の B 行版 (バッチ x 投機で使う)。
+
+        単一行の側をそのまま一般化しない理由: あちらは `row @ rows.T` の
+        2 階行列積で、行を足すとバッチ行列積になる。数学的には同じでも
+        加算順が変わりうるので、**実測が乗っている B=1 の経路には触らない**。
+        """
+        top = mx.argpartition(-mx.quantized_matmul(
+            row, cw, scales=cs, biases=cb, transpose=True,
+            group_size=64, bits=self.RERANK_BITS,
+        ), self.RERANK_TOP - 1, axis=-1)[..., : self.RERANK_TOP]
+        rows = mx.dequantize(
+            lm.weight[top], lm.scales[top], lm.biases[top],
+            group_size=lm.group_size, bits=lm.bits)
+        scores = mx.matmul(
+            row[:, None, :].astype(rows.dtype), rows.transpose(0, 2, 1))[:, 0]
         best = mx.argmax(scores, axis=-1, keepdims=True)
         return mx.take_along_axis(top, best, axis=-1)
 
@@ -682,7 +709,7 @@ class FlashSpecEngine:
         不変条件が、ラウンドを跨いで持ち回れる根拠になっている。
         """
         Q = _arch()
-        keep = cache.offset + 1
+        keep = cache.size() + 1  # 物理列数 (trim_attn_cache の注記参照)
         drafts = []
         tok, hyper = cur, hyper_prev
         for step in range(depth):

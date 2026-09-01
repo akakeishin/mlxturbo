@@ -248,6 +248,78 @@ class RaggedAttnCache:
         return False
 
 
+class RaggedDraftCache:
+    """MTP ドラフト用のバッチ KV キャッシュ。行ごとの論理位置を持つ。
+
+    列は全行そろって伸びる。priming は**各行の末尾に揃えた一定幅** w で行う
+    (w = min(PRIME_WINDOW, 最短プロンプト長-1))。こうすると全列が実データに
+    なり、パディング列を隠す必要が無くなる。
+
+    ``offset`` は本家 Attention の ``_positions`` シームが読む値なので、
+    (B,) の配列を返す。
+
+    受理数が行ごとに違っても列の進み方は変わらない (`_draft_chain` は
+    ラウンドごとに 1 列だけ残す) ので、行がずれることは無い。
+    """
+
+    def __init__(self, batch_size: int):
+        self.keys: mx.array | None = None
+        self.values: mx.array | None = None
+        # base は全行 0。MTP ヘッドの位置は**priming 窓の先頭からの相対**で、
+        # 本物のトークン位置ではない (単一系列の `_prime_draft_cache` も空の
+        # キャッシュから始めて 0.. と数える)。窓幅を全行そろえれば列の意味も
+        # そろうので、行ごとのずれは生じない。配列で持つのは
+        # `Attention._positions` のシームが (B,) を期待するからで、
+        # 単一系列と同じ角度になる。
+        self._base = mx.zeros(batch_size, dtype=mx.int32)
+        self.indexer = _arch()._IndexerCache()
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        if self.keys is None:
+            self.keys, self.values = keys, values
+        else:
+            self.keys = mx.concatenate([self.keys, keys], axis=2)
+            self.values = mx.concatenate([self.values, values], axis=2)
+        return self.keys, self.values
+
+    def size(self) -> int:
+        return 0 if self.keys is None else self.keys.shape[2]
+
+    @property
+    def offset(self) -> mx.array:
+        return self._base + self.size()
+
+    def round_mask(self, T: int):
+        """全列が実データなので、必要なのは新規 T 列どうしの因果性だけ。
+        T==1 (ドラフトは 1 段ずつ) なら mask 自体が要らない。"""
+        if T == 1:
+            return None
+        total = self.size()
+        cols = mx.arange(total)
+        q = total - T + mx.arange(T)
+        return (cols[None, :] <= q[:, None])[None, None]
+
+    def trim(self, n: int) -> int:
+        """末尾 n 列を落とす。
+
+        **切り出しは実体化する (mx.contiguous)。**遅延スライスのまま次の
+        ラウンドで concat すると、その先のグラフが壊れた形で評価される
+        (実測: ドラフト連鎖 2 周目の sdpa で q の head_dim が半分になり
+        `[matmul] ... (1,2,2,1,8) と (1,2,1,7,16)` で落ちた。落ちるのは
+        評価時なので、traceback は無関係な場所を指す)。本家の KVCache は
+        offset を減らすだけでスライスしないので、この罠を踏まない。
+        """
+        n = min(self.size(), n)
+        if n:
+            keep = self.size() - n
+            self.keys = mx.contiguous(self.keys[:, :, :keep])
+            self.values = mx.contiguous(self.values[:, :, :keep])
+        return n
+
+    def is_trimmable(self) -> bool:
+        return True
+
+
 def make_ragged_cache(model, batch_size: int):
     """``model.make_cache()`` のバッチ版。full attention 層には
     ``RaggedAttnCache`` (帳簿を共有)、それ以外には無変更の ``ArraysCache(4)``
@@ -299,8 +371,26 @@ def ragged_attention():
     Q = _arch()
     orig_positions = Q.Attention._positions
     orig_final_mask = Q.Attention._final_mask
+    orig_make_masks = Q.Qwen4ExpModel._make_masks
+
+    def make_masks(self, h, cache):
+        """prefill (右パディング) の間だけ conv_mask を立てる。
+
+        再帰系 (GDN) はパディング列を状態に取り込んでしまうので、入力から
+        落とす必要がある。窓の取り出し (`_tail_window`) だけでは足りない --
+        あちらは「どの列を持ち越すか」で、こちらは「どの列を計算に入れるか」。
+        """
+        mask, conv_mask = orig_make_masks(self, h, cache)
+        led = next((c.ledger for c in cache if hasattr(c, "ledger")), None)
+        if led is not None and led.prefill_lengths is not None:
+            lens = mx.array(led.prefill_lengths)
+            conv_mask = mx.arange(h.shape[1])[None] < lens[:, None]
+        return mask, conv_mask
 
     def positions(self, cache, S):
+        # 列位置 (QSA 用) は物理列数、rope の位置は行別の論理位置。
+        # RaggedAttnCache と RaggedDraftCache が同じ形を返すので、
+        # Attention はキャッシュの種類を知らなくてよい
         return cache.size(), cache.offset[:, None] + mx.arange(S)[None, :]
 
     def final_mask(self, mask, sparse, cache, S, dtype):
@@ -313,11 +403,13 @@ def ragged_attention():
 
     Q.Attention._positions = positions
     Q.Attention._final_mask = final_mask
+    Q.Qwen4ExpModel._make_masks = make_masks
     try:
         yield
     finally:
         Q.Attention._positions = orig_positions
         Q.Attention._final_mask = orig_final_mask
+        Q.Qwen4ExpModel._make_masks = orig_make_masks
 
 
 @contextmanager
@@ -381,12 +473,188 @@ def batched_rollback(model, caches, cap, keeps: list[int], pre_ctx=None, pair=No
     )
 
 
+# ------------------------------------------------------------ generator
+
+
+class BatchSpecGenerator:
+    """B 行同時の MTP 投機デコード (同期ラウンド)。
+
+    ラウンドごとに B 行そろって ``(B, T+1)`` の検証フォワードを 1 回踏み、
+    行ごとの受理数 ``keep_b`` だけ論理長を進める。不採用位置は dead slot
+    として ``RaggedLedger`` が恒久的に隠す (物理列は全行そろって伸びる)。
+
+    ## プロンプト長
+
+    右パディングでそろえる。マスクは「因果 かつ 実長より手前」
+    (`RaggedLedger.round_mask` の prefill モード)、再帰状態の窓は本家の
+    `_tail_window` が ``cache.lengths`` を見て実長基準で取る。GDN の入力からは
+    ``conv_mask`` でパディング列を落とす。
+
+    ## MTP ドラフトキャッシュ
+
+    priming の幅を全行そろえる (各行の末尾に揃えた w 列)。MTP ヘッドの位置は
+    priming 窓の先頭からの相対なので、幅がそろえば行の意味もそろう。受理数が
+    行ごとに違っても列の進み方は変わらない (`_draft_chain` はラウンドごとに
+    1 列だけ残す) ので、単一系列と同じ挙動になる。
+
+    ## 対象外
+
+    QSA (indexer)。kv 長が ``indexer_budget`` を超える構成では
+    ``ragged_attention`` が ``NotImplementedError`` で止まる (モジュール
+    docstring 参照)。呼び手は長いリクエストをバッチから外すこと。
+
+    貪欲のみ。温度つきサンプリングは行ごとに受理判定が変わるだけで構造は
+    同じだが、まだ書いていない。
+    """
+
+    def __init__(self, engine, prompts: list[list[int]], depth: int | None = None):
+        from .spec_flash import PRIME_WINDOW
+
+        if not prompts:
+            raise ValueError("prompts が空")
+        self.eng = engine
+        self.model = engine.model
+        self.B = len(prompts)
+        self.lengths = [len(p) for p in prompts]
+        if min(self.lengths) < 2:
+            raise ValueError("プロンプトは 2 トークン以上 (priming に 1 対要る)")
+        self.depth = depth or engine.depth
+        self.L = max(self.lengths)
+        pad = 0
+        self.ids = mx.array(
+            [list(p) + [pad] * (self.L - len(p)) for p in prompts]
+        )
+        self.caches, self.ledger = make_ragged_cache(self.model, self.B)
+        self.prime_window = min(PRIME_WINDOW, min(self.lengths) - 1)
+        self.out: list[list[int]] = [[] for _ in range(self.B)]
+        self.rounds = 0
+        self.accepted = 0
+        self._cur = None
+        self._hyper_prev = None
+        self._mtp_cache = None
+
+    # ---- prefill ----------------------------------------------------
+
+    def _row_take(self, arr: mx.array, idx: list[int]) -> mx.array:
+        """行 b の位置 idx[b] を 1 つずつ取る (B, 1, ...)。"""
+        pos = mx.array(idx).reshape(self.B, 1, *([1] * (arr.ndim - 2)))
+        return mx.take_along_axis(
+            arr, mx.broadcast_to(pos, (self.B, 1, *arr.shape[2:])), axis=1
+        )
+
+    def prefill(self) -> None:
+        from .spec_flash import capture
+
+        for c in self.caches:
+            if not hasattr(c, "ledger"):
+                # 上流 (ArraysCache) の API で入れる。``lengths`` は advance が
+                # 読んで毎回減らす作業用の値でもあるので、生の代入と後始末を
+                # 自前でやるとズレる。本家の _tail_window もこれを見て実長
+                # 基準で窓を取る
+                c.prepare(lengths=self.lengths)
+        self.ledger.prefill_lengths = self.lengths
+        try:
+            with ragged_attention(), capture(self.model, light=True) as cap:
+                logits = self.model(self.ids, cache=self.caches)
+                mx.eval(logits, cap.hyper)
+        finally:
+            self.ledger.prefill_lengths = None
+            for c in self.caches:
+                if not hasattr(c, "ledger"):
+                    c.finalize()
+        self.ledger.commit_round(self.lengths, self.L)
+
+        last = [n - 1 for n in self.lengths]
+        first = mx.argmax(self._row_take(logits, last)[:, 0], axis=-1)
+        mx.eval(first)
+        for b, t in enumerate(first.tolist()):
+            self.out[b].append(int(t))
+        self._cur = first.reshape(self.B, 1)
+        self._hyper_prev = self._row_take(cap.hyper, last)
+        self._prime(cap.hyper)
+
+    def _prime(self, hyper: mx.array) -> None:
+        """MTP ヘッドに各行の末尾 w 対を流す (幅は全行そろえる)。"""
+        w = self.prime_window
+        cache = RaggedDraftCache(self.B)
+        if w < 1:
+            self._mtp_cache = cache
+            return
+        # 行 b: トークン位置 n_b-w .. n_b-1 と、その 1 つ前の hyper
+        tok_idx = [[n - w + j for j in range(w)] for n in self.lengths]
+        hyp_idx = [[n - w - 1 + j for j in range(w)] for n in self.lengths]
+        toks = mx.take_along_axis(self.ids, mx.array(tok_idx), axis=1)
+        hy = mx.take_along_axis(
+            hyper,
+            mx.broadcast_to(mx.array(hyp_idx)[..., None], (self.B, w, hyper.shape[2])),
+            axis=1,
+        )
+        embeds = self.model.model.embed_tokens(toks)
+        with ragged_attention():
+            # mask は渡さない。`ragged_attention` の `_final_mask` が
+            # `cache.round_mask` で組み直すので、ここで作っても捨てられる
+            # (しかも update_and_fetch の前なので列数が 0 の壊れた形になる)
+            out = self.eng.mtp(
+                embeds, hy, self.eng.rope, None, cache, cache.indexer
+            )
+            mx.eval(out)
+        self._mtp_cache = cache
+
+    # ---- rounds -----------------------------------------------------
+
+    def step(self) -> list[list[int]]:
+        """1 ラウンド進めて、行ごとの新規トークンを返す。"""
+        from .spec_flash import capture  # noqa: F401  (batched_capture 経由)
+
+        eng = self.eng
+        with ragged_attention():
+            drafts = eng._draft_chain(
+                self._cur, self._hyper_prev, self._mtp_cache, self.depth
+            )
+        pair = mx.concatenate([self._cur] + drafts, axis=1)
+        total = pair.shape[1]
+        pre_ctx = snapshot_pre_ctx(self.model, self.caches)
+        with batched_capture(self.model) as cap:
+            lg = self.model(pair, cache=self.caches)
+            nxt = mx.argmax(lg, axis=-1)          # (B, T+1)
+            dv = mx.concatenate(drafts, axis=1)   # (B, T)
+            mx.eval(nxt, dv, cap.hyper)
+        self.rounds += 1
+
+        nxt_l, dv_l = nxt.tolist(), dv.tolist()
+        keeps, new = [], []
+        for b in range(self.B):
+            hit = 0
+            while hit < total - 1 and nxt_l[b][hit] == dv_l[b][hit]:
+                hit += 1
+            keeps.append(hit + 1)
+            self.accepted += hit
+            new.append(nxt_l[b][: hit + 1])
+            self.out[b].extend(new[-1])
+
+        batched_rollback(self.model, self.caches, cap, keeps, pre_ctx, pair)
+        self.ledger.commit_round(keeps, total)
+        last = [k - 1 for k in keeps]
+        self._cur = self._row_take(nxt[..., None], last)[:, :, 0]
+        self._hyper_prev = self._row_take(cap.hyper, last)
+        return new
+
+    def generate(self, max_tokens: int) -> list[list[int]]:
+        """全行が ``max_tokens`` 個に達するまで回す (eos は見ない)。"""
+        self.prefill()
+        while min(len(o) for o in self.out) < max_tokens:
+            self.step()
+        return [o[:max_tokens] for o in self.out]
+
+
 __all__ = [
     "RaggedLedger",
     "RaggedAttnCache",
+    "RaggedDraftCache",
     "make_ragged_cache",
     "ragged_attention",
     "batched_capture",
     "snapshot_pre_ctx",
     "batched_rollback",
+    "BatchSpecGenerator",
 ]
