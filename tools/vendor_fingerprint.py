@@ -19,6 +19,19 @@ budget=8 の chunk=4 と chunk=19 は**互いに食い違う**構成。QSA の�
 格子は kv 長で決まるので、prefill の割り方が変われば選ばれるブロックも
 変わる (端数ブロックの因果性を直しても、これは残る)。この道具が見るのは
 「変更の前後で同じ値が出るか」だけなので、食い違ったままでよい。
+
+## この検査は CPU で走る (B-6)
+
+`mx.set_default_device(mx.cpu)` を見ての通り、ここは CPU 専用の一次検査
+(合成モデル・数秒) であることに価値がある。だが 2026-09-02 に足した融合
+カーネル群 (`kernels/gdn_prework.py` / `kernels/prefill_attn.py` /
+`kernels/gated_delta_blocked.py` / `kernels/hyper_connection.py` /
+`kernels/moe_verify_gather.py`) の `eligible()` はどれも
+``mx.default_device() == mx.gpu`` を要求する。**つまりこの検査は CPU で
+走る限り、これらの `eligible()` を常に False にしか評価できず、GPU 分岐
+そのものは一度も通らない。**緑が出ても、この 5 つのカーネルについては
+「壊れていないこと」の証拠には**ならない**。GPU 分岐の一次検査は
+`tools/gpu_fingerprint.py` (`tools/biglock.sh` 経由、GPU 必須) が別に持つ。
 """
 
 from __future__ import annotations

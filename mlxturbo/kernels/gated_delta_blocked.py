@@ -149,26 +149,39 @@ def eligible(
     外れたら呼び手は既存の逐次経路 (`gated_delta_update`) にそのまま落ちる。
     """
     if not mx.metal.is_available() or mx.default_device() != mx.gpu:
+        _warn_once("gpu", "GPU が既定デバイスでないので使わない")
         return False
     if mask is not None:
         # バッチの右パディング。ブロック内で「状態を進めない位置」を作る形に
         # なり、下三角の連立が崩れる。ここは取りに行かない
+        _warn_once("mask", "mask 付き (バッチの右パディング) は対象外")
         return False
     if q.ndim != 4 or k.shape != q.shape or v.ndim != 4:
+        _warn_once("shape_qkv", "q/k/v の形が (B,T,H,D) でないか q と k の形が揃っていない")
         return False
     B, T, Hk, Dk = q.shape
     if v.shape[:2] != (B, T):
+        _warn_once("shape_v", "v の先頭 2 軸が (B, T) と揃っていない")
         return False
     Hv, Dv = v.shape[2:]
     if Hv < Hk or Hv % Hk != 0:
+        _warn_once("gqa", f"Hv={Hv} が Hk={Hk} の倍数でない (GQA 前提が崩れる)")
         return False
     if beta_src.shape != (B, T, Hv):
+        _warn_once("shape_beta", "beta_src の形が (B, T, Hv) でない")
         return False
     if T < MIN_T:
+        _warn_once(
+            "min_t",
+            f"T={T} は decode/verify 幅 (MIN_T={MIN_T} 未満) なので使わない "
+            "(下ごしらえの費用がブロック化の得を上回る)",
+        )
         return False
     if state is not None and state.dtype != mx.float32:
+        _warn_once("state_dtype", "state が fp32 でない")
         return False
     if state is not None and state.shape != (B, Hv, Dv, Dk):
+        _warn_once("state_shape", "state の形が (B, Hv, Dv, Dk) でない")
         return False
     c = block or BLOCK
     if c < 8 or c & (c - 1):

@@ -196,6 +196,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from . import _fire
+
 _KERNELS: dict[tuple, Any] = {}
 
 GROUP_SIZE = 64
@@ -467,6 +469,7 @@ def gather_gate(
     grid.z は実セグメント数 nseg でなく (nseg はホストに読まないと分からない)
     その上限 P を常に使う (`_segments_gpu` のドキュメント参照)。
     """
+    _fire.bump("moe_verify_gate")
     P = x_sorted.shape[0]
     max_seg = _max_seg_bound(S)
     seg_expert, seg_row0, seg_len = _segments_gpu(idx_sorted, P)
@@ -663,6 +666,7 @@ def gather_gate_up(
     """x_sorted (P, K) bf16 とソート済み idx (P,) から silu(gate)*up (P, H) を返す。
     セグメント境界の計算・grid.z の決め方は `gather_gate` と同じ (`_segments_gpu`
     / `_max_seg_bound` 参照、ホスト同期なし)。`S` は 1 verify ラウンドのトークン数。"""
+    _fire.bump("moe_verify_gate_up")
     P = x_sorted.shape[0]
     max_seg = _max_seg_bound(S)
     seg_expert, seg_row0, seg_len = _segments_gpu(idx_sorted, P)
@@ -847,6 +851,7 @@ def gather_down(
     gate/gate_up と同じセグメント境界計算 (`_segments_gpu` / `_max_seg_bound`、
     ホスト同期なし) だが、こちらは K=640 の端数処理が要る (`_source_down`
     参照)。`S` は 1 verify ラウンドのトークン数。"""
+    _fire.bump("moe_verify_down")
     P = x_sorted.shape[0]
     max_seg = _max_seg_bound(S)
     seg_expert, seg_row0, seg_len = _segments_gpu(idx_sorted, P)

@@ -59,6 +59,21 @@ import mlx.core as mx
 from . import _fire
 
 _KERNELS: dict[tuple, Any] = {}
+_warned: set = set()
+
+
+def _warn_once(key: str, msg: str) -> None:
+    """同じ理由の見送りを 1 度だけ知らせる (黙って落ちないため)。
+
+    `prefill_attn.py` と同じ形 (2026-09-02、B-8 の穴埋め)。ここが無言のまま
+    だと、`eligible` が常に False を返し続けても発火カウンタ (`_fire`) が
+    0 のまま推移するだけで、なぜ 0 なのかが分からない。
+    """
+    if key in _warned:
+        return
+    _warned.add(key)
+    print(f"[mlxturbo] GDN 前処理カーネル: {msg}")
+
 
 # 1 threadgroup = 32 simdgroup x 32 lane。q の 16 head + k の 16 head をちょうど
 # 32 simdgroup に 1:1 で割り当てる (eligible() が 2*n_k <= 32 を確かめる)。
@@ -254,34 +269,52 @@ def eligible(
     """このカーネルで扱える形・幅・量子化かを判定する。外れたら呼び出し側は素の経路へ。"""
 
     if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        _warn_once("gpu", "GPU が既定デバイスでないので使わない")
         return False
     if mixed_qkv.dtype not in (mx.float16, mx.bfloat16):
+        _warn_once("dtype", f"mixed_qkv の dtype {mixed_qkv.dtype} は非対応 (fp16/bf16 のみ)")
         return False
     if conv_w.dtype != mixed_qkv.dtype or conv_state.dtype != mixed_qkv.dtype:
+        _warn_once("dtype_conv", "conv_w/conv_state の dtype が mixed_qkv と揃っていない")
         return False
     if a.dtype != mixed_qkv.dtype or b.dtype != mixed_qkv.dtype:
+        _warn_once("dtype_ab", "a/b の dtype が mixed_qkv と揃っていない")
         return False
     if A_log.dtype != mx.float32 or dt_bias.dtype != mx.float32:
+        _warn_once("dtype_alog", "A_log/dt_bias が fp32 でない")
         return False
     if mixed_qkv.ndim != 3:
+        _warn_once("ndim", f"mixed_qkv.ndim={mixed_qkv.ndim} は 3 でない")
         return False
     B, S, conv_dim = mixed_qkv.shape
     if S > MAX_S or B * S > MAX_M:
+        _warn_once(
+            "width",
+            f"S={S} B*S={B * S} は decode/verify 幅の上限 (MAX_S={MAX_S}, "
+            f"MAX_M={MAX_M}) を超えるので使わない (prefill 幅は素の経路のまま)",
+        )
         return False
     if conv_dim != 2 * key_dim + value_dim or key_dim != n_k * dk:
+        _warn_once("shape_conv", "conv_dim/key_dim の関係が想定と違う")
         return False
     if conv_w.ndim != 3 or conv_w.shape[0] != conv_dim or conv_w.shape[2] != 1:
+        _warn_once("shape_convw", "conv_w の形が (conv_dim, K, 1) でない")
         return False
     K = conv_w.shape[1]
     if conv_state.shape != (B, K - 1, conv_dim):
+        _warn_once("shape_convstate", "conv_state の形が (B, K-1, conv_dim) でない")
         return False
     if a.shape != (B, S, n_v) or b.shape != (B, S, n_v):
+        _warn_once("shape_ab", "a/b の形が (B, S, n_v) でない")
         return False
     if A_log.shape != (n_v,) or dt_bias.shape != (n_v,):
+        _warn_once("shape_alog", "A_log/dt_bias の形が (n_v,) でない")
         return False
     if n_k <= 0 or 2 * n_k > _SIMDGROUPS:
+        _warn_once("nk", f"n_k={n_k} は 2*n_k<=32 simdgroup の枠を外れる")
         return False
     if 2 * key_dim * mixed_qkv.dtype.size > MAX_TG_BYTES:
+        _warn_once("tg", "threadgroup メモリ (tg_q/tg_k) が上限を超える")
         return False
     return True
 

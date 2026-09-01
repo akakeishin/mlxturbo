@@ -344,6 +344,7 @@ def eligible(
         _warn_once("keep", "keep_block が (B,S,n_blocks) の bool でない")
         return False
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        _warn_once("ndim", "q/k/v の ndim が 4 でない ((B, H, S, D) 前提)")
         return False
     head_dim = q.shape[3]
     if k.shape[3] != head_dim or v.shape[3] != head_dim:
@@ -351,6 +352,7 @@ def eligible(
         return False
     n_kv = k.shape[1]
     if n_kv <= 0 or q.shape[1] % n_kv != 0:
+        _warn_once("n_kv", f"n_kv={n_kv} が 0 以下、または q の head 数を割り切れない")
         return False
     gqa = q.shape[1] // n_kv
     if gqa < 1 or gqa > 32:
@@ -358,6 +360,7 @@ def eligible(
         _warn_once("gqa", f"GQA {gqa} は 1..32 の外")
         return False
     if cr < 1 or block_topk < 1:
+        _warn_once("cr_topk", f"cr={cr} block_topk={block_topk} のどちらかが 1 未満")
         return False
     if n_blocks * cr > kv_len or kv_len - n_blocks * cr >= cr:
         _warn_once("blocks", "n_blocks と kv_len の関係が想定と違う")
