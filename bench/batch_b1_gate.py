@@ -35,7 +35,8 @@ exit code 1 で落ちる (CIやワンライナーで拾いやすくするため)
     .venv/bin/python bench/batch_b1_gate.py --dry-run
 
 計時方式は bench/batch_throughput.py および scratchpad の xlong_probe.py
-系と同じ「クライアント側 SSE 計時」(content delta チャンク数 ≈ トークン数)。
+系と同じ「クライアント側 SSE 計時」(delta チャンク数 ≈ トークン数。
+本文と思考 (reasoning_content) の両方を数える)。
 プロンプトは短 decode を測るための短い固定プロンプト1本のみを使う
 (バッチ経路の判定プロトコルにある「1kと16kを同居させない」の対極、ここでは
 単一の短いリクエストだけを繰り返し流して decode 速度のばらつきを見る)。
@@ -91,7 +92,13 @@ def _stream_once(base_url: str, model: str | None, max_tokens: int, timeout: flo
                     continue
                 chunk = json.loads(line[6:])
                 delta = chunk["choices"][0].get("delta", {})
-                if delta.get("content"):
+                # **思考 (reasoning_content) も数える。**うちのサーバーは既定で
+                # 思考を出すので、content だけ見ていると max_tokens が思考で
+                # 尽きて「not enough decode tokens」になる (2026-09-02 に
+                # 全 run が ERROR になって判明。bench/vs_mlx_serve.py でも
+                # 同じ症状を踏んだ)。decode 速度の計測としては、どの経路であれ
+                # トークンが出る間隔が見たいものなので両方数えるのが正しい。
+                if delta.get("content") or delta.get("reasoning_content"):
                     now = time.time()
                     if tfirst is None:
                         tfirst = now
