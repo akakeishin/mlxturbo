@@ -13,6 +13,12 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
   絶対値を語るなら冷ましてから短く測る。ここで信じるのは A/B の差だけ。
 - 生成長は全条件そろえる (既定 512)。長文脈は実文書から切った窓を使う
   (繰り返し文字列だと n-gram と MTP が当てすぎて受理率が嘘になる)。
+- **長文脈では `--prefill-once`。**50k の prefill は 100 秒級で、A/B x 回文
+  だと 12 回踏むことになる (実測: 50k の 1 knob で 30 分)。knob が prefill に
+  効かないなら 1 回で足りる -- エンジンが checkpoint 復帰用に持っている
+  `resume` をそのまま使い、控えたキャッシュから decode だけを流す。
+  各条件がまったく同じ状態から始まるので**制御はむしろ強くなる**。
+  prefill に効く knob (`prefill-group` / `stage-every`) では使えない (弾く)。
 
 ## knob
 
@@ -310,6 +316,77 @@ KNOBS = {
 }
 
 
+def _snapshot(caches):
+    """キャッシュの参照と offset を控える。MLX の配列は不変なので、
+    参照を控えておけば付け替えで完全に戻せる
+    (`spec_flash._pipeline_snapshot` と同じ理屈)。"""
+    st = []
+    for c in caches:
+        if hasattr(c, "keys"):
+            st.append(("a", c.keys, c.values, c.offset,
+                       c.indexer.keys, c.indexer.offset))
+        else:
+            st.append(("l", [c[i] for i in range(4)]))
+    return st
+
+
+def _restore(caches, st):
+    for c, rec in zip(caches, st):
+        if rec[0] == "a":
+            _, c.keys, c.values, c.offset, ik, io = rec
+            c.indexer.keys = ik
+            c.indexer.offset = io
+        else:
+            for i, v in enumerate(rec[1]):
+                c[i] = v
+
+
+def prefill_once(eng, ids, eos_ids):
+    """prefill を 1 回だけ流し、(caches, snapshot, resume, 先頭トークン) を返す。
+
+    50k の prefill は 100 秒級で、A/B x 回文だと 12 回踏むことになる
+    (実測: 50k の 1 knob で 30 分)。**knob が prefill に効かないなら
+    prefill は 1 回で足りる。**エンジンは checkpoint 復帰のために
+    `resume` を既に持っているので、それをそのまま使う
+    (`generate_stream` の `use_resume` 分岐、`ids` が 0 幅のときだけ有効)。
+
+    副産物として、各条件がまったく同じ状態から decode を始めることになるので、
+    prefill をやり直すより**むしろ制御が効く**。
+
+    **prefill に効く knob (prefill-group、stage-every) には使わないこと。**
+    """
+    import mlx.core as mx
+
+    caches = eng.model.make_cache()
+    mx.clear_cache()
+    gen = eng.generate_stream(ids, 1, caches=caches, eos_ids=eos_ids)
+    first = []
+    try:
+        while True:
+            first.extend(next(gen))
+    except StopIteration as e:
+        resume = e.value[2]
+    return caches, _snapshot(caches), resume, first
+
+
+def run_resumed(eng, caches, snap, resume, base_pos, n_tokens, eos_ids):
+    """控えた状態から decode だけを流す。返り値は run_once と同じ形。"""
+    import mlx.core as mx
+
+    _restore(caches, snap)
+    empty = mx.zeros((1, 0), dtype=mx.int32)
+    t0 = time.perf_counter()
+    gen = eng.generate_stream(empty, n_tokens, caches=caches, eos_ids=eos_ids,
+                              resume=resume, base_pos=base_pos)
+    out = []
+    try:
+        while True:
+            out.extend(next(gen))
+    except StopIteration as e:
+        accepted, rounds = e.value[0], e.value[1]
+    return out, 0.0, time.perf_counter() - t0, accepted, rounds
+
+
 def run_once(eng, ids, n_tokens, eos_ids):
     """1 本流して (トークン列, prefill 秒, decode 秒, accepted, rounds) を返す。"""
     import mlx.core as mx
@@ -348,6 +425,9 @@ def main() -> int:
                     help="長さの片方だけ回す (交差点探しで短文脈を省くため)")
     ap.add_argument("--variants", default=None,
                     help="knob の値をカンマ区切りで絞る (既定は KNOBS の全部)")
+    ap.add_argument("--prefill-once", action="store_true",
+                    help="長文脈で prefill を 1 回に畳む (prefill に効く knob "
+                         "= prefill-group / stage-every には使わないこと)")
     args = ap.parse_args()
 
     if args.ngram:
@@ -427,13 +507,29 @@ def main() -> int:
                 run_once(eng, ids, 32, eos_ids)
                 break
 
+    if args.prefill_once and args.knob in ("prefill-group", "stage-every"):
+        print("この knob は prefill に効くので --prefill-once は使えない")
+        return 1
+
     rows = []
     for kind, ids in cases:
         n = ids.shape[1]
         print(f"--- {kind} ctx={n} ---", flush=True)
+        shared = None
+        if args.prefill_once:
+            t0 = time.perf_counter()
+            caches, snap, resume, _first = prefill_once(eng, ids, eos_ids)
+            shared = (caches, snap, resume)
+            print(f"  prefill 1 回だけ流した ({time.perf_counter() - t0:.1f}s)。"
+                  " 以降はここから decode のみ", flush=True)
         for v in order:
             set_variant(v)
-            out, tp, td, acc, rounds = run_once(eng, ids, args.tokens, eos_ids)
+            if shared is None:
+                out, tp, td, acc, rounds = run_once(eng, ids, args.tokens, eos_ids)
+            else:
+                out, tp, td, acc, rounds = run_resumed(
+                    eng, *shared, base_pos=n, n_tokens=args.tokens,
+                    eos_ids=eos_ids)
             ms = td / max(len(out), 1) * 1000
             tpr = len(out) / max(rounds, 1)
             rows.append(dict(kind=kind, ctx=n, variant=v, n_out=len(out),
