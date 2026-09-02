@@ -64,6 +64,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from . import _fire
+
 # threadgroup メモリに normed (hc*d 要素) を丸ごと置く。Apple GPU の上限 32KB に
 # 対してマージンを取る。GLM 系で hc*d がこれを超えるなら素の実装に落とす。
 MAX_TG_BYTES = 28 * 1024
@@ -185,16 +187,16 @@ def _pre_source(cfg: dict) -> str:
     hcd = hc * d
     bits, gs = cfg["bits"], cfg["group_size"]
     eps = cfg["eps"]
-    combine = cfg["combine"]
+    inject_kind = cfg["inject_kind"]
     words = hcd * bits // 32
     n_groups = hcd // gs
     n_down_tg = (lowrank + _ROWS_PER_TG - 1) // _ROWS_PER_TG
 
     inject_body = ""
-    if combine:
+    if inject_kind == "quant":
         inject_body = f"""
     }} else {{
-        // inject 行 (hc 本)。1 スレッドグループで足りる小ささ
+        // inject 行 (hc 本、量子化)。1 スレッドグループで足りる小ささ
         for (int rr = (int)simd_gid; rr < {hc}; rr += {_SIMDGROUPS}) {{
             const device uint32_t* inject_w_row = inject_w + (size_t)rr * {words};
             const device T* s_row = inject_s + (size_t)rr * {n_groups};
@@ -204,6 +206,29 @@ def _pre_source(cfg: dict) -> str:
             acc = simd_sum(acc);
             if (simd_lid == 0) {{
                 // 参照: 2 * sigmoid(qmm(normed) / hc)
+                float xv = (float)((T)((float)((T)acc) / {float(hc)}f));
+                float sg = (float)((T)(1.0f / (1.0f + metal::exp(-xv))));
+                inject[(size_t)m * {hc} + rr] = (T)(2.0f * sg);
+            }}
+        }}"""
+    elif inject_kind == "bf16":
+        inject_body = f"""
+    }} else {{
+        // inject 行 (hc 本、非量子化)。block_inject_weight が
+        // QuantizedLinear に変換されず bf16/fp16 の nn.Linear のまま残った
+        // 層向け (診断: 97 層中 96 層がこれに該当、hc_fire_diag.py 参照)。
+        // 重みは (hc, hcd) の T をそのまま読むだけで逆量子化は不要 (80KB
+        // 前後なので帯域上も無視できる)
+        for (int rr = (int)simd_gid; rr < {hc}; rr += {_SIMDGROUPS}) {{
+            const device T* inject_w_row = inject_w + (size_t)rr * {hcd};
+            float acc = 0.0f;
+            for (int k = (int)simd_lid; k < {hcd}; k += 32) {{
+                acc += (float)inject_w_row[k] * (float)tg_normed[k];
+            }}
+            acc = simd_sum(acc);
+            if (simd_lid == 0) {{
+                // 参照: 2 * sigmoid(qmm(normed) / hc)。qmm は非量子化なら
+                // 単なる行列積 (mlxturbo/fused.py の core() 参照)
                 float xv = (float)((T)((float)((T)acc) / {float(hc)}f));
                 float sg = (float)((T)(1.0f / (1.0f + metal::exp(-xv))));
                 inject[(size_t)m * {hc} + rr] = (T)(2.0f * sg);
@@ -343,13 +368,17 @@ def _get_kernels(cfg: dict):
     if built is not None:
         return built
 
-    tag = "c" if cfg["combine"] else "p"
+    inject_kind = cfg["inject_kind"]
+    tag = {"quant": "c", "bf16": "cb", None: "p"}[inject_kind]
     suffix = f"{cfg['hc']}x{cfg['d']}_{cfg['lowrank']}_{cfg['bits']}b{cfg['group_size']}_{tag}{len(_KERNELS)}"
 
     pre_inputs = ["hyper", "norm_weight", "down_w", "down_s", "down_b"]
     pre_outputs = ["t", "rlane"]
-    if cfg["combine"]:
+    if inject_kind == "quant":
         pre_inputs += ["inject_w", "inject_s", "inject_b"]
+        pre_outputs += ["inject"]
+    elif inject_kind == "bf16":
+        pre_inputs += ["inject_w"]
         pre_outputs += ["inject"]
 
     pre = mx.fast.metal_kernel(
@@ -658,7 +687,15 @@ def eligible(
     hc: int,
     d: int,
 ) -> bool:
-    """このカーネルで扱える形と量子化かを判定する。外れたら呼び出し側は素の実装へ。"""
+    """このカーネルで扱える形と量子化かを判定する。外れたら呼び出し側は素の実装へ。
+
+    ``inject`` は None (combine なし)、量子化 5-tuple ``(w, s, b, gs, bits)``、
+    または非量子化 bf16/fp16 の 2-tuple ``("bf16", weight)`` (fused.py の
+    ``_pack_inject_bf16`` が作る印) のいずれか。後者は prefill 幅のカーネル
+    (:func:`eligible_prefill` 経由) には渡らない -- ``fused.py`` 側が prefill
+    分岐には量子化 inject しか渡さないので、ここでの `inject_bf16` 判定は
+    decode 幅 (:func:`fused_gated_residual`) の呼び出しでしか True にならない。
+    """
 
     if mx.default_device() != mx.gpu or not mx.metal.is_available():
         return False
@@ -671,7 +708,11 @@ def eligible(
     if hc * d * hyper.dtype.size > MAX_TG_BYTES:
         return False
 
-    parts = [down, up] + ([inject] if inject is not None else [])
+    inject_bf16 = inject is not None and len(inject) == 2 and inject[0] == "bf16"
+
+    parts = [down, up]
+    if inject is not None and not inject_bf16:
+        parts.append(inject)
     for w, s, b, gs, bits in parts:
         # 非量子化の線形層 (len 1 のパック) はここに来ない
         if bits not in (4, 8) or gs % (32 // bits) or w.dtype != mx.uint32:
@@ -691,7 +732,7 @@ def eligible(
     # 混ぜて 0.0254 の誤差が実測されている (D-4)。
     if up[3] != down[3] or up[4] != down[4]:
         return False
-    if inject is not None and (inject[3] != down[3] or inject[4] != down[4]):
+    if inject is not None and not inject_bf16 and (inject[3] != down[3] or inject[4] != down[4]):
         return False
 
     lowrank = down[0].shape[0]
@@ -700,7 +741,14 @@ def eligible(
     if lowrank % 32:
         # tg_t の読み込みと simdgroup 分担が半端になる形は素の実装へ
         return False
-    if inject is not None and inject[0].shape[0] != hc:
+
+    if inject_bf16:
+        w = inject[1]
+        if w.dtype != hyper.dtype:
+            return False
+        if w.shape != (hc, hc * d):
+            return False
+    elif inject is not None and inject[0].shape[0] != hc:
         return False
     return True
 
@@ -717,12 +765,21 @@ def fused_gated_residual(
 ):
     """`GatedResidual.__call__` の中身を 2 本のカーネルで計算する。
 
-    引数の ``down`` / ``up`` / ``inject`` は ``(weight, scales, biases,
-    group_size, bits)``。戻り値は ``mixed``、``inject`` があれば
-    ``(mixed, inject)``。
+    引数の ``down`` / ``up`` は ``(weight, scales, biases, group_size, bits)``。
+    ``inject`` はそれに加えて非量子化 bf16/fp16 の 2-tuple
+    ``("bf16", weight)`` も受け付ける (:func:`eligible` 参照)。戻り値は
+    ``mixed``、``inject`` があれば ``(mixed, inject)``。
     """
 
+    _fire.bump("hc_kernel")
     lowrank = down[0].shape[0]
+    inject_bf16 = inject is not None and len(inject) == 2 and inject[0] == "bf16"
+    if inject is None:
+        inject_kind = None
+    elif inject_bf16:
+        inject_kind = "bf16"
+    else:
+        inject_kind = "quant"
     cfg = {
         "hc": hc,
         "d": d,
@@ -730,7 +787,7 @@ def fused_gated_residual(
         "bits": down[4],
         "group_size": down[3],
         "eps": float(eps),
-        "combine": inject is not None,
+        "inject_kind": inject_kind,
     }
     pre, post = _get_kernels(cfg)
 
@@ -745,8 +802,12 @@ def fused_gated_residual(
     pre_inputs = [flat, norm_weight, down[0], down[1], down[2]]
     pre_shapes = [(m, lowrank), (m, hc)]
     pre_dtypes = [dt, mx.float32]
-    if inject is not None:
+    if inject_kind == "quant":
         pre_inputs += [inject[0], inject[1], inject[2]]
+        pre_shapes += [(m, hc)]
+        pre_dtypes += [dt]
+    elif inject_kind == "bf16":
+        pre_inputs += [inject[1]]
         pre_shapes += [(m, hc)]
         pre_dtypes += [dt]
 

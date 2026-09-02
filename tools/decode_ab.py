@@ -489,6 +489,53 @@ def _knob_hc_prefill(ctx):
 
 
 
+def _knob_hc_kernel(ctx):
+    """A = hyper-connection の読み側 (`GatedResidual.__call__`) を融合 Metal
+    カーネルに畳む (既定 off) / B = 素の実装 (既定)。
+
+    `mlxturbo/kernels/hyper_connection.py` の `fused_gated_residual`
+    (`fused.enable_hyper_connection_kernel`)。診断
+    (scratchpad/hc_fire_diag.py、実モデル ~/models/ddalcu-mlxlm、S=1) で、
+    97 層の `GatedResidual` のうち 96 層は `block_inject_weight` が
+    QuantizedLinear に変換されず bf16 の `nn.Linear` のまま残っていて、
+    `fused.py` の `_pack_quantized` が None を返すため inject の量子化
+    5-tuple パックに失敗し、**down/up が量子化で問題なくてもカーネル全体が
+    毎回素の実装へ落ちていた**(発火は inject の無い 1 層 (mixer) だけ)。
+    `kernels/hyper_connection.py` に非量子化 bf16 inject をそのまま読む分岐
+    (`_pre_source` の "bf16" ケース、`eligible`/`fused_gated_residual` の
+    `inject_kind`) を足し、`fused.py` の `_pack_inject_bf16` がそれを渡す
+    ようにしたことで 97 層全部が発火するはず
+    (bench/test_hc_kernel_inject.py がモデル無しの合成入力で素の計算との
+    一致を確認済み。最大絶対誤差は bf16 の丸め幅 1.5e-2 以内 -- sigmoid が
+    ビット単位で再現できないのはこのカーネルの既知の性質で、
+    hyper_connection.py 冒頭の説明を参照)。
+
+    **decode 専用ではない。**`hck.eligible` は M (行数) を一切見ないので、
+    `MLXTURBO_HC_PREFILL` が既定 off でも `enable_hyper_connection_kernel`
+    を呼べば、prefill 幅の呼び出しもこの同じ decode 幅カーネル (pre_tg=21 /
+    post_tg=80 の設計、`_prefill_source` の docstring が言う「M が大きい
+    prefill では threadgroup 数は M だけで GPU を埋められる」の経路) を通る。
+    つまりこの knob は prefill にも効くので **`--prefill-once` は使えない**
+    (`DECODE_ONLY_KNOBS` には入れない -- `bool-mask`/`gdn-metal` もそちらの
+    リストには入っていない。prefill 幅専用の 1 ディスパッチ版は別の knob
+    (`hc-prefill`) が担当する)。
+
+    合格条件: **ms/token が短・長の両方で改善すること。**出力は sigmoid の
+    1 ulp 差で厳密には一致しないので一致は要求しない。
+    発火の確認: `mlxturbo.kernels._fire.snapshot()` の `hc_kernel`
+    (層数ぶん、既定モデルなら 97 になるはず)。
+    """
+    from mlxturbo import fused
+
+    def apply(variant):
+        fused.disable_hyper_connection_kernel()
+        if variant == "A":
+            fused.enable_hyper_connection_kernel()
+
+    return apply
+
+
+
 def _knob_pipeline(ctx):
     """A = 楽観パイプライン (次ラウンドの draft を先に組む) / B = 無効 (既定)。
 
@@ -1078,6 +1125,7 @@ KNOBS = {
     "rms-norm-gated": (_knob_rms_norm_gated, ["A", "C", "B"], True, "B"),
     "moe-route": (_knob_moe_route, ["A", "C", "B"], False, "B"),
     "hc-prefill": (_knob_hc_prefill, ["A", "C", "B"], False, "C"),
+    "hc-kernel": (_knob_hc_kernel, ["A", "B"], False, "B"),
     "pipeline": (_knob_pipeline, ["A", "B"], False, "B"),
     "fast-qmm": (_knob_fast_qmm, ["A", "B"], False, "B"),
     "null": (_knob_null, ["A", "B"], True, "B"),

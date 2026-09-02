@@ -146,6 +146,34 @@ def _pack_quantized(lin):
     return (lin["weight"], lin["scales"], lin["biases"], lin.group_size, lin.bits)
 
 
+def _pack_inject_bf16(lin):
+    """`block_inject_weight` が量子化されていない bf16/fp16 の `nn.Linear` の
+    ときに重みだけ取り出す。`_pack_quantized` が None を返したとき (量子化
+    経路が使えないとき) だけ decode 幅のカーネルから呼ばれる第二の経路で、
+    量子化 inject の経路そのものは変えない。
+
+    診断 (`scratchpad/hc_fire_diag.py`): 97 層の `GatedResidual` のうち 96 層は
+    `block_inject_weight` が `nn.Linear` のまま (形は (hc, hc*d)、hc=4 なら
+    80KB) で、量子化されているのは 1 層 (mixer) だけ。逆量子化が要らないので
+    そのまま Metal カーネルへ渡せる (kernels/hyper_connection.py の
+    `_pre_source` 側の "bf16" 分岐)。
+
+    prefill 幅のカーネル (kernels/hyper_connection.py の `_prefill_source`)
+    は量子化 inject しか読めないので、この関数の戻り値は decode 幅
+    (`fused_gated_residual`) の呼び出しにしか使わない。
+    """
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    if not isinstance(lin, nn.Linear):
+        return None
+    w = lin.weight
+    if w.dtype not in (mx.bfloat16, mx.float16):
+        return None
+    return ("bf16", w)
+
+
 def enable_hyper_connection_kernel() -> None:
     """Replace `GatedResidual.__call__` with the fused Metal kernel.
 
@@ -182,24 +210,39 @@ def enable_hyper_connection_kernel() -> None:
         down = _pack_quantized(self.input_mix_weight_down)
         up = _pack_quantized(self.input_mix_weight_up)
         combine = self.block_inject_weight is not None
-        inject = _pack_quantized(self.block_inject_weight) if combine else None
-        if down is None or up is None or (combine and inject is None):
+        inject_q = _pack_quantized(self.block_inject_weight) if combine else None
+        if down is None or up is None:
             return orig(self, hyper)
 
-        if prefill_on:
+        # prefill 幅のカーネル (`_prefill_source`) は量子化 inject しか読めない
+        # ので、この分岐には量子化パック (`inject_q`) だけを渡す。combine な
+        # のに量子化パックが無い (= bf16 のまま) ときはここを素通りして下の
+        # decode 幅の判定に進む -- 元の実装が「combine かつ inject 無し」で
+        # 即 orig に落ちていたのと同じ理由で、prefill 側は今まで通り一度も
+        # このケースに触れない。
+        if prefill_on and (not combine or inject_q is not None):
             m = 1
             for s in hyper.shape[:-1]:
                 m *= s
             if hck.eligible_prefill(hyper, self.hc_norm.weight, down, up,
-                                     inject, self.hc, self.d, m):
+                                     inject_q, self.hc, self.d, m):
                 out = hck.fused_gated_residual_prefill(
                     hyper, self.hc_norm.weight, self.hc_norm.eps, self.hc,
-                    self.d, down, up, inject,
+                    self.d, down, up, inject_q,
                 )
                 if not combine:
                     return out
                 mixed, inj = out
                 return mixed, hyper, inj
+
+        # decode 幅。量子化 inject が使えなければ非量子化 bf16 を試す
+        # (診断: 97 層中 96 層が block_inject_weight 未量子化のため、これが
+        # 無いとカーネル全体が素の実装に落ちていた)
+        inject = inject_q
+        if combine and inject is None:
+            inject = _pack_inject_bf16(self.block_inject_weight)
+            if inject is None:
+                return orig(self, hyper)
 
         if not hck.eligible(hyper, self.hc_norm.weight, down, up, inject,
                             self.hc, self.d):
