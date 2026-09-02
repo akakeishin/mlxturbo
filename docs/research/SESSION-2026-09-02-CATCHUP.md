@@ -869,3 +869,24 @@ KLD を触るので後回し。判定は小さい in-model (S=1 forward の ABBA
 K/V も head も分けない。qL=2 は素通し (vector に入る)。単体テストに「gqa 12 (24/2) の qL 4 は素の
 MLX では非融合フォールバック」と明記されている。うちの `MLXTURBO_SDPA_SPLIT` と同型。
 融合カーネル `msv_attn_p256` は qL ≥ 16 (prefill) 専用で、verify 幅には出てこない。
+
+## 温 TTFT の中身 (レーン 8、2026-09-02 23:10、scout 読解 + scratchpad/tokenize_cost.py)
+
+サーバー自身の ttft (`runner.generate` の生成開始からの時計、`turbo-0902f.log`):
+reused=4082 new=17 で **0.16 s**、reused=17082 new=16 で **0.19 s**。ハーネスの温 TTFT は 4k 0.46 /
+17k 0.51 s なので、**約 0.3 s は生成前 (HTTP、JSON、chat template、tokenize、セッション照合、
+executor への受け渡し) か、ハーネス側にある。**
+
+生成前の候補を潰した分:
+- chat template + tokenize (モデル無し、CPU、中央値): 4k 2.1 ms、17k 8.9 ms、50k 25.7 ms。
+  相手の `tokenize_cache.zig` が問題にしている「1813 トークンで 240 ms」はうちでは起きていない
+  (HF の Rust tokenizer が速い)。文脈比例だが小さい。
+- セッション照合は Python の LCP ループ (int 比較)。17k で数 ms 級 (読解、未計測)。
+- 温ヒットは KV / GDN / indexer / n-gram を参照のまま使い、複製しない (読解)。
+- prime は delta 長で頭打ち (PRIME_WINDOW 2048)。delta が十数トークンの温ヒットでは小さい。
+
+残る帰属: 生成内 0.15〜0.19 s (17 トークンの forward 1 回は 40 ms 級なので、capture(light) の準備、
+checkpoint、n-gram 行取得、最初のサンプルまでの固定費が 100 ms 前後ある) と、生成前の 0.3 s の
+どこか。次は `--log-level debug` 相当の時刻印 (受信 / template 後 / 照合後 / 生成開始 / 最初のトークン)
+を 1 リクエストぶん取って部品和 ≈ 壁時計を確認する。50k の 1.33 s は delta の forward が kv に
+比例して伸びる分 (attention + indexer) で、こちらは decode の kv 罰と同じ帰属。
