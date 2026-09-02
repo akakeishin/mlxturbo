@@ -336,3 +336,187 @@ xctrace のカーネル区間で相手と突き合わせる。
 
 手: 端数チャンクをグループに入れる (~1 s)、最終チャンクも layer-major で流す
 (~0.4 s)、attention を真の union で集める (kv 依存を消す。最大)、GDN Metal (0.6 s)。
+
+## GDN Metal カーネルの in-model A/B (2026-09-02 13:37-13:48、17k x 3 本、熱い状態)
+
+`--knob gdn-metal --only long --ctx 17000 --tokens 8`: prefill_s A (Metal) 47.86 s、B (逐次)
+48.60 s、**-1.5%** (本ごとに -4.4 / +1.9 / -1.8%)。発火 324 回 (36 層 x 9 チャンク)。
+単体 1.59 倍でも prefill の 5% の部品なので取り分はこの程度。bit 一致ではない
+(相対 1e-5) ので、既定 on にするなら KLD (`bench/quant_eval.py compare`) を通す。
+いまは既定 off のまま。
+
+## コードから読める「未計測の疑い」の棚卸し (2026-09-02 13:55)
+
+1. グループ境界の `mx.clear_cache()` → 既存の A/B (`prefill-pipeline-ab.json`、非同期 + clear 無し)
+   で -0.6%。**閉じる。**
+2. decode の GDN 層の `mx.contiguous` (36 回) と `mx.concatenate` (114 回、attention 層で 1 層 6 回)
+   → xctrace のカーネル区間で相手と突き合わせる (未)。
+3. MoE の sort 経路のタイル水増し (1.4-1.9 倍) → 相手も同じ op 列。差の主因なら
+   行の並べ方 (グループ内連結) の違いになる (未)。
+4. 最終チャンクだけ chunk-major (解剖 6.9 s 対 6.5 s) → 畳むには checkpoint と lm_head の
+   作りを変える (未)。
+
+## 読解で見つけた非対称 3 つ (2026-09-02 14:20、scout 3 本)
+
+1. **QSA マスクの表現** (`Attention._final_mask`): うちは bool の `sparse` を
+   `where(sparse, 0, finfo.min)` の加算マスクにして sdpa に渡す。MLX 0.32.2 の sdpa vector
+   カーネル (`sdpa_vector.h:100-110`) は float マスクなら `use_key = fmask >= finite_min`
+   でキーの読み込みを飛ばすが、**うちの値は finite_min そのものなので `>=` が真になり
+   飛ばない** → 17k のキー全部を読む。相手は bool のまま渡す (`qsaMaskFromBlockSel`)。
+   前セッションの `--knob bool-mask` は 17k で ms/tok -7% と出ていたが採用されていなかった。
+   steel (prefill 幅) の attention はマスクで飛ばさない (`steel_attention.h:329-352` は
+   フラグメント単位で加算するだけ) ので、**効くのは decode 側だけ**。→ 既定を bool にする (実装中)。
+2. **QK-norm + partial RoPE**: 相手は `fusedQkNormRope256` (1 dispatch、rd=64) で
+   rms_norm x2 + rope x2 を畳む。うちは rms_norm x2 + transpose x2 + cos/sin 生成 +
+   `_rope_partial` x2 (slice x2 + concat x2 ずつ) = 約 14 op/層 x 12 層。文脈に依らない固定費。
+   `mx.fast.rope` (partial dims 対応) に置き換えれば数 op に減るが、mrope_interleaved の
+   等価性を確認してから (数値は動きうる)。
+3. **GDN 層の前処理・後処理**: うちの decode 本番経路は GDN 1 層あたり約 30 dispatch
+   (相手 8)。`gdn_prework.py` (conv+silu+split+norm+scale+g/beta を 1 発) と
+   `rms_norm_gated.py` は実装済みで capture 経路にも配線されているが**既定 off**。
+   過去の A/B は `fired={}` で発火未確認のまま「効かない」と判定されていた。
+   発火カウンタ付きで取り直す。MoE router (argpartition+take+softmax) も相手は 1 発
+   (`moe_route.py` は過去 +4% 遅い判定、これも発火未確認)。
+   HC は両者とも 6 dispatch/層で同数。
+
+prefill の MoE は op 列・MLX の分岐とも同一 (`gather_qmm_rhs`、bm は M/E で決まる)。
+差があるならルーティングの偏りとチャンク粒度で、コードからは出ない。
+
+## xctrace は今回は使えなかった (2026-09-02 14:30)
+
+`Metal System Trace` を launch 方式で 32 秒取っても、`metal-gpu-intervals` に python
+(MLX) の Compute 区間がほぼ出ない (49k 行のうち python は 87 行、大半は Claude Helper の
+描画)。`metal-shader-profiler-intervals` は 0 行 (カーネル名は取れない)。attach 方式は
+uv の python に効かず ("Cannot find process")。90 秒版は 19GB で後処理が終わらなかった。
+道具 (`tools/gpu_trace_kernels.py`) は実物の形式に合わせて残したが、**カーネル単位の
+突き合わせはこのレーンでは出ない**。decode の差は読解で見つけた 3 つの非対称
+(bool マスク / QK-norm+RoPE 融合 / GDN 前処理の既定 off) を A/B で潰す方向に切り替える。
+
+## 罠: decode_ab のプロセスが終了時に固まり、91GB を握ったまま残る (2026-09-02 14:50 発見)
+
+`--knob gdn-metal` の decode_ab が 13:48 に結果を書いた後も生き残り (RSS は小さいが
+Metal のバッファは解放されない)、以後の GPU ジョブが 2 モデル分のメモリで走って
+スワップ 25GB (pageouts 190 万ページ) になっていた。**13:48 以降の計測は無効**:
+真の union 統計 (途中で打ち切り)、xctrace の試行、端数チャンク畳み込みの A/B
+(27 分経っても終わらず打ち切り)。GDN Metal の A/B (13:37-13:48) も直前のジョブが
+残っていた可能性があり、取り直す。連鎖スクリプトは各ジョブ後に
+`pkill -f "decode_ab.py --knob"` を入れた。固まる場所は未特定 (sample が取れなかった)。
+
+## 融合 3 つの取り直し (2026-09-02 14:52-、短文脈 3 本 x 512、発火カウンタ付き)
+
+- `gdn-prework`: A +1.4% (遅い) だが **発火カウンタに `gdn_prework` が無い = 一度も dispatch
+  されていない**。過去の判定と同じ「動いていない」状態。knob / enable の配線を診断中。
+- `rms-norm-gated`: A ms/round +3.3%、**tok/round -6.5%** (出力が動く)、C (機構のみ) は基準と同じ。
+  発火表示に `rms_norm_gated` が無いのに出力が動くのは不可解 (カウンタの位置か経路の問題)。
+  時間の取り分が無く受理率を落とすので**却下のまま** (過去の判定と同じ)。
+  注: この A/B 中に診断用の合成モデル GPU プローブが並走した可能性があり、ラウンド時間の
+  絶対値 (60 ms) は信用しない。
+- `moe-route`: 発火 12299 回。A ms/round +4.2%、**tok/round -6.1%** (ルーティングが動く)。
+  **却下** (過去の判定と同じ。融合しても argpartition + softmax より遅い)。
+  注: この 2 本の基準ラウンドが 52-60 ms で、直前の gdn-prework の 39 ms から 30% 悪い。
+  同時に走っていた CPU 側の検証 (別エージェント) か熱。絶対値は捨て、A/B の差だけ読む。
+
+## 端数チャンク畳み込みの A/B (2026-09-02 15:07-15:20、17k x 3 本、熱い + スワップ回復直後)
+
+1 本目は 33 → 36 → 51 → 78 s と暴走 (スワップ回復中)。2-3 本目: A (畳む) 57.0 / 55.7 s、
+B (畳まない) 56.8 / 57.2 s → **差なし (±0.5%)**。端数チャンク単独の 4.49 ms/tok は
+グループに入れても縮まなかった (熱い状態で 17k が 57 s = 冷えた 37.6 s の 1.5 倍)。
+既定は on のまま (ビット一致、害なし) だが取り分は無い。
+
+## 熱の現状 (15:20)
+
+4 時間の連続 GPU 使用で 17k prefill が 37.6 s (11:20) → 57 s。以後の A/B は差だけを読む。
+
+## GDN Metal の取り直し (2026-09-02 15:27-、残留プロセス無し、熱い)
+
+1 本目は熱の立ち上がりで 37.7 → 60.7 s と暴走 (使えない)。2 本目: A 56.6 / 55.4、
+B 56.7 / 56.8 → **-1.3%**。最初の A/B (-1.5%) と一致。採否は KLD を通してから。
+
+## GDN Metal 取り直し (3 本、15:26-15:44): prefill_s A 53.26 / B 55.78 = **-4.5%**
+
+(1 本目は熱の立ち上がりを含む。2 本目単独では -1.3%。) KLD を通してから既定 on にする。
+
+## 参考: M4 Prefill Engine (mohamedhossammohamed.github.io/m4-prefill-engine)
+
+dense LLaMA 系 1B/8B 向けの C++/Metal 単体実装。MLX 4bit 比で M=128-129 のとき
+1.05-1.25 倍、M=2048 で同等。MoE / GDN / QSA は扱わないので Flash-Next には効かない。
+**dense LLaMA / Gemma を載せるとき** (ユーザー方針) に dense SwiGLU 射影と
+barrier 削減 FlashAttention を読み直す。
+
+## 真の union (2026-09-02 15:44-15:55、ctx 11873、`gather_union_stats.py --tiles 64,32`)
+
+| tile | true_union_ratio 平均 (kv 4k → 12k) | dense 比の FLOP |
+|---|---|---|
+| 64 | 0.75 → 0.70 (平均 0.74) | 0.73 |
+| 32 | 0.73 → 0.59 (平均 0.66) | 0.65 |
+
+**宣言していた反転条件「tile 32 で 6 割超なら畳む」に該当。**隣接 32 クエリの選択ブロックの
+和集合が kv の 6 割あり、集めても dense の 3 分の 2 にしかならない。12k → 50k で比は下がる
+(kv 12k で 0.59) が、17k 以下では取り分が attention の 3 割 x 全体の 2-3 割 = 全体の 1 割弱で、
+タイルごとの同期と gather の費用を払って残るのはその半分。**prefill attention の union gather
+レーンは畳む。**50k 専用に再訪するなら tile 16 と kv 50k で測り直す。
+
+## fast-rope の A/B (2026-09-02 15:47-15:58、短文脈 3 本 x 512)
+
+ms/round +0.3% (取り分なし)、tok/round -2.1% (丸めで受理が動く) → ms/tok +2.3%。
+**却下 (既定 off のまま)。**attention 12 層の rope まわり十数 op は、ラウンド 38 ms の中では
+測れない大きさだった。17k 側は測らずに打ち切り。
+
+## bool マスクの A/B (2026-09-02 15:52-16:08、17k x 3 本 x 512、熱い状態)
+
+`--knob bool-mask` (A = bool、既定 / B = 旧加算マスク): **ms/tok -12.8%** (A 35.5、B 40.7)、
+ms/round -12.7%、tok/round 同一 (1.628)、prefill_s 差なし。2-3 本目は A 35.1-36.9 / B 40.1-41.1
+で安定。**今日初めての decode の確定した取り分。**既定 on (commit `ea33a66`)。
+仕組み: 17k の verify 幅 2 では gather 経路が比の上限 (0.20) で辞退して dense マスク経路に
+落ちるので、そこでキーの読み飛ばしが効くようになった。
+
+## bool マスク後の forward S=1 (17k): eval 32.3 ms (変化なし)
+
+S=1 は gather 経路 (union 12% <= 20%) を通るので `_final_mask` を使わない。bool マスクが効いたのは
+verify 幅 2 で gather が辞退する dense 経路。**S=1 でも dense+bool の方が gather より安い可能性**が
+あるので `--knob gather-attn` (A = gather / B = dense) を 17k で取り直す (待ち行列)。
+
+## 相手のチャンク幅プローブ (2026-09-02 16:20、4k プロンプト、熱い)
+
+`MLX_SERVE_PREFILL_CHUNK`: 2048 → 6.15 s、4096 → 5.82 s (3827 tok)。**チャンク幅は相手の速さの
+主因ではない (5.7%)。**うちの G=4 連結 (8192 行) と相手の 4096 行は MoE の行数として同等。
+
+## 4k の 1 トークン費用 2.17 ms の分解 (読み直し)
+
+段 P0 の layer-major チャンク 3617 ms = 1.76 ms/tok に対し、HTTP の 4k は 2.17 ms/tok。差 0.41:
+chunk-major (+10%、4k は最終チャンクが半分) 0.18、n-gram 行取得 0.12 (バッチ化後 0.09)、
+prime / checkpoint / split 0.1。相手 1.51 との差のうち、素のチャンクの差は 1.76 vs ≈1.45 (20%) で、
+GDN のスキャン (Metal 移植で -4.5%) 以外はまだ帰属できていない (MoE のタイル効率が候補)。
+
+## prefill の余地はどこまでか (2026-09-02 16:40、ユーザーの問い「2-3 倍あるのでは」への答え)
+
+**FLOP 天井**: 1 トークンの活性パラメータ ≈ 5.1B (専門家 10 x 48 層 2.36B、GDN/attention 射影
+2.5B、共有 0.24B) → 10 GFLOP、17k の attention 込み 12-13 GFLOP。M3 Max 14 TFLOPS で
+0.9 ms/tok = 1100 tok/s。うち 447、相手 576。天井までうち 2.5 倍、相手 2 倍。
+
+**実際に取れる見込み** (文献と実装物から):
+
+| 項目 | 手 | 見込み | 費用 |
+|---|---|---|---|
+| MoE (4-5 割、効率 47%) | fused MoE (vLLM / TRT-LLM の gate+up 連結 N=1280、SiLU と down を共有メモリで) = oMLX `qwen35_moe_gate_up`。うちの `MLXTURBO_WIDE` は decode で負けたが prefill 幅は未測 | 効率 65% で -15% | A/B 1 本 |
+| 逆量子化 | Marlin / Machete (CUDA W4A16、2 倍) はレイアウト + テンソルコア。Apple は M5 NAX までテンソル演算が無く、MLX の qmm は既にレジスタ内逆量子化 + simdgroup matmul。事前に bf16 へ戻す案は 512 専門家 x 48 層で毎チャンク 240GB を動かすので不成立 | 2-3 割が上限 | カーネル |
+| GDN スキャン | oMLX 移植 (1.59 倍) | -4.5% (実測) | KLD 判定中 |
+| QSA attention (50k で 3 割) | ブロック疎の Metal カーネル (真の union 6 割なので gather では取れない) | 50k -20%、17k -8% | 数日 |
+| ANE | 相手の dense MLP 4 割 offload (oMLX 由来、私的 API) をうちの dense 射影 (FLOP の 45%) に | 1.2-1.4 倍 | 壊れやすい |
+| チャンク外 (4k で 2 割) | 最終チャンクの layer-major 化、checkpoint の軽量化、prime | -5-10% | 半日 |
+
+合計の現実的な上限は **1.5 倍前後**。今日の待ち行列で取れるのは 1 割弱。「2-3 倍」は FLOP 天井の
+話で、同じ MLX op を使う相手が 576 tok/s に留まっているのがその証拠。
+
+## GDN Metal の KLD (2026-09-02 16:33-16:50、`quant_eval.py compare --fusions`、相対レーン)
+
+既定 (Metal off): kld_mean 0.01312 / top-1 一致 0.969。Metal on: **0.01326 / 0.966**。
+差 +0.00014 で受け入れ幅 (+0.0005) の中。prefill -1.3〜-4.5% と合わせて**既定 on にする**。
+
+## gather 経路 vs dense+bool (2026-09-02 16:31-、17k x 3 本 x 512)
+
+1 本目は熱の立ち上がり (B の prefill 85 s) で無効。2-3 本目: A (gather) 35.2 / 34.6 / 36.4、
+B (dense+bool) 34.9 / 35.2 / 36.1 → **差なし**。17k の verify 幅 2 は両者とも dense に落ちる
+ので当然で、gather が効くのは S=1 のラウンドだけ。既定は変えない。
+
+## 多日レーンを切った → `docs/research/LANES-2026-09.md`
