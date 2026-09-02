@@ -138,3 +138,22 @@ GPU が温まるため、それ以外の値は絶対値としては当てにな�
 
 - 2026-09-02: 下書き作成 (骨組みのみ、数字なし)。`bench/suite/` の
   overnight tier 実走後に表を差し替える。
+
+## 2026-09-03 のフルベンチ (self_snapshot、公開ベンチの suite ではなく単発の点計測)
+
+条件: M3 Max 128GB、macOS 26.4、mlx 0.32.2。両エンジン同日・同冷却 (10 分冷却後に起動)、反復 1、生成 256 トークン、
+thinking off、Qwen3.8-Flash-Next 4-bit (mlxturbo: `ddalcu-mlxlm` (lm_head 8-bit) + n-gram interleaved、mlx-serve:
+`ddalcu-flashnext-serve-4bit` `--mtp`、origin/main 8058076)。数字は `docs/research/SESSION-2026-09-02-CATCHUP.md`
+の 2026-09-03 12:20 の節。
+
+| 文脈 | 冷 TTFT serve / turbo | 温 TTFT serve / turbo | decode tok/s serve / turbo |
+|---|---|---|---|
+| 4k | 5.70 / 6.88 | 0.85 / 0.15 | 55.7 / 51.4 |
+| 17k | 27.8 / 31.6 | 0.91 / 0.20 | 49.0 / 45.3 |
+| 25k | 41.3 / 46.6 | 0.89 / 0.23 | 60.8 / 48.0 |
+| 32k | 51.6 / 58.3 | 0.90 / 0.25 | 47.4 / 44.9 |
+| 50k | 82.1 / 93.1 | 15.9 / 0.93 | 45.9 / 46.9 |
+
+主張すること: 温 TTFT (接頭辞キャッシュが当たる 2 ターン目以降) は mlxturbo が 4〜17 倍速い。冷 prefill は mlx-serve が
+1.13〜1.21 倍速い。decode は ±10% で、反復 1 回の揺れの範囲。主張しないこと: 品質の優劣 (同じ 4-bit パックだが
+lm_head のビットが違う)、25k の decode 差 (tok/step の当たり)。
