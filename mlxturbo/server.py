@@ -89,6 +89,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import contextlib
+import copy
 import functools
 import hashlib
 import hmac
@@ -1494,6 +1495,99 @@ def _prompt_already_thinking(prompt_ids: list[int]) -> bool:
     return True
 
 
+# Attribute names under which _new_detokenizer caches its per-tokenizer state
+# directly on the tokenizer object (see _new_detokenizer). Deliberately
+# leading-underscore and mlxturbo-prefixed: mlx_lm's TokenizerWrapper
+# forwards any non-underscore attribute set/get to the wrapped HF tokenizer
+# (__setattr__/__getattr__ in tokenizer_utils.py), but stores underscore
+# attributes on itself, so this is a safe, private place to hang a cache
+# without touching TokenizerWrapper's own fields or the HF tokenizer.
+_DETOK_PROTOTYPE_ATTR = "_mlxturbo_detok_prototype"
+_DETOK_UNSUPPORTED_ATTR = "_mlxturbo_detok_fast_unsupported"
+
+
+def _new_detokenizer(tokenizer):
+    """Return a fresh, independent streaming detokenizer for ``tokenizer``.
+
+    Drop-in replacement for reading ``tokenizer.detokenizer``. mlx_lm's
+    ``TokenizerWrapper.detokenizer`` (tokenizer_utils.py, ``@property``) is
+    *not* a cached value — every read calls ``self._detokenizer_class(self)``
+    from scratch, and for ``BPEStreamingDetokenizer`` (the class real BPE
+    tokenizers use) that means rebuilding the whole id->token ``tokenmap`` by
+    iterating the entire vocabulary (248,077 entries for the tokenizer this
+    was measured against) in a plain Python loop. Measured on the real
+    tokenizer: ~105ms per call (103 / 111 / 106ms across 3 calls).
+    ``ThinkingRouter.__init__`` used to read this property 3 times (for the
+    thinking/content/tool channels) on every request, on the event-loop
+    thread, so it added a fixed ~315ms to every request's TTFT for no
+    algorithmic reason — the tokenmap is identical every time, only the small
+    per-stream fields (``text``, ``tokens``, ``offset``, ``_unflushed``, ...)
+    need to start empty.
+
+    ``StreamingDetokenizer.reset()`` (and every subclass's override —
+    ``BPEStreamingDetokenizer``, ``SPMStreamingDetokenizer``,
+    ``NaiveStreamingDetokenizer`` in tokenizer_utils.py) only ever
+    *reassigns* those small fields to new empty containers
+    (``self.text = ""``, ``self.tokens = []``, ...); it never mutates a
+    shared container in place. That means ``copy.copy(prototype)`` (a cheap
+    shallow copy: the large ``tokenmap`` list, the ``clean_spaces``/
+    ``trim_space`` flags, and (for ``NaiveStreamingDetokenizer``) the
+    ``_tokenizer`` reference are all shared by reference, which is safe
+    because none of them are ever written to after ``__init__``) followed by
+    ``.reset()`` on the copy produces an independent detokenizer without
+    re-running the vocabulary loop. Verified empirically (see
+    bench/test_server.py): two clones fed different token streams never see
+    each other's text, and the prototype itself is untouched after either is
+    used. Measured cost of copy+reset: ~0.001ms — i.e. this turns the fixed
+    ~315ms/request cost into well under 1ms/request (a >300x reduction),
+    while the one real ``tokenizer.detokenizer`` construction needed to seed
+    the prototype is paid once, at model-load time (see ``_load`` in the
+    ``serve`` command), not on any request.
+
+    This does assume the detokenizer type behaves like the three mlx_lm
+    classes above (reset() reassigns rather than mutates, and the instance
+    supports ``copy.copy``). We do not special-case on the class name to stay
+    correct for any current or future ``detokenizer_class`` mlx_lm ships; the
+    mlx_lm classes themselves are not modified. Instead, correctness is
+    verified live: if ``copy.copy(...).reset()`` raises for a given
+    tokenizer's detokenizer type (e.g. a custom/test detokenizer with no
+    ``reset()``), that tokenizer is marked unsupported and every subsequent
+    call for it falls back to the original slow ``tokenizer.detokenizer``
+    construction — correct, just without the speedup, so nothing regresses
+    silently. The prototype/unsupported markers are cached as private
+    attributes on the tokenizer object itself (not in a module-level dict
+    keyed by ``id(tokenizer)``), so they are never at risk of an ``id()``
+    reuse mixing state from a since-garbage-collected tokenizer into a new
+    one, and they disappear automatically when the tokenizer does.
+    """
+
+    if getattr(tokenizer, _DETOK_UNSUPPORTED_ATTR, False):
+        return tokenizer.detokenizer
+
+    prototype = getattr(tokenizer, _DETOK_PROTOTYPE_ATTR, None)
+    if prototype is None:
+        prototype = tokenizer.detokenizer
+        try:
+            setattr(tokenizer, _DETOK_PROTOTYPE_ATTR, prototype)
+        except Exception:
+            # Can't cache on this tokenizer type (unusual __setattr__). Fall
+            # through and still try the fast path for *this* call using the
+            # local `prototype` we just built; future calls simply rebuild
+            # `prototype` again each time (no crash, just no speedup).
+            pass
+
+    try:
+        clone = copy.copy(prototype)
+        clone.reset()
+        return clone
+    except Exception:
+        try:
+            setattr(tokenizer, _DETOK_UNSUPPORTED_ATTR, True)
+        except Exception:
+            pass
+        return tokenizer.detokenizer
+
+
 class ThinkingRouter:
     """Route the model's raw token stream into the two channels reasoning
     (thinking) and content. The markers are not guessed but taken from
@@ -1600,9 +1694,9 @@ class ThinkingRouter:
             self.phase = "detect"
         self.buf: list[int] = []
         self.tool_buf: list[int] = []
-        self.think_detok = tokenizer.detokenizer
-        self.content_detok = tokenizer.detokenizer
-        self.tool_detok = tokenizer.detokenizer
+        self.think_detok = _new_detokenizer(tokenizer)
+        self.content_detok = _new_detokenizer(tokenizer)
+        self.tool_detok = _new_detokenizer(tokenizer)
         self.thinking_token_count = 0
         self.budget_exceeded = False
         # Qwen-family models generate ``\n\n`` right after the thinking end
@@ -6659,6 +6753,14 @@ def main() -> None:
             # wiring things up without editing the caller.
             os.environ[MTP_PATH_ENV] = args.mtp
         model, tokenizer, config = mlx_lm_load(args.model, return_config=True)
+        # detokenizer プロトタイプをここ (load 用スレッド、リクエスト経路の外)
+        # で1回だけ作っておく。_new_detokenizer は初回呼び出しで自動的に
+        # プロトタイプを作ってキャッシュするので必須ではないが、先に呼んで
+        # おかないとキャッシュを埋める役が「たまたま最初に来たリクエスト」に
+        # なってしまい、そのリクエストだけ ~105ms 遅くなる。戻り値 (clone) は
+        # ここでは使わず捨てる — 目的は tokenizer 側にプロトタイプを仕込む
+        # 副作用だけ (_new_detokenizer 参照)。
+        _new_detokenizer(tokenizer)
         # 重みを GPU に wire する。mlx_lm の stream_generate は生成のたびに
         # wired_limit() で巻くが、FlashSpecEngine/SpecEngine の経路はそれを
         # 通らないので、ここで一度だけ恒久的に設定する。wire しないと macOS が

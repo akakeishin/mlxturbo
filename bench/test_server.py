@@ -138,6 +138,80 @@ class FakeTokenizer:
         return list(self._prompt_ids)
 
 
+def test_new_detokenizer_clones_are_independent_and_prototype_untouched():
+    """server._new_detokenizer's fast path (copy.copy(prototype) + .reset())
+    must behave exactly like calling tokenizer.detokenizer fresh every time:
+    two clones fed different token streams must not see each other's text,
+    and the cached prototype itself must stay empty after both are used.
+
+    Uses mlx_lm's real BPEStreamingDetokenizer (the exact class
+    ThinkingRouter reads through tokenizer.detokenizer for real BPE models in
+    production -- this suite's own FakeTokenizer/_FakeDetokenizer has no
+    reset(), so it only ever exercises _new_detokenizer's slow-path
+    fallback, never the fast path this test targets) with a tiny 3-entry
+    vocab: small enough to run instantly, but the same reset()/copy
+    semantics that matter at the real 248,077-entry scale.
+    """
+
+    from mlx_lm.tokenizer_utils import BPEStreamingDetokenizer
+
+    class _TinyHFVocab:
+        vocab = {"a": 0, "b": 1, "c": 2}
+        clean_up_tokenization_spaces = True
+
+    class _TinyTokenizerWrapper:
+        """Just enough of TokenizerWrapper's shape for _new_detokenizer: a
+        `.detokenizer` property building a fresh BPEStreamingDetokenizer, and
+        plain (non-forwarding) attribute set/get so _new_detokenizer's
+        private cache attributes land on this object like they do on the
+        real TokenizerWrapper (whose __setattr__ special-cases leading
+        underscores the same way)."""
+
+        def __init__(self):
+            self._hf = _TinyHFVocab()
+
+        @property
+        def detokenizer(self):
+            return BPEStreamingDetokenizer(self._hf)
+
+    tok = _TinyTokenizerWrapper()
+
+    d1 = server._new_detokenizer(tok)
+    d2 = server._new_detokenizer(tok)
+    assert d1 is not d2
+
+    # Confirm the fast path was actually taken (not the "unsupported"
+    # fallback) -- otherwise independence below would be trivially true even
+    # if copy+reset were broken, since two fresh constructions never share
+    # state regardless.
+    assert getattr(tok, server._DETOK_UNSUPPORTED_ATTR, False) is False
+    prototype = getattr(tok, server._DETOK_PROTOTYPE_ATTR)
+    assert prototype is not None
+
+    d1.add_token(0)  # "a"
+    d2.add_token(1)  # "b"
+    d1.add_token(2)  # "c"
+
+    assert d1.text == "ac"
+    assert d2.text == "b"
+    assert d1.tokens == [0, 2]
+    assert d2.tokens == [1]
+
+    # The shared prototype must not have been mutated by either clone.
+    assert prototype.text == ""
+    assert prototype.tokens == []
+
+    # A third clone drawn after both prior ones were used must start clean,
+    # not inherit d1/d2's state.
+    d3 = server._new_detokenizer(tok)
+    assert d3.text == ""
+    assert d3.tokens == []
+    d3.add_token(1)  # "b"
+    assert d3.text == "b"
+    assert d1.text == "ac"  # d1 unaffected by d3
+    assert d2.text == "b"  # d2 (independently built "b") unaffected too
+
+
 # ---------- フェイク Runner ----------
 
 
