@@ -61,6 +61,47 @@ kv がまだ閾値未満だったり cache の型が合わなかったりする�
         --model ~/models/ddalcu-mlxlm --ngram ~/models/ddalcu-ngram \\
         --ctxs 17000 --q-mode chunk:4096
 
+**2026-09-03 追記。**上の `chunk:4096` 対照群は実測すると kld_mean 0.374と
+カーネル (0.040) より 1 桁大きく出た。ただし chunk 幅は QSA の**意味論**を
+変える (indexer の可視判定は「現在のチャンク内は因果で無条件に見える、
+それより前はブロック単位の top-k 候補」という規約なので、chunk を
+2048->4096 にすると「無条件に見える」窓そのものが倍になる)。つまり
+`chunk:<N>` は「丸めだけの対照」ではなく「選択の母集団も一緒に変える対照」
+になっていた --- カーネルの KLD (0.040) と比べるには荒すぎる物差し。
+
+代わりに、**意味論を変えずに丸め (加算順・カーネル実装) だけを変える**
+既知の対照を 2 つ用意した:
+
+``--q-mode gdn-metal-off`` は Attention/QSA 側を p と全く同じ dense のまま
+(prefill_attn は使わない) にして、GDN (線形注意) の再帰だけ p (既定:
+`mlxturbo/kernels/gdn_blocked_metal.py` の oMLX 移植 Metal カーネル、
+`GatedDeltaNet._gdn_metal`) と q (`mlx_lm` 本来の逐次実装) で切り替える。
+短い continuation では KLD +0.00014 (受け入れ幅 +0.0005 のすぐ外) という
+実績がある既知の小さな非ビット一致で、chunk 幅と違って可視集合や選択の
+母集団は一切変えない。17k の長い prefill を通したときにこの既知の小さな
+差分がカスケードでどれだけ増幅されるかの物差しになる。`_gdn_metal` は
+`GatedDeltaNet` の**クラス属性**なので、呼ぶだけでモデル内の全 GDN 層に
+一括で効く。
+
+    # 対照群: dense vs dense、GDN の再帰カーネルだけ off (chunk は両方 2048)
+    tools/biglock.sh .venv/bin/python tools/kld_prefill_attn.py \\
+        --model ~/models/ddalcu-mlxlm --ngram ~/models/ddalcu-ngram \\
+        --ctxs 17000 --q-mode gdn-metal-off
+
+``--q-mode fold-tail-off`` (端数チャンクのグループ化 `MLXTURBO_PREFILL_FOLD_TAIL`、
+`mlxturbo/spec_flash.py` の `_PREFILL_FOLD_TAIL`) は**このツールでは作れない**。
+このフラグは `FlashSpecEngine` (同ファイル、`class FlashSpecEngine`) が中間
+チャンクをグループ化して `_group_prefill_forward` に渡す**呼び出し側のループ**
+だけが参照しており (`_group_prefill_forward` 自身は受け取らない)、この
+グループ化判定は `FlashSpecEngine` のループ本体に書かれている。この
+ツールの `_run_prefill` は `model(part, cache=cache)` を直接呼ぶだけで
+`FlashSpecEngine` を一度も経由しないため、`MLXTURBO_PREFILL_FOLD_TAIL` を
+どちらに設定しても `_run_prefill` の経路には何の影響も無い (= 対照に
+ならない、on/off で常に同一になるだけ)。意味のある対照を作るには prefill
+の駆動そのものを `FlashSpecEngine` 経由に作り直す必要があり、この差分の
+範囲を超えるので保留した。``--q-mode fold-tail-off`` を指定すると、この
+理由をそのまま表示して終了する。
+
 モデルは 1 回だけ読む。GPU を使うので実行は biglock 経由。
 """
 
@@ -184,17 +225,47 @@ def _verdict(kld_mean: float) -> str:
     return "要確認"
 
 
+_FOLD_TAIL_UNAVAILABLE = (
+    "--q-mode fold-tail-off はこのツールでは作れない: "
+    "MLXTURBO_PREFILL_FOLD_TAIL (mlxturbo/spec_flash.py の _PREFILL_FOLD_TAIL) "
+    "は FlashSpecEngine が中間チャンクをグループ化して _group_prefill_forward "
+    "に渡す呼び出し側のループだけが参照する (_group_prefill_forward 自身は "
+    "受け取らない)。tools/kld_prefill_attn.py の _run_prefill は "
+    "model(part, cache=cache) を直接呼ぶだけで FlashSpecEngine を一度も "
+    "経由しないので、このフラグをどちらに設定しても _run_prefill の経路には "
+    "何の影響も無い (on/off で常に同一になるだけの、対照にならない対照)。"
+    "意味のある対照を作るには prefill の駆動を FlashSpecEngine 経由に作り"
+    "直す必要があり、この差分の範囲を超えるので保留した。"
+)
+
+
 def _parse_q_mode(spec: str) -> tuple[str, int | None]:
     """``--q-mode`` を解釈する。
 
     - ``"kernel"``: 既定。q = `enable_prefill_attn` (段 P1 T=1 カーネル)。
     - ``"chunk:<N>"``: q も p と同じ dense 経路 (prefill_attn off) のまま、
       chunk 幅だけ ``N`` にする対照群。戻り値の 2 要素目が q 側の chunk 幅。
+      **注意 (2026-09-03)**: chunk 幅は QSA の可視判定の意味論そのものを
+      変える (「現在のチャンク内は無条件に見える」窓が chunk 幅に比例して
+      広がる) ので、丸めだけの対照にはならない (実測 kld_mean 0.374、
+      カーネルの 0.040 より 1 桁大きい)。目安には使えるが、カーネルとの
+      直接比較には `gdn-metal-off` の方が適する。
+    - ``"gdn-metal-off"``: q は Attention/QSA 側を p と同じ dense のまま、
+      GDN (線形注意) の再帰カーネルだけ off にする対照群
+      (`mlxturbo.fused.disable_gdn_metal_kernel`)。可視集合や選択の母集団は
+      一切変えない、意味論を保った既知の非ビット一致 (短い continuation で
+      KLD +0.00014 の実績) --- 17k でどれだけ増幅されるかの物差し。
+    - ``"fold-tail-off"``: 未対応。`_FOLD_TAIL_UNAVAILABLE` の理由で
+      ValueError を送出する。
 
-    戻り値は ``("kernel", None)`` または ``("chunk", N)``。
+    戻り値は ``("kernel", None)`` / ``("chunk", N)`` / ``("gdn-metal-off", None)``。
     """
     if spec == "kernel":
         return "kernel", None
+    if spec == "gdn-metal-off":
+        return "gdn-metal-off", None
+    if spec == "fold-tail-off":
+        raise ValueError(_FOLD_TAIL_UNAVAILABLE)
     if spec.startswith("chunk:"):
         n_str = spec[len("chunk:") :]
         try:
@@ -206,7 +277,10 @@ def _parse_q_mode(spec: str) -> tuple[str, int | None]:
         if n <= 0:
             raise ValueError(f"--q-mode chunk:<N> の N は正の整数にすること: {n}")
         return "chunk", n
-    raise ValueError(f"--q-mode は 'kernel' か 'chunk:<N>' のどちらか (got {spec!r})")
+    raise ValueError(
+        "--q-mode は 'kernel' / 'chunk:<N>' / 'gdn-metal-off' のいずれか"
+        f" (got {spec!r})"
+    )
 
 
 def main() -> int:
@@ -234,9 +308,12 @@ def main() -> int:
         default="kernel",
         help="q (比較対象) 側の作り方。'kernel' (既定): enable_prefill_attn"
         " (段 P1 T=1 カーネル、--chunk と同じ幅)。'chunk:<N>': q も dense の"
-        " まま (prefill_attn off) chunk 幅だけ N にする対照群 --- p/q の意味論"
-        " は厳密に同じで、chunk 境界が動くことによる dense 自身の丸めの揺らぎ"
-        " だけを、カーネルの KLD と同じ物差しで見る",
+        " まま (prefill_attn off) chunk 幅だけ N にする対照群 (注意: chunk 幅は"
+        " QSA の可視判定の意味論を変えるので丸めだけの対照ではない、実測"
+        " kld_mean 0.374)。'gdn-metal-off': Attention/QSA は p と同じ dense の"
+        " まま GDN の再帰カーネルだけ off にする対照群 (意味論を変えない既知の"
+        " 非ビット一致、短い continuation で KLD +0.00014)。'fold-tail-off':"
+        " 未対応 (理由を表示して終了、_FOLD_TAIL_UNAVAILABLE 参照)",
     )
     ap.add_argument(
         "--topk",
@@ -264,6 +341,17 @@ def main() -> int:
     except ValueError as e:
         print(str(e))
         return 1
+    if q_mode == "gdn-metal-off" and os.environ.get("MLXTURBO_GDN_METAL") == "0":
+        # `enable_gdn_metal_kernel()` 自身が MLXTURBO_GDN_METAL=0 で
+        # 何もしない (mlxturbo/fused.py)。その状態でこの対照を回すと p 側も
+        # 既に GDN metal off なので、p/q が同じ経路になり差が出ない
+        # (対照として無意味)。先に教えて誤読を防ぐ。
+        print(
+            "--q-mode gdn-metal-off だが MLXTURBO_GDN_METAL=0 が既に立って"
+            "いる: p 側も GDN metal off になるため対照が成立しない"
+            " (この環境変数を外してから実行すること)"
+        )
+        return 1
 
     if args.ngram:
         # n-gram をディスクに置いた構成。vendored arch は import 時に旗を読む。
@@ -280,6 +368,7 @@ def main() -> int:
         enable_prefill_attn,
     )
     from mlxturbo.kernels import prefill_attn as prefill_attn_kernel
+    from mlxturbo import fused
     from mlxturbo import runner as mlxturbo_runner
 
     model_path = os.path.expanduser(args.model)
@@ -348,6 +437,13 @@ def main() -> int:
         # `disable_gather_attn` は `_gather_attn`/`_prefill_attn` の両方を
         # 落とすので、こちらが本来の「dense へ完全に戻す」呼び方。
         disable_gather_attn(model)
+        # `_gdn_metal` は GatedDeltaNet の**クラス属性**(`mlxturbo/fused.py`)
+        # なので、1 つ前の ctx が `--q-mode gdn-metal-off` で q 側を off に
+        # した場合、そのままだと p 側にまで漏れる (`_gather_attn` と同じ
+        # クラスの漏れ)。p は常に本番の既定 (GDN metal on) であるべきなので、
+        # 毎回明示的に立て直す (env `MLXTURBO_GDN_METAL=0` ならここでも off の
+        # ままになるが、それは呼び手が明示的に指定した既定なので尊重する)。
+        fused.enable_gdn_metal_kernel()
         cache_p = model.make_cache()
         logits_p = _run_prefill(model, cache_p, ids, args.chunk, args.tail, PA.pending)
         del cache_p
@@ -377,14 +473,18 @@ def main() -> int:
             del cache_q
             mx.clear_cache()
             q_chunk = args.chunk
-        else:
+        elif q_mode == "chunk":
             # (2b) 対照群: q も p と全く同じ dense 経路 (prefill_attn は
-            # 一度も on にしない)。違うのは chunk 幅だけ。p の意味論と
-            # 厳密に同じなので、ここで出る KLD は「経路 (カーネル) に
-            # 内在する非ビット一致」ではなく「chunk 境界が動くことによる
-            # dense 自身の丸めの揺らぎ」だけを表す --- カーネルの KLD
-            # (kernel_fired>0 の行) と同じ物差しで比べるための対照群。
+            # 一度も on にしない)。違うのは chunk 幅だけ。
+            #
+            # **注意 (2026-09-03)**: chunk 幅は QSA の可視判定の意味論を
+            # 変える (「現在のチャンク内は無条件に見える」窓が chunk 幅に
+            # 比例して広がる) ので、これは厳密な意味論一致の対照ではない
+            # (実測 kld_mean 0.374、カーネルの 0.040 より 1 桁大きい)。
+            # 目安にはなるが、カーネルとの直接比較には q_mode=gdn-metal-off
+            # の方が適する (`_parse_q_mode` の docstring 参照)。
             disable_gather_attn(model)
+            fused.enable_gdn_metal_kernel()
             n_layers = 0
             fired = [0]
             q_chunk = q_mode_chunk
@@ -394,6 +494,38 @@ def main() -> int:
             )
             del cache_q
             mx.clear_cache()
+        elif q_mode == "gdn-metal-off":
+            # (2c) 対照群: Attention/QSA 側は p と全く同じ dense (prefill_attn
+            # は一度も on にしない、chunk 幅も p と同じ args.chunk)。違いは
+            # GDN (線形注意) の再帰カーネルだけ --- p は既定どおり oMLX 移植
+            # の blocked-sequential Metal カーネル (`_gdn_metal`)、q は
+            # `mlx_lm` 本来の逐次実装に戻す
+            # (`mlxturbo.fused.disable_gdn_metal_kernel`)。可視集合や選択の
+            # 母集団は一切変えない、意味論を保った既知の非ビット一致
+            # (短い continuation で KLD +0.00014、受け入れ幅 +0.0005 のすぐ
+            # 外の実績)。17k の長い prefill でこの既知の小さな差分がカスケード
+            # でどれだけ増幅されるかの物差しになる。
+            disable_gather_attn(model)
+            fused.disable_gdn_metal_kernel()
+            n_layers = 0
+            fired = [0]
+            q_chunk = args.chunk
+            try:
+                cache_q = model.make_cache()
+                logits_q = _run_prefill(
+                    model, cache_q, ids, q_chunk, args.tail, PA.pending
+                )
+            finally:
+                # `_gdn_metal` はクラス属性なので、次の ctx (または p) に
+                # 漏れないよう必ず戻す。p 側の防御的な re-assert
+                # (`fused.enable_gdn_metal_kernel()`) と合わせて二重に守る。
+                fused.enable_gdn_metal_kernel()
+            del cache_q
+            mx.clear_cache()
+        else:
+            raise AssertionError(
+                f"unhandled q_mode {q_mode!r} (_parse_q_mode で弾いているはず)"
+            )
 
         stats = _kld_stats(logits_p, logits_q, args.topk)
         stats["kv"] = int(ids.shape[1])
