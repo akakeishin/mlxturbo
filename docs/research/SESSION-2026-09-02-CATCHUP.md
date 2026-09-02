@@ -1251,3 +1251,11 @@ snapshot の参照が無ければ **KV の更新は in-place** (増分・時間�
 prefill_s A (先読み on) 13.31 対 B 13.42 (**-0.9%**)、decode ±0。PLE の 167 ms/チャンクは pread の待ちでは
 なく、行取得後の処理 (ハッシュ、gather、埋め込みの加算) が主で、先読みでは隠れない。反転条件 (-2% 未満) で
 畳む (既定 off のまま)。PLE の効率 7% は別の手 (行取得の GPU 側処理の整理) が要る。
+
+## 固定 300 ms の内訳 (2026-09-03 04:00、`[gen-trace]` + `[ttft-trace]`、`bench/results/logs/ttft-trace-driver2.log`)
+
+完全ヒット (reused=27 new=0): `[gen-trace] entry→cache 0.0, cache→t0 0.0, t0→first 0.9, first→queue 0.0 ms`、
+executor の submit→run 0.1 ms、なのに `[ttft-trace] gen→first_token 310 ms`。温ヒット (new=23) も
+runner 内 154 ms + 外 345 ms。**runner でも executor でもなく、worker がキューに積んだ最初のトークンを
+ハンドラが受け取るまでに 300 ms 掛かっている。**ハンドラ側のキュー待ち (poll 間隔や keepalive の timeout) か、
+イベントループを塞ぐ処理 (detokenizer の構築など) の疑い。ここを潰せば温 TTFT 0.45 → 0.15 s。
