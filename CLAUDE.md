@@ -57,6 +57,8 @@
   `MLXTURBO_GDN_METAL` (既定 on、`=0` で off) も同様に本番の既定値で、
   2026-09-02 の in-model A/B (17k prefill -1.3〜-4.5%、KLD +0.00014) で
   on にした。
+  `MLXTURBO_DEPTH_ADAPT` (既定 on、`=0` で off) も本番の既定値で、2048 超の文脈で受理率 EMA から
+  draft 深さを選ぶ (17k で ms/tok -3〜-6%、2026-09-03)。2048 以下は静的 depth 2 のまま。
 - 品質を売って速度を買わない。fake を実物より緩くしない。KLD の受け入れ幅は
   現行比 +0.0005 (bench/quant_eval.py compare)。
 

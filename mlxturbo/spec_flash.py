@@ -208,7 +208,7 @@ def _depth_ctx_limit(model) -> int:
 # EV コントローラ (索引ごとの条件付き受理率 EMA と、幅ごとのラウンド費用表から
 # 期待トークン数 / 費用を最大化する) を参考にしたが、コードは写していない。
 
-MLXTURBO_DEPTH_ADAPT = os.environ.get("MLXTURBO_DEPTH_ADAPT") == "1"
+MLXTURBO_DEPTH_ADAPT = os.environ.get("MLXTURBO_DEPTH_ADAPT", "1") != "0"  # 2026-09-03: 17k で -4% (4 回とも負側) → 既定 on。2048 超だけ効く
 
 # DepthController が保持する位置別 EMA の本数。MLXTURBO_DEPTH_CAP がこれを
 # 超えて指定されても、ここで頭打ちにする (相手の上限が 6 なので余裕を見て 8)。
