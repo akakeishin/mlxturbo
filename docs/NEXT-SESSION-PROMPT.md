@@ -71,26 +71,15 @@ GPU は `tools/biglock.sh` で 1 本ずつ直列。親の連鎖スクリプト�
 にあり、旗ファイル (`bench/results/logs/*.ready` / `hc.done`) で順番を付けている。連鎖が消えていたら
 下の順番を手で流せばよい (コマンドは各行に書いた)。
 
-GPU の待ち行列 (順に):
-1. **HC カーネルの検証: 済 (畳んだ)**。連鎖 41 us、in-model で素より 7.6 ms 遅い。差分はコミット済みで
-   既定 off。次の手は HC の低ランク射影を隣の行列積に畳む案と、`MLXTURBO_HC=compiled` の A/B。
-2. モデル無しの仮説マイクロ `scratchpad/hyp_micros.py` (KV の slice 代入が全長コピーか、MoE decode の take+qmm)。
-   結果は `bench/results/logs/hyp-micros.log`。N に比例するコピーが出たら `mx.slice_update` で直す (レーン 11)。
-3. depth 適応 margin 版の 17k A/B (`decode_ab --knob depth-adapt --only long --ctx 17000 --tokens 512 --prefill-once`)。
-   -5% 以上なら `MLXTURBO_DEPTH_ADAPT` を既定 on (2048 超だけ効く)。3 版までの結果: 17k -6.0 / -3.2 / -3.2%。
-4. T=1 gather prefill カーネルの A/B (`decode_ab --knob prefill-attn --only long --ctx 17000 --tokens 8`、
-   同 `--ctx 50000`)。旗 `pattn.ready` は置いた。17k で ±0〜-2%、50k で -10% 以上なら既定 on
-   (`MLXTURBO_PREFILL_ATTN=1`、kv ≥ 12288)。KLD (`quant_eval.py compare --fusions`) も取る。
-5. lm_head 4-bit 本焼きパック `~/models/ddalcu-mlxlm-head4` (Sonnet が `tools/splice_head.py` で作成中)。
-   できたら `quant_eval.py compare --model ~/models/ddalcu-mlxlm-head4 ...` (受け入れ幅は +0.0005 だが、
-   相手の一律 4-bit と揃える公平化の名目なので、+0.0015 級なら「速度比較用パック」として採用) と
-   `bench/self_snapshot.py` の小さい結果 (0/4k/17k/50k、反復なし)。
-6. 既知の小さい修正の前後比較 (Sonnet 2 本が実装中): `_verify` の `.item()` 取り直し、最終チャンク lm_head の
-   全幅、wired limit (`tools/` の道具)、n-gram 同期の前倒し (`MLXTURBO_PLE_HOIST`、`decode_ab --knob ple-hoist`)。
-7. グループ幅 G=8 (`decode_ab --knob prefill-group --variants 8,4 --only long --ctx 17000 --tokens 8`)。
-   MoE の帰属の食い違い (router fp32 / 重み付き和 / shared expert を切って測る道具は未作成)。
-8. 仮説検証: draft の hit@2 - hit@1、rerank off の tok/round、temp>0 の厳密棄却サンプリング、indexer の op 整理、
-   group_size 128、`mx.metal.start_capture` のカーネル別計測。一覧は LANES-2026-09.md のレーン 11。
+GPU の待ち行列 (2026-09-03 03:20 時点の状態):
+- 済: HC 検証 (畳む)、仮説マイクロ (KV slice は素の forward では in-place、take+qmm 棄却)、depth margin 版
+  (17k -4%、既定 on)、T=1 gather 17k/50k (50k -21.3%) **ただし長文脈 KLD が 0.04 / 0.017 で幅外 → 原因調査中、
+  既定 off のまま**、lm_head 4-bit 本焼き (KLD +0.0047、速度比較用に限定)、hc-compiled (取り分なし)、G=8 (-1.2%、
+  畳む)、PLE hoist (差なし、畳む)、prefill 8k の内訳 (MoE 43% / GDN 27% / PLE 4.4%)、TTFT 内訳 (固定 300 ms 発見)。
+- 走行中 / 直近: n-gram 先読みの prefill A/B (8k)、`[gen-trace]` で固定 300 ms の内訳、ラウンドごとの
+  ピークメモリ (投機ラウンドの KV コピー疑い)、gather カーネルの分布ずれの原因。
+- その後: 小さいベンチ (mlxturbo だけ、冷、新しい冷却条件の基準) → 仮説 A/B (draft の hit@2、rerank off、
+  厳密棄却サンプリング、indexer の op 整理、group_size 128) → mlx-serve 最新版でフルベンチ → 27B / 35B-A3B。
 
 判定と数字は必ず `docs/research/SESSION-2026-09-02-CATCHUP.md` の末尾に節を足して書く。既定を変えたら
 CLAUDE.md の knob の段落も直す。フルテスト (対 mlx-serve) と overnight tier はユーザーの指示があるまで走らせない。
