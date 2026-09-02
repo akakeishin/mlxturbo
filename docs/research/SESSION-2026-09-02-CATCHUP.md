@@ -1563,3 +1563,9 @@ TTFT が減る) を満たす。**`MLXTURBO_PRIME_WINDOW` の既定を 512 に。
 GPU 時間 3.4 s に対して 250 ms)。`MLXTURBO_NGRAM_PREFETCH=1` が -0.9% しか出なかったのは、先読みが背景スレッドで
 本当に重なっていないため (この計測では prefetch_rows=0)。手: チャンク c の forward を投入した直後に、チャンク c+1
 の行をスレッドで pread し始め、c+1 の `_prelude` で待ち合わせる。見込み: prefill -4〜7% (全文脈長で)。
+
+## 小物 3: MoE 重み付き和の畳み込み (`MLXTURBO_MOE_COMBINE_FOLD`)、8k (2026-09-03 15:20、`bench/results/moe-combine-8k.json`)
+
+prefill_s **-2.2%** (14.11 → 13.81 s)、decode ms/round +1.3% (fold の経路は decode 幅でも SwitchGLU を迂回するため、
+S=1〜3 では (rows, 640) の乗算と個別の gather の分だけ損)。短文脈と 17k の結果を見て、**prefill 幅 (S ≥ 64) だけ
+fold にする**形で採用するかを決める。
