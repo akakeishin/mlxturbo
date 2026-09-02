@@ -1413,3 +1413,9 @@ kld_mean **0.111**、kld_max 1.34、argmax 一致 0.95、top-5 重なり 0.85。
 lm_head -55 us + MoE 48 層 × -13 us ≈ **-0.7 ms (3%)**。パック全体の焼き直し (数時間) と KLD の代償
 (g128 は粗い) に対して取り分が小さい。反転条件 (3% 未満) に該当、**畳む**。lm_head だけ g128 という
 部分適用も lm_head 4-bit 自体が KLD 幅外なので無し。
+
+## `mx.metal.start_capture` によるカーネル別計測は使えない (2026-09-03 08:55)
+
+S=1 forward 1 回の capture が 35 分経っても終わらず、`.gputrace` が 68 GB に達したので止めて削除した。
+MLX の capture はモデルの全バッファ (91 GB) を含めて記録する。相談役の「計測手段 0」は畳む。
+カーネル別の帰属は、これまでどおり部品の連鎖計測 (`qsa_prefill_split --chain`、`kernel_chain_cost`) で取る。
