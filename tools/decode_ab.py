@@ -156,6 +156,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import statistics
 import sys
 import time
 from pathlib import Path
@@ -1397,10 +1398,25 @@ def main() -> int:
     ap.add_argument("--prefill-once", action="store_true",
                     help="長文脈で prefill を 1 回に畳む (prefill に効く knob "
                          "= prefill-group / stage-every には使わないこと)")
+    ap.add_argument("--round-trace", action="store_true",
+                    help="MLXTURBO_ROUND_TRACE=1 を立て、ラウンドごとの "
+                         "peak_delta_mb (verify までのピークメモリ増分、KV "
+                         "全長コピー調査用) を rows に記録する。"
+                         "spec_flash.FlashSpecEngine.last_round_trace を "
+                         "run_once/run_resumed のたびに読み出す。"
+                         "--prefill-once と組み合わせるときは注意: "
+                         "prefill_once/run_resumed の _snapshot/_restore が "
+                         "caches の keys/values を直接掴んだまま次の decode を "
+                         "始めるので、各 variant の最初のラウンドだけ "
+                         "update_and_fetch が donation できずコピーになる "
+                         "(本番の継続 decode には無い、このハーネス自身の "
+                         "アーティファクト)。1 ラウンド目を除いて見ること。")
     args = ap.parse_args()
 
     if args.ngram:
         os.environ.setdefault("FASTMLX_NGRAM_DISK", "1")
+    if args.round_trace:
+        os.environ["MLXTURBO_ROUND_TRACE"] = "1"
 
     import mlx.core as mx
     from mlx_lm import load
@@ -1594,9 +1610,30 @@ def main() -> int:
             if ngram_stream is not None:
                 rows[-1]["ngram"] = dict(ngram_stream.stats)
                 ngram_s = "  " + ngram_stream.stats_line()
+            peak_s = ""
+            if args.round_trace:
+                trace = list(getattr(eng, "last_round_trace", None) or [])
+                rows[-1]["peak_delta_mb"] = trace
+                if trace:
+                    rows[-1]["peak_delta_mb_median"] = statistics.median(trace)
+                    rows[-1]["peak_delta_mb_max"] = max(trace)
+                    # --prefill-once のとき、run_resumed の _restore が
+                    # caches の keys/values を直接掴んだ snap を毎 variant
+                    # の頭で挿し戻す (このファイルの _snapshot/_restore の
+                    # docstring 参照)。そのため 1 ラウンド目だけ
+                    # update_and_fetch が donation できずコピーになるのは
+                    # ハーネス自身のアーティファクトで、本番の継続 decode
+                    # には無い。2 ラウンド目以降だけの値も別に残す。
+                    rest = trace[1:]
+                    if rest:
+                        rows[-1]["peak_delta_mb_median_wo_r1"] = statistics.median(rest)
+                        rows[-1]["peak_delta_mb_max_wo_r1"] = max(rest)
+                    peak_s = (f"  peak_delta_mb median={rows[-1]['peak_delta_mb_median']:.1f}"
+                              f" max={rows[-1]['peak_delta_mb_max']:.1f}"
+                              f" (r1={trace[0]:.1f})")
             print(f"  {v}: prefill {tp:6.2f}s  decode {td:6.2f}s  "
                   f"{ms:6.2f} ms/tok  tok/round {tpr:.3f}  "
-                  f"({acc}/{rounds}){fired_s}{ngram_s}", flush=True)
+                  f"({acc}/{rounds}){fired_s}{ngram_s}{peak_s}", flush=True)
     set_variant(baseline)
 
     # ---- まとめ -------------------------------------------------------

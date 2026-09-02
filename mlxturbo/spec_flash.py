@@ -36,6 +36,7 @@ somewhere, without fail).
 from __future__ import annotations
 
 import os
+import statistics
 import time
 from contextlib import contextmanager
 
@@ -1924,6 +1925,12 @@ class FlashSpecEngine:
         timers = os.environ.get("MLXTURBO_PHASE_TIMERS") == "1"
         phase = {"draft": 0.0, "verify": 0.0, "post": 0.0, "rollback": 0.0}
         self.last_phase = phase if timers else None
+        # MLXTURBO_ROUND_TRACE=1 のときだけ、ラウンドごとの「verify までの
+        # ピークメモリ増分 (MB)」を溜める (KV 全長コピー調査、
+        # docs/research/SESSION-2026-09-02-CATCHUP.md の探針の続き)。
+        # tools/decode_ab.py --round-trace がループ終了後にこの属性を読む
+        # (self.last_phase と同じ「呼び手が generate_stream の外から読む」規約)。
+        self.last_round_trace = [] if _ROUND_TRACE else None
         # 楽観パイプライン: verify の GPU 実行中に「全採用だった場合の次ラウンド」
         # のグラフを CPU で先に組む。全採用なら rollback は no-op なので先組みが
         # そのまま正しく、外れたら _pipeline_restore で参照を戻して組み直す。
@@ -1934,6 +1941,13 @@ class FlashSpecEngine:
         # 1=通常の楽観パイプライン, 2=組むが毎回捨てる (切り分け用), 0=無効
         pipeline = int(os.environ.get("MLXTURBO_PIPELINE", "0") or 0)
         while len(out) < max_tokens:
+            if _ROUND_TRACE:
+                # ラウンド開始時のピーク基準。draft の async_eval 残り分も
+                # このラウンドの GPU 仕事として一緒に数える (粗い括りだが、
+                # 「ラウンドごと」の粒度としてはこれで十分 -- 個々の区間を
+                # 分けたいなら別途 mx.reset_peak_memory() を挟むこと)。
+                mx.reset_peak_memory()
+                _active0 = mx.get_active_memory()
             # depth-adapt の費用 EMA 用 (generate() と同じ理由 -- 既存の
             # 同期点で測るだけで、新たな mx.eval は増やさない)。
             # _round_pos はこの round の drafts を選んだときの pos と一致
@@ -2012,6 +2026,10 @@ class FlashSpecEngine:
                 nxt_all = dv = None
                 mx.eval(lg)
             if _ROUND_TRACE:
+                # verify の mx.eval 直後 (KV の update_and_fetch が全長コピーに
+                # 落ちていれば、ここまでの増分に KV サイズぶんが乗って出る)。
+                _peak_delta_mb = (mx.get_peak_memory() - _active0) / 1e6
+                self.last_round_trace.append(_peak_delta_mb)
                 _rt.append(("eval_done", time.perf_counter()))
             rounds += 1
             if timers:
@@ -2085,7 +2103,8 @@ class FlashSpecEngine:
                 _rt.append(("rollback_done", time.perf_counter()))
                 base_t = _rt[0][1]
                 print(f"[round] t={base_t * 1e3:.2f}", " ".join(
-                    f"{k}={(t - base_t) * 1e3:.2f}" for k, t in _rt[1:]), flush=True)
+                    f"{k}={(t - base_t) * 1e3:.2f}" for k, t in _rt[1:]),
+                    f"peak_delta_mb={_peak_delta_mb:.2f}", flush=True)
             if logprob_rows is not None:
                 # 採用位置 j の logits は pair[:j+1] に正しく条件付いている
                 # (棄却位置のものは採用側に混ざらない)。呼び手はラウンドごとに
@@ -2095,6 +2114,15 @@ class FlashSpecEngine:
             yield vals
             if cut is not None:
                 break
+
+        if _ROUND_TRACE and self.last_round_trace:
+            print(
+                f"[round] peak_delta_mb median="
+                f"{statistics.median(self.last_round_trace):.2f} "
+                f"max={max(self.last_round_trace):.2f} "
+                f"n={len(self.last_round_trace)}",
+                flush=True,
+            )
 
         return accepted, rounds, (logits_tail, hyper_tail0, mtp_snap)
 
