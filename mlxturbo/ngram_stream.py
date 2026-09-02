@@ -454,4 +454,8 @@ def install_ram(model, sidecar: str | Path) -> None:
             f"(91GB のモデルと合わせて 128GB 機で 50k が通らない実測がある)。"
             f"\nn-gram:   layout=interleaved のサイドカーを使うと RAM 0 で、"
             f"decode の差はほとんど無い (17k で 44.4 vs 43.8 tok/s)。"
+            f"\nn-gram:   **--max-batch-spec も効かなくなる。**この常駐のせいで"
+            f" rows_fit が通らず、_admit_next が落ちて全要求が単独経路に倒れる"
+            f" (2026-09-02 実測: separate では joins=0、interleaved では毎回"
+            f" joins=1 で 1880 トークン x 2 本が -21%)。"
         )
