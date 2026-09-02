@@ -100,9 +100,13 @@ GPU の待ち行列 (2026-09-03 03:20 時点の状態):
 - 小物の判定 (16:10): prime 窓 512 を既定に (4k TTFT -2.2%)。MoE 重み付き和の畳み込みは prefill -2.2〜-2.5% /
   decode +0.6〜1.4% → **行数 ≥ 64 だけ既定 on** (KLD 0.01289、幅内。閾値の実装中)。PLE の冷 pread は 257 ms/チャンク
   (7%) で、先読みを本当に重ねる実装中 (`MLXTURBO_NGRAM_PREFETCH` の作り直し)。
-- 残りの小物候補: MoE の並べ替え + 書き戻し (73 ms/チャンク)、attention の qkv 射影 (prefill 幅で 1 本の行列積に)、
-  GDN の前処理 (prefill 20% 超過)、decode の MoE gather_qmm (48 層 × 3 本、床の 3 倍)。
-  ユーザー方針: 小物をちびちび集める (prefill も decode も)。
+- 小物をかき集めた小さいベンチ (17:30、`self-snapshot-turbo-small-0903d.json`): 冷 prefill 4k 6.60 / 17k 31.3 / 50k 89.9 s
+  (相手 12:00 の 5.70 / 27.8 / 82.1 → 1.16x / 1.13x / 1.09x)、decode 51.9 / 46.1 / 42.7 (相手比 -7〜-10%、揺れ込み)。
+- **フルベンチをもう一度回す前に入れる 2 手** (ユーザー方針: 分析して修正してから): (1) PLE の n-gram 行取得を
+  mmap + madvise(WILLNEED) に (syscall 律速の 137〜257 ms/チャンク = 4〜7%)、(2) attention の qkv 連結を prefill 幅だけ
+  (`MLXTURBO_WIDE_SCOPE=attn`、-2% 見込み)。どちらも実装中。入ったら小さいベンチで確かめ、それからフルベンチ。
+- 手なしと判定した残差: MoE の gather_qmm (相手と同じ op)、HC (prefill 幅も decode も融合が効かない)、decode の
+  indexer (op 整理は ±0.3%)。
 - その後: 長文脈の品質ゲートを 17k / 50k で走らせて gather カーネルの採用を裏付ける → temp 0.7 の tok/round →
   mlx-serve 最新版でフルベンチ → 27B / 35B-A3B。
 - その後: 小さいベンチ (mlxturbo だけ、冷、新しい冷却条件の基準) → 仮説 A/B (draft の hit@2、rerank off、
