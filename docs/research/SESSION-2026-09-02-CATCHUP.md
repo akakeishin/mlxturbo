@@ -1374,3 +1374,17 @@ kld_mean **0.374**、kld_max 5.19、argmax 一致 0.92、top-5 重なり 0.84。
 選ぶので、chunk 幅を変えると「全部見える」範囲が倍になり、可視集合の意味論そのものが変わる
 (`MLXTURBO_PREFILL_CHUNK=4096` が in-model で負けた記録にも、この意味論の差が混ざっていた可能性)。
 丸めだけが違う対照 (GDN Metal の on/off、端数チャンクの畳み込み on/off) で取り直す。
+
+## 丸めだけ違う対照 (GDN Metal on 対 off) の長文脈 KLD、17k (2026-09-03 07:40、`bench/results/kld-gdn-metal-off.json`)
+
+kld_mean **0.111**、kld_max 1.34、argmax 一致 0.95、top-5 重なり 0.85。GDN Metal は短い continuation の KLD で
++0.00014 (受理済み、本番既定) の変更なのに、17k の末尾では gather カーネル (0.040) の **3 倍**動く。
+**長文脈の「dense 対 変種」KLD は、QSA の top-k 反転カスケードのせいで、どんな丸めの違いでも 0.04〜0.1 に
+なる**。この物差しでは品質の劣化を測れない (経路自身の混沌を測っている)。
+判定: gather カーネルの 0.040 は既に受け入れている変更 (GDN Metal) の揺らぎより小さい。品質のゲートは
+本来の物差し (`quant_eval.py compare --fusions`、bf16 参照との KLD、longctx-recall / longctx-quote を含む) で
+取り、+0.0005 以内なら **`MLXTURBO_PREFILL_ATTN` を既定 on (kv ≥ 12288)** にする。
+
+## indexer-lean の A/B (2026-09-03 07:30)
+
+短文脈 +0.4%、17k +0.3% (出力一致)。op -8% では取り分が出ない。**畳む** (既定 off のまま)。
