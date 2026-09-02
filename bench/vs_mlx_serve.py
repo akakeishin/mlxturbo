@@ -99,6 +99,27 @@ def model_id(port: int) -> str:
     return items[0]["id"]
 
 
+class StreamResult(tuple):
+    """``stream_once`` の返り値。位置引数 0..3 は従来どおり
+    ``(ttft, dec, n, reply)`` の 4-tuple で、既存の
+    ``ttft, dec, n, reply = stream_once(...)`` はそのまま動く
+    (``bench/self_snapshot.py`` はこの形で使っている — 変更不要)。
+
+    ``t_send_s`` / ``t_headers_s`` / ``t_first_chunk_s`` は新規追加の属性
+    アクセス専用のフィールドで、tuple の要素数には含まれない (既存の
+    unpacking を壊さないため)。いずれも ``t0`` (リクエスト送信直前) からの
+    経過秒で、``ttft`` (最初の content/reasoning_content delta まで) と
+    同じ基準線に揃えてある。"""
+
+    def __new__(cls, ttft, dec, n, reply, t_send_s=None, t_headers_s=None,
+                t_first_chunk_s=None):
+        obj = super().__new__(cls, (ttft, dec, n, reply))
+        obj.t_send_s = t_send_s
+        obj.t_headers_s = t_headers_s
+        obj.t_first_chunk_s = t_first_chunk_s
+        return obj
+
+
 def stream_once(port: int, messages: list, n_tokens: int, model: str = "x",
                  extra_body: dict | None = None):
     """SSE で 1 本流し、(TTFT 秒, decode 秒, チャンク数, 本文) を返す。
@@ -113,6 +134,12 @@ def stream_once(port: int, messages: list, n_tokens: int, model: str = "x",
     `extra_body` を渡すとリクエスト本体にマージする (例: `reasoning_effort`
     で thinking の on/off を揃える)。両サーバーとも OpenAI 標準の
     `reasoning_effort` を読む ("none" で off、"medium" 等で on)。
+
+    返り値は 4-tuple 互換の ``StreamResult``。``.t_send_s`` (送信直前) /
+    ``.t_headers_s`` (HTTP ヘッダ受信) / ``.t_first_chunk_s`` (最初のチャンク
+    受信、SSE の最初の行) を属性として持つ — サーバー側の
+    ``[ttft-trace]`` (debug ログ) と突き合わせて、ハーネスの TTFT とサーバー
+    内 ``ttft_s`` の差がどこにあるかを切り分けるためのもの。
     """
     payload = {
         "model": model,
@@ -129,10 +156,18 @@ def stream_once(port: int, messages: list, n_tokens: int, model: str = "x",
         data=body, headers={"Content-Type": "application/json"})
     t0 = time.perf_counter()
     ttft = None
+    t_headers_s = None
+    t_first_chunk_s = None
     n = 0
     parts = []
+    t_send_s = time.perf_counter() - t0  # 送信直前 (urlopen 呼び出し直前)
     with urllib.request.urlopen(req, timeout=1800) as r:
+        t_headers_s = time.perf_counter() - t0  # HTTP ヘッダ受信 (urlopen が返った時点)
+        first_chunk_seen = False
         for raw in r:
+            if not first_chunk_seen:
+                t_first_chunk_s = time.perf_counter() - t0  # 最初のチャンク受信
+                first_chunk_seen = True
             line = raw.decode("utf-8", "ignore").strip()
             if not line.startswith("data:"):
                 continue
@@ -158,8 +193,10 @@ def stream_once(port: int, messages: list, n_tokens: int, model: str = "x",
                 n += 1
                 parts.append(piece)
     if ttft is None:
-        return float("nan"), float("nan"), 0, ""
-    return ttft, time.perf_counter() - t_dec, n, "".join(parts)
+        return StreamResult(float("nan"), float("nan"), 0, "",
+                             t_send_s, t_headers_s, t_first_chunk_s)
+    return StreamResult(ttft, time.perf_counter() - t_dec, n, "".join(parts),
+                         t_send_s, t_headers_s, t_first_chunk_s)
 
 
 def install_term_handler() -> None:

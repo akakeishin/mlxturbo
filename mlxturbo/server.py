@@ -346,6 +346,10 @@ class ModelState:
     # では必ず None なので、既定の挙動は変わらない。
     spec_batch_coordinator: "Any" = None
     max_batch_spec: int = 1
+    # --log-level debug (既定は info)。既定では黙って何も出さない
+    # ([ttft-trace] 行など) — 起動時に一度だけ決まるので、ホットパスで
+    # getenv や argparse を読み直すことはない (_log_ttft_trace 参照)。
+    debug_log: bool = False
 
 
 STATE: ModelState | None = None
@@ -2620,6 +2624,47 @@ def _log_gen_stats(res: dict) -> None:
     print(line)
 
 
+def _log_ttft_trace(t: dict) -> None:
+    """Debug-only breakdown of a single streaming request's pre-generation
+    latency, split across the 6 points ``_openai_stream``/``chat_completions``
+    record into ``t`` (all ``time.perf_counter()`` values):
+
+    a_start (handler start, right after the request body is parsed) /
+    b_template (after ``_apply_template``) / c_select (after session
+    matching) / d_gen (right before ``runner.generate`` is handed to
+    ``STATE.executor``) / e_first_token (the handler received the first item
+    off the generation queue) / f_first_sse (right after that item's SSE
+    chunk was written out).
+
+    This exists to localize a gap the harness (``bench/vs_mlx_serve.py`` /
+    ``bench/self_snapshot.py``'s ``stream_once``) sees between its own
+    client-side TTFT and the ``ttft_s`` this server reports in
+    ``_log_gen_stats`` (measured from inside ``runner.generate`` — pure model
+    compute, none of the request-handling overhead this function reports on).
+    Silent no-op unless ``--log-level debug`` was passed at startup — this is
+    checked via a bool set once at startup (``STATE.debug_log``), never via
+    getenv on this per-request path.
+    """
+
+    if STATE is None or not STATE.debug_log:
+        return
+
+    def _ms(key_from: str, key_to: str) -> float:
+        t0, t1 = t.get(key_from), t.get(key_to)
+        return (t1 - t0) * 1000 if t0 is not None and t1 is not None else float("nan")
+
+    total = _ms("a_start", "f_first_sse")
+    print(
+        "[ttft-trace] "
+        f"parse→template {_ms('a_start', 'b_template'):.1f} ms, "
+        f"template→select {_ms('b_template', 'c_select'):.1f} ms, "
+        f"select→gen {_ms('c_select', 'd_gen'):.1f} ms, "
+        f"gen→first_token {_ms('d_gen', 'e_first_token'):.1f} ms, "
+        f"first_token→sse {_ms('e_first_token', 'f_first_sse'):.1f} ms, "
+        f"total {total:.1f} ms"
+    )
+
+
 # ---------- generation plumbing ----------
 #
 # on_tokens hands over several tokens at once, batched by what speculation
@@ -3475,6 +3520,14 @@ async def chat_completions(request: Request):
     if not isinstance(body, dict):
         return _openai_error("request body must be a JSON object")
 
+    # [ttft-trace] (debug-only, see _log_ttft_trace): (a) handler start, right
+    # after the request body has been parsed. Captured unconditionally
+    # (time.perf_counter() is cheap) and only ever formatted/printed when
+    # STATE.debug_log is set — no getenv on this hot path. Only the streaming
+    # branch below threads this through to _openai_stream; the non-streaming
+    # branch already has its own timing via res["ttft_s"] / _log_gen_stats.
+    t_trace: dict = {"a_start": time.perf_counter()}
+
     model_err = _check_model_openai(body)
     if model_err is not None:
         return model_err
@@ -3506,6 +3559,8 @@ async def chat_completions(request: Request):
         prompt_ids = _apply_template(norm_messages, enable_thinking, tools=resolved_tools)
     except Exception as exc:
         return _openai_error(f"failed to render chat template: {exc}")
+    # [ttft-trace]: (b) after template rendering/tokenize.
+    t_trace["b_template"] = time.perf_counter()
     ctx_err = _check_context_length(prompt_ids, "openai")
     if ctx_err is not None:
         return ctx_err
@@ -3605,6 +3660,7 @@ async def chat_completions(request: Request):
                     tool_enabled,
                     resolved_tools,
                     runner=gen_runner,
+                    t_trace=t_trace,
                 )
             ),
             media_type="text/event-stream",
@@ -3736,7 +3792,19 @@ async def _openai_stream(
     tool_enabled: bool = False,
     tools_for_parsing=None,
     runner=None,
+    t_trace: dict | None = None,
 ):
+    # [ttft-trace]: caller (chat_completions) seeds t_trace with a_start/
+    # b_template; normalize to a dict here so the rest of this function can
+    # write into it unconditionally without a None-check on every call site.
+    # Recorded points, all keyed on time.perf_counter() (see _log_ttft_trace):
+    # a_start (handler start) / b_template (post apply_template, set by the
+    # caller) / c_select (post session matching) / d_gen (right before
+    # runner.generate is handed to the executor) / e_first_token (handler
+    # received the first generated item off the queue) / f_first_sse (right
+    # after that item's SSE chunk was written out).
+    if t_trace is None:
+        t_trace = {}
     # Acceptance (validation) has already completed on the caller's side,
     # before the StreamingResponse was assembled. Emitting the first event
     # without waiting for generation to start (lock acquisition, worker
@@ -3771,6 +3839,10 @@ async def _openai_stream(
             # fresh prefill — see mlxturbo/batch.py's module docstring).
             session = None
             reused_at_select = 0
+            # [ttft-trace]: (c)/(d) collapse to the same instant on the batch
+            # route — there is no session lookup to separate them (see the
+            # comment above: batched requests always do a fresh prefill).
+            t_trace["c_select"] = t_trace["d_gen"] = time.perf_counter()
             q, future, cancel_event, raw_token_count = _start_batched_generation(
                 batch_route,
                 prompt_ids,
@@ -3800,6 +3872,8 @@ async def _openai_stream(
             # do not match (see the _resolve_runner_for_request docstring).
             downgraded = runner is not None and runner is not STATE.runner
             session = None if downgraded else await _select_session_on_executor(prompt_ids)
+            # [ttft-trace]: (c) after session matching.
+            t_trace["c_select"] = time.perf_counter()
             # By the time ``_select_session`` has chosen a slot it has already
             # truncated the processed sequence to exactly "the length that will
             # actually be reused" (unchanged for a whole-sequence match, the
@@ -3810,6 +3884,9 @@ async def _openai_stream(
             # res dict ("cancelled"), so usage's cached_tokens falls back to this
             # precomputed value.
             reused_at_select = len(session.processed) if session is not None else 0
+            # [ttft-trace]: (d) right before runner.generate is handed to the
+            # executor (_start_generation submits STATE.executor.submit(...)).
+            t_trace["d_gen"] = time.perf_counter()
             q, future, cancel_event, raw_token_count = _start_generation(
                 prompt_ids,
                 max_tokens,
@@ -3834,6 +3911,11 @@ async def _openai_stream(
                     yield _ka_val
                 else:
                     first_item = _ka_val
+            # [ttft-trace]: (e) the handler received the first item off the
+            # generation queue (whatever its kind — in practice almost always
+            # reasoning_delta/content_delta). setdefault since this path only
+            # runs once per request, but stays correct if that ever changes.
+            t_trace.setdefault("e_first_token", time.perf_counter())
             _requeue_front(q, first_item)
 
             finish_reason = "length"
@@ -3881,6 +3963,8 @@ async def _openai_stream(
                     if include_usage:
                         name_chunk["usage"] = None
                     yield f"data: {json.dumps(name_chunk)}\n\n"
+                    # [ttft-trace]: (f) first SSE chunk written out (tool_call branch).
+                    t_trace.setdefault("f_first_sse", time.perf_counter())
                     args_str = json.dumps(payload["arguments"], ensure_ascii=False)
                     for piece in _chunk_string(args_str):
                         args_chunk = {
@@ -3920,6 +4004,8 @@ async def _openai_stream(
                     if include_usage:
                         chunk["usage"] = None
                     yield f"data: {json.dumps(chunk)}\n\n"
+                    # [ttft-trace]: (f) first SSE chunk written out (reasoning_delta branch).
+                    t_trace.setdefault("f_first_sse", time.perf_counter())
                 elif kind == "content_delta":
                     if stopped:
                         continue
@@ -3959,6 +4045,8 @@ async def _openai_stream(
                         if include_usage:
                             chunk["usage"] = None
                         yield f"data: {json.dumps(chunk)}\n\n"
+                        # [ttft-trace]: (f) first SSE chunk written out (content_delta branch).
+                        t_trace.setdefault("f_first_sse", time.perf_counter())
                 elif kind == "budget_exceeded":
                     budget_exceeded = True
                 elif kind == "done":
@@ -3971,6 +4059,7 @@ async def _openai_stream(
                     n_completion = len(payload["tokens"])
                     cached_tokens = payload.get("prefill_reused", 0)
                     _log_gen_stats(payload)
+                    _log_ttft_trace(t_trace)
                     break
                 elif kind == "cancelled":
                     # Only the early cut-off caused by a stop string match (the
@@ -6481,6 +6570,15 @@ def main() -> None:
         " 中止する (exit 1)。未指定 (既定) では従来どおり黙って fallback を"
         " 許す — その場合も /health の fallback_reason で理由が見える",
     )
+    ap.add_argument(
+        "--log-level",
+        default="info",
+        choices=("info", "debug"),
+        help="既定 info では今までどおり。debug にすると [ttft-trace] 行"
+        " (chat completions のストリーミング経路、1 リクエストにつき 1 行) が"
+        " 追加で出る。それ以外の既存ログ (prefill reused=... 等) は両方の"
+        " レベルで従来どおり出る",
+    )
     args = ap.parse_args()
 
     global STATE
@@ -6650,8 +6748,10 @@ def main() -> None:
         max_batch=args.max_batch,
         spec_batch_coordinator=spec_batch_coordinator,
         max_batch_spec=args.max_batch_spec,
+        debug_log=(args.log_level == "debug"),
     )
     print(f"[mlxturbo-serve] version {_FASTMLX_VERSION}")
+    print(f"[mlxturbo-serve] log level: {args.log_level}")
     if batch_coordinator is not None:
         if runner.KIND == FallbackRunner.KIND:
             print(f"[mlxturbo-serve] 継続バッチング: 有効 (--max-batch {args.max_batch})")
