@@ -100,7 +100,7 @@ OpenAI 標準 `usage.prompt_tokens_details.cached_tokens` を実装している
 | `source-code` | (c) ソースコード | python (mlxturbo/tools/bench の自前ソース) + zig (`~/dev/mlx-serve/src/*.zig`、あれば) | 4,108,940 |
 | `structured-data` | (d) 構造化データ | `bench/results/*.json` (計測結果の生 JSON) + `bench/results/logs/*.log` | 2,094,687 |
 | `conversation` | (e) 会話履歴 (構成物) | ja-prose と source-code の断片を `User:`/`Assistant:` プレフィックスで積んだトランスクリプト形。**本物の保存済み会話ログではない** (下記注記) | 398,099 |
-| `repetitive` | (f) 反復の多いテキスト | 表・箇条書きが密な Markdown 24 本 (`docs/README.md`、`docs/MTP-FLASH.md` 等。選定基準は `scenarios.py` の `_REPETITIVE_FILES` docstring) | 59,574 |
+| `repetitive` | (f) 反復の多いテキスト | 表・箇条書きが密な Markdown 30 本 (`docs/README.md`、`docs/research/STATUS.md`、`docs/research/KERNEL-PROGRAM.md` 等、in-repo だけで 154,676 トークン。`~/dev/mlx-serve` があれば `docs/reference.md` 等を追加し 208,653 トークンまで伸びる。選定基準は `scenarios.py` の `_REPETITIVE_FILES`/`_REPETITIVE_FILES_MLX_SERVE` docstring) | **154,676** (in-repo 保証値。mlx-serve 併用時 208,653) |
 
 `conversation` プールは注意が要る。このリポジトリには再利用できる形の
 保存済み会話ログが無い (`bench/opencode_e2e.py` は実サーバーとやり取りする
@@ -112,10 +112,17 @@ source-code の実文プールから段落・関数単位の断片を切り出�
 細かい段落区切りが挟まる」という、単一の長い説明文とは違うトークン分布
 であって、対話の意味的な整合性を測るものではないことを明記しておく。
 
-6 種のうち `repetitive` が最小 (59,574 トークン) で、これが `point` の
-文脈点をどこまで広げられるかの律速になる。`(h)` 節の tier 設計はこの
-実測値から逆算してある。`--dry-run` は毎回、その回の計画がどのプールを
-どれだけ消費するかを実測予算と突き合わせて表示する
+6 種のうち `repetitive` がもっとも小さく、当初は実測 59,574 トークンしか
+無かった (`docs/README.md` 等 24 本のみ)。これが `point` の文脈点を
+どこまで広げられるかの律速になっていたため、同じ選定基準 (表/箇条書き
+比率) で in-repo の文書 6 本 (`docs/research/STATUS.md`、
+`docs/research/KERNEL-PROGRAM.md` 等) を足し、154,676 トークンまで増やした
+(目標の 15 万トークンはこれで超える。`~/dev/mlx-serve` の `docs/reference.md`
+等があれば 208,653 トークンまで伸びるが、無い機体でも劣化しないよう
+`POOL_TOKEN_BUDGET` は in-repo だけの保証値を採用している)。それでも 6 種
+中もっとも小さいことに変わりはなく、`(h)` 節の tier 設計 (特に文脈点の
+選び方) はこの実測値から逆算してある。`--dry-run` は毎回、その回の計画が
+どのプールをどれだけ消費するかを実測予算と突き合わせて表示する
 (`bench/suite/run.py` の `pool_demand_report`)。予算を超えるプールがあれば
 `OVER` と表示し、実行すると `PoolCursor.take()` が `ValueError` で止まる
 (窓を使い果たしたら繰り返しで埋めるのではなく、素直に止まる設計)。
@@ -364,10 +371,19 @@ TTFT・decode tok/s・温 TTFT、thinking off・プール default) を較正点�
 出力にも明記する。**実測ではない、大まかな時間予算。**
 
 `--tier` は 3 段。tier=standard/overnight の文脈点は当てずっぽうではなく、
-`(c)` 節の実測プール予算 (最小のプール `repetitive`、59,574 トークン) から
-「池 x 出力長(2) x thinking(2) x reps の合計消費量が予算に収まる上限」を
-逆算して選んである — 計算は `bench/suite/run.py` の `pool_demand_report`
-と一致する。
+`(c)` 節の実測プール予算 (最小のプール `repetitive`、154,676 トークン —
+`~/dev/mlx-serve` が無い機体でも成立する保証値) から「池 x 出力長 x
+thinking x reps の合計消費量が予算に収まる上限」を逆算して選んである —
+計算は `bench/suite/run.py` の `pool_demand_report` と一致する。
+
+**ブロックの単位は `(シナリオ, 文脈, 軸タグ)`。** 同じ文脈に複数の掃引軸が
+触れても (例: overnight の ctx=17000 は「長文脈ラダー」軸と「17k 池掃引」軸
+の両方が触る)、軸ごとに別ブロック (別サーバー起動) にする。1 ブロックに
+混ぜてしまうと、ブロック内でシャッフルしたセルのどれが「最初 (真の冷)」に
+なるかが運任せになり、長文脈ラダー側の見出し数字 (quick と同じ意味を
+持たせたい数字) が汚れるため — 起動を余分に払うコストと引き換えに、
+軸ごとに独立した「フレッシュ起動直後の rep=0」を確保する
+(`bench/suite/run.py` の `AxisConfig.tag` / `Block.axis_tag`)。
 
 ### quick (既定、約 2 時間)
 
@@ -386,10 +402,12 @@ TTFT・decode tok/s・温 TTFT、thinking off・プール default) を較正点�
 `point` x 文脈 3 点 (`0, 4000, 8000`) x プール 6 種 (`POOL_ORDER`) x
 出力長 2 種 (`128, 1024`) x thinking 2 値 (`off, on`) x 反復 1 (**分布は
 出ない** — `report.py` が「分布なし」と明記する)。文脈点をここまで絞った
-理由: 6 種のうち最小の `repetitive` (59,574 トークン) を基準に、文脈
-(0,4000,8000) x セル 24 種 (プール 6 x 出力長 2 x thinking 2) x 反復 1 の
-消費量が 46,400 トークン (予算の 77.9%) に収まるよう選んだ。もう 1 点
-足すと超える。
+理由: `repetitive` (154,676 トークン) を基準に、文脈 (0,4000,8000) x
+セル 24 種 (プール 6 x 出力長 2 x thinking 2) x 反復 1 の消費量が
+46,400 トークン (予算の 30.0%) に収まるよう選んだ。文脈点はまだ広げる
+余地があるが (`(c)` 節のプール拡張後は 8000 を超えても収まる)、17k 以上の
+池差は overnight の long-diversity 軸が別途担当するので、standard 自体は
+「数時間で気軽に回せる」規模のまま据え置いてある。
 
 ```
 ブロック数: 6 (文脈 3 点 x エンジン 2)
@@ -398,24 +416,36 @@ TTFT・decode tok/s・温 TTFT、thinking off・プール default) を較正点�
 
 ### overnight (`--tier overnight`、反復 3 回以上で p50/p95、一晩)
 
-standard と同じ「池 x 出力長 x thinking の全部」の組を反復 3 回以上で回し
-(p50/p95 が出せる)、かつ quick と同じ長文脈ラダー (プール `default` のみ、
-これは 1,070,797 トークンの予算があるので長文脈でも余裕がある) も反復 3
-回以上で回す。両者を `(シナリオ, 文脈)` の組で合流させる (`0` と `4000` は
-2 つの掃引軸のセルが 1 ブロックに同居する)。池の掃引側は反復 3 回になった
-ぶん、文脈点をさらに `(0, 4000)` の 2 点に絞ってある —
-`repetitive` の消費量は 45,600 トークン (予算の 76.5%) で、`(4000, 8000)`
-の 2 点はそのままでは反復 3 回に耐えない (`(0,4000,8000)` x 反復 3 だと
-139,200 トークン要求、予算の 2.3 倍で確実に `ValueError` になる)。
+3 本の軸を合わせて回す。
+
+1. **長文脈ラダー** (`tag="ladder"`): quick と同じ文脈 6 点、プール
+   `default` のみ、反復 3。
+2. **短文脈の池掃引** (`tag="diversity-short"`): standard と同じ「池 x
+   出力長 x thinking の全部」の組を、文脈 `(0, 4000)` に絞って反復 3 回
+   以上で回す (p50/p95 が出せる)。`repetitive` の消費量は 45,600 トークン
+   (予算の 29.5%)。
+3. **長文脈の池掃引** (`tag="long-diversity"`、新設): mlxturbo が実際に
+   負けているのは 17k 以上の prefill/decode (`docs/NEXT-SESSION-PROMPT.md`)
+   で、短文脈の池掃引だけではそこで池差が出るかが分からないままだった。
+   文脈 17000 の 1 点に絞り、プール 6 種 x 出力長 2 種 x thinking off 固定
+   x 反復 1 (17k は 1 回の窓が大きいので、反復まで増やすと軸 2 と合わせて
+   予算を超える — ここは割り切って反復 1 にした)。窓はプールごとに重ねずに
+   切り、両エンジンに同じ窓を送る (`(c)`(d) 節と同じ規律)。`repetitive` の
+   追加消費量は 33,600 トークン (33,600+45,600=79,200、予算の 51.2%)。
 
 ```
-ブロック数: 12 (長文脈ラダー 6 点 + 池掃引 2 点、うち 0/4000 は合流)
-合計推定: 3h11m34s
+ブロック数: 18 (ladder 6 点 + diversity-short 2 点 + long-diversity 1 点、
+             それぞれ x エンジン 2、文脈が重なっても軸ごとに別ブロック)
+合計推定: 4h08m04s
 ```
 
-3 時間強は「一晩」と呼ぶには短いが、**反復 3 回以上で全条件の分布が出る**
-という、このドキュメントの実データ制約下で正直に出せる最大の掃引がこれ。
-もっと長く回したければ `--reps` を上げるか (実データの予算が許す範囲で)
+内訳: long-diversity の 2 ブロック (mlx-serve 14m24s、mlxturbo 16m45s) が
+純増分の大半で、6 池 x 出力長 2 種 = 12 セルの実測 (冷 prefill 約 30-38s +
+decode) に加えて、軸を分離したぶんの起動/冷却 (360s x 2 ブロック = 12 分)
+が乗る。4 時間強は「一晩」と呼ぶにはまだ短いが、**反復 3 回以上で分布が
+出る短文脈の池掃引と、mlxturbo が実際に負けている 17k での池差の両方**を、
+このドキュメントの実データ制約下で正直に出せる形で足したもの。もっと長く
+回したければ `--reps` を上げるか (実データの予算が許す範囲で)
 `--scenarios` を足す — `--tier overnight --resume` は中断しても続きから
 やり直せるので、複数晩に分けて伸ばすこともできる。
 

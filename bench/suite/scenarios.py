@@ -207,6 +207,27 @@ _REPETITIVE_FILES = (
     "docs/research/KERNEL-BRIEF.md",
     "docs/research/ISA-QUEUE.md",
     "docs/research/OFFLOAD-RESEARCH.md",
+    # 2026-09-02 追記 (repetitive が 6 池中最小で 17k 窓の掃引を律速していた
+    # ため増量。同じ基準 (表/箇条書き比率) で選定):
+    "docs/research/STATUS.md",
+    "docs/research/KERNEL-PROGRAM.md",
+    "docs/research/SESSION-2026-09-02-CATCHUP.md",
+    "docs/research/BAKE-PLAN.md",
+    "docs/research/OFFLOAD-DESIGN-SOL.md",
+    "docs/research/ISA-DIFF.md",
+)
+
+# mlx-serve 側の表密度が高い文書 (~/dev/mlx-serve、あれば追加)。
+# `docs/reference.md` が単体で 15 万文字超と大きく効く。無い機体では
+# 単純に足されない (上の in-repo 分だけで目標 15 万トークンは超える設計、
+# 下記 `_pool_repetitive` 参照)。
+_REPETITIVE_FILES_MLX_SERVE = (
+    "docs/models.md",
+    "benchmarks.md",
+    "docs/app.md",
+    "docs/cli.md",
+    "docs/reference.md",
+    "docs/performance.md",
 )
 
 
@@ -217,8 +238,17 @@ def _pool_repetitive() -> str:
     用意する狙いで、繰り返し文字列を自分で作るのではなく、**実在する
     表・箇条書き密度の高い文書**を選ぶことで「繰り返しで長さを作らない」
     規律を保ったまま反復性の高い実文を確保する。
+
+    6 池中もっとも小さく、17k 文脈の池差測定 (`(h)` 節の overnight tier)
+    を律速していたため in-repo 分を積み増した上で、`~/dev/mlx-serve` の
+    表密度が高い文書 (`docs/reference.md` など、あれば) も足す。in-repo 分
+    だけで目標の 15 万トークンは超えるので、mlx-serve が無い機体でも
+    劣化しない。
     """
     files = [REPO_ROOT / p for p in _REPETITIVE_FILES]
+    mlx_serve_root = Path.home() / "dev" / "mlx-serve"
+    if mlx_serve_root.exists():
+        files += [mlx_serve_root / p for p in _REPETITIVE_FILES_MLX_SERVE]
     return _read_files(files)
 
 
@@ -296,6 +326,12 @@ POOL_ORDER: tuple[str, ...] = (
 # dry-run 自体はトークナイザを読まないので、ここで固定値として持つ。
 # プールの情報源 (docs/**/*.md 等) が増減したら実測し直すこと (単に
 # `PROMPT_POOLS[key].build()` をトークナイズして `len()` を見ればよい)。
+#
+# `repetitive` は `~/dev/mlx-serve` が無い機体でも成立する**保証値**
+# (in-repo 分だけで実測 154,676 トークン) を使う。mlx-serve がある機体では
+# 実際には 208,653 トークンまで伸びる (`docs/reference.md` 等が効く) が、
+# 予算はポータビリティを優先して控えめな方を採用する。目標 15 万トークンは
+# どちらの場合も超えている。
 POOL_TOKEN_BUDGET: dict[str, int] = {
     "default": 1_070_797,
     "ja-prose": 267_148,
@@ -303,7 +339,7 @@ POOL_TOKEN_BUDGET: dict[str, int] = {
     "source-code": 4_108_940,
     "structured-data": 2_094_687,
     "conversation": 398_099,
-    "repetitive": 59_574,  # 6 種のうち最小 — 文脈点を選ぶときの律速
+    "repetitive": 154_676,  # in-repo 保証値 (mlx-serve 併用時は 208,653)
 }
 
 

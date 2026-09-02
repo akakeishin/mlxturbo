@@ -30,12 +30,15 @@
 
   - quick:     今までの既定計画そのまま。約 2 時間
   - standard:  池 (6 種) x 出力長 (128/1024) x thinking (off/on) を反復 1 回で
-               全部回す。文脈点は最小のプール (repetitive, 実測 59,574 トー
-               クン) に収まるよう (0, 4000, 8000) に絞ってある。数時間
+               全部回す。文脈点は最小のプール (repetitive, 実測 154,676 トー
+               クン、in-repo 保証値) に収まるよう (0, 4000, 8000) に絞って
+               ある。数時間
   - overnight: standard と同じ池 x 出力長 x thinking の全部の組を反復 3 回
-               以上で回し (p50/p95 が出せる)、かつ quick と同じ長文脈ラダー
-               (プール "default" のみ、これは十分な残量がある) も反復 3 回
-               以上で回す。二つを合わせて一晩
+               以上で回し (p50/p95 が出せる)、quick と同じ長文脈ラダー
+               (プール "default" のみ) も反復 3 回以上で回し、さらに
+               「mlxturbo が実際に負けている 17k 以上でも池差は出るか」を
+               見るための long-diversity 軸 (17k x 池 6 種 x 出力長 2 種、
+               thinking off、反復 1) を足す。三つを合わせて一晩
 
 実行 (GPU を使う。このスクリプト自身は対戦の判定をしない — 判定は
 CLAUDE.md の「計測の判定と commit は親が行う」を読む人間が行う):
@@ -127,6 +130,14 @@ class Cell:
 class AxisConfig:
     """掃引軸 1 グループ。`ctxs x pools x tokens_set x thinking_set` の
     直積が、そのグループが生む `point` セル群になる。
+
+    `tag` は同じ `(シナリオ, 文脈)` に複数の軸が重なったときに**ブロックを
+    分けるための識別子**。例えば overnight は ctx=17000 に「長文脈ラダー」
+    (`tag="ladder"`) と「17k 池掃引」(`tag="long-diversity"`) の 2 軸が
+    重なるが、同じブロックに混ぜてしまうとブロック内でシャッフルした
+    セルのどれが「最初 (真の冷)」になるか運任せになり、ラダー側の
+    見出し数字 (quick と同じ意味を持たせたい) が汚れる。軸ごとに別ブロック
+    (別起動) にすることで、両方が自分の「最初のセルの rep=0」を持てる。
     """
 
     ctxs: tuple[int, ...]
@@ -134,24 +145,29 @@ class AxisConfig:
     tokens_set: tuple[int, ...]
     thinking_set: tuple[str, ...]
     reps: int
+    tag: str = "axis"
 
 
-# tier=standard/overnight の文脈点 (0, 4000, 8000) と (0, 4000) は当てずっぽう
-# ではない — POOL_TOKEN_BUDGET の実測値 (最小のプール repetitive で 59,574
-# トークン) から、「池 x 出力長(2) x thinking(2) x reps」の総消費量が予算に
-# 収まる上限を逆算して選んだ。計算は本ファイル末尾の `_pool_budget_report`
+# tier=standard/overnight の文脈点は当てずっぽうではない — POOL_TOKEN_BUDGET
+# の実測値 (最小のプール repetitive で 154,676 トークン、in-repo 保証値) から
+# 「池 x 出力長 x thinking x reps」の総消費量が予算に収まる上限を逆算して
+# 選んだ。overnight の 3 本目の軸 (17k の long-diversity) は、mlxturbo が
+# 実際に負けている文脈 (17k 以上の prefill/decode) でも池間のばらつきを
+# 見るために追加した — 短文脈 (0,4000) だけの掃引では、優劣の勝負どころで
+# 池差が出るかどうかが分からないままだった。計算は `pool_demand_report`
 # と対応する (`--dry-run` が同じ計算をして表示する)。
 TIERS: dict[str, dict] = {
     "quick": dict(
         axes=(AxisConfig(ctxs=DEFAULT_CTXS, pools=("default",),
-                         tokens_set=(512,), thinking_set=("off",), reps=3),),
+                         tokens_set=(512,), thinking_set=("off",), reps=3,
+                         tag="ladder"),),
         cooldown=180.0,
         summary="既定計画。文脈 6 点 x プール 1 種 (default) x 反復 3。約 2 時間",
     ),
     "standard": dict(
         axes=(AxisConfig(ctxs=(0, 4000, 8000), pools=POOL_ORDER,
                          tokens_set=(128, 1024), thinking_set=("off", "on"),
-                         reps=1),),
+                         reps=1, tag="diversity"),),
         cooldown=180.0,
         summary=("池 (6 種) x 出力長 (128/1024) x thinking (off/on) を全部、"
                  " 反復 1 回で回す (分布は出ない)。文脈は (0,4000,8000)。数時間"),
@@ -159,15 +175,28 @@ TIERS: dict[str, dict] = {
     "overnight": dict(
         axes=(
             AxisConfig(ctxs=DEFAULT_CTXS, pools=("default",),
-                      tokens_set=(512,), thinking_set=("off",), reps=3),
+                      tokens_set=(512,), thinking_set=("off",), reps=3,
+                      tag="ladder"),
             AxisConfig(ctxs=(0, 4000), pools=POOL_ORDER,
                       tokens_set=(128, 1024), thinking_set=("off", "on"),
-                      reps=3),
+                      reps=3, tag="diversity-short"),
+            # long-diversity: mlxturbo が負けている 17k 以上の文脈でこそ
+            # 池間のばらつきを見たい、というのが短文脈掃引だけでは埋まらない
+            # 穴だった。17k 1 点・thinking off 固定・反復 1 で 6 池 x 出力長
+            # 2 種を振る (文脈 x thinking まで掛けると 154,676 トークンの
+            # 保証予算を超えるので、ここだけは割り切って反復 1・thinking off
+            # 固定にしてある)。`tag` を "ladder" と別にして、ctx=17000 で
+            # ラダー軸とブロックが混ざらないようにしてある (`tag` の docstring
+            # 参照 — 混ざるとラダー側の「真の冷」がセルのシャッフル次第になる)。
+            AxisConfig(ctxs=(17000,), pools=POOL_ORDER,
+                      tokens_set=(128, 1024), thinking_set=("off",), reps=1,
+                      tag="long-diversity"),
         ),
         cooldown=180.0,
-        summary=("quick と同じ長文脈ラダー (default プール) + standard と同じ"
-                 " 池 x 出力長 x thinking の全部の組 (文脈は (0,4000) に圧縮)"
-                 " を、どちらも反復 3 回以上で回す。一晩"),
+        summary=("quick と同じ長文脈ラダー (default プール) + 池 x 出力長 x"
+                 " thinking の全部の組 (文脈 0,4000、反復 3 以上) + 池ごとの"
+                 " 17k 掃引 (出力長 2 種、thinking off、反復 1、独立ブロック)"
+                 " を合わせて回す。一晩"),
     ),
 }
 
@@ -241,15 +270,17 @@ def estimate_block_seconds(engine_kind: str, ctx: int | None,
 
 def expand_cells(scenario_names: list[str], axes: tuple[AxisConfig, ...],
                  default_tokens: int, default_thinking: str,
-                 ) -> list[tuple[str, int | None, Cell]]:
-    """`--scenarios` x tier の軸から `(シナリオ名, ctx, Cell)` の平坦な列を作る。
+                 ) -> list[tuple[str, int | None, str, Cell]]:
+    """`--scenarios` x tier の軸から `(シナリオ名, ctx, 軸タグ, Cell)` の
+    平坦な列を作る。
 
     池 x 出力長 x thinking の掃引は **`point` にだけ**適用する
     (ユーザー要件が「point の各文脈点で」と明示しているスコープ)。
     `agent`/`code-edit`/`rag`/`parallel` は 1 セルだけ (`pool="default"`、
-    `tokens`/`thinking` は CLI の既定値) を使い、挙動を変えない。
+    `tokens`/`thinking` は CLI の既定値) を使い、挙動を変えない
+    (軸タグは `"single"` — 他の軸と混ざる余地が無いので固定)。
     """
-    flat: list[tuple[str, int | None, Cell]] = []
+    flat: list[tuple[str, int | None, str, Cell]] = []
     for name in scenario_names:
         if name == "point":
             for axis in axes:
@@ -257,18 +288,18 @@ def expand_cells(scenario_names: list[str], axes: tuple[AxisConfig, ...],
                     for pool in axis.pools:
                         for tokens in axis.tokens_set:
                             for thinking in axis.thinking_set:
-                                flat.append(("point", ctx, Cell(
+                                flat.append(("point", ctx, axis.tag, Cell(
                                     pool=pool, tokens=tokens,
                                     thinking=thinking, reps=axis.reps)))
         elif name == "rag":
             for mode in ("fresh", "shared"):
-                flat.append(("rag", None, Cell(
+                flat.append(("rag", None, "single", Cell(
                     pool="default", tokens=default_tokens,
                     thinking=default_thinking, reps=axes[0].reps,
                     extra_kwargs=(("mode", mode),))))
         else:
             # agent / code-edit / parallel: シナリオ 1 つに 1 セル
-            flat.append((name, None, Cell(
+            flat.append((name, None, "single", Cell(
                 pool="default", tokens=default_tokens,
                 thinking=default_thinking, reps=axes[0].reps)))
     return flat
@@ -276,39 +307,50 @@ def expand_cells(scenario_names: list[str], axes: tuple[AxisConfig, ...],
 
 @dataclass
 class Block:
-    """1 回のサーバー起動で完結する測定単位。`cells` は同じ (シナリオ, 文脈)
-    に属する全セル (プール x 出力長 x thinking の組)。tier=quick では常に
-    1 セル、standard/overnight では複数になる。
+    """1 回のサーバー起動で完結する測定単位。`cells` は同じ
+    (シナリオ, 文脈, 軸タグ) に属する全セル (プール x 出力長 x thinking の
+    組)。tier=quick では常に 1 セル、standard/overnight では複数になる。
+
+    軸タグ (`axis_tag`) でブロックを分ける理由は `AxisConfig.tag` の
+    docstring を参照 — 同じ文脈に複数の軸が重なっても (例: overnight の
+    ctx=17000 はラダー軸と long-diversity 軸が両方触る)、軸ごとに別ブロック
+    (別起動) にして、それぞれが自分の「最初のセルの rep=0 (真の冷)」を
+    持てるようにする。
     """
 
     index: int
     scenario_name: str
     engine_kind: str
     ctx: int | None
+    axis_tag: str
     cells: list[Cell]
     block_seed: int
 
     def label(self) -> str:
         c = f"ctx={self.ctx}" if self.ctx is not None else "ctx=-"
-        return f"{self.scenario_name:10s} {c:10s} {self.engine_kind:10s} ({len(self.cells)} セル)"
+        return (f"{self.scenario_name:10s} {c:10s} [{self.axis_tag}] "
+               f"{self.engine_kind:10s} ({len(self.cells)} セル)")
 
 
-def group_into_blocks(flat_cells: list[tuple[str, int | None, Cell]],
+def group_into_blocks(flat_cells: list[tuple[str, int | None, str, Cell]],
                       engine_kinds: list[str], seed: int) -> list[Block]:
-    """`(シナリオ, 文脈)` ごとにセルをまとめ、エンジンごとに 1 ブロックを作る。
+    """`(シナリオ, 文脈, 軸タグ)` ごとにセルをまとめ、エンジンごとに
+    1 ブロックを作る。
 
-    「文脈ブロックごとに交互に起動する」の実装: `(シナリオ, 文脈)` の
-    グループの出現順そのものをシャッフルし、各グループでどちらのエンジンを
-    先に起動するかも毎回コインを振る。ブロック内のセル順も (dry-run が
-    見せる実行順そのものとして) シャッフルする — ブロック内で最初に来た
-    セルの最初の rep だけが「真にフレッシュな冷」になる
-    (`docs/research/BENCH-DESIGN-2026-09.md` (i) 節)。
+    「文脈ブロックごとに交互に起動する」の実装: グループの出現順そのものを
+    シャッフルし、各グループでどちらのエンジンを先に起動するかも毎回
+    コインを振る。ブロック内のセル順も (dry-run が見せる実行順そのものと
+    して) シャッフルする — ブロック内で最初に来たセルの最初の rep だけが
+    「真にフレッシュな冷」になる (`docs/research/BENCH-DESIGN-2026-09.md`
+    (i) 節)。**軸タグをグループ鍵に含める** ことで、同じ文脈に複数の軸が
+    重なっても (`AxisConfig.tag` 参照) 別ブロック (別起動) になり、
+    軸ごとに独立した「最初のセルの rep=0」を持てる。
     """
     rng = random.Random(seed)
-    groups: dict[tuple[str, int | None], list[Cell]] = {}
-    order: list[tuple[str, int | None]] = []
-    for name, ctx, cell in flat_cells:
-        key = (name, ctx)
+    groups: dict[tuple[str, int | None, str], list[Cell]] = {}
+    order: list[tuple[str, int | None, str]] = []
+    for name, ctx, tag, cell in flat_cells:
+        key = (name, ctx, tag)
         if key not in groups:
             groups[key] = []
             order.append(key)
@@ -317,14 +359,14 @@ def group_into_blocks(flat_cells: list[tuple[str, int | None, Cell]],
 
     blocks: list[Block] = []
     idx = 0
-    for name, ctx in order:
-        cells = list(groups[(name, ctx)])
+    for name, ctx, tag in order:
+        cells = list(groups[(name, ctx, tag)])
         rng.shuffle(cells)
         pair = list(engine_kinds)
         rng.shuffle(pair)
         for eng in pair:
             blocks.append(Block(index=idx, scenario_name=name, engine_kind=eng,
-                               ctx=ctx, cells=list(cells),
+                               ctx=ctx, axis_tag=tag, cells=list(cells),
                                block_seed=rng.randrange(1 << 30)))
             idx += 1
     return blocks
@@ -348,9 +390,9 @@ def pool_demand_report(blocks: list[Block]) -> list[dict]:
     気づけた方がよい)。
     """
     demand: dict[str, int] = {}
-    seen: set[tuple[str, int | None]] = set()
+    seen: set[tuple[str, int | None, str]] = set()
     for b in blocks:
-        key = (b.scenario_name, b.ctx)
+        key = (b.scenario_name, b.ctx, b.axis_tag)
         if b.scenario_name != "point" or b.ctx in (None, 0) or key in seen:
             continue
         seen.add(key)
@@ -452,7 +494,7 @@ def print_plan(blocks: list[Block], seed: int, cooldown: float, tier: str,
         more = f" (+{len(cell_labels) - 6})" if len(cell_labels) > 6 else ""
         print(f"       cells: {shown}{more}")
         rows.append(dict(index=b.index, scenario=b.scenario_name, ctx=b.ctx,
-                         engine=b.engine_kind, argv=argv,
+                         axis_tag=b.axis_tag, engine=b.engine_kind, argv=argv,
                          cells=[dict(pool=c.pool, tokens=c.tokens,
                                     thinking=c.thinking, reps=c.reps,
                                     extra=dict(c.extra_kwargs)) for c in b.cells],
@@ -542,7 +584,8 @@ def run_block(block: Block, adapter: EngineAdapter, thinking_map: dict,
             [adapter.name, "mlxturbo.server", "mlx-serve --serve"])
 
     return dict(block=dict(index=block.index, scenario_name=block.scenario_name,
-                           engine_kind=block.engine_kind, ctx=block.ctx),
+                           engine_kind=block.engine_kind, ctx=block.ctx,
+                           axis_tag=block.axis_tag),
                cells=cells_out, residual_warnings=warnings,
                server_log=str(log_path))
 
@@ -578,6 +621,7 @@ def _resolve_axes(args) -> tuple[AxisConfig, ...]:
         thinking_set=tuple(args.thinking_set.split(","))
         if args.thinking_set else base.thinking_set,
         reps=args.reps if args.reps is not None else base.reps,
+        tag="custom",
     ),)
 
 
@@ -705,7 +749,8 @@ def main() -> int:
         plan["engine_kinds"] = engine_kinds
         plan["axes"] = [dict(ctxs=list(a.ctxs), pools=list(a.pools),
                              tokens_set=list(a.tokens_set),
-                             thinking_set=list(a.thinking_set), reps=a.reps)
+                             thinking_set=list(a.thinking_set), reps=a.reps,
+                             tag=a.tag)
                         for a in axes]
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "plan.json").write_text(
@@ -723,7 +768,8 @@ def main() -> int:
     plan["engine_kinds"] = engine_kinds
     plan["axes"] = [dict(ctxs=list(a.ctxs), pools=list(a.pools),
                          tokens_set=list(a.tokens_set),
-                         thinking_set=list(a.thinking_set), reps=a.reps)
+                         thinking_set=list(a.thinking_set), reps=a.reps,
+                         tag=a.tag)
                     for a in axes]
     if not args.resume:
         (out_dir / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=2))
@@ -751,7 +797,8 @@ def main() -> int:
             with open(raw_path, "a") as f:
                 f.write(json.dumps(dict(
                     block=dict(index=block.index, scenario_name=block.scenario_name,
-                              engine_kind=block.engine_kind, ctx=block.ctx),
+                              engine_kind=block.engine_kind, ctx=block.ctx,
+                              axis_tag=block.axis_tag),
                     failed=True, error=repr(e)), ensure_ascii=False) + "\n")
             continue
         with open(raw_path, "a") as f:
