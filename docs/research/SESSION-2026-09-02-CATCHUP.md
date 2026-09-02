@@ -674,3 +674,11 @@ MoE 超過 1.07 s の帰属は `tools/moe_routing_skew.py` (chain32 で実行待
 ms/tok depth1 27.6 対 depth2 30.3 (**depth1 が -8.9%**)。tok/round は depth2 が 2.001 対 1.669 で
 高いが、ms/round が +23.9% で相殺を超える。bool マスクで 17k の decode が速くなっても、
 2048 超で depth 1 に落とす現行の方針は変えない。
+
+## gather attention (段 3(b)) の 25k A/B (2026-09-02 19:50)
+
+decode ms/tok A -0.3%、prefill -3.0% (熱の範囲)、tok/round 同じ。結果 JSON の `fired` に gather の
+発火が無い (gdn_metal と ngram だけ)。**25k でも union の上限 0.20·kv の条件で毎回辞退していて、
+一度も走っていない。**17k と同じ結論で、この経路は 0.20 の閾値のままでは 25k まで出番が無い。
+閾値を上げる案は `tools/gather_union_stats.py` の真の union 比 (T=32 で 0.665) からして
+読み出し量が減らないので却下のまま。
