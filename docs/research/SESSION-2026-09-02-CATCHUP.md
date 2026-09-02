@@ -1245,3 +1245,9 @@ snapshot の参照が無ければ **KV の更新は in-place** (増分・時間�
 - HC 97 回 = 380 ms (11%) は素の op で 60%。prefill 幅の融合は -0.9% で却下済み。
 - attention は kv=2k で 353 ms (10%)、うち射影が大半 (S=2048 の qkv/o_proj)。
 - 4k の TTFT 7.2 s = 2 チャンク弱 × 3.5 s + 固定費 (prime 0.25 s、固定 300 ms の TTFT 経路)。
+
+## n-gram 先読みの prefill A/B、8k (2026-09-03 03:40、`bench/results/ngram-prefetch-8k.json`)
+
+prefill_s A (先読み on) 13.31 対 B 13.42 (**-0.9%**)、decode ±0。PLE の 167 ms/チャンクは pread の待ちでは
+なく、行取得後の処理 (ハッシュ、gather、埋め込みの加算) が主で、先読みでは隠れない。反転条件 (-2% 未満) で
+畳む (既定 off のまま)。PLE の効率 7% は別の手 (行取得の GPU 側処理の整理) が要る。
