@@ -1268,3 +1268,15 @@ runner 内 154 ms + 外 345 ms。**runner でも executor でもなく、worker 
 乗る (`[ttft-trace]` gen→first_token 310 ms、runner 内 0.9 ms、executor 0.1 ms と整合)。
 相手は Zig 側でトークナイザを 1 回だけ組む。直し方: prototype を 1 回作って複製 + reset。見込み: 温 TTFT
 0.45 → 0.15 s (相手 0.87 の 6 倍速)、冷 ctx 0 も 0.5 → 0.2 s、4k 冷は 7.2 → 6.9 s。
+
+## 投機ラウンドごとのピークメモリ (2026-09-03 04:40、`decode_ab --knob null --round-trace`、64 トークン)
+
+| ctx | ラウンド数 | peak_delta 中央値 | 最大 (1 ラウンド目 = ハーネスの復元由来) |
+|---|---|---|---|
+| 17k | 26 | **33 MB** | 880 MB |
+| 50k | 29 | **133 MB** | 1862 MB |
+
+本番の投機ラウンドで KV 全体 (17k 415 MB / 50k 1.2 GB) を毎回写してはいない (中央値が KV の 1 割以下)。
+50k の 133 MB は indexer の pooled キャッシュの concat (ブロック確定ごと) 級で、費用は 1 ms/round 未満。
+**KV コピー仮説は本番では棄却。**decode の kv 罰 (+8.5 ms/tok) の帰属は attention 層の verify 幅 (S=2) の
+中身に戻る。`qsa_prefill_split --S 2 --chain 50` (同期の床を外した部品計測) で決める。
