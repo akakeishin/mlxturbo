@@ -1781,3 +1781,15 @@ stage 境界の async_eval が commit を強制するので、env で締め切�
 **Python だけで r=40 -11.4%、r=160 -3.6%** が取れる。segmented (BM=32) は r=160 -5.9% (gate/up) / -3.9% (down)、
 r=40 -4% / 0% なので、小さい専門家は BM=16 (既製 + padding)、大きい専門家は BM=32 (segmented) が良い。
 第 3 段の A/B に variant C (pad16 + 既製) を足して 3 者で取る。
+
+### 2026-09-03 08:28 P1 の proof-of-life: 2 本の GPU stream (`tools/two_stream_micro.py --n 8`、モデル無し)
+
+A 単独 (GDN scan 連鎖) 23.3 ms、B 単独 (qmm 連鎖) 74.7 ms、1 stream 交互 97.2 ms、2 stream 93.8 ms。
+2 stream / 1 stream = 0.965 (判定線 0.95 以上で直列化)。重なったのは 3.4 ms で、隠せる最大 23 ms の 15%。
+Apple GPU + MLX 0.32.2 では compute の command buffer が queue 間でほぼ直列に走る。**P1 は畳む** (in-model に進まない)。
+
+### 2026-09-03 08:28 D5 の proof-of-life: decode 幅の gather_qmm のスケール (`tools/gather_qmm_scale_micro.py`)
+
+1 セット (gate/up/down) あたり: 22 行 / 20 専門家 196 us、22 行 / 11 専門家 139 us、11 / 11 98 us、1 / 1 75 us。
+時間は行数でなく**異なる専門家の数**で決まる (22/20 と 22/11 で 34% 差)。つまり重複行の重み読みは既に共有されており、
+verify 行間で同じ専門家をまとめ直しても減らない (Challenger の読み: union 21〜22.5/30 の重複は既に安い)。**D5 は畳む**。
