@@ -11,7 +11,8 @@
 import json, statistics, sys, time, urllib.request
 from pathlib import Path
 
-sys.path.insert(0, "/Users/ht/dev/fastmlx")
+# リポジトリのルートを絶対パスで決め打ちにしない (他人の環境で動かない)。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from bench.eval_prompts import PROMPTS  # noqa: E402
 
 TOKENS = 128
