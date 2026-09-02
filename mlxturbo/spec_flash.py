@@ -271,6 +271,35 @@ def _depth_explore_every_default() -> int:
     return _DEPTH_EXPLORE_EVERY_DEFAULT
 
 
+# 2026-09-03 の 3 回目の 17k A/B (bench/results/depth-adapt3-17k.json):
+# 費用モデルと搾取の罠を両方直した後、ms/tok -3.2% (tok/round +15.4% は
+# 取れているのに ms/round +11.3% がそれを上回って食う) -- 1 版 (費用を
+# 過大に罰っていた壊れた版) の -6.0% より悪化した。depth 2 の選択回数は
+# 増えた (108-122 対 28-152) が、「期待値がわずかに上回るだけの depth 2」
+# を選ぶと実測では損になる (E(m)/T(m) の期待値はサンプル数が少ない a[]/
+# cost_ema の推定値に乗っているので、僅差の勝ちは推定誤差の範囲に収まり
+# やすい)。1 版の過大な費用罰則が結果的にちょうどよい閾値として機能して
+# いたと分かったので、深さを増やす側にだけヒステリシスを入れる:
+# 深い方の m を選ぶには、比較対象 (直前に確定している最良の m) の
+# スコアを margin 分上回ることを要求する (下 choose() 参照)。
+_DEPTH_MARGIN_DEFAULT = 0.15
+
+
+def _depth_margin_default() -> float:
+    """深さを増やす側のヒステリシス margin。MLXTURBO_DEPTH_MARGIN が最優先、
+    無ければ 0.15。負の値は無視して既定に落ちる (0 は「ヒステリシス無効化 =
+    素の argmax」として許す)。"""
+    env = os.environ.get("MLXTURBO_DEPTH_MARGIN")
+    if env:
+        try:
+            v = float(env)
+        except ValueError:
+            v = -1.0
+        if v >= 0:
+            return v
+    return _DEPTH_MARGIN_DEFAULT
+
+
 def _depth_adapt_min_pos_default(ctx_limit: int) -> int:
     """``FlashSpecEngine._effective_depth`` が controller を使い始める最小
     位置。既定は ``ctx_limit`` (= 静的規則 ``choose_depth`` が depth 1 に
@@ -389,7 +418,8 @@ class DepthController:
                  beta: float | None = None,
                  prior: float = _DEPTH_EMA_PRIOR,
                  explore_every: int | None = None,
-                 stale_rounds: int = _DEPTH_STALE_ROUNDS_DEFAULT):
+                 stale_rounds: int = _DEPTH_STALE_ROUNDS_DEFAULT,
+                 margin: float | None = None):
         self.max_depth = max_depth
         self.beta = beta if beta is not None else _depth_beta_default()
         self.prior = prior
@@ -412,6 +442,9 @@ class DepthController:
         self.stale_rounds = stale_rounds
         self.round_count = 0
         self.last_observed_round: list[int | None] = [None] * max_depth
+        # 深さを増やす側のヒステリシス (2026-09-03 の 3 回目の A/B、上の
+        # モジュールコメント参照)。margin=0 は無効化 (素の argmax)。
+        self.margin = margin if margin is not None else _depth_margin_default()
 
     def observe(self, n_accepted: int, depth: int,
                 round_ms: float | None = None) -> None:
@@ -498,25 +531,39 @@ class DepthController:
                 out[i] = (out[i] + self.prior) / 2.0
         return out
 
+    def _score(self, m: int, pos: int, a: list[float]) -> float:
+        """depth=m を選んだときの E(m)/T(m)。"""
+        cost = self._cost_for(m, pos)
+        return self.expected_tokens(m, a) / cost if cost > 0 else 0.0
+
     def choose(self, pos: int) -> int:
-        """E(m)/T(m) を最大にする m (1..cap) を返す。
+        """E(m)/T(m) を最大にする m (1..cap) を、深さを増やす側のヒステリシス
+        ``margin`` 付きで返す。
 
         ``explore_every`` ラウンドに 1 回 (``explore_every>0`` のとき)、
         期待値計算を無視して cap そのものを強制する -- depth 1 に居座って
         いる間は position>=1 の a[] が一度も観測されない (搾取の罠) ので、
-        定期的に深く引いて更新の機会を作る。
+        定期的に深く引いて更新の機会を作る。それ以外のラウンドは m=1 を
+        基準に、深い m を採用するたびその m を新しい基準に差し替えながら
+        m=1..cap の順に見ていく (ラチェット): 候補 m のスコアが直前の基準の
+        スコアを ``margin`` 分 (``(1+margin)`` 倍) 上回るときだけ、その m が
+        新しい基準になる。2026-09-03 の 3 回目の 17k A/B
+        (bench/results/depth-adapt3-17k.json) で、僅差の期待値優位だけで
+        depth を増やすと実測では負けると分かった (E(m)/T(m) の差はサンプル
+        数の少ない a[]/cost_ema の推定誤差に埋もれやすい) ため。
         """
         cap = min(_depth_cap_default(pos), self.max_depth)
         self.round_count += 1
         if self.explore_every > 0 and self.round_count % self.explore_every == 0:
             return cap
         a = self._effective_a()
-        best_m, best_score = 1, -1.0
-        for m in range(1, cap + 1):
-            cost = self._cost_for(m, pos)
-            score = self.expected_tokens(m, a) / cost if cost > 0 else 0.0
-            if score > best_score:
-                best_score, best_m = score, m
+        best_m = 1
+        best_score = self._score(1, pos, a)
+        threshold = 1.0 + self.margin
+        for m in range(2, cap + 1):
+            score = self._score(m, pos, a)
+            if score >= threshold * best_score:
+                best_m, best_score = m, score
         return best_m
 
 

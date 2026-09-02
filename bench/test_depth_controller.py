@@ -19,27 +19,41 @@ from mlxturbo.spec_flash import (
     _depth_cap_default,
     _depth_cost_params,
     _depth_explore_every_default,
+    _depth_margin_default,
 )
 
 
 def test_prior_chooses_cap_at_start():
-    """観測前 (全位置が事前値 0.85) は E(m)/T(m) が m について単調に増える
-    ので、cap そのものを選ぶ (短文脈 cap=3、長文脈 (>2048) cap=2)。"""
+    """観測前 (全位置が事前値 0.85) の cold start は、margin (既定 0.15) の
+    ヒステリシス込みで選ぶ。
+
+    短文脈 (cap=3): m=1->2 の伸びは +14.1% で margin に届かないが、そこで
+    足踏みせず m=1->3 まで見ると +19.8% で届くので cap=3 を選ぶ。
+    長文脈 (cap=2、pos>2048): 比較できる相手が m=2 までしかなく、その伸びは
+    +13.0% で margin に届かないので depth=1 のまま -- 僅差では深くしない、
+    というこの節の狙いそのもの (2026-09-03 の 3 回目の 17k A/B、
+    bench/results/depth-adapt3-17k.json)。
+    """
     ctl = DepthController()
     assert _depth_cap_default(0) == 3
     assert _depth_cap_default(4000) == 2
     assert ctl.choose(0) == 3
-    assert ctl.choose(4000) == 2
+    assert ctl.choose(4000) == 1
 
 
 def test_high_acceptance_prefers_deeper():
-    """毎ラウンド depth 全部が的中し続けると、a が 1 に近づいて cap まで
-    深く選ぶようになる。"""
+    """毎ラウンド depth 全部が的中し続けると a が 1 に近づく。m=1->2 の
+    伸び (+23.1%) は margin (15%) を越えるので depth 2 まで深くする。
+    m=2->3 の伸びは (新しい基準 m=2 に対して) +13.0% で margin に届かない
+    ので、cap=3 まで無条件には深くしない -- 「僅かに勝るだけの深さ」への
+    creep を抑えるのがこのヒステリシスの狙い
+    (2026-09-03 の 3 回目の 17k A/B、bench/results/depth-adapt3-17k.json)。
+    """
     ctl = DepthController()
     for _ in range(200):
         ctl.observe(n_accepted=3, depth=3)
     assert all(a > 0.99 for a in ctl.a[:3])
-    assert ctl.choose(0) == 3
+    assert ctl.choose(0) == 2
 
 
 def test_low_acceptance_prefers_shallow():
@@ -88,21 +102,25 @@ def test_expected_tokens_matches_closed_form():
 
 
 def test_choose_matches_bruteforce_argmax():
-    """choose() が探索する範囲 (cap まで) を総当たりした結果と一致する。"""
+    """choose() が、margin 込みのラチェット規則 (m=1 を基準に、基準を
+    margin 分上回るたびその m が新しい基準へ差し替わる) を素朴に書いた
+    参照実装と一致することを確かめる。"""
     ctl = DepthController()
     ctl.a[0], ctl.a[1], ctl.a[2] = 0.6, 0.9, 0.2
     # 「たった今観測した」ことにして、選択時の陳腐化平均 (_effective_a、
     # 2026-09-03 の搾取の罠対策) が効かないようにする -- このテストが見たいのは
-    # E(m)/T(m) の argmax 計算そのもので、陳腐化の扱いは別テストの対象。
+    # E(m)/T(m) のラチェット計算そのもので、陳腐化の扱いは別テストの対象。
     ctl.last_observed_round[0] = ctl.last_observed_round[1] = ctl.last_observed_round[2] = 0
     for pos in (0, 4000):
         t1, dt = _depth_cost_params(pos)
         cap = _depth_cap_default(pos)
-        scores = {
-            m: ctl.expected_tokens(m) / (t1 + m * dt) for m in range(1, cap + 1)
-        }
-        expect = max(scores, key=scores.get)
-        assert ctl.choose(pos) == expect
+        best_m = 1
+        best_score = ctl.expected_tokens(1) / (t1 + 1 * dt)
+        for m in range(2, cap + 1):
+            score = ctl.expected_tokens(m) / (t1 + m * dt)
+            if score >= (1.0 + ctl.margin) * best_score:
+                best_m, best_score = m, score
+        assert ctl.choose(pos) == best_m
 
 
 def test_depth_cap_env_override(monkeypatch):
@@ -144,23 +162,25 @@ def test_cost_ema_shifts_choice_away_from_linear_model():
     """
     # beta=0 で位置別 a[] を凍結し、費用 EMA だけの効果を見る
     ctl = DepthController(beta=0.0)
-    ctl.a[0] = ctl.a[1] = ctl.a[2] = 0.5
+    ctl.a[0] = ctl.a[1] = ctl.a[2] = 0.7
     # 「たった今観測した」ことにして陳腐化平均 (_effective_a) を避ける
     # (このテストは費用 EMA だけの効果を見たい)
     ctl.last_observed_round[0] = ctl.last_observed_round[1] = ctl.last_observed_round[2] = 0
 
     # cold start (cost_ema が空): 線形モデル T1=25, dT=7 のままだと depth 1
+    # (margin のヒステリシスもあるので、より一層 depth 1 に留まる)
     assert ctl.choose(0) == 1
 
-    # 実測: depth 2 は depth 1 よりわずかしか高くつかない (線形モデルが
-    # 想定する dT=7 よりずっと軽い、実測 ~3ms 相当)
+    # 実測: depth 2 は depth 1 とほぼ同じ費用 (線形モデルが想定する dT=7 と
+    # 違い、実測はほぼ横ばい ~1ms) -- E(2) の伸びがこの決定的な費用差込みで
+    # margin (15%) も越えるので、ここでは depth 2 に切り替わる
     ctl.observe(n_accepted=1, depth=1, round_ms=30.0)
-    ctl.observe(n_accepted=2, depth=2, round_ms=33.0)
+    ctl.observe(n_accepted=2, depth=2, round_ms=31.0)
     assert ctl.choose(0) == 2
 
     # a[] は beta=0 のままなので凍結されているはず (費用 EMA だけの効果と
     # 切り分けるための前提)
-    assert ctl.a[0] == ctl.a[1] == ctl.a[2] == 0.5
+    assert ctl.a[0] == ctl.a[1] == ctl.a[2] == 0.7
 
 
 def test_observe_without_round_ms_leaves_cost_ema_untouched():
@@ -253,3 +273,43 @@ def test_periodic_explore_forces_cap_and_updates_a1():
     ctl.observe(n_accepted=cap, depth=cap)
     assert ctl.observations[1] == 1
     assert ctl.last_observed_round[1] == 4
+
+
+def test_depth_margin_env_override(monkeypatch):
+    monkeypatch.delenv("MLXTURBO_DEPTH_MARGIN", raising=False)
+    assert _depth_margin_default() == 0.15
+    monkeypatch.setenv("MLXTURBO_DEPTH_MARGIN", "0.3")
+    assert _depth_margin_default() == 0.3
+    assert DepthController().margin == 0.3
+    # 0 は「無効化 (素の argmax)」として許す
+    monkeypatch.setenv("MLXTURBO_DEPTH_MARGIN", "0")
+    assert _depth_margin_default() == 0.0
+    # 負や非数値は既定に落ちる
+    monkeypatch.setenv("MLXTURBO_DEPTH_MARGIN", "-0.1")
+    assert _depth_margin_default() == 0.15
+    monkeypatch.setenv("MLXTURBO_DEPTH_MARGIN", "nope")
+    assert _depth_margin_default() == 0.15
+
+
+def test_margin_reverts_choice_to_depth_one():
+    """margin が無ければ僅差で depth 2 を選ぶ場面でも、margin ありだと
+    depth 1 に留まる (2026-09-03 の 3 回目の 17k A/B --
+    bench/results/depth-adapt3-17k.json -- で、僅差の期待値優位だけで
+    depth を増やすと実測では損だったことの再現)。"""
+    ctl_no_margin = DepthController(margin=0.0)
+    ctl_with_margin = DepthController(margin=0.15)
+    for ctl in (ctl_no_margin, ctl_with_margin):
+        ctl.a[0], ctl.a[1] = 0.75, 0.75
+        ctl.last_observed_round[0] = ctl.last_observed_round[1] = 0
+
+    # cap=2 (長文脈、pos=4000) 一本勝負にして、m=1 と m=2 の比較だけを見る。
+    # cold start の線形モデルで m=1->2 の伸びは正 (m=2 の方がわずかに良い)
+    # だが margin (15%) には届かない差にしておく。
+    t1, dt = _depth_cost_params(4000)
+    e1 = 1 + 0.75
+    e2 = e1 + 0.75 * 0.75
+    ratio = (e2 / (t1 + 2 * dt)) / (e1 / (t1 + 1 * dt))
+    assert 1.0 < ratio < 1.15  # 「僅かに勝る」ことの前提を確認しておく
+
+    assert ctl_no_margin.choose(4000) == 2  # margin 無しなら僅差でも深くする
+    assert ctl_with_margin.choose(4000) == 1  # margin ありだと depth 1 に戻る
