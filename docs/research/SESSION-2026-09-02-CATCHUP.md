@@ -1669,3 +1669,31 @@ decode 側は HC 4.7 ms / indexer 2.7 ms に手が無く、-7% は当面残る�
 prefill_s A +0.3%、decode ±0、出力一致。**取り分なし**。q/k/v/gate の 4 本を 1 本にしても M=2048 の qmm は
 既に同じ効率で走っている (5 TFLOPS 相当の「射影 19 ms/層」は qmm 以外 (rope、qk-norm、gate の split、
 reshape) の小物の合算)。畳む (既定 off のまま)。17k は確認だけ。
+
+## 4k の prefill trace (2026-09-03 19:30、`MLXTURBO_PREFILL_TRACE=1`、`bench/results/logs/trace-4k.log`)
+
+| 区間 | トークン | 時間 | 1 トークンあたり |
+|---|---|---|---|
+| group build + eval (g=1) | 1825 | 2.95 + 0.16 = 3.11 s | 1.70 ms |
+| tail forward (chunk 主導の最終チャンク) | 2048 | 3.54 s | **1.73 ms** |
+| prime (窓 512) | — | 0.05 s | |
+
+advisor の「最終チャンクは 1 トークンあたり 2.1 倍」は 4k では成り立たない (1.73 対 1.70 ms/tok、差 2%)。
+17k の 2.1 倍は末尾チャンクの attention (kv 17k) が重い分だった。4k を g=2 のグループに畳んでも MoE の行数が
+1825 → 3873 (M/E 36 → 75) になる分 (MoE -8% = 4k の -3%) しか無く、**-10% の見込みは外れ**。実装の優先度は下げる
+(prefill 全体の 1.13x と同じ、小物の合算)。
+
+## GDN 1 層の部品計測、S=2048 (2026-09-03 19:30、`tools/gdn_split.py`、kv 4k / 16k、層 1 / 18 で同じ)
+
+| 部品 | ms | 割合 | 効率 (FLOP 下限比) |
+|---|---|---|---|
+| `_project_in` (4-bit qmm × 4) | 15.0〜16.8 | **57%** | 92〜103% (天井) |
+| conv1d + silu | 1.0 | 4% | 20% (dispatch 律速) |
+| split / gate / beta | 0.5 | 2% | 17% |
+| 再帰スキャン (gdn_metal) | 3.2〜3.3 | 12% | (逐次カーネル、FLOP 比は意味なし) |
+| norm(out, z) + out_proj | 7.2〜7.3 | 26% | 78〜80% |
+| 部品和 / 壁時計 | 27〜29 / 26〜28 | | |
+
+**GDN の 83% (in_proj + out_proj) は既に天井。**前処理 (conv/silu/gate) は dispatch 律速だが 1.5 ms/層 = 1 チャンクの
+1.5% で、Metal 側に取り込んでも取り分はその程度。「超過 20% = 190 ms」は前処理ではなく out_proj の 80% と
+スキャンの分。**GDN は閉じる** (前処理の取り込みは機会があればの小物)。
