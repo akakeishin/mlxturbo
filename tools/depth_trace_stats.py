@@ -244,6 +244,66 @@ def margin_auc_at_position(records: list[dict], position: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# (f) D2 判定指標: 信号 a (直前 k ラウンド全採用条件付きの P(hit>=3)) と
+#     信号 b (位置 1 マージン下位カバレッジでの棄却率)
+#     -- `docs/research/IDEAS-2026-09-03.md` の Challenge 表の判定線
+#     (信号 a: 0.5、信号 b: margin 下位 20% で棄却率 < 0.7 なら畳む) 用。
+# ---------------------------------------------------------------------------
+
+
+def full_history_hit3_rate(runs: list[list[dict]], k: int = 3) -> dict:
+    """直前 k ラウンドが全部全採用だったときの P(hit>=3) と件数 (信号 a)。
+
+    (c) と同じビット列バケット化 (`history_bucket_stats`) を使い、全ビット 1
+    (= 直前 k ラウンドが全部全採用) のバケットだけを取り出す。
+    """
+    key = "1" * k
+    st = history_bucket_stats(runs, k=k).get(key, {"n": 0, "p_hit_ge_3": None})
+    return {"k": k, "n": st["n"], "p_hit_ge_3": st["p_hit_ge_3"]}
+
+
+def margin_coverage_precision(
+    records: list[dict], position: int, coverage_fracs: tuple[float, ...]
+) -> list[dict]:
+    """位置 `position` のマージンを昇順 (自信が低い順) に並べ、下位
+    `coverage_fracs` (被覆率) における「その draft が棄却だった割合」
+    (= 精度、信号 b) を返す。
+
+    抽出条件は `margin_auc_at_position` と同じ (depth > position かつ
+    margins[position] が数値)。母集団が空なら各カバレッジとも n=0 で返す。
+    """
+    pairs = []  # (margin, accepted)
+    for rec in records:
+        depth = rec.get("depth") or 0
+        margins = rec.get("margins")
+        if depth <= position or not margins or len(margins) <= position:
+            continue
+        m = margins[position]
+        if m is None:
+            continue
+        accepted = (rec.get("hit") or 0) > position
+        pairs.append((m, accepted))
+
+    if not pairs:
+        return [{"coverage": f, "n": 0, "threshold_margin": None, "reject_rate": None}
+                for f in coverage_fracs]
+
+    pairs.sort(key=lambda t: t[0])
+    n_total = len(pairs)
+    out = []
+    for f in coverage_fracs:
+        n_cov = min(max(1, round(f * n_total)), n_total)
+        subset = pairs[:n_cov]
+        reject_rate = sum(1 for _, acc in subset if not acc) / n_cov
+        out.append({
+            "coverage": f, "n": n_cov,
+            "threshold_margin": subset[-1][0],
+            "reject_rate": reject_rate,
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # (e) 費用シミュレーション: 定常 / 履歴表 / マージン閾値
 # ---------------------------------------------------------------------------
 
@@ -453,6 +513,25 @@ def main() -> int:
         print("  マージン閾値: margins が 1 件も無い (want_margin が発火して"
               "いない --- trace_top2=True で _draft_chain が呼ばれていない"
               "か、rerank のバッチ行だった可能性)")
+    print()
+
+    print("=== (f) D2 判定指標 (IDEAS-2026-09-03.md Challenge 表) ===")
+    sig_a = full_history_hit3_rate(runs, k=3)
+    judge_a = "n/a"
+    if sig_a["p_hit_ge_3"] is not None:
+        judge_a = "OK (>=0.500)" if sig_a["p_hit_ge_3"] >= 0.5 else "NG (<0.500)"
+    print(f"  信号a: P(hit>=3 | 直前3ラウンド全採用) = {_fmt(sig_a['p_hit_ge_3'])}"
+          f"  (n={sig_a['n']})  判定線=0.500  {judge_a}")
+    print()
+    print("  信号b: 位置1マージン下位カバレッジでの棄却率 (判定線=0.700)")
+    for cov in margin_coverage_precision(records, position=1,
+                                          coverage_fracs=(0.1, 0.2, 0.3)):
+        judge_b = "n/a"
+        if cov["reject_rate"] is not None:
+            judge_b = "OK (>=0.700)" if cov["reject_rate"] >= 0.7 else "NG (<0.700)"
+        print(f"    coverage={cov['coverage'] * 100:4.0f}%  n={cov['n']:5d}"
+              f"  threshold_margin={_fmt(cov['threshold_margin'])}"
+              f"  reject_rate={_fmt(cov['reject_rate'])}  {judge_b}")
     print()
     return 0
 
