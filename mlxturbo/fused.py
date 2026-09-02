@@ -1069,6 +1069,58 @@ def disable_moe_verify_gather() -> None:
     _MOE_DISPATCH_VERIFY_ON = False
 
 
+def enable_fast_rope(model) -> int:
+    """decode の attention 層で QK-norm 後の rope を `mx.fast.rope` 1 dispatch
+    に畳む (``Attention._qkv`` の ``_fast_rope`` 分岐、
+    `mlxturbo/_vendor/qwen4_exp.py`)。素の経路は cos/sin の生成
+    (`RotaryEmbedding.__call__`、mx.cos/mx.sin) + `_rope_partial` x2
+    (各回 slice x2 + concatenate x2) を op のまま積む。層あたり
+    cos 1 / sin 1 / concatenate 6 / (rms_norm は変えない) が減る計算。
+
+    CPU 上の合成入力で `mx.fast.rope(dims=64, traditional=False, base=1e7)`
+    が `RotaryEmbedding` + `_rope_partial` と (テキストのみ、offset+arange(S)
+    の位置に対して) 浮動小数の丸み差だけで一致することを確認済み
+    (`docs/research/KERNEL-BRIEF-DECODE-BW.md`)。出力はビット不一致
+    (積和の順が変わる) だが、既定の丸め誤差の範囲内 --- 採否は
+    `tools/decode_ab.py --knob fast-rope` の in-model 計測で決める。
+
+    実験的な分岐なので、この関数を呼ぶだけでは何も起きない --- 環境変数
+    `MLXTURBO_FAST_ROPE=1` が立っているときだけ `_fast_rope` を立てる
+    (呼び出し側が env var を忘れても既定 off が保たれるように、ゲートを
+    関数自身の中に持たせている、`enable_moe_verify_gather` と同じ作法)。
+
+    `Attention._qkv` 側にも実行時ガードがある: バッチ経路
+    (`mlxturbo/batch.py` / `batch_spec.py`) が `Attention._positions` を
+    差し替えている間は、この属性が立っていても素の経路に落ちる (パディング・
+    dead slot で positions が offset+arange(S) の形を保証できないため)。
+
+    戻り値は適用した層数 (full_attention 層のみ。linear_attention 層は
+    `self_attn` を持たない)。
+    """
+    import os
+
+    if os.environ.get("MLXTURBO_FAST_ROPE") != "1":
+        return 0
+    n = 0
+    for layer in model.model.layers:
+        sa = getattr(layer, "self_attn", None)
+        if sa is not None and hasattr(sa, "q_norm"):
+            sa._fast_rope = True
+            n += 1
+    return n
+
+
+def disable_fast_rope(model) -> int:
+    """`enable_fast_rope` を打ち消す。戻り値は外した数。A/B で交互に測るために要る。"""
+    n = 0
+    for layer in model.model.layers:
+        sa = getattr(layer, "self_attn", None)
+        if sa is not None and getattr(sa, "_fast_rope", False):
+            sa._fast_rope = False
+            n += 1
+    return n
+
+
 __all__ = [
     "enable_gather_sort",
     "enable_gdn_blocked_kernel",
@@ -1095,4 +1147,6 @@ __all__ = [
     "enable_moe_route_nofuse",
     "enable_rms_norm_gated",
     "enable_rms_norm_gated_nofuse",
+    "enable_fast_rope",
+    "disable_fast_rope",
 ]

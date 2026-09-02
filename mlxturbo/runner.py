@@ -1260,7 +1260,7 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
     生き残るが、閾値や交差点は構成で動く。
 
     env で切り替わるもの (MLXTURBO_HC / _HC_WRITE / _WIDE / _SORT_MIN /
-    _MOE_GLU / _MOE_VERIFY / _FAST_QMM) の既定はここが唯一の出どころ。
+    _MOE_GLU / _MOE_VERIFY / _FAST_QMM / _FAST_ROPE) の既定はここが唯一の出どころ。
     """
     from . import fused
 
@@ -1383,6 +1383,15 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
             n = _ga.enable_prefill_attn(model)
             print(f"{log_prefix} prefill attention 融合カーネル有効"
                   f" (段 P1、{n} 層、MLXTURBO_PREFILL_ATTN=1)")
+
+        # QK-norm 後の rope (cos/sin 生成 + _rope_partial x2) を mx.fast.rope
+        # 1 dispatch x2 (q/k) に畳む。enable_fast_rope 自身が MLXTURBO_FAST_ROPE=1
+        # をゲートに持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
+        # バッチ経路が Attention._positions を差し替えている間は
+        # Attention._qkv 側の実行時ガードで素の経路に落ちる。
+        n = fused.enable_fast_rope(model)
+        if os.environ.get("MLXTURBO_FAST_ROPE") == "1":
+            print(f"{log_prefix} fast_rope 有効 (QK-norm 後の rope を mx.fast.rope へ、{n} 層)")
 
 
 

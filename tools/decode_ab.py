@@ -118,6 +118,19 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              しないこと。
 
              発火の確認: `mlxturbo.kernels._fire.snapshot()` の `gdn_metal`。
+
+`fast-rope`  QK-norm 後の rope (cos/sin 生成 + `_rope_partial` x2、層あたり
+             cos 1 / sin 1 / concatenate 6) を `mx.fast.rope` 1 dispatch x2
+             (q/k) に畳む (MLXTURBO_FAST_ROPE、既定 off、
+             `Attention._qkv` の `_fast_rope` 分岐)。CPU 上の合成入力では
+             offset+arange(S) の位置に対して浮動小数の丸み差だけで一致
+             することを確認済み (`docs/research/KERNEL-BRIEF-DECODE-BW.md`)。
+             出力はビット不一致 (積和の順が変わる) なので出力一致は要求
+             しない。バッチ経路 (`Attention._positions` が差し替わっている
+             間) は実行時ガードで素の経路に落ちるため、この knob は
+             batch/batch_spec 経路には効かない。
+             合格条件: **ms/token が短・長の両方で改善すること。**
+             どちらかで悪化したら既定 off のまま据え置く。
 """
 
 from __future__ import annotations
@@ -188,6 +201,32 @@ def _knob_moe_verify(ctx):
             fused.enable_moe_verify_gather()
         else:
             fused.disable_moe_verify_gather()
+
+    return apply
+
+
+def _knob_fast_rope(ctx):
+    """A = QK-norm 後の rope を mx.fast.rope 1 dispatch x2 (q/k) に畳む
+    (MLXTURBO_FAST_ROPE、既定 off) / B = 素の cos/sin 生成 + _rope_partial x2
+    (既定)。CPU 上の合成入力では offset+arange(S) の位置に対して浮動小数の
+    丸み差だけで一致することを確認済み (`docs/research/KERNEL-BRIEF-DECODE-BW.md`)。
+    出力はビット不一致 (積和の順が変わる) なので出力一致は要求しない。
+    合格条件: **ms/token が短・長の両方で改善すること。**どちらかで悪化
+    したら既定 off のまま据え置く。tok/round も併せて見る (受理率が動く
+    経路ではないはずだが、他の knob で受理率が変わって差し引き負けた前例
+    が複数あるため)。"""
+    import os
+
+    from mlxturbo import fused
+
+    os.environ["MLXTURBO_FAST_ROPE"] = "1"  # enable 側のゲートを開ける
+    eng = ctx["eng"]
+
+    def apply(variant):
+        if variant == "A":
+            fused.enable_fast_rope(eng.model)
+        else:
+            fused.disable_fast_rope(eng.model)
 
     return apply
 
@@ -935,6 +974,7 @@ KNOBS = {
     #        まとめで基準にする variant)
     "qsa-tail": (_knob_qsa_tail, ["A", "B"], True, "B"),
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
+    "fast-rope": (_knob_fast_rope, ["A", "B"], False, "B"),
     "gdn-prework": (_knob_gdn_prework, ["A", "B"], False, "B"),
     "gdn-blocked": (_knob_gdn_blocked, ["A", "B"], False, "B"),
     "gdn-metal": (_knob_gdn_metal, ["A", "B"], False, "B"),

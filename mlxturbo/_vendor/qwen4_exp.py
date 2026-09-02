@@ -186,6 +186,10 @@ def _rope_partial(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
 class RotaryEmbedding:
     def __init__(self, dim: int, base: float):
         self.dim = dim
+        # mlxturbo: kept alongside inv_freq (not read by the original code) so
+        # that `Attention._qkv`'s `_fast_rope` branch can hand the same base
+        # to `mx.fast.rope` without recomputing it from inv_freq.
+        self.base = base
         self.inv_freq = base ** (-mx.arange(0, dim, 2, dtype=mx.float32) / dim)
 
     def __call__(self, positions: mx.array):
@@ -605,9 +609,37 @@ class Attention(nn.Module):
         )
         v = vv.reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        cos, sin = rope(positions)
-        cos, sin = cos[:, None], sin[:, None]
-        q, k = _rope_partial(q, cos, sin), _rope_partial(k, cos, sin)
+        # mlxturbo: `MLXTURBO_FAST_ROPE=1` (`mlxturbo/fused.py:enable_fast_rope`)
+        # collapses `rope()` (cos/sin build) + 2x `_rope_partial` (each a
+        # slice x2 + concatenate x2) into one `mx.fast.rope` dispatch per
+        # tensor. Verified equivalent (bf16, floating-point-rounding-only
+        # diff) to `RotaryEmbedding` + `_rope_partial` for the text-only,
+        # single-position-per-token case this model always uses --
+        # `docs/research/KERNEL-BRIEF-DECODE-BW.md`. Gated to only the plain
+        # single-sequence path: `Attention._positions` unmodified guarantees
+        # positions == offset + arange(S) by construction (see its
+        # docstring); `mlxturbo/batch.py` / `batch_spec.py` monkeypatch that
+        # seam while batching (left padding, dead-slot bookkeeping), and this
+        # identity check is how we detect that without ever inspecting
+        # `positions`' actual values (would force a GPU sync every layer).
+        if (
+            getattr(self, "_fast_rope", False)
+            and B == 1
+            and type(self)._positions is _ORIG_ATTN_POSITIONS
+        ):
+            offset = cache.offset if cache is not None else 0
+            q = mx.fast.rope(
+                q, rope.dim, traditional=False, base=rope.base, scale=1.0,
+                offset=offset,
+            )
+            k = mx.fast.rope(
+                k, rope.dim, traditional=False, base=rope.base, scale=1.0,
+                offset=offset,
+            )
+        else:
+            cos, sin = rope(positions)
+            cos, sin = cos[:, None], sin[:, None]
+            q, k = _rope_partial(q, cos, sin), _rope_partial(k, cos, sin)
 
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
@@ -931,6 +963,16 @@ class Attention(nn.Module):
             )
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
+
+
+# mlxturbo: captured immediately after class definition, i.e. before anything
+# has a chance to monkeypatch `Attention._positions` (`mlxturbo/batch.py` /
+# `batch_spec.py` do this while a batched or spec-decode call is in flight).
+# `_qkv`'s `_fast_rope` branch compares against this to tell "plain
+# single-sequence path" (positions guaranteed == offset + arange(S), see
+# `_positions`'s docstring) apart from a batching override, without ever
+# reading `positions`' actual values.
+_ORIG_ATTN_POSITIONS = Attention._positions
 
 
 # ------------------------------------------------------------------- gated deltanet
