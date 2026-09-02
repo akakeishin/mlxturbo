@@ -88,8 +88,13 @@ GPU の待ち行列 (2026-09-03 03:20 時点の状態):
 - 済 (08:00): gather カーネルは **既定 on** (KLD 0.04 は top-k 反転のカスケードで、受理済みの GDN Metal の同じ物差し
   0.111 より小さい)。indexer-lean は畳んだ (+0.3%)。小さいベンチ (冷却強化後、既知を片付けた基準) は
   `bench/results/self-snapshot-turbo-small-0903b.json` (gather 前) と `...-0903c.json` (gather 後、走行中)。
-- 次: 仮説 A/B (レーン 11 の 8 段目: draft の hit@2、rerank off、厳密棄却サンプリング、group_size 128、
-  `mx.metal.start_capture`)。宿題: 長文脈の品質ゲート (課題の正答率、dense 対 カーネル)。
+- 済 (10:00): 仮説 A/B の判定 — rerank は受理率を削らず速い (維持)、draft の木は hit@2−hit@1 = 17 pt だが
+  verify 幅 +1 の費用に食われて畳む、group_size 128 は forward -3% で焼き直しに見合わず畳む、
+  `mx.metal.start_capture` は 68 GB で使えない、indexer-lean は ±0.3% で畳む。
+- 走行中 / 作成中: HC の split-K カーネル (最後の試み)、`decode_ab --temp` (厳密棄却サンプリングの上限測定用)、
+  `tools/longctx_quality.py` (長文脈の品質ゲート、recall / quote の正答率、dense 対 カーネル)。
+- その後: 長文脈の品質ゲートを 17k / 50k で走らせて gather カーネルの採用を裏付ける → temp 0.7 の tok/round →
+  mlx-serve 最新版でフルベンチ → 27B / 35B-A3B。
 - その後: 小さいベンチ (mlxturbo だけ、冷、新しい冷却条件の基準) → 仮説 A/B (draft の hit@2、rerank off、
   厳密棄却サンプリング、indexer の op 整理、group_size 128) → mlx-serve 最新版でフルベンチ → 27B / 35B-A3B。
 
