@@ -1225,3 +1225,23 @@ snapshot の参照が無ければ **KV の更新は in-place** (増分・時間�
 受け入れ幅 (+0.0005) の 30〜80 倍。合成の誤差 7e-3 では説明できない大きさで、**可視集合の解釈 (末尾の未確定
 ブロックの扱い) か GQA の対応が dense 経路と違う疑い**。速度 (-21% at 50k) は正しさが付くまで採用しない。
 `MLXTURBO_PREFILL_ATTN` は既定 off のまま。原因調査中。
+
+## prefill 短文脈の内訳、8k (2026-09-03 03:10、`tools/prefill_anatomy.py --ctx 8000`、完全チャンク 3 本、部品和 ≈ 壁時計 ±3%)
+
+| 部品 (1 チャンク 2048 tok) | チャンク 0 (kv 2k) | チャンク 2 (kv 6k) | 効率 (FLOP 下限比) |
+|---|---|---|---|
+| MoE 48 層 | 1484 ms | 1649 | 59〜66% (gate/up/down の qmm が各 440 ms、水増し 1.41) |
+| GDN 36 層 | 924 | 961 | 80〜83% |
+| attention 12 層 (indexer 込み) | 353 | 629 | 78% (indexer は 7〜29 ms) |
+| HC 97 回 | 378 | 390 | 60〜62% (素の op) |
+| **PLE 1 層 (n-gram 行取得込み)** | **167** | **167** | **7%** |
+| 壁時計 | 3416 | 3810 | |
+
+読み方 (短文脈の prefill が遅い理由):
+- MoE 43% + GDN 27% が大半で、どちらも FLOP 効率 60〜80% で計算律速。相手も同じ op なので差の主因ではない。
+- **PLE の n-gram 行取得 167 ms/チャンク (4.4%) は効率 7%** で、pread の I/O 待ち。次チャンクの行を GPU の
+  実行中に先読みすれば丸ごと隠せる (`MLXTURBO_NGRAM_PREFETCH` は decode で却下されたが prefill は未測)。
+  A/B: `decode_ab --knob ngram-prefetch --only long --ctx 8000 --tokens 8`。
+- HC 97 回 = 380 ms (11%) は素の op で 60%。prefill 幅の融合は -0.9% で却下済み。
+- attention は kv=2k で 353 ms (10%)、うち射影が大半 (S=2048 の qkv/o_proj)。
+- 4k の TTFT 7.2 s = 2 チャンク弱 × 3.5 s + 固定費 (prime 0.25 s、固定 300 ms の TTFT 経路)。
