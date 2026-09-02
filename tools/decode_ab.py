@@ -607,6 +607,41 @@ def _knob_hc_kernel(ctx):
 
 
 
+def _knob_hc_compiled(ctx):
+    """A = hyper-connection の読み側を mx.compile で 1 グラフに畳む
+    (`fused.enable_hyper_connection`、`MLXTURBO_HC=compiled` 相当) / B = 素の
+    実装 (既定は `hc-kernel` の融合 Metal カーネルだが、この knob の B は
+    `disable_hyper_connection` と `disable_hyper_connection_kernel` を両方
+    呼んで `GatedResidual.__call__` を素の実装に戻した状態)。
+
+    `hc-kernel` (Metal カーネル、sigmoid が bf16 1 ulp でビット一致しない) と
+    違い、compiled 版は重みを引数で渡す mx.compile の記録なので**素の実装と
+    ビット同一**(`enable_hyper_connection` の docstring)。対照 (出力一致) が
+    そのまま効く。
+
+    **decode 専用ではない。**`patched` は M (行数) を一切見ないので prefill
+    幅の呼び出しにも同じグラフがかかる。つまりこの knob は prefill にも
+    効くので **`--prefill-once` は使えない** (`DECODE_ONLY_KNOBS` には入れ
+    ない -- `hc-kernel` と同じ理由)。
+
+    合格条件: **ms/token が短・長の両方で改善すること。**出力はビット同一
+    なので一致することを確かめる (割れたら測定は無効)。
+
+    `enable_hyper_connection` は `_ORIG_HC is not None` なら何もしないので、
+    切替のたびに両方の disable を先に呼んでから A なら enable する
+    (`hc-kernel` の `apply` と同じ書き方)。
+    """
+    from mlxturbo import fused
+
+    def apply(variant):
+        fused.disable_hyper_connection()
+        fused.disable_hyper_connection_kernel()
+        if variant == "A":
+            fused.enable_hyper_connection()
+
+    return apply
+
+
 def _knob_pipeline(ctx):
     """A = 楽観パイプライン (次ラウンドの draft を先に組む) / B = 無効 (既定)。
 
@@ -1200,6 +1235,7 @@ KNOBS = {
     "moe-route": (_knob_moe_route, ["A", "C", "B"], False, "B"),
     "hc-prefill": (_knob_hc_prefill, ["A", "C", "B"], False, "C"),
     "hc-kernel": (_knob_hc_kernel, ["A", "B"], False, "B"),
+    "hc-compiled": (_knob_hc_compiled, ["A", "B"], True, "B"),
     "pipeline": (_knob_pipeline, ["A", "B"], False, "B"),
     "fast-qmm": (_knob_fast_qmm, ["A", "B"], False, "B"),
     "null": (_knob_null, ["A", "B"], True, "B"),
