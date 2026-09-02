@@ -686,6 +686,144 @@ def _knob_prefill_pipeline(ctx):
     return apply
 
 
+def _knob_ngram_layout(ctx):
+    """n-gram サイドカーのレイアウト。A = interleaved (`StreamNGram`、ディスク
+    参照) / B = separate (`RamNGram`、RAM 常駐)。
+
+    本番 (HTTP サーバー、50k を通す構成) は interleaved。`StreamNGram.__call__`
+    は先頭で `np.array(gid.reshape(-1))` が GPU→CPU 同期を起こし、行ごとに
+    `os.pread` を ThreadPoolExecutor に投げる。`RamNGram` は連結テーブルを
+    RAM に置いて `mx.take` 1 回で読む (GPU 上の gather)。decode の差は未測
+    (`docs/BACKLOG.md` の「n-gram サイドカーのレイアウト選択が 50k を殺して
+    いた」)。
+
+    A 側は `--ngram` (layout=interleaved)、B 側は `--ngram-b`
+    (既定 `~/models/ddalcu-ngram-sep`、layout=separate)。どちらも同じ 4bit
+    行を dequantize するだけなので、manifest の bits/group_size が一致して
+    いれば**値はビット一致するはず** (`control_identical=True` で短文脈の
+    出力一致を検査する)。一致しなければ setup 時点でヘッダに警告を出す。
+
+    切り替えは `mlxturbo.ngram_stream.install(model, path)` を呼んで PLE 層の
+    `ngram_embedding` を差し替える (install は再呼び出し可能: 単に
+    `emb.ngram_embedding = ...` を代入するだけ)。install/install_ram は内部で
+    `StreamNGram(path)`/`RamNGram(path)` を毎回素で作り直すので、そのまま
+    呼ぶと B に切り替えるたびに 32GB を読み直してしまう。**両方のインスタンス
+    を控えて使い回す**ために、コンストラクタだけをパスごとに使い回す
+    薄いサブクラスに差し替える (install 自体の中身・print・戻り値は変えない)。
+    B への初回切り替えだけ 32GB の読み込みで 20 秒級、以降 (A に戻すときも
+    含め) は代入だけなので即時。
+
+    合格条件: **ms/token の差が A/B で 3% 以上なら、interleaved の同期
+    (`StreamNGram.__call__` の `np.array(gid)`) を疑う。tok/round は同一の
+    はず** (どちらも同じ行を dequantize するだけで、受理率には関与しない)。
+    """
+    import json
+    from pathlib import Path
+
+    from mlxturbo import ngram_stream as NS
+
+    args = ctx["args"]
+    model = ctx["eng"].model
+    if not args.ngram:
+        raise ValueError("ngram-layout には --ngram (A 側、layout=interleaved) が要る")
+    path_a = Path(os.path.expanduser(args.ngram))
+    path_b = Path(os.path.expanduser(args.ngram_b))
+
+    man_a = json.loads((path_a / "manifest.json").read_text())
+    man_b = json.loads((path_b / "manifest.json").read_text())
+    for key in ("bits", "group_size"):
+        if man_a.get(key) != man_b.get(key):
+            print(f"[ngram-layout] 警告: manifest の {key} が A/B で異なる"
+                  f" (A={man_a.get(key)!r} B={man_b.get(key)!r})。"
+                  " 出力一致の対照は成立しない可能性がある")
+
+    # パスごとに 1 インスタンスだけ作って使い回す。__new__ でキャッシュを
+    # 引き、__init__ は初回だけ本体を走らせる (2 回目以降は何もしない)。
+    # サブクラスなので isinstance(x, StreamNGram/RamNGram) は変わらず通る。
+    cache: dict[Path, object] = {}
+
+    class _CachedStream(NS.StreamNGram):
+        def __new__(cls, sidecar, *a, **kw):
+            hit = cache.get(Path(sidecar))
+            return hit if hit is not None else super().__new__(cls)
+
+        def __init__(self, sidecar, *a, **kw):
+            p = Path(sidecar)
+            if p in cache:
+                return
+            super().__init__(sidecar, *a, **kw)
+            cache[p] = self
+
+    class _CachedRam(NS.RamNGram):
+        def __new__(cls, sidecar, *a, **kw):
+            hit = cache.get(Path(sidecar))
+            return hit if hit is not None else super().__new__(cls)
+
+        def __init__(self, sidecar, *a, **kw):
+            p = Path(sidecar)
+            if p in cache:
+                return
+            super().__init__(sidecar, *a, **kw)  # B の初回だけ 32GB を読む
+            cache[p] = self
+
+    NS.StreamNGram = _CachedStream
+    NS.RamNGram = _CachedRam
+
+    def apply(variant):
+        NS.install(model, path_a if variant == "A" else path_b)
+
+    return apply
+
+
+def _knob_ngram_prefetch(ctx):
+    """n-gram サイドカーの先読み (`StreamNGram.prefetch`)。A = 有効 (既定) /
+    B = 無効。
+
+    prefill はプロンプト全体の n-gram 行 id が最初から全部わかっている。
+    GPU が chunk 0 を計算している間に CPU 側でディスクから先読みしておけば
+    (`mlxturbo/spec_flash.py` の `_prefetch_ngram_rows`、`generate_stream` の
+    prefill ループ直前で 1 回呼ぶ)、後続チャンクの `StreamNGram.__call__` が
+    キャッシュヒットで待たずに返る。温キャッシュの pread 自体も 17k で
+    約 2.5s、50k で約 7s が GPU が止まったまま CPU で消えている実測がある
+    (行 1 つ 7.6us、prefill 1 チャンク 32768 行で約 250ms)。
+
+    環境変数 (`MLXTURBO_NGRAM_PREFETCH`) は使わない。あちらは `StreamNGram`
+    インスタンスの初期値を決めるだけで、1 プロセス内で A/B を交互に取る
+    このハーネスからは (インストール後に) 直接インスタンスの
+    `prefetch_enabled` を切り替えるほうが確実。**`--ngram` で install 済みの
+    StreamNGram を直接触るので、B 側でもプロセスは張り直さない。**
+
+    prefetch はキャッシュを温めるだけで `__call__` が返す値は変えない
+    (ヒットでもミスでも同じ行を返す) ので出力は一致するはず
+    (`control_identical=True`)。判定は **prefill_s** (prefill-group knob と
+    同じ扱い)。`--prefill-once` とは併用できない (prefill 自体を先読みごと
+    畳んでしまうと A/B の差が消える) ので `DECODE_ONLY_KNOBS` には入れない。
+    """
+    model = ctx["eng"].model
+    if not ctx["args"].ngram:
+        raise ValueError("ngram-prefetch には --ngram (StreamNGram の install) が要る")
+    streams = []
+    for layer in model.model.layers:
+        ple = getattr(layer, "ple", None)
+        if ple is None:
+            continue
+        stream = ple.ple_embedding.ngram_embedding
+        if not hasattr(stream, "prefetch_enabled"):
+            raise ValueError(
+                "ngram_embedding が StreamNGram ではない (--ngram の manifest が"
+                " layout=separate だと RamNGram になり prefetch を持たない)"
+            )
+        streams.append(stream)
+    if not streams:
+        raise ValueError("PLE 層が見つからない")
+
+    def apply(variant):
+        for s in streams:
+            s.prefetch_enabled = variant == "A"
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
@@ -713,6 +851,10 @@ KNOBS = {
     "prefill-attn": (_knob_prefill_attn, ["A", "B"], False, "B"),
     "wide": (_knob_wide, ["A", "B"], False, "B"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
+    # A = interleaved (本番既定) を基準に、B = separate (RAM 常駐) と比べる
+    "ngram-layout": (_knob_ngram_layout, ["A", "B"], True, "A"),
+    # A = 先読み有効 (既定) / B = 無効。判定は prefill_s
+    "ngram-prefetch": (_knob_ngram_prefetch, ["A", "B"], True, "A"),
 }
 
 
@@ -815,6 +957,9 @@ def main() -> int:
     ap.add_argument("--knob", required=True, choices=sorted(KNOBS))
     ap.add_argument("--model", required=True)
     ap.add_argument("--ngram", default=None)
+    ap.add_argument("--ngram-b", default="~/models/ddalcu-ngram-sep",
+                    help="ngram-layout knob の B 側 (layout=separate、RAM 常駐)。"
+                         "A 側は --ngram (layout=interleaved) を使う")
     ap.add_argument("--mtp", default=None,
                     help="既定は --model の中の mtp.safetensors")
     ap.add_argument("--mtp-bits", type=int, default=4)
@@ -890,7 +1035,7 @@ def main() -> int:
         variants = [v.strip() for v in args.variants.split(",")]
         if baseline not in variants:
             baseline = variants[0]
-    set_variant = setup({"eng": eng})
+    set_variant = setup({"eng": eng, "args": args})
     order = variants + variants[::-1]
 
     print(f"knob={args.knob}  判定基準はモジュール docstring のとおり"
@@ -930,6 +1075,11 @@ def main() -> int:
         # fast_qmm は検証フォワードの密 qmm だけを差し替える。prefill は
         # fast_qmm 自身の窓判定で素通りする (M_MIN=3..8 の窓)。
         "fast-qmm",
+        # ngram-layout は PLE の n-gram 参照バックエンドを差し替えるだけ。
+        # prefill 幅でも呼ばれるが、返す値は manifest が一致していればビット
+        # 一致 (対照が効く) なので prefill_s は動かない。ステップ数に比例する
+        # decode の呼び出し回数のところで初めて差が出る。
+        "ngram-layout",
     }
     if args.prefill_once and args.knob not in DECODE_ONLY_KNOBS:
         print(f"knob={args.knob} は prefill に影響しうるので --prefill-once は"

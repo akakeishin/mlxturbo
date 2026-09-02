@@ -28,22 +28,28 @@ def text_pool() -> str:
     return "\n\n".join(f.read_text(errors="ignore") for f in files if f.exists())
 
 
-def long_prompts(tok, ctx: int, questions: list[str]) -> list[str]:
+def long_prompts(
+    tok, ctx: int, questions: list[str], offset_tokens: int = 0
+) -> list[str]:
     """互いに重ならない窓を切って、末尾に質問を付けたプロンプトを返す。
+
+    `offset_tokens` を足すと、池の先頭からその分だけずらした位置から窓を
+    切り出す (呼び出しをまたいで重ならない窓を作るのに使う)。
 
     足りなければ ValueError。**足りないまま繰り返しで埋めない** (受理率が
     嘘になる)。
     """
     ids = tok.encode(text_pool())
     win = max(ctx - 200, 16)  # 質問文とテンプレートのぶんを空ける
-    need = win * len(questions)
+    need = offset_tokens + win * len(questions)
     if need > len(ids):
         raise ValueError(
-            f"素材が足りない (必要 {need} tok, 手元 {len(ids)} tok)。"
-            "窓を減らすか ctx を下げること"
+            f"素材が足りない (必要 {need} tok [offset {offset_tokens} 込み], "
+            f"手元 {len(ids)} tok)。窓を減らすか ctx を下げること"
         )
     out = []
     for i, q in enumerate(questions):
-        body = tok.decode(ids[i * win : (i + 1) * win])
+        lo = offset_tokens + i * win
+        body = tok.decode(ids[lo : lo + win])
         out.append(f"{body}\n\n---\n\n{q}")
     return out

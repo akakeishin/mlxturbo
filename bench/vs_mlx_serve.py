@@ -99,7 +99,8 @@ def model_id(port: int) -> str:
     return items[0]["id"]
 
 
-def stream_once(port: int, messages: list, n_tokens: int, model: str = "x"):
+def stream_once(port: int, messages: list, n_tokens: int, model: str = "x",
+                 extra_body: dict | None = None):
     """SSE で 1 本流し、(TTFT 秒, decode 秒, チャンク数, 本文) を返す。
 
     本文を返すのは**追記ターン (warm TTFT) を作るため**。実クライアントは
@@ -108,14 +109,21 @@ def stream_once(port: int, messages: list, n_tokens: int, model: str = "x"):
     うちは checkpoint 復帰と BPE 末尾分割がここに乗っている
     (追記ターン 16k で 6.14s -> 1.1s の修正)。**冷えた TTFT だけ測ると、
     その仕事が 1 ミリも見えない。**
+
+    `extra_body` を渡すとリクエスト本体にマージする (例: `reasoning_effort`
+    で thinking の on/off を揃える)。両サーバーとも OpenAI 標準の
+    `reasoning_effort` を読む ("none" で off、"medium" 等で on)。
     """
-    body = json.dumps({
+    payload = {
         "model": model,
         "messages": messages,
         "max_tokens": n_tokens,
         "temperature": 0,
         "stream": True,
-    }).encode()
+    }
+    if extra_body:
+        payload.update(extra_body)
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=body, headers={"Content-Type": "application/json"})
@@ -176,13 +184,21 @@ def install_term_handler() -> None:
 
 
 class Server:
-    def __init__(self, name: str, argv: list[str], port: int):
+    def __init__(self, name: str, argv: list[str], port: int,
+                 log_path: str | None = None):
         self.name, self.argv, self.port = name, argv, port
+        self.log_path = log_path
         self.proc = None
+        self._logf = None
 
     def __enter__(self):
+        if self.log_path:
+            self._logf = open(self.log_path, "ab")
+            out = err = self._logf
+        else:
+            out = err = subprocess.DEVNULL
         self.proc = subprocess.Popen(
-            self.argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            self.argv, stdout=out, stderr=err,
             start_new_session=True)
         if not wait_ready(self.port):
             self.__exit__(None, None, None)
@@ -196,6 +212,8 @@ class Server:
                 self.proc.wait(timeout=60)
             except subprocess.TimeoutExpired:
                 os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+        if self._logf:
+            self._logf.close()
         time.sleep(5)  # メモリが返るのを待つ
         return False
 

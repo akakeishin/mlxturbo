@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import statistics
 import sys
 import time
@@ -56,31 +57,74 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=2,
                     help="文脈ごとの繰り返し (中央値を取る)")
     ap.add_argument("--out", default="bench/results/self-snapshot.json")
+    ap.add_argument("--warm-long", type=int, default=4000,
+                    help="温め 2 段目 (専門家重みと n-gram 行のページイン) の"
+                         " 窓トークン数。0 で無効")
+    ap.add_argument("--server-log", default=None,
+                    help="指定するとサーバーの stdout/stderr をこのファイルに追記する"
+                         " (既定は捨てる)")
+    ap.add_argument("--serve-log-level", default="debug",
+                    help="mlx-serve の --log-level に渡す値")
+    ap.add_argument("--serve-extra", default=None,
+                    help="mlx-serve の argv 末尾に足す文字列 (shlex.split)")
+    ap.add_argument("--turbo-extra", default=None,
+                    help="mlxturbo の argv 末尾に足す文字列 (shlex.split)")
+    ap.add_argument("--thinking", choices=("off", "on", "default"), default="off",
+                    help="reasoning_effort を揃えて thinking の on/off を比較可能にする。"
+                         " mlx-serve は qwen4_exp で thinking を既定 off、mlxturbo は"
+                         " テンプレート既定で on なので、揃えないと比較にならない。"
+                         " off→reasoning_effort=none、on→medium、default→送らない"
+                         " (各サーバーの既定のまま)")
     args = ap.parse_args()
+
+    thinking_extra = {
+        "off": {"reasoning_effort": "none"},
+        "on": {"reasoning_effort": "medium"},
+        "default": None,
+    }[args.thinking]
 
     from transformers import AutoTokenizer
     from _bench_text import long_prompts
 
+    t_start = time.time()
+
+    def log(msg: str) -> None:
+        print(f"[{time.strftime('%H:%M:%S')}] (+{time.time() - t_start:6.1f}s) {msg}",
+              flush=True)
+
     tok = AutoTokenizer.from_pretrained(os.path.expanduser(args.model))
     ctxs = [int(c) for c in args.ctxs.split(",")]
-    # **文脈ごとに、かつ繰り返しごとに別のプロンプトを使う。**同じ本文を
+    # **文脈・繰り返しの全組で、互いに重ならない窓を切る。**同じ本文を
     # 2 回送ると 2 回目が接頭辞キャッシュに当たり、「冷 TTFT」が冷えた 1 回と
     # キャッシュ当たり 1 回の平均になる。**2026-09-02 に実際にそれをやった**
-    # (17k で 31.7s のはずが 16.89s = (31.7+2)/2 と出た)。
-    # `long_prompts` は問いごとに違う窓を切るので、問いを変えれば本文も変わる。
+    # (17k で 31.7s のはずが 16.89s = (31.7+2)/2 と出た)。文脈をまたいでも
+    # 池の先頭から切ると接頭辞関係になるので、累積 offset を持って
+    # 1 本切るごとに窓幅ぶん進める。
     prompts: dict[int, list[str]] = {}
+    prompt_meta: dict[int, list[dict]] = {}
+    offset = 0
     for i, c in enumerate(ctxs):
         if c == 0:
             # 短文脈は本文が固定なので、末尾に通し番号を足して別物にする
             prompts[c] = [f"{SHORT} (#{r})" for r in range(args.reps)]
+            prompt_meta[c] = [dict(offset=None, tokens=len(tok.encode(prompts[c][r])))
+                              for r in range(args.reps)]
         else:
             qs = [QUESTIONS[(i * args.reps + r) % len(QUESTIONS)]
                   for r in range(args.reps)]
-            prompts[c] = [long_prompts(tok, c, [q])[0] for q in qs]
-            if len({p[:200] for p in prompts[c]}) < args.reps:
-                print(f"警告: 文脈 {c} で {args.reps} 本の別プロンプトを作れなかった"
-                      f" (問いが {len(QUESTIONS)} 本しかない)。--reps を下げること",
-                      flush=True)
+            win = max(c - 200, 16)
+            base = offset
+            prompts[c] = long_prompts(tok, c, qs, offset_tokens=base)
+            prompt_meta[c] = [dict(offset=base + r * win,
+                                   tokens=len(tok.encode(prompts[c][r])))
+                              for r in range(args.reps)]
+            offset = base + win * args.reps
+
+    # 温め 2 段目: 全測定窓の後ろ (未使用領域) から窓を切る
+    warm_long_prompt = None
+    if args.warm_long > 0:
+        warm_long_prompt = long_prompts(
+            tok, args.warm_long + 200, ["(warmup)"], offset_tokens=offset)[0]
 
     if args.serve_bin:
         if not args.serve_model:
@@ -89,7 +133,10 @@ def main() -> int:
         label = "mlx-serve"
         argv = [os.path.expanduser(args.serve_bin), "--serve",
                 "--model", os.path.expanduser(args.serve_model),
-                "--host", "127.0.0.1", "--port", str(args.port), "--mtp"]
+                "--host", "127.0.0.1", "--port", str(args.port), "--mtp",
+                "--log-level", args.serve_log_level]
+        if args.serve_extra:
+            argv += shlex.split(args.serve_extra)
     else:
         label = "mlxturbo"
         argv = [sys.executable, "-m", "mlxturbo.server",
@@ -99,32 +146,52 @@ def main() -> int:
             argv += ["--ngram", os.path.expanduser(args.ngram)]
         if args.mtp:
             argv += ["--mtp", os.path.expanduser(args.mtp)]
+        if args.turbo_extra:
+            argv += shlex.split(args.turbo_extra)
 
     rows = []
+    print(f"[{label}] thinking={args.thinking} extra_body={thinking_extra}")
     print(f"[{label}] 生成 {args.tokens} トークン、文脈 {ctxs}、各 {args.reps} 回の中央値\n")
-    with Server(label, argv, args.port):
+    log(f"{label} 起動開始")
+    with Server(label, argv, args.port, log_path=args.server_log):
+        log(f"{label} 起動完了")
         mid = model_id(args.port)
-        # 温め: カーネルの初回コンパイルを済ませる。**測定と別のプロンプトで。**
-        stream_once(args.port, [{"role": "user", "content": SHORT}], 8, mid)
+        # 温め 1 段目: カーネルの初回コンパイルを済ませる。**測定と別のプロンプトで。**
+        stream_once(args.port, [{"role": "user", "content": SHORT}], 8, mid,
+                    extra_body=thinking_extra)
+        log("温め 1 (短) 完了")
+        # 温め 2 段目: 専門家重みと n-gram 行のページイン。**測定に使わない窓で。**
+        if warm_long_prompt is not None:
+            stream_once(args.port, [{"role": "user", "content": warm_long_prompt}], 8, mid,
+                        extra_body=thinking_extra)
+            log(f"温め 2 (長 {args.warm_long} tok) 完了")
         for c in ctxs:
             colds, warms, decs, ntok = [], [], [], []
             for r in range(args.reps):
                 msgs = [{"role": "user", "content": prompts[c][r]}]
-                t_cold, dec, n, reply = stream_once(args.port, msgs, args.tokens, mid)
+                t_cold, dec, n, reply = stream_once(args.port, msgs, args.tokens, mid,
+                                                     extra_body=thinking_extra)
                 # 追記ターン: 実クライアントは履歴をまるごと送り直す
                 msgs2 = msgs + [{"role": "assistant", "content": reply},
                                 {"role": "user", "content": "続けて。"}]
-                t_warm, _, _, _ = stream_once(args.port, msgs2, 8, mid)
+                t_warm, _, _, _ = stream_once(args.port, msgs2, 8, mid,
+                                               extra_body=thinking_extra)
                 colds.append(t_cold)
                 warms.append(t_warm)
                 decs.append((n - 1) / dec if dec > 0 and n > 1 else 0.0)
                 ntok.append(n)
+                # 両エンジンが同種のテキストを出しているか後で見るための痕跡
+                prompt_meta[c][r]["reply_head"] = reply[:160]
+                prompt_meta[c][r]["reply_chars"] = len(reply)
+                log(f"文脈 {c} rep {r} 完了 (冷 {t_cold:.2f}s 温 {t_warm:.2f}s)")
             row = dict(ctx=c, cold_ttft=statistics.median(colds),
                        warm_ttft=statistics.median(warms),
                        decode_tps=statistics.median(decs),
-                       n_tokens=statistics.median(ntok))
+                       n_tokens=statistics.median(ntok),
+                       colds=colds, warms=warms, decs=decs, ntoks=ntok,
+                       prompts=prompt_meta[c])
             rows.append(row)
-            pt = len(tok.encode(prompts[c][0]))
+            pt = prompt_meta[c][0]["tokens"]
             print(f"  文脈 {c:>6} ({pt:>6} tok)  冷 TTFT {row['cold_ttft']:7.2f}s  "
                   f"温 TTFT {row['warm_ttft']:6.2f}s  "
                   f"decode {row['decode_tps']:6.1f} tok/s  "
