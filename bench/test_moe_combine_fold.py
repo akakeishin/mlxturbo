@@ -1,27 +1,44 @@
-"""SparseMoeBlock._combine_fold (mlxturbo/_vendor/qwen4_exp.py) の数値検査。
+"""SparseMoeBlock の MoE combine-fold (mlxturbo/_vendor/qwen4_exp.py の
+`_moe_combine_fold` / `_combine_fold_min_s`) の数値検査。
 
-MLXTURBO_MOE_COMBINE_FOLD=1 で有効になる経路 (ルータ重み w を down_proj の
-入力 (SwiGLU 出力、(rows, moe_intermediate_size)) に先掛けしてから down_proj
-を通し、top_k 軸の和は down_proj の出力側 (rows, hidden_size) で取る) が、
-素の経路 `(switch_mlp(x, idx) * w[..., None]).sum(-2)` (switch_mlp の出力を
-先に実体化してから w を掛けて和を取る) と数式上は同じ値になることを確認
-する。down_proj は bias 無しの線形写像なので、w を掛ける位置を前後に動かし
-ても値は変わらないはず -- 実際にずれるとすれば量子化 4bit + bf16 活性の
-積和順が変わることによる丸めだけ。
+MLXTURBO_MOE_COMBINE_FOLD (既定 on、`=0` で無効化) で有効になる経路
+(ルータ重み w を down_proj の入力 (SwiGLU 出力、(rows, moe_intermediate_size))
+に先掛けしてから down_proj を通し、top_k 軸の和は down_proj の出力側
+(rows, hidden_size) で取る) が、素の経路
+`(switch_mlp(x, idx) * w[..., None]).sum(-2)` (switch_mlp の出力を先に
+実体化してから w を掛けて和を取る) と数式上は同じ値になることを確認する。
+down_proj は bias 無しの線形写像なので、w を掛ける位置を前後に動かしても
+値は変わらないはず -- 実際にずれるとすれば量子化 4bit + bf16 活性の積和順
+が変わることによる丸めだけ。
+
+行数ゲート: 初回の in-model A/B (2026-09-03、行数ゲート無し) で prefill は
+勝った (8k -2.2%/17k -2.5%) が decode は負けた (8k +1.3%/17k +0.6%/短文脈
+ms/round +1.4%、tok/round -4.0%)。そこで行数 (B×S) が
+`MLXTURBO_MOE_COMBINE_FOLD_MIN_S` (既定 64、`enable_moe_combine_fold` が
+起動時に 1 回だけ読んで `_combine_fold_min_s` に積む) 未満のときは必ず
+素の経路に落ちる (decode/verify 幅 S<=8 はここに入る)。この検査は
+「閾値未満はビット一致 (素の経路そのもの)」と「閾値以上は RMS 相対誤差
+<= 1e-2」の両方を、`_combine_fold_min_s` を直接差し替えて確認する
+(env var は経由しない -- `enable_moe_combine_fold`/`disable_moe_combine_fold`
+はモデル全体を組んでからでないと呼べないので、単体の SparseMoeBlock に
+対してはそれらが属性へ積むのと同じ値を直接セットする)。
 
 `tools/vendor_fingerprint.py` と同じ作り方 (合成した小さい Flash-Next 形状、
 CPU、乱数固定、乱数分布は N(0, 0.05^2)) で SparseMoeBlock を単体で作る。
 switch_mlp の 3 射影 (gate/up/down) だけ量子化して本番の量子化+bf16 の丸めを
 再現し、router/shared_expert は密 bf16 のまま (本番の量子化構成と同じ切り分
-け)。並べ替え閾値 `MLXTURBO_SORT_MIN` をまたぐ複数のトークン数
-(未ソート経路・ソート経路の両方、decode 1 トークン相当・verify 幅相当・
-prefill 相当) を全部検査する。
+け)。行数ゲートの境界 (閾値未満/以上) と、fold 内部の並べ替え閾値
+`MLXTURBO_SORT_MIN` の境界 (未ソート経路・ソート経路の両方、decode 1
+トークン相当・verify 幅相当・prefill 相当、batch>1 の (B,S,top_k) 形状)
+を全部検査する。
 
-判定は RMS 相対誤差 <= 1e-2 (`_rel_err` 参照)。要素ごとの
+閾値以上の判定は RMS 相対誤差 <= 1e-2 (`_rel_err` 参照)。要素ごとの
 |got-ref|/|ref| ではなく RMS で正規化するのは、top_k=2 の専門家出力が
 router 重みでほぼ 0.5/0.5 に混ぜられて符号違いでほぼ相殺する要素がある
 ため (分母がほぼ 0 になり、要素ごとの相対誤差だと発散する。実装のバグでは
 なく `mlxturbo/kernels/moe_verify_gather.py` の `_max_rel_err` と同じ理由)。
+閾値未満の判定はビット一致 (同じコード経路を通るだけなので diff は厳密に
+0 になるはず)。
 
 実行: uv run python bench/test_moe_combine_fold.py
 """
@@ -111,55 +128,83 @@ def _rel_err(got: mx.array, ref: mx.array) -> float:
     return math.sqrt(float(mx.mean(d * d))) / scale
 
 
-def _check(seq_len: int, sort_min: int, batch: int = 1, seed: int = 0) -> bool:
+def _check(seq_len: int, min_s: int, sort_min: int, batch: int = 1, seed: int = 0) -> bool:
+    """min_s: `_combine_fold_min_s` 相当 (行数 B×S と比較する行数ゲート)。
+    sort_min: `_MOE_COMBINE_SORT_MIN` 相当 (fold が発火したときだけ意味を
+    持つ、fold 内部の並べ替え閾値)。"""
     mlp = _build_block(seed=seed)
     x = (mx.random.normal((batch, seq_len, HIDDEN)) * 0.1).astype(mx.bfloat16)
+    rows = batch * seq_len
+    do_fold = rows >= min_s
 
     # _moe_combine_fold は実行時に一度だけ読んだモジュール定数
     # _MOE_COMBINE_SORT_MIN を見る (MLXTURBO_SORT_MIN の値そのもの)。
     # ここでは env var を経由せず、その定数を直接この検査の間だけ差し替えて
-    # 未ソート/ソートの両方の分岐を確実に踏む。
+    # 未ソート/ソートの両方の分岐を確実に踏む (fold が発火する場合のみ意味
+    # を持つ、行数ゲートで素の経路に落ちるときは参照しない)。
     old_sort_min = Q._MOE_COMBINE_SORT_MIN
     Q._MOE_COMBINE_SORT_MIN = sort_min
     try:
-        mlp._combine_fold = False
+        # 参照値は行数ゲートを完全に外した (素の経路しか使わない) 状態。
+        mlp._combine_fold_min_s = None
         ref = mlp(x)
-        mlp._combine_fold = True
+        # enable_moe_combine_fold が積むのと同じ形 (閾値そのものを属性に
+        # 持つ) で行数ゲートを掛ける。
+        mlp._combine_fold_min_s = min_s
         got = mlp(x)
         mx.eval(ref, got)
     finally:
         Q._MOE_COMBINE_SORT_MIN = old_sort_min
 
-    err = _rel_err(got, ref)
-    do_sort = batch * seq_len * TOP_K >= sort_min
-    ok = err <= TOL
-    print(
-        f"batch={batch} seq_len={seq_len:>3} top_k={TOP_K} sort_min={sort_min:>2} "
-        f"do_sort={do_sort!s:<5} rel_err(rms)={err:.3e}  {'OK' if ok else 'FAILED'}"
-    )
+    if do_fold:
+        err = _rel_err(got, ref)
+        ok = err <= TOL
+        print(
+            f"batch={batch} seq_len={seq_len:>3} rows={rows:>3} min_s={min_s:>3} "
+            f"sort_min={sort_min:>2} do_fold=True  rel_err(rms)={err:.3e}"
+            f"  {'OK' if ok else 'FAILED'}"
+        )
+    else:
+        # 閾値未満は SparseMoeBlock.__call__ が use_fold=False の分岐 (素の
+        # 経路そのもの) を通るはずなので、参照値とビット一致する。
+        diff = float(mx.max(mx.abs(got.astype(mx.float32) - ref.astype(mx.float32))))
+        ok = diff == 0.0
+        print(
+            f"batch={batch} seq_len={seq_len:>3} rows={rows:>3} min_s={min_s:>3} "
+            f"sort_min={sort_min:>2} do_fold=False bit_exact_diff={diff:.3e}"
+            f"  {'OK' if ok else 'FAILED'}"
+        )
     return ok
 
 
 def main() -> int:
     ok = True
-    # decode 1 トークン (S=1): idx.size=2 < 16、既定 sort_min のまま未ソート
-    ok &= _check(seq_len=1, sort_min=16)
-    # decode の小さいバッチ: idx.size=8 < 16、未ソート
-    ok &= _check(seq_len=4, sort_min=16)
-    # 検証 (verify) 幅相当: idx.size=6、sort_min を下げてソート経路を強制
-    # (本番の既定 MLXTURBO_SORT_MIN=16 が verify 幅 T=2..4 を拾うのと同じ形)
-    ok &= _check(seq_len=3, sort_min=4)
-    # prefill 相当の大きいバッチ: idx.size=40 >= 16、ソート経路
-    ok &= _check(seq_len=20, sort_min=16)
-    # 境界ちょうど (idx.size == sort_min): ソート経路に入る側
-    ok &= _check(seq_len=8, sort_min=16)
-    # バッチ検証形状 (B, T, top_k)。fused.py の moe_verify 実装コメントが
-    # 警告する通り、`indices.shape[-2]` ではなく `indices.size` から
-    # トークン数を出さないと壊れる形 -- combine-fold も同じ罠を踏みうる
-    # ので、B>1 も別に検査する。idx.size=2*3*2=12 < 16 で未ソート。
-    ok &= _check(seq_len=3, sort_min=16, batch=2)
-    # 同じバッチ形状でソート経路も踏む。idx.size=2*20*2=80 >= 16。
-    ok &= _check(seq_len=20, sort_min=16, batch=2)
+
+    # --- 行数ゲート未満 (既定 MIN_S=64 相当): 必ず素の経路、ビット一致 ---
+    # decode 1 トークン (rows=1)
+    ok &= _check(seq_len=1, min_s=64, sort_min=16)
+    # decode/verify 幅の上限相当 (rows=8、runner.py のコメントの S<=8)
+    ok &= _check(seq_len=8, min_s=64, sort_min=16)
+    # 境界のすぐ下 (rows=63)
+    ok &= _check(seq_len=63, min_s=64, sort_min=16)
+    # batch を含めた行数で判定していること (B×S=2*31=62 < 64)。
+    # S だけで判定していたら誤って fold してしまう形。
+    ok &= _check(seq_len=31, min_s=64, batch=2, sort_min=16)
+
+    # --- 行数ゲート境界ちょうど・以上: fold 発火、RMS 相対誤差で判定 ---
+    # 境界ちょうど (rows=64 == min_s)。既定 sort_min=16 で idx.size=128 -> ソート
+    ok &= _check(seq_len=64, min_s=64, sort_min=16)
+    # batch 込みで境界ちょうど (B×S=2*32=64)。S だけなら未満に見える形。
+    ok &= _check(seq_len=32, min_s=64, batch=2, sort_min=16)
+    # prefill 相当の大きいバッチ
+    ok &= _check(seq_len=100, min_s=64, sort_min=16)
+    # 閾値を下げて decode 幅でも fold を強制発火させ、fold 内部の未ソート
+    # 経路 (idx.size=4*2=8 < sort_min=16) を検査する。
+    ok &= _check(seq_len=4, min_s=4, sort_min=16)
+    # 同じく閾値を下げて、fold 内部のソート経路 (verify 幅相当、
+    # idx.size=8*2=16 >= sort_min=4) を検査する。
+    ok &= _check(seq_len=8, min_s=4, sort_min=4)
+
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
 

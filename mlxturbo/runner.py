@@ -1387,16 +1387,21 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         fused.enable_moe_verify_gather()
         if os.environ.get("MLXTURBO_MOE_VERIFY") == "1":
             print(f"{log_prefix} moe_verify_gather カーネル有効 (verify 幅の gate+up 融合 + down)")
-        # enable_moe_combine_fold 自身が MLXTURBO_MOE_COMBINE_FOLD=1 をゲートに
-        # 持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
-        # 有効な間は switch_mlp.__call__ を経由しない (gate_proj/up_proj/
-        # down_proj を直接呼ぶ) ため、moe_glu/moe_verify_gather のような
-        # SwitchGLU.__call__ 側のカーネル差し替えとは併用しても効果が
-        # 乗らない (詳細は fused.enable_moe_combine_fold の docstring)。
+        # enable_moe_combine_fold 自身が MLXTURBO_MOE_COMBINE_FOLD=0 で
+        # 無効化するゲートを持っているので、ここでは呼ぶだけでよい (既定
+        # on)。行数 (B×S) が MLXTURBO_MOE_COMBINE_FOLD_MIN_S (既定 64)
+        # 未満は必ず素の SwitchGLU 経路に落ちる (decode/verify 幅 S<=8 は
+        # ここに入る。2026-09-03 の in-model A/B で decode 幅が負けたため
+        # 行数ゲートを足した)。fold が発火する側は switch_mlp.__call__ を
+        # 経由しない (gate_proj/up_proj/down_proj を直接呼ぶ) ため、
+        # moe_glu/moe_verify_gather のような SwitchGLU.__call__ 側の
+        # カーネル差し替えとは併用しても効果が乗らない (詳細は
+        # fused.enable_moe_combine_fold の docstring)。
         n_combine_fold = fused.enable_moe_combine_fold(model)
-        if n_combine_fold:
-            print(f"{log_prefix} moe_combine_fold 有効: ルータ重みを down_proj 前で畳む"
-                  f" ({n_combine_fold} 層)")
+        if n_combine_fold and os.environ.get("MLXTURBO_MOE_COMBINE_FOLD") != "0":
+            min_s = os.environ.get("MLXTURBO_MOE_COMBINE_FOLD_MIN_S", "64")
+            print(f"{log_prefix} moe_combine_fold 有効 (既定 on): ルータ重みを"
+                  f" down_proj 前で畳む (行数>={min_s} のみ、{n_combine_fold} 層)")
         # enable_gdn_prework_kernel 自身が MLXTURBO_GDN_PREWORK=1 をゲートに
         # 持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
         # model を渡すことで、A_log/dt_bias が bf16 で読み込まれた実モデルでも

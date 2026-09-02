@@ -1198,15 +1198,16 @@ def disable_moe_verify_gather() -> None:
 
 
 def enable_moe_combine_fold(model) -> int:
-    """SparseMoeBlock の重み付き和を down_proj の前に畳む
-    (``SparseMoeBlock._combine_fold`` 分岐、`mlxturbo/_vendor/qwen4_exp.py`
-    の `_moe_combine_fold`)。素の経路は switch_mlp の出力
-    (rows, top_k, hidden_size)=(rows, top_k, 2560) を実体化してから router
-    重み w を掛けて sum するが、down_proj は bias 無しの線形写像なので、w を
-    down_proj の「入力」(SwiGLU 出力、(rows, top_k, moe_intermediate_size)
-    =(rows, top_k, 640)) に先掛けしても数式上は同じ結果になる。乗算が触る
-    実体は 4 分の 1 で済む (top_k 軸の和自体は down_proj の出力側で
-    `sum(axis=-2)` のまま取るので、その実体化は残る)。
+    """SparseMoeBlock の重み付き和を down_proj の前に畳む (行数ゲート付き、
+    ``SparseMoeBlock._combine_fold_min_s`` 分岐、
+    `mlxturbo/_vendor/qwen4_exp.py` の `_moe_combine_fold`)。素の経路は
+    switch_mlp の出力 (rows, top_k, hidden_size)=(rows, top_k, 2560) を
+    実体化してから router 重み w を掛けて sum するが、down_proj は bias
+    無しの線形写像なので、w を down_proj の「入力」(SwiGLU 出力、
+    (rows, top_k, moe_intermediate_size)=(rows, top_k, 640)) に先掛けしても
+    数式上は同じ結果になる。乗算が触る実体は 4 分の 1 で済む (top_k 軸の
+    和自体は down_proj の出力側で `sum(axis=-2)` のまま取るので、その
+    実体化は残る)。
 
     実測 (prefill 8k、`tools/prefill_anatomy.py --ctx 8000`、
     `bench/results/logs/prefill-anatomy-8k-0903.log`、
@@ -1214,34 +1215,47 @@ def enable_moe_combine_fold(model) -> int:
     8k」): MoE 48 層の内訳で「ルータ重み + top-K 縮約」が 142ms/チャンク
     (効率 9.9%) と最大。
 
-    数式上は等価だが bf16 の丸め順が変わるため出力はビット不一致 (積和の
-    結合順が変わるだけ、bench/test_moe_combine_fold.py で許容誤差 1e-2 を
-    確認)。この経路は switch_mlp.__call__ を経由しない (gate_proj/up_proj/
-    down_proj を直接呼ぶ) ため、有効な間は同じ SwitchGLU.__call__ に載って
-    いる他の 3 経路 (enable_wide_projections の連結射影 / enable_gather_sort
-    のソート閾値変更 / enable_moe_glu / enable_moe_verify_gather) を素通り
-    する -- ソート判定・並べ替え自体は `_moe_combine_fold` が
-    `MLXTURBO_SORT_MIN` を読んで自前で再現しているので正しさは保たれるが、
-    それらのカーネル差し替えの効果は乗らない。
+    数式上は等価だが bf16 の丸め順が変わるため fold 発火時の出力はビット
+    不一致 (積和の結合順が変わるだけ、bench/test_moe_combine_fold.py で
+    許容誤差 1e-2 を確認)。fold が発火する側は switch_mlp.__call__ を
+    経由しない (gate_proj/up_proj/down_proj を直接呼ぶ) ため、その間は
+    同じ SwitchGLU.__call__ に載っている他の 3 経路
+    (enable_wide_projections の連結射影 / enable_gather_sort のソート閾値
+    変更 / enable_moe_glu / enable_moe_verify_gather) を素通りする --
+    ソート判定・並べ替え自体は `_moe_combine_fold` が `MLXTURBO_SORT_MIN`
+    を読んで自前で再現しているので正しさは保たれるが、それらのカーネル
+    差し替えの効果は乗らない。
 
-    実験的な分岐なので、この関数を呼ぶだけでは何も起きない -- 環境変数
-    `MLXTURBO_MOE_COMBINE_FOLD=1` が立っているときだけ `_combine_fold` を
-    立てる (呼び出し側が env var を忘れても既定 off が保たれるように、
-    ゲートを関数自身の中に持たせている。`enable_moe_verify_gather` /
-    `enable_fast_rope` と同じ作法)。prefill に効く変更なので decode_ab の
-    DECODE_ONLY には入れない。
+    **行数ゲート**: 初回の in-model A/B (2026-09-03) は prefill 8k -2.2%/
+    17k -2.5% と勝った一方、decode は 8k +1.3%/17k +0.6%/短文脈 ms/round
+    +1.4% (tok/round -4.0%) と負けた。行数 (B×S、`x.shape[0]*x.shape[1]`)
+    が少ないと、乗算を 4 分の 1 に減らす分より gate_proj/up_proj/down_proj
+    を個別に呼ぶディスパッチ増分のほうが効く。そこで
+    `MLXTURBO_MOE_COMBINE_FOLD_MIN_S` (既定 64) 未満の行数では必ず素の経路
+    に落とす (decode/verify 幅 S<=8 は必ずここに入る)。この閾値はここで
+    起動時に 1 回だけ読んで `_combine_fold_min_s` に積む -- `__call__` の
+    ホットパスでは getenv しない。
+
+    2026-09-03 に既定 on にした (行数ゲート込みで再測定予定。prefill は
+    勝ち筋が確認済みで、decode 幅は行数ゲートで必ず素の経路に固定される
+    ため理論上ここでは負けない)。`MLXTURBO_MOE_COMBINE_FOLD=0` で無効化
+    できる (呼び出し側が env var を忘れても既定 on が保たれるように、
+    ゲートを関数自身の中に持たせている。`enable_gdn_metal_kernel` と同じ
+    「既定 on、`=0` で無効化」の作法)。prefill に効く変更なので decode_ab
+    の DECODE_ONLY には入れない。
 
     戻り値は適用した層数 (MoE 層は全 48 層)。
     """
     import os
 
-    if os.environ.get("MLXTURBO_MOE_COMBINE_FOLD") != "1":
+    if os.environ.get("MLXTURBO_MOE_COMBINE_FOLD") == "0":
         return 0
+    min_s = int(os.environ.get("MLXTURBO_MOE_COMBINE_FOLD_MIN_S", "64"))
     n = 0
     for layer in model.model.layers:
         mlp = getattr(layer, "mlp", None)
         if mlp is not None and hasattr(mlp, "switch_mlp"):
-            mlp._combine_fold = True
+            mlp._combine_fold_min_s = min_s
             n += 1
     return n
 
@@ -1251,8 +1265,8 @@ def disable_moe_combine_fold(model) -> int:
     n = 0
     for layer in model.model.layers:
         mlp = getattr(layer, "mlp", None)
-        if mlp is not None and getattr(mlp, "_combine_fold", False):
-            mlp._combine_fold = False
+        if mlp is not None and getattr(mlp, "_combine_fold_min_s", None) is not None:
+            mlp._combine_fold_min_s = None
             n += 1
     return n
 

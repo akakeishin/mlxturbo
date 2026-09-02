@@ -1319,8 +1319,9 @@ class GatedDeltaNet(nn.Module):
 
 # ------------------------------------------------------------------------- MoE
 
-# mlxturbo: MLXTURBO_MOE_COMBINE_FOLD=1 (既定 off、mlxturbo.fused.enable_moe_combine_fold
-# が SparseMoeBlock インスタンスへ `_combine_fold=True` を立てて有効化する)。
+# mlxturbo: MLXTURBO_MOE_COMBINE_FOLD (既定 on、`=0` で無効化。
+# mlxturbo.fused.enable_moe_combine_fold が SparseMoeBlock インスタンスへ
+# `_combine_fold_min_s` (閾値そのもの、既定 64) を立てて有効化する)。
 # 素の経路は `(switch_mlp(x, idx) * w[..., None]).sum(-2)` で、switch_mlp の
 # 出力 (rows, top_k, hidden_size)=(rows, top_k, 2560) を一度実体化してから
 # ルータ重み w を掛けて top_k 軸を潰す (prefill 8k の実測でここが 142ms、
@@ -1330,17 +1331,32 @@ class GatedDeltaNet(nn.Module):
 # 先掛けしてから down_proj を通しても数学的には同じ結果になる。640 は
 # 2560 の 1/4 なので、乗算が触る実体は 4 分の 1 で済む (和自体は down_proj
 # の出力側で `sum(axis=-2)` のまま取るので、その実体化は残る)。
+#
+# 初回の in-model A/B (2026-09-03) は prefill 8k -2.2%/17k -2.5% と勝った
+# 一方、decode は 8k +1.3%/17k +0.6%/短文脈 ms/round +1.4% (tok/round -4.0%)
+# と負けた。fold は行数が少ないほど「乗算を 4 分の 1 に減らす」ことで浮く
+# 時間より、gate_proj/up_proj/down_proj を自前で 3 回呼ぶ側のディスパッチ
+# 増分のほうが効く (switch_mlp.__call__ 1 回 -> 3 回の個別呼び出し)。
+# そこで **行数 (B×S、`SparseMoeBlock.__call__` の `x.shape[0]*x.shape[1]`)
+# が `_combine_fold_min_s` (MLXTURBO_MOE_COMBINE_FOLD_MIN_S、既定 64) 未満
+# のときは fold を使わず、必ず素の経路に落とす** (decode/verify 幅
+# S<=8 は必ずここに入る)。この行数ゲートは `enable_moe_combine_fold` が
+# 起動時に env var を 1 回だけ読んで属性に持たせたものを見るだけで、
+# ホットパス (毎レイヤー・毎トークンの `__call__`) では getenv しない。
+#
 # switch_mlp.__call__ (mlx_lm.models.switch_layers.SwitchGLU) をそのまま
-# 呼ぶと down_proj の入力に w を差し込む隙が無いため、gate_proj/up_proj/
-# down_proj を自前で呼び、SwitchGLU.__call__ 自身と同じソート判定・並べ替え
-# (`_gather_sort`/`_scatter_unsort` 相当) をここで再現する。並べ替えると
-# インデックス列だけでなく w もインデックス列と同じ並べ替え (`order`) で
-# 揃える必要がある (switch_layers._gather_sort は order を外に返さず
-# inv_order だけを返すため、ここでは argsort を直接呼んで order も手元に
-# 残す)。bf16 の丸め順が変わるため出力はビット不一致 (積和の結合順が
+# 呼ぶと down_proj の入力に w を差し込む隙が無いため、fold が発火する側は
+# gate_proj/up_proj/down_proj を自前で呼び、SwitchGLU.__call__ 自身と同じ
+# ソート判定・並べ替え (`_gather_sort`/`_scatter_unsort` 相当) をここで
+# 再現する (この並べ替え閾値は `_MOE_COMBINE_SORT_MIN`/`MLXTURBO_SORT_MIN`
+# で、上の行数ゲートとは別物)。並べ替えるとインデックス列だけでなく w も
+# インデックス列と同じ並べ替え (`order`) で揃える必要がある
+# (switch_layers._gather_sort は order を外に返さず inv_order だけを
+# 返すため、ここでは argsort を直接呼んで order も手元に残す)。bf16 の
+# 丸め順が変わるため fold 発火時の出力はビット不一致 (積和の結合順が
 # 変わるだけで、down_proj が線形なので誤差は丸め誤差の範囲、
-# bench/test_moe_combine_fold.py で許容誤差を確認)。採否は
-# tools/decode_ab.py --knob moe-combine の in-model 計測で決める。
+# bench/test_moe_combine_fold.py で許容誤差を確認)。閾値未満は素の経路
+# そのものなのでビット一致 (同じくその検査で確認)。
 _MOE_COMBINE_SORT_MIN_RAW = int(os.environ.get("MLXTURBO_SORT_MIN", "16"))
 # enable_gather_sort と同じ規約: 0 (無効化) のときは switch_layers の素の
 # 閾値 64 に戻す (runner.py の `if sort_min: fused.enable_gather_sort(...)`
@@ -1394,6 +1410,11 @@ class SparseMoeBlock(nn.Module):
         self.shared_expert_gate = nn.Linear(args.hidden_size, 1, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
+        # 行数 (B×S) が _combine_fold_min_s 未満なら fold は使わない
+        # (enable_moe_combine_fold が起動時に 1 回だけ属性へ積んだ値を見る
+        # だけで、ここでは getenv しない -- 上のコメント参照)。
+        min_s = getattr(self, "_combine_fold_min_s", None)
+        use_fold = min_s is not None and x.shape[0] * x.shape[1] >= min_s
         r513 = getattr(self, "_router513", None)
         if r513 is not None:
             # mlxturbo.fused.enable_moe_shared_fold: shared expert は
@@ -1407,13 +1428,13 @@ class SparseMoeBlock(nn.Module):
             idx = mx.concatenate(
                 [idx, mx.full((*idx.shape[:-1], 1), 512, dtype=idx.dtype)], axis=-1)
             w = mx.concatenate([w, sg], axis=-1)
-            if getattr(self, "_combine_fold", False):
+            if use_fold:
                 return _moe_combine_fold(self.switch_mlp, x, idx, w).astype(x.dtype)
             return (self.switch_mlp(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
         logits = self.gate(x.astype(mx.float32))
         idx = mx.argpartition(-logits, self.top_k - 1, axis=-1)[..., : self.top_k]
         w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
-        if getattr(self, "_combine_fold", False):
+        if use_fold:
             out = _moe_combine_fold(self.switch_mlp, x, idx, w).astype(x.dtype)
         else:
             out = (self.switch_mlp(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
