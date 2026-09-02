@@ -1584,3 +1584,8 @@ KLD は `quant_eval compare --fusions` (prompt 約 600 トークンで fold が�
 PLE の補足 (`tools/ple_split.py` の再計測): 冷の pread は **257 ms/チャンク (89%)**、`prefill_anatomy` の 167 ms は
 ページキャッシュが温まった値だった。本番 (新しい本文) では冷の 257 ms が掛かる = 1 チャンク 3.4〜3.8 s の 7%。
 先読みを本当に重ねれば prefill -7% の見込み (実装中)。
+
+## MoE 畳み込み on の KLD (2026-09-03 16:10、`quant_eval compare --fusions`、bf16 参照、48 層で発火)
+
+kld_mean **0.01289** / agree 0.967 (現行 0.01326 / 0.966)。差 -0.0004 で受け入れ幅内 (むしろ僅かに良い。bf16 の
+丸め位置が変わる分の揺れ)。**品質は不変。prefill 幅 (行数 ≥ 64) だけ既定 on にする** (実装中)。
