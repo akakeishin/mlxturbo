@@ -981,6 +981,50 @@ def _knob_wide(ctx):
     return apply
 
 
+def _knob_wide_attn(ctx):
+    """A = 連結射影を attention の qkv(+gate) だけに絞って on / B = off (既定)。
+
+    `wide` knob (上) は 4 種類 (gdn/attn/shared/experts) まとめてで、experts の
+    gather 連結を含んでいたため 17k prefill で +62% と大きく負けて棄却された
+    (`docs/research/KERNEL-BRIEF-DECODE-BW.md`)。attention 単独の数字は無かった。
+
+    `docs/research/SESSION-2026-09-02-CATCHUP.md` の「QSA attention 1 層の
+    内訳」(2026-09-02 実測、実モデル) では、prefill 幅 S=2048 の qkv 射影が
+    1 層 14ms・75 GFLOP で 5 TFLOPS 相当と低い。q_proj (2560->6144, gate 込み)
+    / k_proj (2560->512) / v_proj (2560->512) を個別の 4-bit qmm 3 本で呼んで
+    いるところを 1 本の 2560->7168 に連結すれば、M=2048 での効率が上がる
+    見込み (-2% prefill)。
+
+    `fused.enable_wide_projections(model, scope={"attn"})` で attn 以外
+    (gdn/shared/experts) には一切触れない。連結した射影は
+    `Attention._wide_qkv` に置かれ、`_vendor/qwen4_exp.py` の `_qkv` が
+    行数 (B*S) >= `_wide_min_rows` (既定 64、`MLXTURBO_WIDE_MIN_ROWS`) の
+    ときだけそれを使う -- decode 幅 (S=1..4 程度) は必ず個別 3 射影に落ちる
+    ので、この knob は実質 prefill (チャンク幅 2048) だけを動かす。
+
+    連結は「同じ入力に掛かる量子化行列を出力次元で連結するだけ」で、各出力行
+    の量子化パラメータは行単位のため個々の出力は他の行が何本連結されても
+    変わらないはず。CPU の合成量子化モデルで qkv 3 本 -> 1 本の呼び出し回数の
+    減少 (S=128 で quantized_matmul 呼び出し数が層あたり -2) と、出力の
+    ビット一致 (max|diff|=0.0) を確認した上での想定
+    (`control_identical=True`)。実測で崩れたらここに記録して False にする。
+    """
+    from mlxturbo import fused
+
+    eng = ctx["eng"]
+    applied = {"on": False}
+
+    def apply(variant):
+        if variant == "A" and not applied["on"]:
+            fused.enable_wide_projections(eng.model, scope={"attn"})
+            applied["on"] = True
+        elif variant == "B" and applied["on"]:
+            fused.disable_wide_projections(eng.model)
+            applied["on"] = False
+
+    return apply
+
+
 def _knob_bool_mask(ctx):
     """2026-09-02 に既定を bool にした。A = bool (新既定) / B = 加算 (旧経路の再現)。
 
@@ -1491,6 +1535,7 @@ KNOBS = {
     "gather-tile": (_knob_gather_tile, ["-1", "0", "256"], False, "-1"),
     "prefill-attn": (_knob_prefill_attn, ["A", "B"], False, "B"),
     "wide": (_knob_wide, ["A", "B"], False, "B"),
+    "wide-attn": (_knob_wide_attn, ["A", "B"], True, "B"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
     "depth-adapt": (_knob_depth_adapt, ["A", "B"], False, "B"),
     "draft-rerank": (_knob_draft_rerank, ["A", "B"], False, "B"),

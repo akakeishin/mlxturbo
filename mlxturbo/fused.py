@@ -746,6 +746,38 @@ def disable_hc_write() -> None:
 #
 # ビット幅か group_size が揃っていないモジュールはその場で素通し (連結しない)。
 # 元のモジュールは残す (rebit や保存経路が触るため)。増えるメモリは連結分。
+#
+# scope (2026-09-03): 4 種類まとめての A/B (17k prefill +62%) は experts の
+# gather 連結込みだった。attention だけを切り出して測るための絞り込み。
+# `enable_wide_projections(model, scope={"attn"})` で attn 以外を素通しにする。
+# 既定 (scope=None かつ env 未設定) は今まで通り全部で、呼び出し互換は崩さない。
+
+_WIDE_SCOPES = frozenset({"gdn", "attn", "shared", "experts"})
+
+
+def _resolve_wide_scope(scope):
+    """`scope` 引数と `MLXTURBO_WIDE_SCOPE` (カンマ区切り) から有効な集合を決める。
+
+    優先順位: 明示引数 > 環境変数 > 既定 (全部)。呼び出し側が `scope` を
+    渡さず env も立っていなければ、これまでの「常に全部」という挙動のまま。
+    """
+    import os
+
+    if scope is not None:
+        resolved = {s for s in scope}
+    else:
+        env = os.environ.get("MLXTURBO_WIDE_SCOPE")
+        if env:
+            resolved = {s.strip() for s in env.split(",") if s.strip()}
+        else:
+            resolved = set(_WIDE_SCOPES)
+    unknown = resolved - _WIDE_SCOPES
+    if unknown:
+        raise ValueError(
+            f"unknown wide-projection scope entries: {sorted(unknown)}"
+            f" (valid: {sorted(_WIDE_SCOPES)})"
+        )
+    return resolved
 
 
 def _cat_quantized(lins):
@@ -791,6 +823,9 @@ def disable_wide_projections(model, mtp=None) -> int:
             if mod is not None and getattr(mod, attr, None) is not None:
                 setattr(mod, attr, None)
                 n += 1
+        sa = getattr(layer, "self_attn", None)
+        if sa is not None and getattr(sa, "_wide_min_rows", None) is not None:
+            sa._wide_min_rows = None
         # experts の連結は mlp.switch_mlp に _fused_w/_fused_s/_fused_b として
         # 置かれる (enable_wide_projections:760)。dispatched() の wide() は
         # `hasattr(self, "_fused_w")` で見るので、setattr(..., None) では
@@ -804,9 +839,26 @@ def disable_wide_projections(model, mtp=None) -> int:
     return n
 
 
-def enable_wide_projections(model, mtp=None) -> dict:
-    """読み込み済みモデルに連結射影を仕込む。戻り値は種類別の適用層数。"""
+def enable_wide_projections(model, mtp=None, scope=None) -> dict:
+    """読み込み済みモデルに連結射影を仕込む。戻り値は種類別の適用層数。
+
+    ``scope``: 仕込む種類を絞る集合 (``{"gdn", "attn", "shared", "experts"}``
+    の部分集合)。``None`` なら `MLXTURBO_WIDE_SCOPE` (カンマ区切り) を見て、
+    それも無ければ全部 (これまでの既定動作のまま)。scope に入っていない
+    種類は counts が 0 のまま、対応する属性も仕込まれない。
+
+    attention (``scope`` に "attn" を含む場合) は仕込んだ ``self_attn`` に
+    ``_wide_min_rows`` も置く (`MLXTURBO_WIDE_MIN_ROWS`、既定 64)。
+    `_vendor/qwen4_exp.py` の `Attention._qkv` がこれを見て、行数
+    (B*S) がこの値未満なら `_wide_qkv` を無視し、decode 幅は従来の
+    個別 3 射影に落ちる (連結射影は M が大きい prefill だけを狙う)。
+    """
+    import os
+
     import mlx.core as mx
+
+    scope_set = _resolve_wide_scope(scope)
+    min_rows = int(os.environ.get("MLXTURBO_WIDE_MIN_ROWS", "64"))
 
     counts = {"gdn": 0, "attn": 0, "shared": 0, "experts": 0}
 
@@ -818,49 +870,54 @@ def enable_wide_projections(model, mtp=None) -> dict:
                 yield layer
 
     for layer in each_layer():
-        la = getattr(layer, "linear_attn", None)
-        if la is not None:
-            cat = _cat_quantized(
-                [la.in_proj_qkv, la.in_proj_z, la.in_proj_b, la.in_proj_a])
-            if cat is not None:
-                w, sc, bi, gs, bits = cat
-                c1 = la.conv_dim
-                c2 = c1 + la.value_dim
-                c3 = c2 + la.n_v
-                la._wide_in = (w, sc, bi, gs, bits, (c1, c2, c3))
-                counts["gdn"] += 1
-        sa = getattr(layer, "self_attn", None)
-        if sa is not None and hasattr(sa, "q_proj"):
-            cat = _cat_quantized([sa.q_proj, sa.k_proj, sa.v_proj])
-            if cat is not None:
-                w, sc, bi, gs, bits = cat
-                c1 = sa.n_heads * sa.head_dim * 2
-                c2 = c1 + sa.n_kv_heads * sa.head_dim
-                sa._wide_qkv = (w, sc, bi, gs, bits, (c1, c2))
-                counts["attn"] += 1
+        if "gdn" in scope_set:
+            la = getattr(layer, "linear_attn", None)
+            if la is not None:
+                cat = _cat_quantized(
+                    [la.in_proj_qkv, la.in_proj_z, la.in_proj_b, la.in_proj_a])
+                if cat is not None:
+                    w, sc, bi, gs, bits = cat
+                    c1 = la.conv_dim
+                    c2 = c1 + la.value_dim
+                    c3 = c2 + la.n_v
+                    la._wide_in = (w, sc, bi, gs, bits, (c1, c2, c3))
+                    counts["gdn"] += 1
+        if "attn" in scope_set:
+            sa = getattr(layer, "self_attn", None)
+            if sa is not None and hasattr(sa, "q_proj"):
+                cat = _cat_quantized([sa.q_proj, sa.k_proj, sa.v_proj])
+                if cat is not None:
+                    w, sc, bi, gs, bits = cat
+                    c1 = sa.n_heads * sa.head_dim * 2
+                    c2 = c1 + sa.n_kv_heads * sa.head_dim
+                    sa._wide_qkv = (w, sc, bi, gs, bits, (c1, c2))
+                    sa._wide_min_rows = min_rows
+                    counts["attn"] += 1
         mlp = getattr(layer, "mlp", None)
         if mlp is not None and getattr(mlp, "_router513", None) is not None:
             continue          # shared 畳み込み済み: shared/experts はそちらが持つ
-        se = getattr(mlp, "shared_expert", None) if mlp is not None else None
-        if se is not None:
-            cat = _cat_quantized(
-                [se.gate_proj, se.up_proj, mlp.shared_expert_gate])
-            if cat is not None:
-                w, sc, bi, gs, bits = cat
-                h = _rows(se.gate_proj)
-                mlp._wide_shared = (w, sc, bi, gs, bits, h)
-                counts["shared"] += 1
-        sw = getattr(mlp, "switch_mlp", None) if mlp is not None else None
-        if sw is not None and hasattr(sw.gate_proj, "scales"):
-            g, u = sw.gate_proj, sw.up_proj
-            if g.group_size == u.group_size and g.bits == u.bits:
-                w = mx.concatenate([g.weight, u.weight], axis=1)
-                sc = mx.concatenate([g.scales, u.scales], axis=1)
-                bi = mx.concatenate([g.biases, u.biases], axis=1)
-                mx.eval(w, sc, bi)
-                sw._fused_w, sw._fused_s, sw._fused_b = w, sc, bi
-                sw._fused_h = _rows(g)
-                counts["experts"] += 1
+        if "shared" in scope_set:
+            se = getattr(mlp, "shared_expert", None) if mlp is not None else None
+            if se is not None:
+                cat = _cat_quantized(
+                    [se.gate_proj, se.up_proj, mlp.shared_expert_gate])
+                if cat is not None:
+                    w, sc, bi, gs, bits = cat
+                    h = _rows(se.gate_proj)
+                    mlp._wide_shared = (w, sc, bi, gs, bits, h)
+                    counts["shared"] += 1
+        if "experts" in scope_set:
+            sw = getattr(mlp, "switch_mlp", None) if mlp is not None else None
+            if sw is not None and hasattr(sw.gate_proj, "scales"):
+                g, u = sw.gate_proj, sw.up_proj
+                if g.group_size == u.group_size and g.bits == u.bits:
+                    w = mx.concatenate([g.weight, u.weight], axis=1)
+                    sc = mx.concatenate([g.scales, u.scales], axis=1)
+                    bi = mx.concatenate([g.biases, u.biases], axis=1)
+                    mx.eval(w, sc, bi)
+                    sw._fused_w, sw._fused_s, sw._fused_b = w, sc, bi
+                    sw._fused_h = _rows(g)
+                    counts["experts"] += 1
     if counts["experts"]:
         _ensure_moe_dispatch_installed()
     return counts

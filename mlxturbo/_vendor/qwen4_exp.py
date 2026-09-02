@@ -628,6 +628,16 @@ class Attention(nn.Module):
         """
         B, S, _ = x.shape
         wide = getattr(self, "_wide_qkv", None)
+        if wide is not None:
+            # `mlxturbo.fused.enable_wide_projections(..., scope={"attn"})` が
+            # `_wide_min_rows` を仕込んだときだけ効く行数ゲート (既定属性なしなら
+            # 0 = ゲートしない、これまでの挙動のまま)。連結射影は M (行数) が
+            # 大きい prefill だけ狙いなので、decode 幅 (B*S 小) は個別 3 射影に
+            # 落とす。連結は値を変えない演算のはずなので、ここで分岐しても
+            # 数値は経路によらず不変 (fused.py の scope セクションのコメント参照)。
+            min_rows = getattr(self, "_wide_min_rows", 0) or 0
+            if B * S < min_rows:
+                wide = None
         if wide is None:
             qg, kk, vv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         else:
