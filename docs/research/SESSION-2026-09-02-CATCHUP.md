@@ -1259,3 +1259,12 @@ executor の submit→run 0.1 ms、なのに `[ttft-trace] gen→first_token 310
 runner 内 154 ms + 外 345 ms。**runner でも executor でもなく、worker がキューに積んだ最初のトークンを
 ハンドラが受け取るまでに 300 ms 掛かっている。**ハンドラ側のキュー待ち (poll 間隔や keepalive の timeout) か、
 イベントループを塞ぐ処理 (detokenizer の構築など) の疑い。ここを潰せば温 TTFT 0.45 → 0.15 s。
+
+## 固定 300 ms の正体: リクエストごとの detokenizer 構築 (2026-09-03 04:20)
+
+`tokenizer.detokenizer` (mlx_lm の `@property`) は呼ぶたびに `BPEStreamingDetokenizer` を作り直し、248,077 語彙の
+`tokenmap` を Python ループで組む。**実トークナイザで 1 回 105 ms** (103 / 111 / 106 ms)。`ThinkingRouter.__init__`
+がリクエストごとにこれを 3 回、イベントループのスレッドで呼ぶ → **約 315 ms** が全リクエストの TTFT に固定で
+乗る (`[ttft-trace]` gen→first_token 310 ms、runner 内 0.9 ms、executor 0.1 ms と整合)。
+相手は Zig 側でトークナイザを 1 回だけ組む。直し方: prototype を 1 回作って複製 + reset。見込み: 温 TTFT
+0.45 → 0.15 s (相手 0.87 の 6 倍速)、冷 ctx 0 も 0.5 → 0.2 s、4k 冷は 7.2 → 6.9 s。
