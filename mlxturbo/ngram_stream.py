@@ -216,14 +216,31 @@ class StreamNGram:
     `FASTMLX_NGRAM_BACKEND=mmap` or `backend="mmap"`.
 
     prefetch: prefill プロンプトの行 id は最初から全部わかっているので、
-    `prefetch()` にまとめて渡すと専用のバックグラウンドスレッドが行キャッシュ
+    `prefetch()` に渡すと専用のバックグラウンドスレッドが行キャッシュ
     (`_NGramCacheGen`) を埋めておく。`__call__` はキャッシュに乗っている行を
     そのまま返し、乗っていない行だけ pread する。呼び出しは即時に返り、キャッシュ
     への書き込みは `_cache_lock` で守られているので `__call__` と並走しても壊れない
     (同じ行を二重に読んでも結果は同じなので、そこは守らない)。
-    `MLXTURBO_NGRAM_PREFETCH=1` で有効化できる (既定 off。17k の in-model A/B
-    (`tools/decode_ab.py --knob ngram-prefetch`) で先読みの取り分が 0% だった
-    ため。backend=mmap では常に無効)。
+    `MLXTURBO_NGRAM_PREFETCH=1` で有効化できる (既定 off。backend=mmap では
+    常に無効)。
+
+    呼び出し側 (`mlxturbo/spec_flash.py` の `_prefetch_ngram_span`) は
+    プロンプト全体を一度にではなく、**次の 1 eval 境界ぶんだけ**、直前境界の
+    GPU 実行に重ねて `prefetch()` を呼ぶ。最初の実装 (`_prefetch_ngram_rows`、
+    削除済み) は `generate_stream` のループへ入る前に `ids` 全体を一度に
+    渡していて、まだどの GPU 実行も投入されていない状態でバックグラウンド
+    pread が始まっていた。重ねる相手が無いので実質先出し同期待ちにしかならず、
+    その上 `__call__` 側の on-demand フォールバック (`_gather_pread`) と
+    背景スレッドの `_gather_pread` が同じ `self._pool` (pread 用スレッド
+    プール) を取り合って競合していた。17k の in-model A/B
+    (`tools/decode_ab.py --knob ngram-prefetch`) で先読みの取り分がほぼ 0%
+    (-0.9%) だったのはこの 2 つが原因 (`bench/results/ple-split.json` の
+    `prefetch_rows=0` は別の計測ツール (`tools/ple_split.py`、prefetch を
+    そもそも有効にしない) の結果で、直接の証拠ではない — 内訳の切り分けに
+    使っただけ)。2026-09-03 に呼び出し側を「次の 1 境界だけ、直前境界の
+    `mx.eval` 投入直前に」呼ぶ形へ直し、on-demand 側が動く時間帯 (境界の
+    graph 構築中) と背景スレッドが動く時間帯 (前の境界の GPU 実行中) が
+    重ならないようにした。
     """
 
     def __init__(

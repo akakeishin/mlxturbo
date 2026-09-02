@@ -11,14 +11,21 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
 import pytest
 
 mx.set_default_device(mx.cpu)
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+for _p in (REPO_ROOT, REPO_ROOT / "tools"):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 from mlxturbo.ngram_stream import StreamNGram
 
@@ -309,6 +316,92 @@ def test_batch_min_rows_default_and_override(tmp_path):
     stream.batch_min_rows = 10**9
     got_forced_naive = stream._gather_pread(ids)
     assert got_forced_naive.tobytes() == want.tobytes()
+
+
+def test_prefetch_ngram_span_matches_real_forward(tmp_path):
+    """`mlxturbo/spec_flash.py` の `_prefetch_ngram_span` (次の 1 eval 境界
+    ぶんの n-gram 先読み) が計算する行 id が、実際の prefill フォワード
+    (直前文脈をキャッシュ `pc[3]` から引く経路) がその境界で要求する行 id と
+    ビット一致することを確認する。
+
+    `_prefetch_ngram_span` は「次の境界の GPU 実行がまだ始まっていない
+    (直前境界の分までしかキャッシュが進んでいない) 時点」に呼ぶ都合上、
+    直前文脈を `pc[3]` ではなく `ids` 自身の `[start-context_len, start)`
+    から直接切り出して計算する。この一致が崩れていると、先読みで温めた
+    キャッシュが実フォワードの要求と一度も噛み合わず、キャッシュヒットが
+    常に 0 になる (正しさ自体は壊れない -- miss してその場で同期 pread に
+    落ちるだけだが、先読みの効果が丸ごと消える。2026-09-02 の 17k A/B が
+    ほぼ 0% だった不具合と同じ症状)。
+
+    合成した小さい Flash-Next (`tools/verify_batch_cache.TINY`、PLE 層が
+    1 つ、ngram_size=3 -> context_len=2) を CPU で使う。実モデルは読まない。
+    """
+    import mlxturbo.ngram_stream as NS
+    import mlxturbo.spec_flash as SF
+    from verify_batch_cache import TINY, build
+
+    model = build(8)  # indexer_budget=8 (TINY の既定の 1 つ)
+    ple_layer_idx = model.model.ple_layers[0]
+    ple_emb = model.model.layers[ple_layer_idx].ple.ple_embedding
+    dim = ple_emb.ngram_embedding.dim
+
+    # group_size=dim にしておけば、TINY の dim (32/heads_per_ngram) が
+    # 何であっても必ず割り切れる
+    sidecar, _ = _build_synthetic_sidecar(
+        tmp_path, rows=200_000, dim=dim, bits=4, group_size=dim
+    )
+    NS.install(model, sidecar)
+    stream = ple_emb.ngram_embedding
+    assert isinstance(stream, NS.StreamNGram)
+    stream.prefetch_enabled = True  # 既定 off。ここは先読み自体を確認する
+
+    ctx_len = ple_emb.context_len  # TINY: ngram_size=3 -> 2
+    start, length, total_len = 5, 4, 12
+    assert start >= ctx_len and start + length <= total_len
+    rng = np.random.default_rng(11)
+    ids_np = rng.integers(0, TINY["vocab_size"], size=total_len).astype(np.int64)
+    ids = mx.array(ids_np[None])
+
+    # -- 基準: start までを実フォワードで流し、実際の pc[3] (直前文脈) から
+    #    次の区間の行 id を計算する (本番の _group_prefill_forward /
+    #    NGramEmbedding.__call__ と同じ経路)。
+    cache = model.make_cache()
+    model.model(ids[:, :start], cache=cache)
+    prev_from_cache = cache[ple_layer_idx][3]
+    expected_history = mx.concatenate(
+        [prev_from_cache, ids[:, start : start + length]], axis=1
+    )
+    expected_gid = ple_emb.ngram_ids(expected_history)[:, -length:]
+    mx.eval(expected_gid)
+    expected_flat = np.array(expected_gid.reshape(-1), copy=False).astype(np.int64)
+
+    # -- _prefetch_ngram_span: ids から直接切り出して計算する経路 (キャッシュは
+    #    見ない)。stream.prefetch に渡された行 id をそのまま捕まえる。
+    captured: dict = {}
+    orig_prefetch = stream.prefetch
+
+    def capture_prefetch(flat_ids: np.ndarray) -> None:
+        captured["flat"] = np.array(flat_ids, copy=True)
+        orig_prefetch(flat_ids)
+
+    stream.prefetch = capture_prefetch
+    try:
+        SF._prefetch_ngram_span(model, ids, start, length)
+    finally:
+        stream.prefetch = orig_prefetch
+
+    assert "flat" in captured, "stream.prefetch が呼ばれなかった"
+    assert np.array_equal(captured["flat"], expected_flat)
+
+    # 先読みしたキャッシュが実際に消費されることも合わせて確認する (行 id が
+    # 一致していても、_gather_cached が引かなければ意味が無い)
+    if stream._prefetch_thread is not None:
+        stream._prefetch_thread.join()
+    stream.reset_stats()
+    got = stream(expected_gid)
+    assert stream.stats["hits"] == expected_flat.size
+    assert stream.stats["misses"] == 0
+    mx.eval(got)
 
 
 if __name__ == "__main__":

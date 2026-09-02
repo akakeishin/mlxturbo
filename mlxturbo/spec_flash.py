@@ -877,6 +877,15 @@ _PREFILL_PIPELINE = os.environ.get("MLXTURBO_PREFILL_PIPELINE") == "1"
 # 単独処理) に戻る。A/B は tools/decode_ab.py の knob `fold-tail`。
 _PREFILL_FOLD_TAIL = os.environ.get("MLXTURBO_PREFILL_FOLD_TAIL", "1") != "0"
 
+# `_prefetch_ngram_span` が「次の境界」ぶんとして先読みする幅 (トークン数)。
+# 既定グループ幅 (_PREFILL_GROUP チャンク) に、fold-tail が畳み込みうる
+# 端数 1 チャンク分の余裕を足した上限。実際の次の境界がこれより狭くても
+# (末尾の単独チャンクなど) 正しさに影響しない -- 余分に読んだ行は無駄に
+# なるだけ。MLXTURBO_PREFILL_CHUNK で `big` を伸ばして次の境界がこれより
+# 広くなる場合も、超えた分だけ先読みが外れて同期 pread に落ちるだけ
+# (これも正しさには影響しない)。
+_NGRAM_LOOKAHEAD_WIDTH = (_PREFILL_GROUP + 1) * PREFILL_STEP_SIZE
+
 if _PREFILL_GROUP > 1 and os.environ.get("MLXTURBO_PREFILL_CHUNK"):
     # MLXTURBO_PREFILL_CHUNK を立てると big != step になり、下の group 経路の
     # 条件が外れて layer-major prefill が**黙って無効化**される。チャンク幅の
@@ -959,26 +968,56 @@ def _group_prefill_forward(model, chunks, caches):
     return hs
 
 
-def _prefetch_ngram_rows(model, ids: mx.array, caches) -> None:
-    """この呼び出しで prefill する `ids` 全体ぶんの n-gram 行を先読みする。
+def _prefetch_ngram_span(model, ids: mx.array, start: int, length: int) -> None:
+    """`ids` (この呼び出しで prefill する新規トークン全体) のうち
+    `[start, start+length)` にあたる**次の** eval 境界ぶんの n-gram 行を
+    先読みする。呼び手は、いま組み立て終えた境界 (グループ or 単独チャンク)
+    の `mx.eval` / `mx.async_eval` を投入する**直前**にこれを呼ぶ約束
+    (`generate_stream` のチャンクループ 2 箇所)。そうすると
+    `StreamNGram.prefetch` が立てるバックグラウンドスレッドの pread が、
+    直前境界の GPU 実行の壁時計 (2048 トークンのチャンクで 3.4〜3.8s、
+    `docs/research/SESSION-2026-09-02-CATCHUP.md` 「小物 2」) の間ずっと
+    動く。1 チャンク 2048 トークンぶんの pread は 32,768 行 (16 次 x 2048)
+    x 1.3KB = 42MB、冷 252ms / 温 137ms なので、GPU 側の壁時計に対して
+    1 桁小さく丸ごと隠れる見込み。間に合わなければ
+    `StreamNGram._gather_cached` が普通に miss してその場で同期 pread に
+    落ちるだけで、正しさには影響しない。
 
-    prefill では `ids` (プロンプト全体、またはセッション継続時はその新規
-    分) の行 id が最初から全部わかっているので、GPU がチャンク 0 を計算
-    している間に CPU 側でディスクから先読みしておけば、後続チャンクの
-    `StreamNGram.__call__` が待たずに返る。`ngram_ids` の計算自体は 1 回
-    (GPU) で済ませ、以降は `StreamNGram.prefetch` がバックグラウンドスレッド
-    で pread する (呼び出しは即時に返る)。
+    **なぜ「プロンプト全体を一度に」ではなく「次の 1 境界ぶんだけ」か**:
+    旧実装 (`_prefetch_ngram_rows`、削除済み) は `generate_stream` の
+    ループに入る**前**に `ids` 全体の行をまとめて 1 回の
+    `StreamNGram.prefetch` に渡していた。呼ばれる時点ではまだ GPU 実行が
+    1 つも投入されていないので、重ねる相手 (先行する GPU 実行) が存在
+    しない。ループはそのまま最初の境界の構築へ進み、`StreamNGram.__call__`
+    がほぼ即座に (Python でグラフを組むだけの区間なので) その境界自身の
+    行を要求する -- 背景スレッドがまだ遠くの行まで届いていない確率が高く、
+    on-demand の同期 pread (`_gather_pread`、`self._pool` の 12 スレッド)
+    にフォールバックする。この on-demand 経路と背景スレッドの
+    `_gather_pread` (これも同じ `self._pool` を使う) が**同じディスク I/O
+    予算を取り合い**、17k の in-model A/B (`tools/decode_ab.py --knob
+    ngram-prefetch`) で先読みの取り分がほぼ 0% (-0.9%) だった原因はここ。
+    「次の 1 境界だけ、直前境界の GPU 実行に重ねて」呼べば、その境界の
+    graph 構築 (on-demand fetch を含みうる) は前の境界の `mx.eval` が
+    完了した後にしか始まらない -- つまり on-demand 側が動く時間帯と
+    背景スレッドが動く時間帯が重ならず、競合が構造的に起きない。
+
+    `start == 0` (呼び出し元の `ids` の先頭、= 最初の境界そのもの) では
+    何もしない -- 最初の境界には重ねる相手の GPU 実行がまだ無い
+    (これから投入するのがまさにその GPU 実行) ので、先読みしても
+    上の競合を再現するだけで得にならない。直前文脈は `ids` 自身の
+    `[start-context_len, start)` を直接切り出す。`ngram_ids` は
+    `context_len` トークン分の左文脈だけで決まる純粋な窓関数
+    (`NGramEmbedding.ngram_ids`) なので、これは `_group_prefill_forward`
+    が `prev_ctxs[ci]` 経由で計算する値とビット一致する。呼ばれる時点で
+    キャッシュ (`pc[3]`) はまだこの境界まで進んでいない (1 つ前の境界の
+    分までしか進んでいない) ので `pc[3]` は使わない -- 使うと 1〜2 境界分
+    古い文脈を掴む。呼び手はどれも `start >= PREFILL_STEP_SIZE` (常に
+    `context_len` 超) で呼ぶので、`start - context_len` は負にならない。
 
     `ngram_embedding` が `StreamNGram` でない (RamNGram / 未 install) か
     `prefetch_enabled=False` のときは何もしない (`getattr` で判定)。
-
-    先頭の文脈 (`prev_ctx`) の扱いは `Qwen4ExpModel._prelude` /
-    `_group_prefill_forward` と揃えてある: セッション継続ならキャッシュ
-    (`pc[3]`) の文脈から、そうでなければ eos x(ngram_size-1) から始める。
-    ここがズレても正しさは壊れない (miss してその場で pread するだけ) が、
-    先読みの分だけ効かなくなる。
     """
-    if ids.shape[1] == 0:
+    if start <= 0 or length <= 0:
         return
     m = model.model
     for pli in getattr(m, "ple_layers", None) or []:
@@ -986,14 +1025,10 @@ def _prefetch_ngram_rows(model, ids: mx.array, caches) -> None:
         stream = ple_emb.ngram_embedding
         if not getattr(stream, "prefetch_enabled", False):
             continue
-        pc = caches[pli] if caches is not None else None
-        prev = pc[3] if pc is not None else None
-        if prev is None:
-            prev = mx.full(
-                (ids.shape[0], ple_emb.context_len), ple_emb.eos_token_id, ids.dtype
-            )
-        history = mx.concatenate([prev, ids], axis=1)
-        gid = ple_emb.ngram_ids(history)[:, -ids.shape[1] :]
+        ctx_len = ple_emb.context_len
+        lo = max(0, start - ctx_len)
+        history = ids[:, lo : start + length]
+        gid = ple_emb.ngram_ids(history)[:, -length:]
         mx.eval(gid)
         stream.prefetch(np.array(gid.reshape(-1), copy=False).astype(np.int64))
 
@@ -1777,11 +1812,11 @@ class FlashSpecEngine:
             # capture(light=True) records only GatedResidual's hyper, so this
             # does not reintroduce the OOM that `light` exists to avoid.
             hyper_chunks = []
-            if _pf:
-                _t = time.perf_counter()
-            _prefetch_ngram_rows(model, ids, caches)
-            if _pf:
-                _t = _pf.log("prefetch", _t)
+            # 最初の境界 (i=0) 自身の n-gram 行は先読みしない (重ねる相手の
+            # GPU 実行がまだ無い -- `_prefetch_ngram_span` の docstring)。
+            # 各境界の n-gram 先読みは、その境界の graph を組み終えて
+            # `mx.eval`/`mx.async_eval` を投入する直前に、次の境界ぶんとして
+            # ループの内側で呼ぶ (下の 2 箇所)。
             while i < n:
                 remaining = n - i
                 # 前方の等長 2048 チャンクはレイヤー主導でグループ処理する
@@ -1843,6 +1878,18 @@ class FlashSpecEngine:
                         st for c in caches
                         if (st := getattr(c, "state", None)) is not None
                     ]
+                    # このグループの forward を投入する直前に、次の境界ぶんの
+                    # n-gram 行を先読みしておく (`_prefetch_ngram_span` の
+                    # docstring)。次の境界の正確な幅はまだ分からない
+                    # (`remaining` 更新後にしか決まらない)ので、
+                    # _NGRAM_LOOKAHEAD_WIDTH で上限見積もりする。
+                    if _pf:
+                        _t = time.perf_counter()
+                    next_start = i + consumed
+                    next_len = min(n - next_start, _NGRAM_LOOKAHEAD_WIDTH)
+                    _prefetch_ngram_span(model, ids, next_start, next_len)
+                    if _pf:
+                        _t = _pf.log(f"ngram lookahead i={i} g={gn}", _t)
                     if _PREFILL_PIPELINE:
                         # グループ境界の完全同期をやめ、非同期投入にして次の
                         # グループのグラフ構築を先に始める。全部使うグラフ
@@ -1944,6 +1991,13 @@ class FlashSpecEngine:
                 else:
                     if _pf:
                         _t = time.perf_counter()
+                    # このチャンクの forward を投入する直前に、次の境界ぶんの
+                    # n-gram 行を先読みしておく (group 分岐と同じ約束、
+                    # `_prefetch_ngram_span` の docstring)。
+                    next_len = min(n - j, _NGRAM_LOOKAHEAD_WIDTH)
+                    _prefetch_ngram_span(model, ids, j, next_len)
+                    if _pf:
+                        _t = _pf.log(f"ngram lookahead i={i} j={j}", _t)
                     # light=True (added for MTP priming): only the cheap
                     # GatedResidual hook runs, so this branch's computation and
                     # cache updates are unchanged -- we additionally record

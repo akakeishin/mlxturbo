@@ -1266,12 +1266,26 @@ def _knob_ngram_prefetch(ctx):
     B = 無効。
 
     prefill はプロンプト全体の n-gram 行 id が最初から全部わかっている。
-    GPU が chunk 0 を計算している間に CPU 側でディスクから先読みしておけば
-    (`mlxturbo/spec_flash.py` の `_prefetch_ngram_rows`、`generate_stream` の
-    prefill ループ直前で 1 回呼ぶ)、後続チャンクの `StreamNGram.__call__` が
-    キャッシュヒットで待たずに返る。温キャッシュの pread 自体も 17k で
-    約 2.5s、50k で約 7s が GPU が止まったまま CPU で消えている実測がある
+    呼び出し側 (`mlxturbo/spec_flash.py` の `_prefetch_ngram_span`、
+    `generate_stream` のチャンクループ内 2 箇所) は、いま組み立て終えた
+    eval 境界 (グループ or 単独チャンク) の `mx.eval`/`mx.async_eval` を
+    投入する**直前**に、**次の 1 境界ぶんだけ**先読みを呼ぶ。そうすると
+    CPU 側の pread が直前境界の GPU 実行の壁時計 (2048 トークンのチャンクで
+    3.4〜3.8s) に重なり、次の境界の `StreamNGram.__call__` がキャッシュ
+    ヒットで待たずに返る。温キャッシュの pread 自体も 17k で約 2.5s、50k で
+    約 7s が (重ねなければ) GPU が止まったまま CPU で消えている実測がある
     (行 1 つ 7.6us、prefill 1 チャンク 32768 行で約 250ms)。
+
+    2026-09-02 の 17k A/B で取り分が 0% (-0.9%) だったのは、当時の実装
+    (`_prefetch_ngram_rows`、削除済み) が `generate_stream` のループへ
+    入る**前**に `ids` 全体を一度にまとめて先読みしていたため。まだどの
+    GPU 実行も投入されていない時点でバックグラウンド pread が始まるので
+    重ねる相手が無く、かつ最初の境界自身の `StreamNGram.__call__`
+    (on-demand フォールバック、`self._pool` 使用) と背景スレッドの
+    `_gather_pread` (同じ `self._pool`) が競合していた
+    (`mlxturbo/ngram_stream.py` の `StreamNGram` docstring 参照)。
+    2026-09-03 に「次の 1 境界だけ、直前境界の GPU 実行に重ねて」呼ぶ形へ
+    直したので、この A/B は改めて取り直すこと。
 
     環境変数 (`MLXTURBO_NGRAM_PREFETCH`) は使わない。あちらは `StreamNGram`
     インスタンスの初期値を決めるだけで、1 プロセス内で A/B を交互に取る
@@ -1286,8 +1300,9 @@ def _knob_ngram_prefetch(ctx):
     畳んでしまうと A/B の差が消える) ので `DECODE_ONLY_KNOBS` には入れない。
 
     `StreamNGram.prefetch_enabled` の既定は off (`MLXTURBO_NGRAM_PREFETCH=1`
-    で明示的に有効化しない限り on にならない)。17k の in-model A/B で先読みの
-    取り分が 0% だったため (2026-09-02)。
+    で明示的に有効化しない限り on にならない)。2026-09-02 時点の値 (0%) は
+    上記のとおり旧実装のもので、直し後の値はまだ取っていない --
+    `--knob ngram-prefetch --only long --ctx 8000/17000` で取り直すこと。
     """
     model = ctx["eng"].model
     if not ctx["args"].ngram:
