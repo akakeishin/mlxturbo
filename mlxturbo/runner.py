@@ -1447,7 +1447,32 @@ def build_runner(
     ``lookup_min_match`` (the arguments of both cli.py and server.py have
     this shape. cli.py does not have these newer flags, so
     ``getattr(..., None)``/``getattr(..., False)`` tolerate their absence).
+
+    Environment variable ``MLXTURBO_REBIT`` (e.g. ``"head=4"``, unset by
+    default): read exactly once here, at the top of this function, i.e.
+    right after the model is handed to runner.py and before
+    ``enable_default_fusions`` runs (both the draft-model early-return
+    below and ``_build_base_runner``'s fusion step happen after this
+    point). When set, ``mlxturbo.rebit.apply`` re-quantizes the named
+    classes in place. This is the same knob as server.py's ``--rebit``
+    flag, wired here instead so every caller of this function (cli.py,
+    server.py, and anything else that goes through ``build_runner``)
+    picks it up without repeating the wiring. It exists only to put our
+    speed on the same footing as mlx-serve's uniform 4-bit pack (ours
+    ships lm_head at 8-bit); see ``mlxturbo/rebit.py``'s module docstring
+    for why this is a speed-only comparison knob, not a quality-accepted
+    configuration.
     """
+
+    rebit_spec = os.environ.get("MLXTURBO_REBIT")
+    if rebit_spec:
+        from . import rebit
+
+        rebit.apply(model, rebit_spec)
+        print(
+            f"{log_prefix} rebit 適用: {rebit_spec} "
+            "(二重量子化、速度比較用。品質は KLD 未受理)"
+        )
 
     draft_model_path = getattr(args, "draft_model", None)
     if draft_model_path:

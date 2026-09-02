@@ -6435,6 +6435,107 @@ def test_build_runner_routes_qwen4_exp_with_mtp_to_flash_spec(monkeypatch):
     assert captured["weights"] is None
 
 
+def _build_tiny_qwen4_exp_wide():
+    """``_build_tiny_qwen4_exp`` の寸法だと hidden_size=16 なので lm_head の
+    in_dims=16 になり、mlx の QuantizedLinear が受け付ける group_size
+    (32/64/128 のみ) のどれとも割り切れない。加えて FlashSpecEngine の粗
+    再ランク (``_build_rerank``) は lm_head 打ち直し後の重みを group_size=64
+    固定で再量子化するので、それも割り切れる必要がある。rebit の実打ち直しを
+    "head=4" (spec 例そのまま、group_size 省略時の既定 64) で CPU 通しする
+    ためだけに hidden_size/ple_embed_dim を 64 に上げた別個体 (他の
+    _build_tiny_qwen4_exp 利用テストには影響しない、完全に独立したビルド)。"""
+
+    import mlx_lm.models.qwen4_exp as Q
+    from mlxturbo.mtp_flash import FlashMTPModule
+
+    text_args = Q.TextArgs(
+        hidden_size=64,
+        num_hidden_layers=4,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=8,
+        vocab_size=32,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=8,
+        shared_expert_intermediate_size=8,
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        hc_count=2,
+        hc_lowrank=4,
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=8,
+        indexer_budget=8,
+        indexer_compress_ratio=2,
+        ngram_size=3,
+        heads_per_ngram=2,
+        ngram_vocab_size_base=32,
+        ple_embed_dim=64,
+        ple_layer_ids=[2],
+        ple_conv_kernel_size=4,
+        full_attention_interval=4,
+        partial_rotary_factor=0.25,
+        rope_theta=10_000.0,
+        tie_word_embeddings=False,
+    )
+    model_args = Q.ModelArgs(text_config=text_args.__dict__.copy())
+    model = Q.Model(model_args)
+    mx.eval(model.parameters())
+    mtp = FlashMTPModule(model_args.text, variant="lane")
+    mx.eval(mtp.parameters())
+    return model, mtp
+
+
+def test_build_runner_applies_rebit_env_var_before_fusions(monkeypatch, capsys):
+    """MLXTURBO_REBIT (環境変数) は runner.build_runner の先頭 (enable_default_
+    fusions より前) で rebit.apply を通す配線。server.py の既存 --rebit フラグ
+    とは別経路 (build_runner 経由なので cli.py からも自動で効く)。ここでは
+    実物の qwen4_exp tiny モデルを使い、起動経路で例外なく通ることと、
+    lm_head が実際に QuantizedLinear へ打ち直されること、ログ行が出ることを
+    確認する (CPU のみ、GPU 推論は無し)。"""
+
+    import mlx.nn as nn
+    import mlxturbo.mtp_flash as mtp_flash_module
+    import mlxturbo.runner as runner_module
+
+    model, mtp = _build_tiny_qwen4_exp_wide()
+    assert not hasattr(model.lm_head, "scales")  # 打ち直し前は素の bf16 Linear
+
+    def fake_load_flash_mtp(path, text_args, quantize=None, weights=None):
+        return mtp
+
+    monkeypatch.setattr(mtp_flash_module, "load_flash_mtp", fake_load_flash_mtp)
+    # 仕様書の例と同じ "head=4" (group_size 省略 = 既定 64)。tiny モデルの
+    # hidden_size=64 はこれで割り切れる (本番の hidden_size も 64 の倍数)。
+    monkeypatch.setenv("MLXTURBO_REBIT", "head=4")
+
+    args = SimpleNamespace(
+        model="fake-model",
+        original="fake-original",
+        mtp="fake-sidecar.safetensors",
+        mtp_bits=None,
+        no_mtp=False,
+        no_fused=True,
+    )
+    runner = runner_module.build_runner(
+        model, tokenizer=object(), config={}, args=args, log_prefix="[test-rebit]"
+    )
+    assert isinstance(runner, FlashSpecRunner)
+    # lm_head が QuantizedLinear (4bit/gs64) に打ち直されている == 起動経路で
+    # 例外なく rebit.apply が通った証拠
+    assert isinstance(model.lm_head, nn.QuantizedLinear)
+    assert model.lm_head.bits == 4
+    assert model.lm_head.group_size == 64
+
+    out = capsys.readouterr().out
+    assert "[test-rebit] rebit 適用: head=4 " in out
+    assert "KLD 未受理" in out
+
+
 def test_build_runner_exits_when_flash_mtp_sidecar_unreadable_after_retry(monkeypatch, capsys):
     """``--mtp`` は運用者の明示指定なので、1 回リトライしても読めなければ
     フォールバックせず理由を明示して ``SystemExit(1)`` する (仕様変更:
