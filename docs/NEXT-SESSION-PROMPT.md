@@ -93,8 +93,11 @@ GPU の待ち行列 (2026-09-03 03:20 時点の状態):
   `mx.metal.start_capture` は 68 GB で使えない、indexer-lean は ±0.3% で畳む。
 - 済 (10:50): HC の split-K も否定 (レーン 1 の HC カーネルは閉じた)、temp 0.7 の受理は greedy の 0.91 倍で
   厳密棄却サンプリングは畳んだ。仮説 A/B は一通り終わり。
-- 作成中: `tools/longctx_quality.py` (長文脈の品質ゲート、recall / quote の正答率、dense 対 カーネル)。上がったら
-  17k で走らせ (chain69、`lq.ready`)、gather カーネルの採用を裏付ける。
+- 走行中 (03:56〜): **フルベンチ** (chain70、`bench/results/self-snapshot-full-0903.json`、両エンジン、0/4k/17k/25k/32k/50k、
+  反復 1、冷却 10 分後)。mlx-serve は origin/main と同じで再ビルド不要と確認済み。
+- その後 (chain71): 長文脈の品質ゲート `tools/longctx_quality.py` を 17k (n=8) と 50k (n=6) で。1 回目は thinking on の
+  ままで課題不成立だった (直して 2k の健全性 recall 3/3、quote 2/3)。dense と kernel の正答率と一致率で gather
+  カーネルの採用を裏付ける (kernel が dense より有意に低ければ既定 off に戻す)。
 - その後: 長文脈の品質ゲートを 17k / 50k で走らせて gather カーネルの採用を裏付ける → temp 0.7 の tok/round →
   mlx-serve 最新版でフルベンチ → 27B / 35B-A3B。
 - その後: 小さいベンチ (mlxturbo だけ、冷、新しい冷却条件の基準) → 仮説 A/B (draft の hit@2、rerank off、
