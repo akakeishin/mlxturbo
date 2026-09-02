@@ -1293,3 +1293,22 @@ runner 内 154 ms + 外 345 ms。**runner でも executor でもなく、worker 
 
 `[ttft-trace]` の gen→first_token が完全ヒットで 310 → 1.2 ms。**全リクエストから 300 ms が消えた。**
 温 TTFT は相手 (0.87〜0.92 s) の 6 倍速。既定に入った (コミット 3ecf835)。
+
+## decode 幅 S=2 の attention 部品、連鎖版 (2026-09-03 05:10、`qsa_prefill_split --S 2 --chain 50`、部品和 ≈ 壁時計 ±3〜10%、us/層/回)
+
+| kv | 経路 | indexer | マスク/選択 | sdpa | その他 (qkv+gate+o_proj、**復元コピー込み**) | 壁時計 |
+|---|---|---|---|---|---|---|
+| 4096 | dense | 228 | 0.2 | 71 | 190 | 477 |
+| 17000 | dense | 235 | 5.7 | 153 | 324 | 717 |
+| 25000 | gather | 246 | 136 | 71 | 423 | 855 |
+| 50000 | gather | 307 | 185 | 71 | 712 | 1162 |
+
+- 「その他」の kv 比例は連鎖モードが各回の前にキャッシュを復元するため `update_and_fetch` が全長コピーになる
+  分 (17k で +90 us ×2、50k で +260 us ×2) で、本番には無い。差し引くと「その他」は約 190 us で kv に依らない。
+- kv に比例する本物: **indexer 228 → 307 us**、**gather 経路のマスク/選択 0 → 185 us** (25k 以上)、dense 経路の
+  sdpa 71 → 153 us (17k、bool マスクの vector でもキーを読む分)。合計で 4k → 50k は +270 us/層 =
+  **+3.3 ms/round (12 層)**。17k は +240 us/層 = +2.9 ms/round。
+- indexer が 4k でも 228 us/層 = 2.7 ms/round と、sdpa (71 us) の 3 倍ある。**decode の attention 層で最大の
+  部品は indexer** (pooled スコア、argpartition、keep ブロック構築の小さい op 列)。op 整理の対象。
+- decode の kv 罰 (+8.5 ms/tok ≈ +15 ms/round) のうち attention 層で説明できるのは +3 ms。残りの帰属は
+  ラウンド全体の built / eval の内訳 (`[round]` trace) で追う。
