@@ -682,3 +682,36 @@ decode ms/tok A -0.3%、prefill -3.0% (熱の範囲)、tok/round 同じ。結果
 一度も走っていない。**17k と同じ結論で、この経路は 0.20 の閾値のままでは 25k まで出番が無い。
 閾値を上げる案は `tools/gather_union_stats.py` の真の union 比 (T=32 で 0.665) からして
 読み出し量が減らないので却下のまま。
+
+## QSA タイル union の真の大きさ、T=4/8 (2026-09-02 20:40、`bench/results/gather-union-stats-t4t8.json`)
+
+17k prefill 全体の平均 (kv 4k〜16.8k の記録 44k 本):
+
+| T (束ねるクエリ数) | 真の union 比 (平均) | 同 kv=16.8k | 読み出し ∝ union/T | dense 比の FLOP |
+|---|---|---|---|---|
+| 32 | 0.665 | — | 0.021 | — |
+| 8 | 0.442 | 0.295 | 0.055 | 0.993 |
+| 4 | 0.364 | 0.221 | 0.091 | 0.702 |
+
+隣り合うクエリの top-512 ブロックの重なりが小さく、4 本束ねただけで union が kv の 36% (理想は
+12%) になる。**FLOP は T=4 でも dense causal の 70%、T=8 で差なし**。dense の steel attention は
+クエリタイル 32 本で K/V を共有するので読み出しは 1/32、T=4 のブロック疎はその 3 倍読む。
+設計書 `QSA-PREFILL-KERNEL-DESIGN.md` のゲート (合成テンソルで dense sdpa の 2 倍) には
+どの T でも届かない。**レーン 3 のブロック疎カーネルは畳む** (設計書と骨組みは記録として残す)。
+17k 以上の prefill attention を縮める手は、疎化ではなく dense attention そのものの効率
+(相手と同じ steel を使っているので差にならない) か、indexer (QSA の選択側) の費用に絞られる。
+
+## カスタム Metal カーネル 1 回の固定費 (2026-09-02 20:35、モデル無し、直列依存の連鎖 500 本)
+
+| 種類 | eval us/op |
+|---|---|
+| `mx.fast.metal_kernel` (2560 要素の加算) | **24.8** |
+| 組み込みの elementwise (`y + 1.0`) | 7.4 |
+| `mx.fast.rms_norm` | 12.6 |
+
+**カスタムカーネルは組み込み op の 3.4 倍の固定費を持つ。**融合で 3 op 未満しか減らせない
+融合 (gdn_prework、rms_norm_gated、router) が in-model で効かなかった理由がこれ。マイクロの
+gdn_prework fused 230 対 plain 227 us、HC fused 262 対 plain 428 us (HC は 10 op 以上を 1 つに
+しているので勝つ) とも整合する。相手 (mlx-serve) は融合カーネルを MLX の写しに一次 primitive
+として足しているので、この固定費を払わない。decode の未帰属 6 ms の候補として、
+S=1 forward のカスタムカーネル呼び出し数 × 17 us を次に数える。
