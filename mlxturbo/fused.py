@@ -383,7 +383,7 @@ def disable_rms_norm_gated() -> None:
     _ORIG_RNG = None
 
 
-def enable_gdn_prework_kernel() -> None:
+def enable_gdn_prework_kernel(model=None) -> None:
     """GatedDeltaNet の前処理 (conv1d -> silu -> q/k の rms_norm+スケール ->
     次段 conv 状態の書き出し -> g -> beta) を 1 dispatch のカーネルに畳む
     (mlxturbo/kernels/gdn_prework.py)。
@@ -396,6 +396,18 @@ def enable_gdn_prework_kernel() -> None:
     `gdn_prework.eligible` が判定する。外れれば素の経路 (conv1d -> silu ->
     rms_norm -> ...) にそのまま落ちる。
 
+    `model` を渡すと、その全 GatedDeltaNet 層 (``model.model.layers[*].linear_attn``)
+    の `A_log`/`dt_bias` を fp32 に変換した写し (``_A_log_f32``/``_dt_bias_f32``)
+    を層に持たせる。実モデル (mlx_lm の 4bit 変換など) では `A_log`/`dt_bias`
+    が bf16 で読み込まれていることがあり (2026-09-02、実機ログで確認)、
+    `eligible()` は dtype を fp32 限定で見るのでそのままだと毎回弾かれて
+    カーネルが一度も発火しない。素の経路 (`mlx_lm` の `compute_g`) は
+    `A_log.astype(float32)` して計算するので、fp32 に揃えるのは意味的に
+    同じ。写しは enable 時に 1 回だけ作る (毎ステップ astype を dispatch
+    しないため)。`model` を渡さない場合はこの写しを作らず、
+    `A_log`/`dt_bias` が元から fp32 でない層は従来どおり `eligible()` の
+    dtype 判定で弾かれる。
+
     既定 off。環境変数 `MLXTURBO_GDN_PREWORK=1` が立っているときだけ
     有効化する (enable_moe_verify_gather と同じゲート方式 -- 呼ぶだけでは
     何も起きない)。採否は in-model A/B (tools/decode_ab.py --knob
@@ -403,11 +415,25 @@ def enable_gdn_prework_kernel() -> None:
     """
     import os
 
+    import mlx.core as mx
     import mlx_lm.models.qwen4_exp as Q
 
     if os.environ.get("MLXTURBO_GDN_PREWORK") != "1":
         return
     Q.GatedDeltaNet._gdn_prework = True
+    if model is None:
+        return
+    copies = []
+    for layer in model.model.layers:
+        gdn = getattr(layer, "linear_attn", None)
+        if gdn is None:
+            continue
+        gdn._A_log_f32 = gdn.A_log.astype(mx.float32)
+        gdn._dt_bias_f32 = gdn.dt_bias.astype(mx.float32)
+        copies.append(gdn._A_log_f32)
+        copies.append(gdn._dt_bias_f32)
+    if copies:
+        mx.eval(copies)
 
 
 def disable_gdn_prework_kernel() -> None:

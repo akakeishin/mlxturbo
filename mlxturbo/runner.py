@@ -1317,7 +1317,10 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
             print(f"{log_prefix} moe_verify_gather カーネル有効 (verify 幅の gate+up 融合 + down)")
         # enable_gdn_prework_kernel 自身が MLXTURBO_GDN_PREWORK=1 をゲートに
         # 持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
-        fused.enable_gdn_prework_kernel()
+        # model を渡すことで、A_log/dt_bias が bf16 で読み込まれた実モデルでも
+        # fp32 の写しが作られ、eligible() の dtype 判定で弾かれなくなる
+        # (2026-09-02、実機ログで発火 0 が判明した分の修正)。
+        fused.enable_gdn_prework_kernel(model)
         if os.environ.get("MLXTURBO_GDN_PREWORK") == "1":
             print(f"{log_prefix} gdn_prework カーネル有効 (conv1d/silu/rms_norm/g/beta を"
                   " decode/verify 幅のみ 1 dispatch に融合)")

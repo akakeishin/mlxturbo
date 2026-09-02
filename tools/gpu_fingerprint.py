@@ -239,7 +239,7 @@ def _build_real_gdn_shape(budget: int):
     return model
 
 
-def check_gdn_prework_capture() -> dict:
+def check_gdn_prework_capture(bf16_alog: bool = False) -> dict:
     """`gdn_prework` を **`spec_flash.capture()` + `_staged_forward` 経由**
     (投機の検証フォワードが実際に通る経路) で確かめる。
 
@@ -251,14 +251,28 @@ def check_gdn_prework_capture() -> dict:
 
     実機の GDN 形 (n_k=16 で `2*n_k<=32` の境界ちょうど) を使い、S=1..3 の
     複数呼び出し (検証フォワードの幅) を通す。
+
+    ``bf16_alog=True`` は実機と同じ状態 (A_log/dt_bias も bf16 --
+    `_cast_bf16_except` の keep リストを空にする) を再現する。実モデル
+    (`~/models/ddalcu-mlxlm`) の decode A/B ログで `eligible()` が
+    ``A_log/dt_bias が fp32 でない`` で毎回弾け、発火 0 のまま「効果なし」と
+    誤判定していた分 (2026-09-02) の再現・修正確認。まず
+    `enable_gdn_prework_kernel()` を model 無しで呼び (修正前の呼び方 --
+    fp32 の写しが作られないので `eligible()` の dtype 判定で毎回弾かれ、
+    発火 0 のはず) を確かめてから、`enable_gdn_prework_kernel(model)` で
+    写しを作らせ、発火することを確かめる。**発火 0 のまま「一致」を出さない**
+    (モジュール docstring の方針どおり)。
     """
     from mlxturbo import spec_flash
 
     model = _build_real_gdn_shape(8)
-    _cast_bf16_except(model, ("A_log", "dt_bias"))
+    keep = () if bf16_alog else ("A_log", "dt_bias")
+    _cast_bf16_except(model, keep)
 
     gdn0 = model.model.layers[2].linear_attn
     shape_ok = (gdn0.n_k, gdn0.n_v, gdn0.dk, gdn0.conv_dim) == (16, 48, 128, 10240)
+    want_alog_dtype = mx.bfloat16 if bf16_alog else mx.float32
+    alog_ok = gdn0.A_log.dtype == want_alog_dtype and gdn0.dt_bias.dtype == want_alog_dtype
 
     ids = [(i * 7 + 3) % TINY["vocab_size"] for i in range(20)]
 
@@ -284,7 +298,19 @@ def check_gdn_prework_capture() -> dict:
 
     base_logits = run(False)
 
-    fused.enable_gdn_prework_kernel()
+    pre_fix_fired = None
+    if bf16_alog:
+        # 修正前の呼び方 (model を渡さない enable): fp32 の写しが作られない
+        # ので eligible() の dtype_alog 分岐で毎回弾かれ、発火 0 のはず。
+        fused.enable_gdn_prework_kernel()
+        _fire.reset()
+        try:
+            run(True)
+            pre_fix_fired = _fire.snapshot().get("gdn_prework", 0)
+        finally:
+            fused.disable_gdn_prework_kernel()
+
+    fused.enable_gdn_prework_kernel(model)
     _fire.reset()
     try:
         on_logits = run(True)
@@ -296,11 +322,22 @@ def check_gdn_prework_capture() -> dict:
     rel = max(_diff(a, b)[1] for a, b in zip(base_logits, on_logits))
     # check_gdn_prework と同じ緩めの絶対値ゲート (bf16 sigmoid が参照とビット
     # 一致しない分 + cache 経由の伝播)。
-    ok = shape_ok and fired > 0 and diff < 0.5
-    return {"name": "gdn-prework(capture)", "fired": fired, "diff": diff, "rel": rel,
-            "ok": ok,
-            "note": "実機 GDN 形 (n_k=16 境界) x capture()+_staged_forward、S=1..3"
-                    + ("" if shape_ok else "  ★形が実機と不一致★")}
+    ok = shape_ok and alog_ok and fired > 0 and diff < 0.5
+    if bf16_alog:
+        ok = ok and pre_fix_fired == 0
+    name = "gdn-prework(capture,bf16-alog)" if bf16_alog else "gdn-prework(capture)"
+    if bf16_alog:
+        note = ("実機 GDN 形 (n_k=16 境界) x capture()+_staged_forward、S=1..3、"
+                 "A_log/dt_bias も bf16 (実機と同じ状態)。修正前 (model 無し enable)"
+                 f" は発火 {pre_fix_fired}、修正後 (model 渡し) は発火 {fired}、"
+                 "diff は素の経路 (compute_g の fp32 astype) との差")
+    else:
+        note = "実機 GDN 形 (n_k=16 境界) x capture()+_staged_forward、S=1..3"
+    if not shape_ok:
+        note += "  ★形が実機と不一致★"
+    if not alog_ok:
+        note += f"  ★A_log/dt_bias dtype が想定 ({want_alog_dtype}) と不一致★"
+    return {"name": name, "fired": fired, "diff": diff, "rel": rel, "ok": ok, "note": note}
 
 
 def check_gdn_blocked() -> dict:
@@ -499,6 +536,7 @@ def main() -> int:
         check_hc_write,
         check_gdn_prework,
         check_gdn_prework_capture,
+        lambda: check_gdn_prework_capture(bf16_alog=True),
         check_prefill_attn,
         check_gdn_blocked,
         check_moe_verify,

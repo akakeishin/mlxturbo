@@ -234,16 +234,22 @@ def _knob_fast_rope(ctx):
 
 
 def _knob_gdn_prework(ctx):
-    """A = GDN 前処理の融合カーネル on / B = off (既定)。"""
+    """A = GDN 前処理の融合カーネル on / B = off (既定)。
+
+    model を渡すのは、A_log/dt_bias が bf16 で読み込まれた実モデルでも
+    fp32 の写しを作って eligible() の dtype 判定を通すため
+    (mlxturbo/fused.py の enable_gdn_prework_kernel docstring 参照。
+    2026-09-02、実機ログで発火 0 が判明した分の修正)。"""
     import os
 
     from mlxturbo import fused
 
     os.environ["MLXTURBO_GDN_PREWORK"] = "1"  # enable 側のゲートを開ける
+    eng = ctx["eng"]
 
     def apply(variant):
         if variant == "A":
-            fused.enable_gdn_prework_kernel()
+            fused.enable_gdn_prework_kernel(eng.model)
         else:
             fused.disable_gdn_prework_kernel()
 
