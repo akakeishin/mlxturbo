@@ -77,6 +77,13 @@ _THREADS = _SIMDGROUPS * 32
 # 読み直すので、増やすと並列度と引き換えに冗長読みが増える。lowrank=320 なら
 # 16 行 x 20 本で、冗長読みは重み 3.3MB に対して 0.8MB。
 #
+# down 側の 1 threadgroup は _SIMDGROUPS(32) 本の simdgroup のうち
+# _ROWS_PER_TG(16) 本しか使わない (rr の for ループが simd_gid>=16 で回らない
+# ので、残り 16 本は down の仕事では常に遊んでいる)。inject (hc=4 本) は
+# その遊んでいる simdgroup を tgi==0 の中で使い回す (_fold_inject_ok 参照)。
+# 専用の 21 番目の threadgroup を割り当てて normed をもう一度計算させるより、
+# 既に tg_normed を持っている threadgroup に相乗りさせる方が起動 1 回ぶん安い。
+#
 # (_ROWS_PER_TG, _SIMDGROUPS) は重みを 96 組み回してキャッシュに乗らない状態を
 # 作った上で 3 回ずつ測って選んだ (中央値 us/call、素は同条件で 90.7):
 # (16,32) 39.9、(8,16) 41.2、(32,32) 40.9、(16,16) 42.4、(8,8) 46.2、(4,4) 64.3。
@@ -86,6 +93,16 @@ _THREADS = _SIMDGROUPS * 32
 # 19.7 -> 16.6us にしかならず、hc_pre は帯域ではなく要素あたりの
 # 逆量子化 ALU と threadgroup メモリ読みで律速しているため。
 _ROWS_PER_TG = 16
+
+
+def _fold_inject_ok(hc: int) -> bool:
+    """inject (hc 行) を down の空き simdgroup (_ROWS_PER_TG.._SIMDGROUPS-1)
+    に相乗りさせられるか。hc がその余白に収まらない構成なら専用
+    threadgroup (旧経路) に戻す。現行の hc=4 では 16 本の余白に対して
+    4 本なので常に True。
+    """
+    return hc <= (_SIMDGROUPS - _ROWS_PER_TG)
+
 
 _KERNELS: dict[tuple, Any] = {}
 
@@ -182,6 +199,31 @@ def _dot_loop(wname: str, words: int, bits: int, group_size: int, index_expr: st
                 }}"""
 
 
+def _dot_loop_half(wname: str, words: int, bits: int, group_size: int, index_expr: str) -> str:
+    """1 行ぶんの積和ループを 2 simdgroup (`half_idx` が 0/1) で分担する版。
+
+    呼び出し側が `_vec4_ok(words, bits, group_size)` と `words // 4 >= 2` を
+    保証すること (uint4 の範囲を単純に前半/後半で割るだけなので、奇数なら
+    後半が 1 個多く持つ)。1 行の総和を 2 つの simdgroup が別々の部分和として
+    計算し、呼び出し元が `simd_sum` の結果 2 つを device/threadgroup メモリで
+    合算する想定 (このループ自体は合算しない)。
+
+    生成コードは呼び出し元スコープの `int half_idx` (0 か 1) を参照する。
+    Metal では `half` は 16bit float の予約型名なので、変数名としては使えない
+    (`int half = ...` はコンパイルエラーになる -- 実測済み)。
+    """
+    inner = _dequant_block_vec4(wname, bits, group_size, index_expr)
+    return f"""
+                const device uint4* {wname}_vec = (const device uint4*){wname}_row;
+                int {wname}_total_vec = {words // 4};
+                int {wname}_half_vec = {wname}_total_vec / 2;
+                int {wname}_vstart = half_idx * {wname}_half_vec;
+                int {wname}_vend = (half_idx == 0) ? {wname}_half_vec : {wname}_total_vec;
+                for (int vi = {wname}_vstart + (int)simd_lid; vi < {wname}_vend; vi += 32) {{
+{inner}
+                }}"""
+
+
 def _pre_source(cfg: dict) -> str:
     hc, d, lowrank = cfg["hc"], cfg["d"], cfg["lowrank"]
     hcd = hc * d
@@ -191,12 +233,43 @@ def _pre_source(cfg: dict) -> str:
     words = hcd * bits // 32
     n_groups = hcd // gs
     n_down_tg = (lowrank + _ROWS_PER_TG - 1) // _ROWS_PER_TG
+    # 候補 (b, 2026-09-03 in-model 検証): down の 1 行ぶんの内積を 2 simdgroup
+    # (half=0/1) で分担し、down では今まで遊んでいた上位 16 simdgroup も動員
+    # する。全 32 simdgroup が down で埋まるので、この間は inject を fold
+    # する空きが無く、専用 threadgroup (旧経路) に戻る。
+    split_down = _vec4_ok(words, bits, gs) and (words // 4) >= 2
+    fold_inject = (not split_down) and inject_kind is not None and _fold_inject_ok(hc)
 
     inject_body = ""
     if inject_kind == "quant":
-        inject_body = f"""
+        if fold_inject:
+            inject_body = f"""
+    // inject 行 (hc 本、量子化)。down で使わない上位 simdgroup
+    // ({_ROWS_PER_TG}..{_SIMDGROUPS - 1}) を tgi==0 の中で相乗りさせる
+    // (この threadgroup は既に tg_normed を持っているので、専用
+    // threadgroup を割り当てて正規化をもう一度計算させるより安い)
+    if (tgi == 0 && (int)simd_gid >= {_ROWS_PER_TG}) {{
+        for (int rr = (int)simd_gid - {_ROWS_PER_TG}; rr < {hc}; rr += {_SIMDGROUPS - _ROWS_PER_TG}) {{
+            const device uint32_t* inject_w_row = inject_w + (size_t)rr * {words};
+            const device T* s_row = inject_s + (size_t)rr * {n_groups};
+            const device T* b_row = inject_b + (size_t)rr * {n_groups};
+            float acc = 0.0f;
+{_dot_loop("inject_w", words, bits, gs, "(float)tg_normed[{k}]")}
+            acc = simd_sum(acc);
+            if (simd_lid == 0) {{
+                // 参照: 2 * sigmoid(qmm(normed) / hc)
+                float xv = (float)((T)((float)((T)acc) / {float(hc)}f));
+                float sg = (float)((T)(1.0f / (1.0f + metal::exp(-xv))));
+                inject[(size_t)m * {hc} + rr] = (T)(2.0f * sg);
+            }}
+        }}
+    }}"""
+        else:
+            inject_body = f"""
     }} else {{
-        // inject 行 (hc 本、量子化)。1 スレッドグループで足りる小ささ
+        // inject 行 (hc 本、量子化)。hc が down の空き simdgroup に収まらない
+        // ので専用 threadgroup に戻す (_fold_inject_ok 参照。現行の hc=4 では
+        // 通らない経路)
         for (int rr = (int)simd_gid; rr < {hc}; rr += {_SIMDGROUPS}) {{
             const device uint32_t* inject_w_row = inject_w + (size_t)rr * {words};
             const device T* s_row = inject_s + (size_t)rr * {n_groups};
@@ -212,13 +285,36 @@ def _pre_source(cfg: dict) -> str:
             }}
         }}"""
     elif inject_kind == "bf16":
-        inject_body = f"""
+        if fold_inject:
+            inject_body = f"""
+    // inject 行 (hc 本、非量子化)。折り込み版 (量子化 inject と同じ理由)。
+    // 重みは (hc, hcd) の T をそのまま読むだけで逆量子化は不要 (80KB 前後
+    // なので帯域上も無視できる)
+    if (tgi == 0 && (int)simd_gid >= {_ROWS_PER_TG}) {{
+        for (int rr = (int)simd_gid - {_ROWS_PER_TG}; rr < {hc}; rr += {_SIMDGROUPS - _ROWS_PER_TG}) {{
+            const device T* inject_w_row = inject_w + (size_t)rr * {hcd};
+            float acc = 0.0f;
+            for (int k = (int)simd_lid; k < {hcd}; k += 32) {{
+                acc += (float)inject_w_row[k] * (float)tg_normed[k];
+            }}
+            acc = simd_sum(acc);
+            if (simd_lid == 0) {{
+                // 参照: 2 * sigmoid(qmm(normed) / hc)。qmm は非量子化なら
+                // 単なる行列積 (mlxturbo/fused.py の core() 参照)
+                float xv = (float)((T)((float)((T)acc) / {float(hc)}f));
+                float sg = (float)((T)(1.0f / (1.0f + metal::exp(-xv))));
+                inject[(size_t)m * {hc} + rr] = (T)(2.0f * sg);
+            }}
+        }}
+    }}"""
+        else:
+            inject_body = f"""
     }} else {{
         // inject 行 (hc 本、非量子化)。block_inject_weight が
         // QuantizedLinear に変換されず bf16/fp16 の nn.Linear のまま残った
         // 層向け (診断: 97 層中 96 層がこれに該当、hc_fire_diag.py 参照)。
-        // 重みは (hc, hcd) の T をそのまま読むだけで逆量子化は不要 (80KB
-        // 前後なので帯域上も無視できる)
+        // hc が down の空き simdgroup に収まらないので専用 threadgroup に
+        // 戻す (_fold_inject_ok 参照。現行の hc=4 では通らない経路)
         for (int rr = (int)simd_gid; rr < {hc}; rr += {_SIMDGROUPS}) {{
             const device T* inject_w_row = inject_w + (size_t)rr * {hcd};
             float acc = 0.0f;
@@ -235,58 +331,40 @@ def _pre_source(cfg: dict) -> str:
             }}
         }}"""
 
-    return f"""
-    typedef float U;
-
-    uint simd_gid = simdgroup_index_in_threadgroup;
-    uint simd_lid = thread_index_in_simdgroup;
-    int  tid = (int)simd_gid * 32 + (int)simd_lid;
-    int  tgi = (int)threadgroup_position_in_grid.y;
-    int  m   = (int)threadgroup_position_in_grid.z;
-
-    threadgroup float tg_part[{_SIMDGROUPS}];
-    threadgroup float tg_r[{hc}];
-    threadgroup T     tg_normed[{hcd}];
-
-    const device T* hyper_m = hyper + (size_t)m * {hcd};
-
-    // 1) レーンごとの rms。mx.fast.rms_norm と同じく fp32 で溜める。
-    //    ついでに hyper を threadgroup メモリへ移しておく (2 パス目で device
-    //    メモリを読み直さずに済む)
-    for (int l = 0; l < {hc}; l++) {{
-        float ss = 0.0f;
-        for (int i = tid; i < {d}; i += {_THREADS}) {{
-            T raw = hyper_m[l * {d} + i];
-            tg_normed[l * {d} + i] = raw;
-            float v = (float)raw;
-            ss += v * v;
-        }}
-        ss = simd_sum(ss);
-        if (simd_lid == 0) tg_part[simd_gid] = ss;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) {{
-            float tot = 0.0f;
-            for (int q = 0; q < {_SIMDGROUPS}; q++) tot += tg_part[q];
-            tg_r[l] = metal::rsqrt(tot / {float(d)}f + {eps!r}f);
+    if split_down:
+        down_body = f"""
+        // 候補 (b): 1 行を 2 simdgroup (half_idx=0/1) で分担する。down では
+        // 単独 simdgroup だと {_ROWS_PER_TG} 本しか埋まらなかった (残り
+        // {_SIMDGROUPS - _ROWS_PER_TG} 本は常に遊んでいた) ので、1 行の内積を
+        // 前半/後半に割って両方使い切る。部分和は tg_down_partial 経由で
+        // 合算する (追加バリア 1 回)。合算順序は「同じ 2 項を足すだけ」
+        // なので (T)acc への丸め (bf16, 8bit 仮数) 前で fp32 の LSB が
+        // 入れ替わり得るだけ -- 参照との一致は bf16 丸め後で見ているので
+        // 実質的な影響は無い (bench/test_hc_kernel_inject.py で確認)。
+        // 変数名は half_idx (Metal では `half` が 16bit float の予約型名で
+        // 変数名に使えない -- 実測でコンパイルエラーになった)。
+        int rr = (int)simd_gid % {_ROWS_PER_TG};
+        int half_idx = (int)simd_gid / {_ROWS_PER_TG};
+        int row = tgi * {_ROWS_PER_TG} + rr;
+        if (row < {lowrank}) {{
+            const device uint32_t* down_w_row = down_w + (size_t)row * {words};
+            const device T* s_row = down_s + (size_t)row * {n_groups};
+            const device T* b_row = down_b + (size_t)row * {n_groups};
+            float acc = 0.0f;
+{_dot_loop_half("down_w", words, bits, gs, "(float)tg_normed[{k}]")}
+            acc = simd_sum(acc);
+            if (simd_lid == 0) tg_down_partial[rr * 2 + half_idx] = acc;
         }}
         threadgroup_barrier(mem_flags::mem_threadgroup);
-    }}
-
-    // 2) normed を threadgroup メモリに置く。参照は rms_norm の出力と
-    //    (1 + weight) をそれぞれ bf16 に落とすので、その丸めを再現する
-    for (int i = tid; i < {hcd}; i += {_THREADS}) {{
-        T nrm   = (T)((float)tg_normed[i] * tg_r[i / {d}]);
-        T scale = (T)(1.0f + (float)norm_weight[i]);
-        tg_normed[i] = (T)((float)nrm * (float)scale);
-    }}
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // hc_post が normed を組み直すのに使う。全 threadgroup が同じ値を持つので
-    // 1 本だけ書けばよい
-    if (tgi == 0 && tid < {hc}) rlane[(size_t)m * {hc} + tid] = tg_r[tid];
-
-    // 3) down (hcd -> lowrank) + silu、あるいは inject
-    if (tgi < {n_down_tg}) {{
+        if (half_idx == 0 && simd_lid == 0 && row < {lowrank}) {{
+            float acc = tg_down_partial[rr * 2 + 0] + tg_down_partial[rr * 2 + 1];
+            // 参照: nn.silu(qmm(normed) / hc) = x * sigmoid(x)、各段 bf16
+            float xv = (float)((T)((float)((T)acc) / {float(hc)}f));
+            float sg = (float)((T)(1.0f / (1.0f + metal::exp(-xv))));
+            t[(size_t)m * {lowrank} + row] = (T)(xv * sg);
+        }}"""
+    else:
+        down_body = f"""
         for (int rr = (int)simd_gid; rr < {_ROWS_PER_TG}; rr += {_SIMDGROUPS}) {{
             int row = tgi * {_ROWS_PER_TG} + rr;
             if (row < {lowrank}) {{
@@ -303,7 +381,70 @@ def _pre_source(cfg: dict) -> str:
                     t[(size_t)m * {lowrank} + row] = (T)(xv * sg);
                 }}
             }}
+        }}"""
+
+    down_partial_decl = (
+        f"threadgroup float tg_down_partial[{_ROWS_PER_TG * 2}];" if split_down else ""
+    )
+
+    return f"""
+    typedef float U;
+
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+    int  tid = (int)simd_gid * 32 + (int)simd_lid;
+    int  tgi = (int)threadgroup_position_in_grid.y;
+    int  m   = (int)threadgroup_position_in_grid.z;
+
+    threadgroup float tg_part[{hc * _SIMDGROUPS}];
+    threadgroup float tg_r[{hc}];
+    threadgroup T     tg_normed[{hcd}];
+    {down_partial_decl}
+
+    const device T* hyper_m = hyper + (size_t)m * {hcd};
+
+    // 1) レーンごとの rms。mx.fast.rms_norm と同じく fp32 で溜める。
+    //    ついでに hyper を threadgroup メモリへ移しておく (2 パス目で device
+    //    メモリを読み直さずに済む)。tg_part をレーン別の領域に広げてあるので
+    //    4 レーン分の書き込みは互いに依存が無く、バリア無しで済む
+    //    (元は同じ tg_part を使い回していたため「書く->barrier->読む->barrier」
+    //    を 4 レーン分 = 8 回払っていた。ここでは最後に 1 回だけ同期する。
+    //    各レーンの総和の相手・順序は変えていないのでビット単位で従来と同じ)
+    for (int l = 0; l < {hc}; l++) {{
+        float ss = 0.0f;
+        for (int i = tid; i < {d}; i += {_THREADS}) {{
+            T raw = hyper_m[l * {d} + i];
+            tg_normed[l * {d} + i] = raw;
+            float v = (float)raw;
+            ss += v * v;
         }}
+        ss = simd_sum(ss);
+        if (simd_lid == 0) tg_part[l * {_SIMDGROUPS} + simd_gid] = ss;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < {hc}) {{
+        float tot = 0.0f;
+        for (int q = 0; q < {_SIMDGROUPS}; q++) tot += tg_part[tid * {_SIMDGROUPS} + q];
+        tg_r[tid] = metal::rsqrt(tot / {float(d)}f + {eps!r}f);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 2) normed を threadgroup メモリに置く。参照は rms_norm の出力と
+    //    (1 + weight) をそれぞれ bf16 に落とすので、その丸めを再現する
+    for (int i = tid; i < {hcd}; i += {_THREADS}) {{
+        T nrm   = (T)((float)tg_normed[i] * tg_r[i / {d}]);
+        T scale = (T)(1.0f + (float)norm_weight[i]);
+        tg_normed[i] = (T)((float)nrm * (float)scale);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // hc_post が normed を組み直すのに使う。全 threadgroup が同じ値を持つので
+    // 1 本だけ書けばよい
+    if (tgi == 0 && tid < {hc}) rlane[(size_t)m * {hc} + tid] = tg_r[tid];
+
+    // 3) down (hcd -> lowrank) + silu、あるいは inject
+    if (tgi < {n_down_tg}) {{
+{down_body}
 {inject_body}
     }}
 """
@@ -797,7 +938,15 @@ def fused_gated_residual(
     flat = hyper.reshape((m, hc * d))
 
     n_down_tg = (lowrank + _ROWS_PER_TG - 1) // _ROWS_PER_TG
-    pre_tg = n_down_tg + (1 if inject is not None else 0)
+    # _pre_source の split_down/fold_inject と同じ条件をここでも評価する
+    # (grid.y = pre_tg の決め方がカーネル本体の tgi 割り付けと一致していないと
+    # down/inject の行が抜け落ちる)。
+    words = hc * d * down[4] // 32
+    split_down = _vec4_ok(words, down[4], down[3]) and (words // 4) >= 2
+    fold_inject = (not split_down) and inject is not None and _fold_inject_ok(hc)
+    # inject が down の空き simdgroup に相乗りできるなら、専用の 21 本目の
+    # threadgroup は要らない (_pre_source の fold_inject 分岐を参照)。
+    pre_tg = n_down_tg + (0 if (inject is None or fold_inject) else 1)
 
     pre_inputs = [flat, norm_weight, down[0], down[1], down[2]]
     pre_shapes = [(m, lowrank), (m, hc)]
