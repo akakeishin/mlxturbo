@@ -8288,6 +8288,57 @@ def test_spec_round_depth_respects_rectangle_and_budget():
     assert coord._round_depth(0, 2048) == 0
 
 
+def test_spec_batch_depth_drops_past_sparse_boundary():
+    """バッチのラウンドにも文脈長連動の depth を被せる (2026-09-02 に単独経路
+    から移した)。
+
+    移す根拠は単独経路の実測 (mlxturbo/spec_flash.py の DEPTH_CONTEXT_LIMIT、
+    複数プロンプト x 512 の回文順掃引): depth 2 を基準に 2.6k で -3.3% /
+    4k で -3.1% / 17k で -10.9%。境界は疎注意 (QSA) が働き始める
+    indexer_budget で、機構としても符合する。バッチでは 1 位置足す費用が
+    行数ぶん重なるので、効く向きは同じで大きさはむしろ大きい。
+
+    行ごとに T を変えられないので、位置は論理長の最大で代表する。境界の
+    内側 (短いプロンプトのバッチ、B=4 で +19% が出ている土俵) では発火しない。
+    """
+
+    import os
+
+    from mlxturbo.batch_spec import BatchSpecGenerator
+
+    def gen(max_valid_len: int, depth: int = 2, batch: int = 2):
+        g = BatchSpecGenerator.__new__(BatchSpecGenerator)
+        g.depth = depth
+        g.B = batch
+        g.eng = SimpleNamespace(depth=depth, depth_ctx_limit=2048)
+        g.ledger = SimpleNamespace(max_valid_len=lambda: max_valid_len)
+        return g
+
+    # 既定 (env 無し) は移す前の挙動そのまま。境界の外でも depth を落とさない
+    os.environ.pop("MLXTURBO_BATCH_DEPTH_CTX", None)
+    assert gen(17000)._depth_for_round(None) == 2
+    assert gen(17000)._depth_for_round(3) == 3
+
+    # env を立てると政策が効く。**毎ラウンド読む**ので、同じプロセスの中で
+    # 立てたり倒したりできる (1 サーバーの中で on/off 交互に流すため)
+    os.environ["MLXTURBO_BATCH_DEPTH_CTX"] = "1"
+    try:
+        # 境界の内側: 何も変わらない (既定も、スケジューラ指定も素通り)
+        assert gen(64)._depth_for_round(None) == 2
+        assert gen(2047)._depth_for_round(3) == 3
+        # 境界の外側: 1 に落ちる
+        assert gen(2048)._depth_for_round(None) == 1
+        assert gen(17000)._depth_for_round(3) == 1
+        # 上限としてだけ被せる。予算が 0 (素の decode) を指示したラウンドを
+        # 1 に押し上げない
+        assert gen(17000)._depth_for_round(0) == 0
+        assert gen(64)._depth_for_round(0) == 0
+    finally:
+        os.environ.pop("MLXTURBO_BATCH_DEPTH_CTX", None)
+    # 倒せば同じプロセスで元に戻る
+    assert gen(17000)._depth_for_round(None) == 2
+
+
 def test_spec_rows_fit_counts_only_new_bytes():
     """メモリの判定は「これから増える分」だけを数える (free_bytes は
     書き終わった KV を含む現在の常駐を既に引いている)。数えられない環境では

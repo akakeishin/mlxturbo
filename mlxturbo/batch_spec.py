@@ -82,6 +82,7 @@ rope 角は本家と同じ 1 本で済み、行ごとに違うのは「何ブロ
 from __future__ import annotations
 
 import math
+import os
 from contextlib import contextmanager
 
 import mlx.core as mx
@@ -1256,6 +1257,64 @@ class BatchSpecGenerator:
 
     # ---- rounds -----------------------------------------------------
 
+    def _depth_for_round(self, depth: "int | None") -> int:
+        """このラウンドのドラフト数。文脈長連動の政策をここで被せる。
+
+        単独経路の ``FlashSpecEngine._effective_depth`` と同じ ``choose_depth``
+        を通す。論理長が疎注意の境界 (``indexer_budget``) を越えたら 1 に
+        落とす政策で、単独経路の実測は depth 2 を基準に 2.6k で -3.3% /
+        4k で -3.1% / 17k で -10.9% (``mlxturbo/spec_flash.py`` の
+        ``DEPTH_CONTEXT_LIMIT`` の注記、複数プロンプト x 512 の回文順掃引)。
+
+        バッチではラウンドが ``(B, T+1)`` の矩形なので、1 位置足す費用は行数
+        ぶん重なる一方、受理が増える利得は行ごとに独立。**効く向きは単独と
+        同じで、大きさはむしろ大きい。**行ごとに T を変えられないので、位置は
+        **論理長の最大**で代表する。全行が境界の内側にいる限り (短いプロンプト
+        のバッチ) この規則は発火しないので、そちらの振る舞いは変わらない。
+
+        被せ方は上限としてだけ。``choose_depth`` は境界の内側では引数の
+        ``depth`` をそのまま返すが、境界の外では 1 を返すので、スケジューラが
+        予算の都合で 0 (素の decode) を指示したラウンドを 1 に押し上げて
+        しまわないよう ``min`` を取る。
+
+        ``MLXTURBO_BATCH_DEPTH_CTX=1`` で有効。**既定 off = 移す前のバッチの
+        挙動そのまま。**env を**毎ラウンド読む**のは、1 つのサーバープロセスの
+        中で同じ負荷を on/off 交互に流せるようにするため -- プロセスを分けた
+        比較は熱とメモリ状態が変わり、狙っている差 (数 %) と同じ桁のドリフトが
+        乗る (``MLXTURBO_PIPELINE`` が ``spec_flash.py`` の decode ループで
+        毎ラウンド読んでいるのと同じ形)。読むのはラウンドに 1 回で、
+        1 ラウンドは数十 ms なので費用は無視できる。
+
+        **効果は未確認 (2026-09-02)。**コーディネータ経由 (chunked prefill +
+        走行中の join)、1880 トークン x 2 本 x 512 生成、1 プロセス内で回文順
+        (on/off/off/on)、4 ラウンドとも joins=1:
+
+            壁時計    on 23.20s  off 23.03s  (+0.7%)
+            decode 中央値  on 31.8  off 32.5 tok/s
+
+        採用の線は「2% 以上縮む」だったので届かない。理由は発火の窓が狭い
+        こと -- 1880 + 512 = 2392 なので、規則が効くのは decode の後ろ 2/3
+        だけで、壁時計はプロンプト 2 本の prefill が半分を占める。
+        4k でも測ったが、**そちらはドリフトで判定不能**だった (同じ条件の
+        ラウンドが 33.94s と 61.35s、回文順を逆にすると符号も反転)。
+
+        一方**閉じたバッチ** (``BatchSpecGenerator`` を直接、一括 prefill で
+        1 ラウンド目から全行そろっている形) では、同じ 1 プロセス回文順で
+        1880x2 が -3.3%、3962x2 が -3.1% (256 生成) / -4.1% (512 生成)、
+        ラウンド数も 248→294 / 134→159 / 265→319 と規則の発火が確認できた。
+        単独経路の記録とも大きさが一致する。**機構としては効いているが、
+        実運用の経路 (コーディネータ) では取り分が窓に埋もれる。**
+        """
+        from .spec_flash import choose_depth
+
+        base = self.depth if depth is None else max(0, depth)
+        if os.environ.get("MLXTURBO_BATCH_DEPTH_CTX", "0") != "1":
+            return base
+        return min(base, choose_depth(
+            self.ledger.max_valid_len(), base, self.eng.depth_ctx_limit,
+            batch_size=self.B,
+        ))
+
     def step(self, truncate=None, depth: int | None = None) -> list[list[int]]:
         """1 ラウンド進めて、行ごとの新規トークンを返す。
 
@@ -1273,11 +1332,13 @@ class BatchSpecGenerator:
         1 列も足さないので、ヘッドから見た履歴に穴が 1 つ空く。受理率が
         少し動くだけで、出す**トークンは変わらない** (出力は本体の検証
         フォワードの logits から来る)。
+
+        そのうえで文脈長連動の上限を被せる (``_depth_for_round``)。
         """
         from .spec_flash import _staged_forward
 
         eng = self.eng
-        d = self.depth if depth is None else max(0, depth)
+        d = self._depth_for_round(depth)
         drafts = []
         if d:
             with ragged_attention():
@@ -1611,9 +1672,13 @@ class SpecPrefillLane:
 # 駆動の間に他の要求が終わった等) でも、走行中のバッチも車線も空で
 # 待ち行列に 1 本しか無いときは
 # `BatchSpecGenerator` を使わず、`FlashSpecRunner.generate`
-# (= `FlashSpecEngine.generate_stream`) をそのまま呼ぶ。単独経路には楽観
-# パイプライン・次ラウンドの draft 先行投入・適応的 depth が乗っていて、
-# バッチ経路にはどれも無い。単独リクエストをバッチ経路に流すと、それだけで
+# (= `FlashSpecEngine.generate_stream`) をそのまま呼ぶ。単独経路には次ラウンドの
+# draft 先行投入が乗っていて、バッチ経路には無い (単体で測った記録が無いので
+# 移していない -- 導入時の commit で段階投入と束ねて測られている)。文脈長連動の
+# depth は 2026-09-02 に `_depth_for_round` として移したが、**既定 off**で、
+# 1815 トークン x 2 本では効果が雑音に埋もれた (下の docstring 参照)。
+# 楽観パイプラインは単独経路でも既定 off (短 +49.3% / 長 +34.6% の負け)。
+# 単独リクエストをバッチ経路に流すと、それだけで
 # 短 decode が落ちる (`bench/batch_b1_gate.py` が固定している線)。同時到着を
 # 拾うために、1 本しか無いときだけ `wait_ms` (既定 15ms) だけ相方を待つ --
 # 待つのは TTFT の手前だけで、decode の ms/token には入らない。
@@ -2083,6 +2148,12 @@ class BatchSpecCoordinator:
         収める。どちらにも収まらなければ 0 (素の decode) -- 小さい予算を
         投機で食い潰さない。走行中の行は必ず 1 トークンは進めるので、
         予算が 0 でもラウンド自体は回す。
+
+        ここで見るのは矩形と予算だけ。文脈長で 1 に落とす規則
+        (``MLXTURBO_BATCH_DEPTH_CTX``、既定 off) は
+        ``BatchSpecGenerator._depth_for_round`` が上限として被せる -- 帳簿を
+        持っている側で引くほうが素直なため。落ちたぶん予算を多めに引くことに
+        なるが、2 行なら 6 対 4 トークンの差で 2048 の予算には響かない。
         """
         if n_rows <= 0:
             return 0
