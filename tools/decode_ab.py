@@ -104,6 +104,20 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              層あたり 2 回、48 層で計 96 回。演算順を変えないのでビット同一。
              合格条件: 出力一致 (対照) に加え、短・長の両方で ms/token が
              改善すること。
+
+`gdn-metal`  GDN の再帰を oMLX (jundot/oMLX) 移植の blocked-sequential Metal
+             カーネルで解く (MLXTURBO_GDN_METAL、既定 off、
+             mlxturbo/kernels/gdn_blocked_metal.py)。`gdn-blocked` (行列積へ
+             作り替え) とは別物で、逐次版と**同じ再帰をそのまま**計算する
+             (k/q の threadgroup ステージングと状態のレジスタ常駐だけが違う)。
+             **prefill 幅 (T >= 64)、Dk == 128、Dv % 32 == 0 のみが対象**で、
+             decode/verify 幅は両者とも逐次カーネルに落ちる --
+             **したがって --long で prefill を見ないと差が出ない。**
+             加算順が変わるので出力一致は要求しない。
+             合格条件: prefill_s の改善に加え、tok/round と KLD が悪化
+             しないこと。
+
+             発火の確認: `mlxturbo.kernels._fire.snapshot()` の `gdn_metal`。
 """
 
 from __future__ import annotations
@@ -219,6 +233,37 @@ def _knob_gdn_blocked(ctx):
             fused.enable_gdn_blocked_kernel()
         else:
             fused.disable_gdn_blocked_kernel()
+
+    return apply
+
+
+def _knob_gdn_metal(ctx):
+    """A = GDN の再帰を oMLX 移植の blocked-seq Metal カーネルで解く / B = 逐次カーネル (既定)。
+
+    A は oMLX (jundot/oMLX) の `gated_delta_blocked_seq` (kernel S) を移植
+    したもの (`mlxturbo/kernels/gdn_blocked_metal.py`)。`gdn-blocked` (行列積
+    への作り替え) と違い、逐次版と**同じ再帰をそのまま**計算する。
+    **prefill 幅 (T >= 64)、Dk == 128、Dv % 32 == 0 のみが対象**で、
+    decode/verify 幅は両者とも逐次カーネルに落ちる -- **したがって --long で
+    prefill を見ないと差が出ない。**加算順が変わるので出力一致は要求しない。
+
+    合格条件: **17k の prefill 壁時計 (prefill_s)。**tok/round と KLD も
+    併せて見る (prefill の数値を変えたカーネルが受理率を落として差し引きで
+    負けた前例がある)。
+
+    発火の確認: `mlxturbo.kernels._fire.snapshot()` の `gdn_metal`。
+    """
+    import os
+
+    from mlxturbo import fused
+
+    os.environ["MLXTURBO_GDN_METAL"] = "1"  # enable 側のゲートを開ける
+
+    def apply(variant):
+        if variant == "A":
+            fused.enable_gdn_metal_kernel()
+        else:
+            fused.disable_gdn_metal_kernel()
 
     return apply
 
@@ -831,6 +876,7 @@ KNOBS = {
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
     "gdn-prework": (_knob_gdn_prework, ["A", "B"], False, "B"),
     "gdn-blocked": (_knob_gdn_blocked, ["A", "B"], False, "B"),
+    "gdn-metal": (_knob_gdn_metal, ["A", "B"], False, "B"),
     "hc-write": (_knob_hc_write, ["A", "C", "B"], True, "B"),
     "rms-norm-gated": (_knob_rms_norm_gated, ["A", "C", "B"], True, "B"),
     "moe-route": (_knob_moe_route, ["A", "C", "B"], False, "B"),

@@ -443,6 +443,34 @@ def disable_gdn_blocked_kernel() -> None:
     Q.GatedDeltaNet._gdn_blocked = False
 
 
+def enable_gdn_metal_kernel() -> None:
+    """GDN の再帰を oMLX (jundot/oMLX) 移植の blocked-sequential Metal
+    カーネルで解く (mlxturbo/kernels/gdn_blocked_metal.py)。
+
+    `enable_gdn_blocked_kernel` と同じ形で、`GatedDeltaNet.__call__` 側の
+    シーム (`getattr(self, "_gdn_metal", False)`) を立てるだけ。実際に
+    使えるかどうか (幅・形・マスクの有無) は毎呼び出し
+    `gdn_blocked_metal.eligible` が判定し、外れれば `_gdn_blocked` か
+    逐次カーネルに落ちる。
+
+    既定 off。環境変数 `MLXTURBO_GDN_METAL=1` のときだけ有効化する
+    (呼ぶだけでは何も起きない)。
+    """
+    import os
+
+    import mlx_lm.models.qwen4_exp as Q
+
+    if os.environ.get("MLXTURBO_GDN_METAL") != "1":
+        return
+    Q.GatedDeltaNet._gdn_metal = True
+
+
+def disable_gdn_metal_kernel() -> None:
+    import mlx_lm.models.qwen4_exp as Q
+
+    Q.GatedDeltaNet._gdn_metal = False
+
+
 def disable_hyper_connection() -> None:
     global _ORIG_HC
     if _ORIG_HC is None:
@@ -1044,12 +1072,14 @@ def disable_moe_verify_gather() -> None:
 __all__ = [
     "enable_gather_sort",
     "enable_gdn_blocked_kernel",
+    "enable_gdn_metal_kernel",
     "enable_gdn_prework_kernel",
     "enable_moe_glu",
     "enable_moe_shared_fold",
     "enable_moe_verify_gather",
     "enable_wide_projections",
     "disable_gdn_blocked_kernel",
+    "disable_gdn_metal_kernel",
     "disable_gdn_prework_kernel",
     "disable_hc_write",
     "disable_hyper_connection",

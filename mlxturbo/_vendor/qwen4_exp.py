@@ -1053,13 +1053,27 @@ class GatedDeltaNet(nn.Module):
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
         state = cache[1] if cache is not None else None
+        out = None
+        # mlxturbo.fused.enable_gdn_metal_kernel が立てる。oMLX (jundot/oMLX)
+        # の blocked-sequential Metal カーネルを移植したもの
+        # (mlxturbo/kernels/gdn_blocked_metal.py)。逐次カーネルと同じ再帰を
+        # そのまま計算する (下の gated_delta_blocked.py とは別の道具で、
+        # チャンク分解や行列積への作り替えはしない)。prefill 幅・Dk==128・
+        # Dv%32==0 のみが対象で、外れれば下の gdn_blocked、さらに逐次カーネル
+        # へ落ちる。既定 off。
+        if getattr(self, "_gdn_metal", False) and not self.training:
+            from mlxturbo.kernels import gdn_blocked_metal as gbm
+
+            if gbm.eligible(q, k, v, state, mask):
+                out, state = gbm.gated_delta_update_blocked_metal(
+                    q, k, v, a, b, self.A_log, self.dt_bias, state,
+                )
         # mlxturbo.fused.enable_gdn_blocked_kernel が立てる。再帰を長さ C の
         # ブロックに切り、ブロック内を行列積 (単位下三角の連立) にまとめた
         # prefill 幅専用の経路 (mlxturbo/kernels/gated_delta_blocked.py)。
         # decode/verify 幅とマスク付き (バッチの右パディング) は対象外で、
         # その場合は下の逐次カーネルにそのまま落ちる。既定 off。
-        out = None
-        if getattr(self, "_gdn_blocked", False) and not self.training:
+        if out is None and getattr(self, "_gdn_blocked", False) and not self.training:
             from mlxturbo.kernels import gated_delta_blocked as gdb
 
             if gdb.eligible(q, k, v, b, state, mask):
