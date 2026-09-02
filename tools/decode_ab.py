@@ -1392,7 +1392,12 @@ def main() -> int:
     if args.out:
         Path(args.out).write_text(json.dumps(rows, ensure_ascii=False, indent=1))
         print(f"\n書き出し: {args.out}")
-    return 0 if ok else 1
+    # 計測ツールなので destructor (スレッドプール等の後始末) に用は無い。
+    # interpreter shutdown 待ちでプロセスが Metal のメモリを握ったまま
+    # 1 時間以上残った実測があるので、結果を書き終えたら即 _exit で落とす
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

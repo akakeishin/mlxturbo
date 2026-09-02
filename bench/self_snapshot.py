@@ -49,7 +49,7 @@ def main() -> int:
     ap.add_argument("--serve-bin", default=None,
                     help="指定すると mlxturbo ではなく mlx-serve を単独で測る。"
                          "**手順は完全に同じにする** — 対戦ハーネス (A→B→B→A) と"
-                         "単独測定で 35% 食い違ったので、その切り分けに使う")
+                         "単独測定で 35%% 食い違ったので、その切り分けに使う")
     ap.add_argument("--serve-model", default=None)
     ap.add_argument("--port", type=int, default=8140)
     ap.add_argument("--ctxs", default="0,4000,17000,50000")

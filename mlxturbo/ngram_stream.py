@@ -34,6 +34,7 @@ disappears from the lookup path.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import struct
@@ -274,6 +275,49 @@ class StreamNGram:
             os.environ.get("MLXTURBO_NGRAM_PREFETCH", "0") == "1"
         )
         self.reset_stats()
+
+        # `install()` は今のこのインスタンスへの参照を呼び手に返さない (現状
+        # 戻り値は無し) ので、後始末をその戻り値に頼らずここで自前に予約する。
+        # ThreadPoolExecutor のワーカースレッドは非 daemon (Python の仕様。
+        # `concurrent.futures.thread` が自前の atexit でジョインしようとする)
+        # ため、明示的に shutdown しないままだと interpreter shutdown 時の
+        # スレッド join 待ちでプロセスが残ることがある (計測ツールで 1 時間
+        # 以上プロセスが残り、Metal のバッファも握ったままだった実測がある)。
+        # ここで登録した close() は同モジュール import 時に登録済みの
+        # `_python_exit` より後に登録されるので、atexit の LIFO 順で
+        # `_python_exit` より先に呼ばれ、join 待ちが始まる前にプールを
+        # shutdown できる
+        self._closed = False
+        atexit.register(self.close)
+
+    def close(self) -> None:
+        """pool のワーカースレッドと prefetch スレッドの後始末をする。
+
+        多重呼び出しに耐える (atexit と __del__ の両方から呼ばれ得る)。
+        interpreter shutdown 中に呼ばれる可能性があるので、内部で例外が
+        出ても外には投げない。
+        """
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        t = getattr(self, "_prefetch_thread", None)
+        if t is not None and t.is_alive():
+            try:
+                t.join(timeout=1.0)
+            except Exception:
+                pass
+        pool = getattr(self, "_pool", None)
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def reset_stats(self) -> None:
         """発火カウンタを初期化しなおす。A/B の条件ごとの頭で呼ぶ。"""

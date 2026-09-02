@@ -705,7 +705,12 @@ def main() -> int:
         mx.eval([model.model(ids[:, ci * step : (ci + 1) * step], cache=cache)]
                 + pending(cache))
         mx.clear_cache()
-    return 0
+    # 計測ツールなので destructor (スレッドプール等の後始末) に用は無い。
+    # interpreter shutdown 待ちでプロセスが Metal のメモリを握ったまま
+    # 1 時間以上残った実測があるので、結果を書き終えたら即 _exit で落とす
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
