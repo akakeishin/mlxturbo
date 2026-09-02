@@ -95,6 +95,8 @@ GPU は `tools/biglock.sh` で 1 本ずつ直列。親の連鎖スクリプト�
    D6 (indexer 228 us/層の内訳) は計測から。
 4. P3: MoE の grouped GEMM を自前で書く (設計は fable が調査中: mlx の `affine_gather_qmm_rhs` の律速をソースで確定してから)。
    最初の proof-of-life は単一専門家の bf16 × 4-bit GEMM で dense qmm の 0.9 倍以内に入るか。KLD ゲート +0.0005。
+   **NAX 対応機 (M5 系) でも使う** (ユーザー方針 08:30): カーネルは NAX 専用 intrinsic を使わず、`MLXTURBO_MOE_GEMM=auto|on|off` で
+   NAX 機では auto=off (MLX の NAX カーネルとの A/B を NAX 機で取り直すまで)。この機の数字は全部「非 NAX」の数字。
 5. 小さいベンチ (mlxturbo だけ、冷却 10 分) → 報告 → フルベンチ (mlx-serve は origin/main と同じで再ビルド不要) → 27B / 35B-A3B。
    27B / 35B-A3B では mlx-serve だけでなく **mlx-lm (mlx_lm.server) と oMLX** とも比較する (ユーザー方針 2026-09-03 08:10)。
    Flash-Next は相手が mlx-serve だけでよい (mlx-lm は Flash-Next の MTP を持たない)。
