@@ -1146,3 +1146,9 @@ kld_mean **0.01794** / agree 0.962 (現行 8-bit + GDN Metal: 0.01326 / 0.966)�
 反復 1 回なので tok/step の揺れ (1.40〜2.41) が decode を ±15% 動かす。17k の冷ターンは tok/step 1.96 で
 depth 適応が効いているが、温ターン (42.6) が中央値を下げた。この表は「速度比較用パック + depth 適応」の
 存在確認まで。判定は decode_ab の複数プロンプト平均で済ませてある (depth 適応 -4%、head4 は +4% 級の見込み)。
+
+## `MLXTURBO_HC=compiled` (mx.compile 版 HC) の短文脈 A/B (2026-09-03 00:45、`bench/results/hc-compiled-short.json`)
+
+ms/round **+0.6%** (取り分なし)。ms/tok -4.1% は tok/round +4.5% (2.28 対 2.18) によるもので、出力は一致して
+いるのに受理数が違う = draft 側の HC の丸めが変わって draft が変わっただけ (テキスト運)。**採用しない。**
+HC の 4.7 ms は素の op 列でも compiled でもカーネルでも取れない。残る手は低ランク射影を隣の行列積に畳む案のみ。
