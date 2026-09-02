@@ -87,6 +87,12 @@ def _run_prefill(model, cache, ids, chunk: int, tail: int, pending):
     return tail_logits
 
 
+def _flat(a):
+    """mx.array の入れ子リストを平らな int の列にする (top-k の添字が (1, k) 形で来ても壊れない)。"""
+    import mlx.core as mx
+    return [int(v) for v in mx.array(a).reshape(-1).tolist()]
+
+
 def _kld_stats(logits_p, logits_q, topk: int) -> dict:
     """位置ごとに ``bench/quant_eval.py`` の kld_mean と同じ式で KL(p‖q) を出す。
 
@@ -127,7 +133,7 @@ def _kld_stats(logits_p, logits_q, topk: int) -> dict:
     t5p = np.array(top5_p)
     t5q = np.array(top5_q)
     overlap = np.array(
-        [len(set(t5p[i].tolist()) & set(t5q[i].tolist())) for i in range(t5p.shape[0])],
+        [len(set(_flat(t5p[i])) & set(_flat(t5q[i]))) for i in range(t5p.shape[0])],
         dtype=np.float64,
     )
 
