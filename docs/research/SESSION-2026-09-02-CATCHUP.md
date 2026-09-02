@@ -1199,3 +1199,18 @@ prefill_s +0.1%、ms/round -0.1%、出力一致。**畳む** (既定 off のま�
 t0」か「runner の最初の yield → ハンドラのキュー受信」にある。tokenize / template / セッション照合は 1〜5 ms
 で無罪。これを潰せば温 TTFT 0.45 → 0.15 s (相手 0.87 の 6 倍速)、冷 ctx 0 も 0.5 → 0.2 s。内訳の時刻印
 (`[gen-trace]`) を足して次に測る。
+
+## KV 全長コピー、復元なしの探針 (本番の素の forward の形、2026-09-03 02:30)
+
+| ctx | S=1 forward 壁 | ピーク増分 | `update_and_fetch` 1 層 |
+|---|---|---|---|
+| 4k | 30.7 ms | 22 MB | 190 us |
+| 17k | 32.8 | 23 | 191 |
+| 50k | 33.7 | 28 | 191 |
+
+snapshot の参照が無ければ **KV の更新は in-place** (増分・時間とも kv に依らない)。素の forward では仮説 2 は
+成り立たない。ただし復元ありの探針では 50k で forward +12 ms (1.2 GB の写し) が出ているので、**本番の投機
+ラウンド**で `pre` / `capture` / checkpoint が K/V 配列の参照を持っていれば同じことが起きる。ラウンドごとの
+ピーク増分を `MLXTURBO_ROUND_TRACE` に足して 17k / 50k で確かめる (実装中)。
+素の forward の kv 罰は 4k → 50k で +3 ms しかない (attention 層 +2 ms が主)。実 decode の +8.5 ms/tok との
+差が、この投機ラウンド側の候補 (KV コピー、S=2 の verify、draft の MTP) にある。
