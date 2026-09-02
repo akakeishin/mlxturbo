@@ -1162,3 +1162,8 @@ MoE の「残り 1.5 倍」は gather_qmm 自体で、行数を太らせても�
 ## PLE hoist の短文脈 A/B (2026-09-03 01:10、`bench/results/ple-hoist-short.json`)
 
 ms/round +0.6%、出力一致。前提 (PLE 層 1 つ) どおり取り分なし。17k の結果が -1% 未満なら畳む (既定 off のまま)。
+
+## PLE hoist の 17k A/B (2026-09-03 01:45、`bench/results/ple-hoist-17k.json`)
+
+prefill_s +0.1%、ms/round -0.1%、出力一致。**畳む** (既定 off のまま)。相談役の仮説 3 は前提 (PLE 5 層) が
+外れていた。同期 1 回の位置を動かしても取り分は無い。
