@@ -1280,3 +1280,16 @@ runner 内 154 ms + 外 345 ms。**runner でも executor でもなく、worker 
 50k の 133 MB は indexer の pooled キャッシュの concat (ブロック確定ごと) 級で、費用は 1 ms/round 未満。
 **KV コピー仮説は本番では棄却。**decode の kv 罰 (+8.5 ms/tok) の帰属は attention 層の verify 幅 (S=2) の
 中身に戻る。`qsa_prefill_split --S 2 --chain 50` (同期の床を外した部品計測) で決める。
+
+## detokenizer 修正後の TTFT (2026-09-03 04:50、`bench/results/logs/ttft-trace-driver3.log`)
+
+| リクエスト | 修正前 | 修正後 |
+|---|---|---|
+| ctx 0 冷 (new=27) | 0.52 s | **0.23 s** (runner 0.20) |
+| ctx 0 完全ヒット | 0.30 s | **0.003 s** |
+| ctx 0 温 (new=23) | 0.45 s | **0.151 s** |
+| 4k 冷 | 7.28〜7.91 s | **6.96 s** |
+| 4k 温 (new=18) | 0.46 s | **0.154 s** |
+
+`[ttft-trace]` の gen→first_token が完全ヒットで 310 → 1.2 ms。**全リクエストから 300 ms が消えた。**
+温 TTFT は相手 (0.87〜0.92 s) の 6 倍速。既定に入った (コミット 3ecf835)。
