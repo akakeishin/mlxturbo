@@ -1788,6 +1788,27 @@ def main() -> int:
                          "fired 収集 (_fire.snapshot()) にそのまま乗るので "
                          "結果 JSON の fired に出る。木化ドラフト (レーン11 "
                          "仮説7) の上限 = hit@2 - hit@1 を見るための道具。")
+    ap.add_argument("--depth", type=int, default=None,
+                    help="`--knob depth` を経由せず、engine の投機深さを "
+                         "指定した値に固定する (どの knob と組み合わせても "
+                         "効く)。`eng.depth` を書き換え、`_knob_depth` と "
+                         "同じ理由で `eng.depth_ctx_limit` も 1<<30 に "
+                         "上げるので、文脈長によらず指定した深さのまま "
+                         "(MLXTURBO_DEPTH_ADAPT=1 のときは、それでも "
+                         "depth_adapt_min_pos を超えた位置では controller が "
+                         "上書きする -- 完全に固定したいなら "
+                         "MLXTURBO_DEPTH_ADAPT=0 も一緒に渡すこと)。"
+                         "MLXTURBO_DEPTH_TRACE の trace 採取を `--knob null` "
+                         "と組み合わせて 1 本だけ流すために足した")
+    ap.add_argument("--save-out", action="store_true",
+                    help="既定では rows に生成トークンの先頭 24 個 "
+                         "(head=out[:24]) しか残さない。このフラグを立てると "
+                         "各 row に生成トークン id の全列 (`out`、list[int]) "
+                         "と、プロンプトのトークン id 列 (`prompt_ids`、"
+                         "長文脈だと 17k 個規模になるのでこのフラグの "
+                         "ときだけ) を追加で持たせる。既定 off のときの "
+                         "結果 JSON は今までと完全に同一 (行を追加するだけで "
+                         "既存キーは変えない)。")
     args = ap.parse_args()
 
     if args.ngram:
@@ -1829,6 +1850,13 @@ def main() -> int:
                                    model.args.text, quantize=q)
     mx.eval(mtp.parameters())
     eng = spec_flash.FlashSpecEngine(model, mtp)
+    if args.depth is not None:
+        # `_knob_depth` と同じ理由 (このファイル内のコメント参照): ここで
+        # ctx_limit も上げておかないと、文脈長が indexer_budget を越えた
+        # 位置で engine 自身が depth を 1 に落としてしまい、指定した深さの
+        # まま全位置を観測できない。
+        eng.depth = args.depth
+        eng.depth_ctx_limit = 1 << 30
 
     eos = tok.eos_token_ids if hasattr(tok, "eos_token_ids") else ()
     eos_ids = tuple(eos) if eos else ()
@@ -1882,6 +1910,7 @@ def main() -> int:
     for want in ("short", "long"):
         for kind, ids in cases:
             if kind == want:
+                eng.depth_trace_prompt_id = f"warmup:{kind}"
                 run_once(eng, ids, 32, eos_ids, temp=args.temp)
                 break
 
@@ -1949,7 +1978,7 @@ def main() -> int:
         return 1
 
     rows = []
-    for kind, ids in cases:
+    for case_idx, (kind, ids) in enumerate(cases):
         n = ids.shape[1]
         print(f"--- {kind} ctx={n} ---", flush=True)
         shared = None
@@ -1970,6 +1999,7 @@ def main() -> int:
         # 段差になっている。**この日の長文脈の A/B は全部 A 側に約 5% の
         # 下駄を履かせていた。**
         set_variant(baseline)
+        eng.depth_trace_prompt_id = f"warmup:{kind}:{case_idx}"
         if shared is None:
             run_once(eng, ids, 32, eos_ids, temp=args.temp)
         else:
@@ -1983,6 +2013,9 @@ def main() -> int:
             _fire.reset()
             if ngram_stream is not None:
                 ngram_stream.reset_stats()
+            # MLXTURBO_DEPTH_TRACE の prompt_id フィールド用 (未設定 = トレース
+            # 無効時は engine 側で読まれないだけなので、常に立てて害はない)。
+            eng.depth_trace_prompt_id = f"{kind}:{case_idx}"
             if shared is None:
                 out, tp, td, acc, rounds = run_once(
                     eng, ids, args.tokens, eos_ids, temp=args.temp)
@@ -2000,6 +2033,12 @@ def main() -> int:
                              ms_per_round=td / max(rounds, 1) * 1000,
                              accepted=acc, rounds=rounds, tok_per_round=tpr,
                              head=out[:24]))
+            if args.save_out:
+                # 既定 (off) の JSON は上の rows.append(...) までで変わらない。
+                # --save-out のときだけ、生成トークン id の全列と (長文脈だと
+                # 17k 個規模になる) プロンプトのトークン id 列を追加で持たせる。
+                rows[-1]["out"] = out
+                rows[-1]["prompt_ids"] = ids[0].tolist()
             fired = _fire.snapshot()
             rows[-1]["fired"] = fired
             fired_s = ("  発火 " + " ".join(f"{k}={n}" for k, n in

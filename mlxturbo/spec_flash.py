@@ -35,6 +35,7 @@ somewhere, without fail).
 
 from __future__ import annotations
 
+import json
 import os
 import statistics
 import time
@@ -781,6 +782,16 @@ _MTP_CACHE_APPEND = os.environ.get("MLXTURBO_MTP_CACHE_APPEND", "1") != "0"
 # --- off のときは既存のフラグ読み出しのみで生成コストゼロ。
 _DRAFT_TRACE = os.environ.get("MLXTURBO_DRAFT_TRACE") == "1"
 
+# MLXTURBO_DEPTH_TRACE=<path>: depth 制御にどんな信号が使えるか (直近の
+# 受理履歴、draft の確信度マージン) を集めるための計測専用トレース。
+# generate_stream がラウンドごとに 1 レコード (round/depth/hit/margins/pos/
+# prompt_id) を溜め、生成終了時に JSON Lines で <path> に追記する
+# (tools/depth_trace_stats.py が読む)。読んで積むだけで、depth の選択
+# (_effective_depth) や受理判定 (_verify) には一切関与しない --- off の
+# ときは既存のフラグ読み出しのみで生成コストゼロ。_DRAFT_TRACE と違い
+# path 文字列なので "1" ではなく素の環境変数の有無で判定する。
+_DEPTH_TRACE_PATH = os.environ.get("MLXTURBO_DEPTH_TRACE") or None
+
 
 class _PrefillTracer:
     """_PREFILL_TRACE=1 のときだけ prefill の区間を ms で刻んで 1 行ずつ print する。
@@ -1204,6 +1215,13 @@ class FlashSpecEngine:
         # 読んで消費する (1 ラウンドに 1 回だけ、常に対で消費されるので
         # 世代をまたいで残らない --- _trace_draft_hit の docstring 参照)。
         self._trace_top2: list | None = None
+        # MLXTURBO_DEPTH_TRACE=<path> のときだけ使う受け渡しスロット
+        # (_trace_top2 と全く同じ規約 --- _draft_chain が置き、
+        # _trace_depth_round が 1 ラウンドに 1 回だけ対で消費する)。
+        self._trace_margins: list | None = None
+        # tools/decode_ab.py がプロンプトごとに設定できる識別子 (任意)。
+        # None のままなら depth trace レコードの prompt_id は null になる。
+        self.depth_trace_prompt_id: str | None = None
         # draft-rerank (mlx-serve の設計の移植): trunk lm_head の 2bit 再量子化で
         # 全語彙を粗く読み、正確な top-32 だけを trunk のヘッドの行で再採点する。
         # 粗い top-32 に真の argmax が入っている限り draft は trunk と一致し、
@@ -1245,7 +1263,7 @@ class FlashSpecEngine:
         del w
         mx.clear_cache()
 
-    def _draft_argmax(self, out, want_top2: bool = False):
+    def _draft_argmax(self, out, want_top2: bool = False, want_margin: bool = False):
         """draft 用の次トークン。(1, 1) を返す。
 
         rerank あり: 2bit 粗ヘッドで全語彙 -> top-32 -> trunk の該当行を
@@ -1264,23 +1282,42 @@ class FlashSpecEngine:
         (``row.shape[0] > 1``) のときは top2 側の再計算をしない
         (``_draft_argmax_rows`` は加算順を変えないため触らない対象) ので
         ``(tok, None)`` を返す --- 呼び手はここで trace を諦めること。
+
+        ``want_margin`` (既定 False、MLXTURBO_DEPTH_TRACE 専用): True なら
+        top-1 と top-2 の (rerank ありなら再採点後の) スコア差を、行ごとの
+        ``mx.array`` として戻り値に追加する。``want_top2`` と独立に効き、
+        **``want_top2`` 単独のときの戻り値の形 (``(tok, top2)``) は変えない**
+        --- 既存の呼び出し (``_DRAFT_TRACE`` 側) を壊さないため、戻り値の
+        要素数は ``want_top2``/``want_margin`` の組み合わせで変わる:
+        両方 False は ``tok``、``want_top2`` のみは ``(tok, top2)`` (従来どおり)、
+        ``want_margin`` のみは ``(tok, margin)``、両方 True は
+        ``(tok, top2, margin)``。``margin`` は top2 と同じ理由でバッチ行
+        (``row.shape[0] > 1``) では計算せず None を返す。
         """
+        need_pair = want_top2 or want_margin
         if self._rerank is None:
             logits = self._head(out)[:, -1]
             tok = mx.argmax(logits, axis=-1).reshape(-1, 1)
-            if not want_top2:
+            if not need_pair:
                 return tok
             part = mx.argpartition(-logits, 1, axis=-1)[..., :2]
             vals = mx.take_along_axis(logits, part, axis=-1)
+            margin = mx.abs(vals[..., 0] - vals[..., 1]) if want_margin else None
+            if not want_top2:
+                return tok, margin
             order = mx.argsort(-vals, axis=-1)
             top2 = mx.take_along_axis(part, order, axis=-1)
-            return tok, top2
+            return (tok, top2, margin) if want_margin else (tok, top2)
         lm = self.model.lm_head  # _rerank があるなら lm_head も必ずある
         row = out[:, -1]
         cw, cs, cb = self._rerank
         if row.shape[0] > 1:
             tok = self._draft_argmax_rows(row, lm, cw, cs, cb)
-            return (tok, None) if want_top2 else tok
+            if not need_pair:
+                return tok
+            if want_top2 and want_margin:
+                return tok, None, None
+            return tok, None
         coarse = mx.quantized_matmul(
             row, cw, scales=cs, biases=cb, transpose=True,
             group_size=64, bits=self.RERANK_BITS)
@@ -1291,13 +1328,16 @@ class FlashSpecEngine:
         scores = (row.astype(rows.dtype) @ rows.T)
         best = mx.argmax(scores, axis=-1, keepdims=True)
         tok = mx.take_along_axis(top, best, axis=-1)
-        if not want_top2:
+        if not need_pair:
             return tok
         part = mx.argpartition(-scores, 1, axis=-1)[..., :2]
         vals = mx.take_along_axis(scores, part, axis=-1)
+        margin = mx.abs(vals[..., 0] - vals[..., 1]) if want_margin else None
+        if not want_top2:
+            return tok, margin
         order = mx.argsort(-vals, axis=-1)
         top2 = mx.take_along_axis(top, mx.take_along_axis(part, order, axis=-1), axis=-1)
-        return tok, top2
+        return (tok, top2, margin) if want_margin else (tok, top2)
 
     def _draft_argmax_rows(self, row, lm, cw, cs, cb) -> mx.array:
         """`_draft_argmax` の rerank 経路の B 行版 (バッチ x 投機で使う)。
@@ -1357,12 +1397,22 @@ class FlashSpecEngine:
         ``_draft_argmax`` に ``want_top2=True`` を渡して top-2 候補を
         ``self._trace_top2`` に置く (どのトークンを drafts に積むかという
         決定そのものは変わらない --- ``_draft_argmax`` の docstring 参照)。
+
+        同じく ``trace_top2`` かつ ``MLXTURBO_DEPTH_TRACE=<path>`` のときだけ、
+        **全段**の ``_draft_argmax`` に ``want_margin=True`` を渡して
+        top-1/top-2 のスコア差を集め、``self._trace_margins`` (長さ ``depth``、
+        各要素は float か None) に置く --- depth 制御の候補信号 (draft の
+        確信度) を全位置ぶん見るための読み出し専用の追加で、``_trace_top2``
+        と全く同じ「set/consume が対で1回ずつ」の規約 (呼び出し側は
+        ``generate_stream._trace_depth_round`` で消費する)。
         """
         Q = _arch()
         keep = cache.size() + 1  # 物理列数 (trim_attn_cache の注記参照)
         drafts = []
         tok, hyper = cur, hyper_prev
         want_top2 = trace_top2 and _DRAFT_TRACE
+        want_margin = trace_top2 and _DEPTH_TRACE_PATH is not None
+        margins: list | None = [] if want_margin else None
         for step in range(depth):
             emb = self.model.model.embed_tokens(tok)
             mask = Q.create_attention_mask(emb, None)
@@ -1371,13 +1421,29 @@ class FlashSpecEngine:
                 x, self.rope, mask, None, cache, cache.indexer, None, None
             )
             out = self.mtp.hyper_connection_mixer(x)
-            if want_top2 and step == 0:
+            step_want_top2 = want_top2 and step == 0
+            margin = None
+            if not step_want_top2 and not want_margin:
+                tok = self._draft_argmax(out)
+            elif step_want_top2 and want_margin:
+                tok, top2, margin = self._draft_argmax(
+                    out, want_top2=True, want_margin=True)
+                if top2 is not None:
+                    mx.eval(top2)
+                    self._trace_top2 = top2[0].tolist()
+            elif step_want_top2:
                 tok, top2 = self._draft_argmax(out, want_top2=True)
                 if top2 is not None:
                     mx.eval(top2)
                     self._trace_top2 = top2[0].tolist()
-            else:
-                tok = self._draft_argmax(out)
+            else:  # want_margin だけ (steps>0、または DRAFT_TRACE 無効時の step 0)
+                tok, margin = self._draft_argmax(out, want_margin=True)
+            if want_margin:
+                if margin is not None:
+                    mx.eval(margin)
+                    margins.append(float(margin.reshape(-1)[0].item()))
+                else:
+                    margins.append(None)
             drafts.append(tok)
             hyper = x
             if step < depth - 1:
@@ -1386,6 +1452,8 @@ class FlashSpecEngine:
                 # async_eval するので、廃棄されるグラフは無い
                 mx.async_eval(tok)
         trim_attn_cache(cache, keep)
+        if want_margin:
+            self._trace_margins = margins
         return drafts
 
     def _prime_accepted_gap(self, toks: list, hypers: list, cache) -> None:
@@ -1450,6 +1518,33 @@ class FlashSpecEngine:
             _fire.bump("draft_trace_hit2")
         elif true0 == c2:
             _fire.bump("draft_trace_hit2")
+
+    def _trace_depth_round(self, round_no: int, depth: int, hit: int, pos: int) -> None:
+        """MLXTURBO_DEPTH_TRACE=<path> のときだけ ``generate_stream`` から
+        ``_verify`` 直後 (受理数 ``hit`` が確定した時点) に呼ぶ。
+
+        ``_draft_chain`` (``trace_top2=True`` で呼ばれたもの --- 通常経路と
+        次ラウンド先組みの両方、``_trace_top2`` と同じ「1 ラウンドに1回だけ
+        対で消費する」規約) が残したマージン列 (``self._trace_margins``、
+        長さ ``depth``) を、このラウンドの round 番号/depth/hit/pos と
+        prompt_id (``self.depth_trace_prompt_id``、呼び手が設定していれば)
+        と合わせて 1 レコードにし、``self._depth_trace_records`` (無ければ
+        黙ってスキップ) に積む。ファイルへの書き出しはラウンドごとではなく
+        ``generate_stream`` の終了時にまとめて行う。
+        """
+        margins = getattr(self, "_trace_margins", None)
+        self._trace_margins = None
+        records = getattr(self, "_depth_trace_records", None)
+        if records is None:
+            return
+        records.append({
+            "round": round_no,
+            "depth": depth,
+            "hit": hit,
+            "margins": margins,
+            "pos": pos,
+            "prompt_id": getattr(self, "depth_trace_prompt_id", None),
+        })
 
     def _verify(self, cap, lg, drafts, temp, precomputed=None, sampler=None):
         """検証フォワードの結果から、採用するトークンと hyper を取り出す。
@@ -2089,6 +2184,10 @@ class FlashSpecEngine:
         # tools/decode_ab.py --round-trace がループ終了後にこの属性を読む
         # (self.last_phase と同じ「呼び手が generate_stream の外から読む」規約)。
         self.last_round_trace = [] if _ROUND_TRACE else None
+        # MLXTURBO_DEPTH_TRACE=<path> のときだけ、ラウンドごとのレコード
+        # (round/depth/hit/margins/pos/prompt_id) を溜める。書き出しは
+        # この generate_stream 呼び出しの終了時 (下の return の直前)。
+        self._depth_trace_records = [] if _DEPTH_TRACE_PATH is not None else None
         # 楽観パイプライン: verify の GPU 実行中に「全採用だった場合の次ラウンド」
         # のグラフを CPU で先に組む。全採用なら rollback は no-op なので先組みが
         # そのまま正しく、外れたら _pipeline_restore で参照を戻して組み直す。
@@ -2210,6 +2309,8 @@ class FlashSpecEngine:
                 # 仕事は終わっている。
                 round_ms = (time.perf_counter() - _round_t0) * 1000.0
                 self._depth_controller.observe(hit, len(drafts), round_ms)
+            if _DEPTH_TRACE_PATH is not None:
+                self._trace_depth_round(rounds, len(drafts), hit, _round_pos)
 
             cut = next((k for k, v in enumerate(vals) if v in eos), None)
             if cut is not None:
@@ -2296,6 +2397,16 @@ class FlashSpecEngine:
                 f"hit2={_dt.get('draft_trace_hit2', 0)}",
                 flush=True,
             )
+
+        if _DEPTH_TRACE_PATH is not None and self._depth_trace_records:
+            # 呼び出し (=1 回の generate_stream、run_once/run_resumed 1 本) の
+            # 終わりにまとめて追記する。複数プロンプト/複数 variant で
+            # generate_stream を繰り返し呼ぶ decode_ab.py のハーネスでは、
+            # この関数がその都度呼ばれるので、ファイルには呼び出し順に
+            # 1 本ずつ追記されていく (JSON Lines)。
+            with open(_DEPTH_TRACE_PATH, "a") as f:
+                for rec in self._depth_trace_records:
+                    f.write(json.dumps(rec) + "\n")
 
         return accepted, rounds, (logits_tail, hyper_tail0, mtp_snap)
 
