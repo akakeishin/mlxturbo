@@ -654,3 +654,9 @@ prime 0.25 s、checkpoint。
 専門家を別の gather_qmm 呼び出し (bm を変える) に分ける Python だけの手が成立する。
 偏りでないなら MLX の `gather_qmm_rhs` そのものの効率で、相手も同じ op なので差の説明に
 ならず、prefill の差は attention (17k 以上) と GDN/HC の小物に絞られる。
+
+## MTP キャッシュに受理トークンを積む (A-1) の A/B、17k (2026-09-02 19:00)
+
+ms/tok A -1.5%、ms/round -0.3%、tok/round +1.2% (1.669 対 1.649)。短文脈で害なし、17k で
+小さく効くので **既定 on (MLXTURBO_MTP_CACHE_APPEND=1) のまま**。レビューの「生成長に比例して
+受理率が落ちる」は 512 トークン窓では 1% 程度の効果に留まる。
