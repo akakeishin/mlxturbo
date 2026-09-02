@@ -54,6 +54,9 @@
   `MLXTURBO_PREFILL_GROUP=4` / `MLXTURBO_STAGE_EVERY=2` /
   `MLXTURBO_DRAFT_RERANK=1` / `MLXTURBO_HC=kernel` / `MLXTURBO_SORT_MIN=16`
   は本番の既定値そのもので、値を変えると本番の挙動が変わる。
+  `MLXTURBO_GDN_METAL` (既定 on、`=0` で off) も同様に本番の既定値で、
+  2026-09-02 の in-model A/B (17k prefill -1.3〜-4.5%、KLD +0.00014) で
+  on にした。
 - 品質を売って速度を買わない。fake を実物より緩くしない。KLD の受け入れ幅は
   現行比 +0.0005 (bench/quant_eval.py compare)。
 

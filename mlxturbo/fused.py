@@ -453,14 +453,15 @@ def enable_gdn_metal_kernel() -> None:
     `gdn_blocked_metal.eligible` が判定し、外れれば `_gdn_blocked` か
     逐次カーネルに落ちる。
 
-    既定 off。環境変数 `MLXTURBO_GDN_METAL=1` のときだけ有効化する
-    (呼ぶだけでは何も起きない)。
+    2026-09-02 に既定 on にした (in-model A/B: 17k prefill_s -1.3〜-4.5%、
+    KLD +0.00014、受け入れ幅 +0.0005 の中)。環境変数 `MLXTURBO_GDN_METAL=0`
+    で無効化できる。
     """
     import os
 
     import mlx_lm.models.qwen4_exp as Q
 
-    if os.environ.get("MLXTURBO_GDN_METAL") != "1":
+    if os.environ.get("MLXTURBO_GDN_METAL") == "0":
         return
     Q.GatedDeltaNet._gdn_metal = True
 

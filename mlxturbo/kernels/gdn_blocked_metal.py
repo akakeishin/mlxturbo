@@ -62,8 +62,8 @@ log 経由の往復誤差は無い。
 Hv%Hk==0 (GQA) のときだけ真。外れたら呼び手は既存のブロック化スキャン
 (`gated_delta_blocked.py`) か逐次カーネルへそのまま落ちる。
 
-既定 off。`mlxturbo.fused.enable_gdn_metal_kernel` が
-`MLXTURBO_GDN_METAL=1` のときだけ `GatedDeltaNet._gdn_metal` を立てる。
+2026-09-02 に既定 on にした。`mlxturbo.fused.enable_gdn_metal_kernel` が
+`MLXTURBO_GDN_METAL=0` でなければ `GatedDeltaNet._gdn_metal` を立てる。
 """
 
 from __future__ import annotations

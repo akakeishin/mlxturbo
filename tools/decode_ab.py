@@ -106,7 +106,7 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              改善すること。
 
 `gdn-metal`  GDN の再帰を oMLX (jundot/oMLX) 移植の blocked-sequential Metal
-             カーネルで解く (MLXTURBO_GDN_METAL、既定 off、
+             カーネルで解く (MLXTURBO_GDN_METAL、既定 on、2026-09-02〜、
              mlxturbo/kernels/gdn_blocked_metal.py)。`gdn-blocked` (行列積へ
              作り替え) とは別物で、逐次版と**同じ再帰をそのまま**計算する
              (k/q の threadgroup ステージングと状態のレジスタ常駐だけが違う)。
@@ -116,6 +116,8 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              加算順が変わるので出力一致は要求しない。
              合格条件: prefill_s の改善に加え、tok/round と KLD が悪化
              しないこと。
+             結果 (2026-09-02): 17k prefill_s -1.3〜-4.5%、KLD 0.01312 ->
+             0.01326 (受け入れ幅 +0.0005 の中)。既定 on にした。
 
              発火の確認: `mlxturbo.kernels._fire.snapshot()` の `gdn_metal`。
 
@@ -277,7 +279,9 @@ def _knob_gdn_blocked(ctx):
 
 
 def _knob_gdn_metal(ctx):
-    """A = GDN の再帰を oMLX 移植の blocked-seq Metal カーネルで解く / B = 逐次カーネル (既定)。
+    """2026-09-02 に既定 on にした (17k prefill_s -1.3〜-4.5%、KLD +0.00014)。
+    A = GDN の再帰を oMLX 移植の blocked-seq Metal カーネルで解く (既定) /
+    B = 逐次カーネル (旧既定)。
 
     A は oMLX (jundot/oMLX) の `gated_delta_blocked_seq` (kernel S) を移植
     したもの (`mlxturbo/kernels/gdn_blocked_metal.py`)。`gdn-blocked` (行列積
@@ -296,12 +300,12 @@ def _knob_gdn_metal(ctx):
 
     from mlxturbo import fused
 
-    os.environ["MLXTURBO_GDN_METAL"] = "1"  # enable 側のゲートを開ける
-
     def apply(variant):
         if variant == "A":
+            os.environ.pop("MLXTURBO_GDN_METAL", None)  # 既定 on のゲートを開けたまま
             fused.enable_gdn_metal_kernel()
         else:
+            os.environ["MLXTURBO_GDN_METAL"] = "0"  # off 側のゲートを閉じる
             fused.disable_gdn_metal_kernel()
 
     return apply

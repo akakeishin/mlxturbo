@@ -1327,12 +1327,11 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         if os.environ.get("MLXTURBO_GDN_BLOCKED") == "1":
             print(f"{log_prefix} GDN ブロック化スキャン有効 (再帰を prefill 幅のみ"
                   " 行列積に畳む)")
-        # enable_gdn_metal_kernel 自身が MLXTURBO_GDN_METAL=1 をゲートに
-        # 持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
+        # enable_gdn_metal_kernel 自身が MLXTURBO_GDN_METAL=0 で無効化する
+        # ゲートを持っているので、ここでは呼ぶだけでよい (既定 on)。
         fused.enable_gdn_metal_kernel()
-        if os.environ.get("MLXTURBO_GDN_METAL") == "1":
-            print(f"{log_prefix} GDN blocked-seq Metal カーネル有効 (oMLX 移植、"
-                  " prefill 幅の再帰を融合カーネルで解く)")
+        if os.environ.get("MLXTURBO_GDN_METAL") != "0":
+            print(f"{log_prefix} GDN blocked-seq Metal カーネル有効 (oMLX 移植、既定 on)")
         if os.environ.get("MLXTURBO_FAST_QMM") == "1":
             # 検証フォワード (M=3..8) の密 qmm を 8x8 MMA タイルに通す。
             # stock qmv は M にほぼ比例して重みを読み直すが、MMA タイルは
