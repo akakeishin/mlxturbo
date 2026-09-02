@@ -41,6 +41,14 @@
 を 1 トークンずつ、最大 `--max-new` 既定 64、EOS で停止) を直に回す
 (速度は測らない)。
 
+**2026-09-03 訂正 (17k 実走で dense recall 1/6、quote 0/6)。**思考が既定 on
+のモデルでは、貪欲デコード数十トークンの先頭が `<think>...</think>` の推論で
+埋まり、答えそのものに辿り着く前に打ち切られていた。`mlxturbo/server.py` の
+`_apply_template` が `reasoning_effort: "none"` を `enable_thinking=False` に
+落としているのと同じ kwarg を `_build_ids` で常に渡すようにした
+(テンプレートが受けない場合は `_apply_template` と同じ TypeError フォール
+バックで無しに落とす)。
+
 ## 時間の目安
 
 50k の prefill は 1 回あたり約 95 秒。1 問につき dense + kernel の 2 回、
@@ -81,11 +89,22 @@ if str(TOOLS_DIR) not in sys.path:
 
 _PASSWORD_ALPHABET = string.ascii_uppercase + string.digits
 
-# `。！？!?.` の直後の空白、または改行 1 個以上で文を切る (見出しレベルの
-# 粗い近似)。`os.path.join` のようにピリオドの直後に空白が無い識別子は
-# 割らない。ソースコードと Markdown が混在する文書 (`_bench_text.text_pool`)
-# を素で相手にするための緩いヒューリスティックなので、厳密な文分割は狙わない。
-_SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?.])\s+|\n+")
+# 全角の文末記号 (。！？) は直後に空白が無くても文の切れ目として確実
+# (Markdown の `**強調**` がそのまま続く `発火していない。**次は` のような
+# 形でも切る。直後に閉じ記号 (`**`/`」`/`)` 等) が続くならそれも区切りごと
+# 消費する)。半角の `.!?` は `os.path.join` のような識別子を割らないよう
+# 空白が続く場合だけ切る。改行 1 個以上でも切る。
+#
+# **2026-09-03 訂正 (17k 実走で発覚)。**旧版は全角文末記号も「直後に空白」
+# を要求していたため、`発火していない。**ハーネスの...` のように句点の
+# 直後に Markdown 装飾が続く箇所で切れず、意味の異なる 2 文が 1 つの
+# 「文」に融合していた (`_pick_quote_pair` が 20〜40 文字という理由だけで
+# それを引用文に選び、model が正しく続きを言えない実例が出た)。
+_SENT_SPLIT_RE = re.compile(
+    r"(?<=[。！？])[)\]）」』\"'*_`]*\s*"  # 全角文末記号: 空白不要、閉じ記号ごと消費
+    r"|(?<=[.!?])\s+"  # 半角文末記号: 空白が続く場合だけ
+    r"|\n+"
+)
 
 
 def _random_password(rng: random.Random) -> str:
@@ -132,10 +151,18 @@ def _pick_quote_pair(rng: random.Random, body: str) -> tuple[str, str]:
     `_MIN_QUOTE_BODY_LEN` 文字さえあれば失敗しない。
     """
     sentences = _split_sentences(body)
-    candidates = [i for i in range(len(sentences) - 1) if 20 <= len(sentences[i]) <= 40]
+    # インラインコード (バッククォート) を含む「文」は除外する。2026-09-03
+    # の実走で `矩形の上限は \`B*(1+k) <= 8\`。` のようなコード片を引用させると、
+    # 「次の文」が定義しにくく model が質問文をそのまま繰り返すだけの失敗が
+    # 実際に出た (`bench/results/longctx-quality-sanity.json` problem 1)。
+    no_code = [i for i in range(len(sentences) - 1) if "`" not in sentences[i]]
+    candidates = [i for i in no_code if 20 <= len(sentences[i]) <= 40]
     if not candidates:
         # フォールバック 1: 20〜40 文字の文が見つからない小さな文書向け。
-        # 文長の条件を緩め、次の文が存在する任意の文から選ぶ。
+        # 文長の条件を緩め、次の文が存在する任意の文から選ぶ (コード片除外は維持)。
+        candidates = [i for i in no_code if len(sentences[i]) >= 5]
+    if not candidates:
+        # フォールバック 1b: コード片しか無い文書向け。除外を諦める。
         candidates = [i for i in range(len(sentences) - 1) if len(sentences[i]) >= 5]
     if candidates:
         i = rng.choice(candidates)
@@ -167,13 +194,24 @@ def _windows(tok, ctx: int, count: int, offset_tokens: int = 0) -> list[str]:
 
 
 def _build_ids(tok, text: str):
+    """``text`` (文書+質問を 1 本にまとめたもの) を単発の user メッセージとして
+    テンプレートに通す。``enable_thinking=False`` を明示する ---
+    `mlxturbo/server.py` の `_apply_template` が `reasoning_effort: "none"` を
+    ここへ落としているのと同じ kwarg (思考トークンで最初の 32〜64 トークンが
+    埋まると、貪欲デコード数十トークンでは答えに辿り着かない)。この kwarg を
+    受けないテンプレートもあるので、`_apply_template` と同じ TypeError
+    フォールバックで無しの呼び出しに落とす。
+    """
     import mlx.core as mx
 
-    return mx.array(
-        tok.apply_chat_template(
-            [{"role": "user", "content": text}], add_generation_prompt=True
+    messages = [{"role": "user", "content": text}]
+    try:
+        ids = tok.apply_chat_template(
+            messages, add_generation_prompt=True, enable_thinking=False
         )
-    )[None]
+    except TypeError:
+        ids = tok.apply_chat_template(messages, add_generation_prompt=True)
+    return mx.array(ids)[None]
 
 
 def _set_route(model, route: str) -> int:
