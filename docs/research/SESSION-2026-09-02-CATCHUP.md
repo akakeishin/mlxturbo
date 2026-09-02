@@ -1077,3 +1077,23 @@ a[1] が更新されず、一度低く出ると再探索されない (搾取の�
 (1) HC の低ランク射影 (10240→320→10240) を隣の行列積 (GDN の in_proj / attention の qkv) に畳んで
 op と読み出しを減らす、(2) `MLXTURBO_HC=compiled` (mx.compile 版、-0.4 ms) を既定にする小さい取り分。
 (2) は A/B が要る (短文脈 3 本 × 512、ms/round -1% 以上で既定 on)。
+
+## 仮説マイクロ (モデル無し、biglock 単独、2026-09-03 08:40、`bench/results/logs/hyp-micros.log`)
+
+**仮説 2: 事前確保した KV バッファへの slice 代入が全長コピーになっている疑い** (相談役)
+
+| N (kv) | `buf[..., i:i+1, :] = x` 1 回 (同期込み) | `mx.slice_update` | バッファ | 全長コピーの床 (400 GB/s) |
+|---|---|---|---|---|
+| 4096 | 242 us | 244 | 4 MB | 10 us |
+| 17000 | 306 | 304 | 17 MB | 44 us |
+| 50000 | 481 | 478 | 51 MB | 128 us |
+
+同期の床 (~230 us) を引くと 4k 10 / 17k 75 / 50k 250 us で、**バッファ長に比例している**。この micro では
+Python 変数と返り値の 2 参照があるので donation が効かず、コピーになるのは当然でもある。本番の
+`KVCache.update_and_fetch` (`self.keys[..., prev:offset, :] = k` の後に `self.keys[..., :offset, :]` の view を
+返す) で同じことが起きているかは実モデルで確かめる: 1 ステップの `mx.get_peak_memory` の増分が KV 実体
+(17k で 12 層 × K/V 420 MB) と同じ桁なら毎ステップ写している。当たれば 17k で +2 ms、50k で +6 ms の
+decode kv 罰の正体で、相手 (Zig の refcount 共有) は払っていない項目。
+
+**番外: MoE decode を take + quantized_matmul に** (相手の形): M=1 で gather_qmm 240 us 対 take+qmm 437 us、
+M=2 で 323 対 697、M=3 で 292 対 538。**gather_qmm の方が速い。棄却。**
