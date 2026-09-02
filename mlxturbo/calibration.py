@@ -58,6 +58,11 @@ def load(path: Optional[str] = None) -> Optional[dict]:
         if not path:
             _profile = None
             return None
+    else:
+        # 明示指定でもここで立てないと、次の describe()/load(None) が
+        # 「まだ読んでいない」と誤認して env を読み直し、この呼び出しで
+        # 読んだプロファイルを None で上書きしてしまう (D-9)。
+        _loaded = True
     try:
         with open(path, "r", encoding="utf-8") as f:
             prof = json.load(f)

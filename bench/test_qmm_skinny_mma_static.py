@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from mlxturbo.kernels._qmm_skinny_mma_source import (
+from mlxturbo.kernels._qmm_e120_source import (
     ACTIVE_INPUT_GROUPS,
     BITS,
     BLOCK_SIZE,
@@ -80,10 +80,11 @@ def test_host_constants_and_width_plan_match_e120():
 def test_python_constants_are_witnessed_in_vendored_swift():
     swift = SWIFT_REFERENCE.read_text()
     license_text = (SWIFT_REFERENCE.parent / "LICENSE").read_text()
-    for relative in (
-        "mlxturbo/kernels/_qmm_skinny_mma_source.py",
-        "mlxturbo/kernels/qmm_skinny_mma.py",
-    ):
+    # _qmm_e120_source.py is the only file that carries the ported Layr-Labs
+    # content; qmm_skinny_mma.py is the dispatcher (imports both the e120
+    # port and the independent clean-room v5 source), so it does not (and
+    # should not) repeat the e120-only attribution.
+    for relative in ("mlxturbo/kernels/_qmm_e120_source.py",):
         port = (REPO_ROOT / relative).read_text()
         assert "Layr-Labs/qwen-3.8-mtp-challenge" in port
         assert "Copyright (c) 2026 Layr Labs" in port
@@ -172,10 +173,16 @@ def test_gpu_gate_has_v3_acceptance_thresholds():
     gate = (REPO_ROOT / "bench/test_qmm_skinny_mma.py").read_text()
     assert "BF16_CORRECTNESS_THRESHOLD = 8e-3" in gate
     assert "CORRECTNESS_SHAPES = ((512, 1024), (5120, 4096))" in gate
-    assert 'timings[8]["chain_speedup"] >= 1.5' in gate
+    # the 1.5x bar moved from an inline literal to a named constant; pin both
+    # the comparison and the numeric value so this still catches a silently
+    # lowered bar.
+    assert "M8_DEPENDENCY_CHAIN_SPEEDUP = 1.5" in gate
+    assert 'timings[8]["chain_speedup"] >= M8_DEPENDENCY_CHAIN_SPEEDUP' in gate
     assert "range(M_MIN, M_MAX + 1)" in gate
-    assert "mx.array_equal(actual, no_table)" in gate
-    assert '"table_on_off_bit_exact"' in gate
+    # v5 dropped the table variant entirely (test_source_is_e120_no_table_
+    # and_respects_prohibitions above asserts "USE_TABLE" not in the v5
+    # source), so the v3/v4-era table-on/off bit-exact comparison this used
+    # to check for here no longer exists in the v5 gate by design.
 
 
 def test_layout_eligibility_boundaries():

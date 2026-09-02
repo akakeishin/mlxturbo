@@ -263,13 +263,17 @@ class StreamNGram:
             self._pool = ThreadPoolExecutor(max_workers=self.n_threads)
             self._fd = os.open(str(rows_bin), os.O_RDONLY)
 
-            # 行キャッシュ (prefetch 用)。既定 4M 行 = 400MB (50k プロンプト =
-            # 80万行が入る)。満杯になったら世代ごと全消し (単純さ優先)
+            # 行キャッシュ。既定 4M 行 = 400MB (50k プロンプト = 80万行が
+            # 入る)。満杯になったら世代ごと全消し (単純さ優先)。
+            # ここでは確保しない -- prefetch を使わない構成 (既定) でも
+            # この 419MB を無条件に確保していたのが B-7。実際に使う時点
+            # (`_ensure_cache_gen`) まで遅延し、prefetch が有効にならない
+            # 限り作らない。
             self._cache_cap = cache_rows or int(
                 os.environ.get("FASTMLX_NGRAM_CACHE_ROWS", str(1 << 22))
             )
             self._cache_lock = threading.Lock()
-            self._cache_gen = _NGramCacheGen(self._cache_cap, self.rec)
+            self._cache_gen: "_NGramCacheGen | None" = None
 
         self.prefetch_enabled = self.backend == "pread" and (
             os.environ.get("MLXTURBO_NGRAM_PREFETCH", "0") == "1"
@@ -390,15 +394,38 @@ class StreamNGram:
             f.result()
         return buf
 
+    def _ensure_cache_gen(self):
+        """`_cache_gen` を必要になった時点で遅延生成する。
+
+        `prefetch_enabled` が False のままなら作らない (呼び手は None を
+        「キャッシュ無し」として扱う) -- 既定の prefetch 無効構成で
+        419MB (4M 行) を無条件に確保していたのが B-7。ロック無しで読んで
+        から要るときだけロックの下で作り直す (double-checked) ので、既に
+        出来ている通常時はロックを取らない。
+        """
+        gen = self._cache_gen
+        if gen is not None or not self.prefetch_enabled:
+            return gen
+        with self._cache_lock:
+            gen = self._cache_gen
+            if gen is None:
+                gen = _NGramCacheGen(self._cache_cap, self.rec)
+                self._cache_gen = gen
+            return gen
+
     def _cache_put(self, rows: np.ndarray, data: np.ndarray) -> None:
         """`rows`/`data` (`_gather_pread` の戻り値) をキャッシュへ書き込む。
 
-        スロットの割り当てとキャッシュ辞書への公開をロックの下で行う。
-        `buf[slot] = data` を辞書への登録より先に済ませてから登録するので、
-        ロック無しで読む `_gather_cached` は「辞書にあれば buf の中身も
-        揃っている」を常に見られる。満杯なら世代ごと差し替える (既存の
-        読み手がまだ古い世代を掴んでいても、その世代は書き換えない)。
+        prefetch が無効で `_cache_gen` がまだ (これからも) 無いときは何も
+        しない (B-7)。それ以外はスロットの割り当てとキャッシュ辞書への
+        公開をロックの下で行う。`buf[slot] = data` を辞書への登録より先に
+        済ませてから登録するので、ロック無しで読む `_gather_cached` は
+        「辞書にあれば buf の中身も揃っている」を常に見られる。満杯なら
+        世代ごと差し替える (既存の読み手がまだ古い世代を掴んでいても、
+        その世代は書き換えない)。
         """
+        if self._ensure_cache_gen() is None:
+            return
         with self._cache_lock:
             gen = self._cache_gen
             for i in range(rows.shape[0]):
@@ -417,13 +444,15 @@ class StreamNGram:
         `_gather_pread` する。ヒット分はキャッシュのスロット配列から集める。
         戻り値は従来 (`_gather_pread(flat)` だけ) と完全に同じ `buf`。
 
-        キャッシュが空 (`gen.n == 0`) のときは全行が確実に miss なので、
-        1 行ずつ `idx.get` する意味が無い。素通しで `_gather_pread` に渡す
-        (無駄な dict 参照を消す)。
+        キャッシュが空 (`gen is None` または `gen.n == 0`) のときは全行が
+        確実に miss なので、1 行ずつ `idx.get` する意味が無い。素通しで
+        `_gather_pread` に渡す (無駄な dict 参照を消す)。`gen is None`
+        (prefetch 無効) のときは `_cache_put` も何もしないので、キャッシュは
+        育たないまま (B-7)。
         """
         gen = self._cache_gen  # 1 回だけ読む: 以降はこの世代の idx/buf で通す
         n = flat.shape[0]
-        if gen.n == 0:
+        if gen is None or gen.n == 0:
             out = self._gather_pread(flat)
             self._cache_put(flat, out)
             self.stats["misses"] += n
@@ -470,7 +499,13 @@ class StreamNGram:
         t.start()
 
     def _prefetch_worker(self, ids64: np.ndarray) -> None:
-        gen = self._cache_gen
+        # prefetch() は呼び出し時点で prefetch_enabled を確認済みだが、
+        # ここが最初のキャッシュ利用なら `_cache_gen` はまだ無いので
+        # 遅延生成する (B-7: 419MB は実際に要るときまで確保しない)。
+        gen = self._ensure_cache_gen()
+        if gen is None:
+            self.stats["prefetch_done"] += 1
+            return
         idx = gen.idx
         uniq = np.unique(ids64)
         # 事前に重複/既キャッシュ分を削る (無くても正しさは変わらないが、

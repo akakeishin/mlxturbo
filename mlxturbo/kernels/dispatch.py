@@ -101,16 +101,20 @@ def _load_kernels():
     # fast_qmm にする。wide (m=9..16) も有効化。適格外は内部で stock へ落ちる。
     # `MLXLM_FAST_QMM_WIDE` は fast_qmm.py 側で「既定 off」と読める公開の
     # 環境変数なので、ここで os.environ.setdefault してプロセス全体の既定を
-    # 横取りしない -- fast_qmm 側に用意した内部フラグ経由で、この MMA 経路
-    # だけ wide を有効化する (A2, Opus 設計レビュー指摘。挙動は不変)。
-    from .. import fast_qmm as _fast_qmm_mod
-
-    _fast_qmm_mod._WIDE_FORCE_ON = True
+    # 横取りしない -- fast_qmm() の呼び出し単位の `force_wide=True` で、この
+    # MMA 経路の呼び出しだけ wide を有効化する (A2、Opus 設計レビュー指摘)。
+    # 以前はモジュールグローバルなフラグを立てて済ませていたが、それだと
+    # ここで一度立てるだけでプロセス全体の fast_qmm() 呼び出し (例:
+    # fast_qmm.enable() が全 QuantizedLinear に配る側) にまで wide が
+    # 伝染していた (D-3)。
     from ..fast_qmm import fast_qmm
     from .qmv_wide_nocap import qmv_wide_nocap
 
     def mma(flat, w, scales, biases, *, group_size, bits):
-        return fast_qmm(flat, w, scales, biases, group_size=group_size, bits=bits)
+        return fast_qmm(
+            flat, w, scales, biases, group_size=group_size, bits=bits,
+            force_wide=True,
+        )
 
     _KERNELS = (qmv_wide_nocap, mma)
     return _KERNELS

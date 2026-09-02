@@ -989,6 +989,10 @@ def _tail_window(cache, arr: mx.array, n_keep: int) -> mx.array:
 
     再帰系の状態はどれもこの形に落ちる: GDN の conv 窓、PLE の short conv 窓、
     n-gram の直前文脈。3 階 (B, L, C) と 2 階 (B, L) の両方を受ける。
+
+    注意: `spec_flash.py` の `capture()` 内 3 か所 (GDN/PLE の差し替え) は
+    ここを通さず生スライスで同じ窓を取っている (A-4)。ここを変えても
+    capture 側は追随しないので、変更するときは spec_flash.py 側も見ること。
     """
     lengths = getattr(cache, "lengths", None)
     if lengths is None:
@@ -1135,7 +1139,7 @@ class GatedDeltaNet(nn.Module):
         # そのまま計算する (下の gated_delta_blocked.py とは別の道具で、
         # チャンク分解や行列積への作り替えはしない)。prefill 幅・Dk==128・
         # Dv%32==0 のみが対象で、外れれば下の gdn_blocked、さらに逐次カーネル
-        # へ落ちる。既定 off。
+        # へ落ちる。2026-09-02 に既定 on にした (MLXTURBO_GDN_METAL=0 で無効化)。
         if getattr(self, "_gdn_metal", False) and not self.training:
             from mlxturbo.kernels import gdn_blocked_metal as gbm
 

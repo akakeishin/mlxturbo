@@ -435,9 +435,13 @@ def _install_model_patches(BatchAttnCache):
         block_end = block_starts + self.compress_ratio - 1
         visible = block_end[None, None, :] <= q_col[None, :, None]
         if left_pad is not None:
-            # Exclude blocks that are entirely padding from the candidates.
-            # Without this they eat up the budget, and on top of that `pooled`
-            # gets contaminated with padding keys
+            # `block_starts >= left_pad` drops not just blocks that are
+            # entirely padding but also any block whose start still straddles
+            # the padding boundary (block_starts < left_pad <= block_end) --
+            # safe side, since a partially-padded block would still mix
+            # padding keys into `pooled`. Without this exclusion these blocks
+            # would eat up the budget, and `pooled` would get contaminated
+            # with padding keys
             visible = visible & (block_starts[None, None, :] >= left_pad[:, None, None])
         scores = mx.where(visible, scores, -mx.inf)
 
@@ -609,9 +613,23 @@ def disable_batch_cache() -> None:
 #      0.00378) for every configuration this module will ever actually
 #      admit into a shared batch.
 #
-# `classify()` below is what keeps guarantee 3 honest: a request whose
-# kv length could ever cross `indexer_budget` (QSA could activate for it) is
-# always run alone ("solo" tier), never sharing a batch with anything else.
+# `classify()` below is *intended* to keep guarantee 3 honest, but as written
+# it does not fully do so (B-3): it looks only at one request's own
+# `prompt_len + max_tokens` against `indexer_budget`, while what actually
+# determines whether QSA can activate for a shared batch is the batch's
+# *physical* column count (`BatchKVCache._idx` = the longest co-resident
+# prompt plus elapsed decode steps). Two requests can each individually
+# classify "pool" (own prompt_len + max_tokens <= budget) and still, once
+# co-resident, push max(prompt_len) + max(max_tokens) across the batch past
+# budget — e.g. A = 2040+8 and B = 8+2040 against a 2048 budget: each is
+# "pool" alone, but sharing a batch gives a physical column count of
+# 2040 + 2040 = 4080 > 2048, so QSA can activate for that pair even though
+# neither request was classified "solo". The correct condition would be on
+# the co-resident set (max(prompt_len) + max(max_tokens) across whatever
+# ends up sharing the batch), not on each request in isolation; `classify()`
+# does not implement that (this comment records the gap, not a fix — the
+# runtime behavior of `classify()` is unchanged).
+#
 # QSA's block grid is cut by absolute column position, so an unequal-length,
 # left-padded batch can select a different set of blocks than solo
 # generation would (mlxturbo/batch.py's own "Remaining limitation" section,
@@ -626,7 +644,9 @@ def disable_batch_cache() -> None:
 # joins" across a continuously-refilling batch is a correctness-sensitive
 # bookkeeping problem this pass chose not to take on; the cost is one
 # forgone speed opportunity (equal-length long prompts always run one at a
-# time here), not a correctness gap.
+# time here), not a correctness gap. That said, this "cost, not a gap" framing
+# assumes classify()'s solo/pool split is otherwise sound, which the
+# co-resident-budget gap above means it currently is not.
 
 import queue as _queue
 import threading
@@ -645,11 +665,16 @@ def _indexer_budget(model) -> int | None:
 
 
 def classify(model, prompt_len: int, max_tokens: int) -> str:
-    """"solo": this request's kv length could exceed indexer_budget before it
-    is done, so QSA could activate for it — it must never share a batch with
-    anything else (see the module docstring above). "pool": QSA provably
-    cannot activate for this request regardless of what else is batched with
-    it, so it may share freely."""
+    """"solo": this request's own kv length could exceed indexer_budget
+    before it is done, so QSA could activate for it — it must never share a
+    batch with anything else (see the module docstring above). "pool": QSA
+    cannot activate from this request's own length alone.
+
+    This is a per-request check, not a per-batch one (B-3, see the module
+    docstring above): two "pool" requests can still push a shared batch's
+    physical column count (longest co-resident prompt + elapsed steps) past
+    `indexer_budget` once they are actually co-resident, so "pool" does not
+    provably rule out QSA activating for the batch they end up in."""
 
     budget = _indexer_budget(model)
     if budget is None:

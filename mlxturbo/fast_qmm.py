@@ -146,15 +146,13 @@ M_WIDE_MAX = 16    # up to the second MMA tile — the weight read is identical 
 # in-window (M<=8) path is left untouched.
 
 # Wide (M=9..16) の既定は off。有効化は `MLXLM_FAST_QMM_WIDE=1` (公開の環境
-# 変数) か、この内部フラグの直接代入 (kernels/dispatch.py の MMA 経路が使う)
-# のどちらか -- dispatch.py は自分の経路だけ wide を強制したいので、
-# os.environ を書き換えてプロセス全体の既定を横取りする代わりにこのフラグを
-# 立てる (A2, Opus 設計レビュー指摘)。
-_WIDE_FORCE_ON = False
-
-
-def _wide_enabled() -> bool:
-    return _WIDE_FORCE_ON or os.environ.get("MLXLM_FAST_QMM_WIDE") == "1"
+# 変数)、または個別呼び出しの `force_wide=True` (kernels/dispatch.py の MMA
+# 経路が自分の呼び出しだけに使う) のどちらか。以前はモジュールグローバルな
+# フラグ経由だったが、それだと dispatch.py 側の 1 回の呼び出しがプロセス全体の
+# `fast_qmm()` (fast_qmm.enable() が全 QuantizedLinear に配る側) にまで
+# wide を伝染させてしまっていた (D-3)。呼び出し単位の引数にして閉じ込める。
+def _wide_enabled(force_wide: bool = False) -> bool:
+    return force_wide or os.environ.get("MLXLM_FAST_QMM_WIDE") == "1"
 
 
 _SRC_WIDE = r"""
@@ -333,11 +331,14 @@ def width_histogram():
     return dict(sorted(_WIDTH_HIST.items()))
 
 
-def fast_qmm(x, w, scales, biases, *, group_size: int, bits: int):
+def fast_qmm(x, w, scales, biases, *, group_size: int, bits: int, force_wide: bool = False):
     """Drop-in for `mx.quantized_matmul(..., transpose=True)` in the small-M window.
 
     Falls back whenever the shape or dtype is outside what the kernel handles, so
-    callers never have to check.
+    callers never have to check. `force_wide` opts this one call into the M=9..16
+    window regardless of `MLXLM_FAST_QMM_WIDE` -- kernels/dispatch.py's own MMA
+    route passes it so wide stays confined to that route instead of leaking into
+    every `fast_qmm()` caller in the process (D-3).
     """
     K = x.shape[-1]
     M = 1
@@ -348,7 +349,7 @@ def fast_qmm(x, w, scales, biases, *, group_size: int, bits: int):
         _WIDTH_HIST[M] = _WIDTH_HIST.get(M, 0) + 1
     if (
         M_MAX < M <= M_WIDE_MAX
-        and _wide_enabled()
+        and _wide_enabled(force_wide)
         and _eligible(x, w, scales, biases, group_size, bits, K, N)
     ):
         return _wide_qmm(x, w, scales, biases, M=M, K=K, N=N)

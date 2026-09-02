@@ -228,8 +228,9 @@ def rollback_recurrent_rows(
     if layers:
         # `keeps[b]` は「行 b の受理数 (1..total)」という契約 (docstring) だが
         # 呼び手にそれを強制する型は無い。MLX の `mx.take_along_axis` は
-        # 範囲外の添字を例外にせず末尾へクランプするため (実測確認済み)、
-        # 契約違反を渡されると「その行だけ状態が静かにずれる」形で隠れる。
+        # 範囲外の添字を例外にせず値 0 を返すため (mlx 0.32.2 で実測確認済み。
+        # 末尾へのクランプではない)、契約違反を渡されると「その行だけ状態が
+        # 静かにずれる」形で隠れる。
         # `RaggedLedger.commit_round` の `assert 1 <= keep <= total` は
         # rollback の後に呼ばれる順序なのでここでは防波堤にならない。
         # 単一行版 `rollback_recurrent` の `keep - 1 if keep > 0 else None`

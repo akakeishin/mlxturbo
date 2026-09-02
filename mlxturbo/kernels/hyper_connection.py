@@ -683,6 +683,17 @@ def eligible(
         if k % gs or s.shape != (n, k // gs) or b.shape != (n, k // gs):
             return False
 
+    # fused_gated_residual は down の bits/group_size (down[3]/[4]) だけを
+    # cfg に載せてカーネルを組み、up/inject もそれで復号する。3 層のうち
+    # どれか 1 つでも bits/group_size が違うと、そのバンクだけ誤った
+    # 幅/グループ境界で読まれる (bits 違いは値が化ける、group_size 違いは
+    # scales/biases の範囲外読み)。up 8bit だけ混ぜて 0.0586、gs=32 だけ
+    # 混ぜて 0.0254 の誤差が実測されている (D-4)。
+    if up[3] != down[3] or up[4] != down[4]:
+        return False
+    if inject is not None and (inject[3] != down[3] or inject[4] != down[4]):
+        return False
+
     lowrank = down[0].shape[0]
     if down[0].shape[0] != up[0].shape[1] * 32 // up[4] or up[0].shape[0] != hc * d:
         return False

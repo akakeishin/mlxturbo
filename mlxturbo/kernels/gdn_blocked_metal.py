@@ -200,6 +200,20 @@ _KERNEL_S_SRC = """
 _SUPPORTED_BLOCK_T = (16, 32, 48)
 _kernel_s_by_tb: dict[int, object] = {}
 
+# threadgroup メモリ使用量 (バイト) = TB * (k_s + q_s + v_s の行あたりバイト数
+# + g_s/b_s の行あたり 8 バイト)。k_s/q_s は [Dk+8] 個、v_s は [DB+8] 個の
+# InT。Dk/DB は eligible() が Dk==128 / Dv%32==0 (DB=32 固定) を要求するので
+# ここでは固定値として扱う (`_KERNEL_S_SRC` の `constexpr int DB = 32;` と同じ)。
+_KERNEL_DK = 128
+_KERNEL_DB = 32
+_METAL_THREADGROUP_LIMIT = 32768  # Metal の threadgroup メモリ上限 (32KiB)
+
+
+def _threadgroup_bytes(block_t: int, input_dtype) -> int:
+    itemsize = 4 if input_dtype == mx.float32 else 2
+    per_row = (2 * (_KERNEL_DK + 8) + (_KERNEL_DB + 8)) * itemsize + 8
+    return block_t * per_row
+
 
 def _normalize_block_t(block_t: int | str | None, input_dtype=None) -> int:
     if block_t is None:
@@ -216,6 +230,23 @@ def _normalize_block_t(block_t: int | str | None, input_dtype=None) -> int:
         raise ValueError(
             f"MLXTURBO_GDN_BLOCK_T must be one of {_SUPPORTED_BLOCK_T}, got {block_t}"
         )
+    # env 指定 (MLXTURBO_GDN_BLOCK_T) のときも上の dtype 分岐を素通りしない。
+    # 以前は block_t is None の枝でしか fp32 の引き下げをしていなかったので、
+    # env で明示的に 32/48 を指定すると fp32 入力でそのまま threadgroup
+    # メモリ超過 (40,192 > 32,768) で落ちていた (D-5)。収まる最大の TB まで
+    # 丸め下げる。
+    while _threadgroup_bytes(block_t, input_dtype) > _METAL_THREADGROUP_LIMIT:
+        smaller = [t for t in _SUPPORTED_BLOCK_T if t < block_t]
+        if not smaller:
+            # Dk==128/DB=32 が固定である限り TB=16 は常に収まるので、実際には
+            # 到達しない安全弁。
+            raise ValueError(
+                f"block_t={block_t} ({input_dtype}) needs "
+                f"{_threadgroup_bytes(block_t, input_dtype)} bytes of threadgroup "
+                f"memory, over the {_METAL_THREADGROUP_LIMIT} limit, even at the "
+                "smallest supported block size"
+            )
+        block_t = max(smaller)
     return block_t
 
 
@@ -319,6 +350,23 @@ def eligible(
         return False
     if state is not None and state.shape != (B, Hv, Dv, Dk):
         _warn_once("state_shape", "state の形が (B, Hv, Dv, Dk) でない")
+        return False
+    # gated_delta_update_blocked_metal は block_t=None で呼ばれる (呼び手の
+    # qwen4_exp.py は指定しない) ので、_normalize_block_t が実際に選ぶ TB を
+    # ここでも再現し、threadgroup メモリ予算に収まることを確認する。env の
+    # MLXTURBO_GDN_BLOCK_T が不正な値、または (Dk/DB が将来変わるなどで)
+    # 最小の TB でも収まらない場合は ValueError になるので、ここで捕まえて
+    # 素通し (呼び手を逐次カーネルへ落とす) にする (D-5)。
+    try:
+        resolved_tb = _normalize_block_t(None, q.dtype)
+    except ValueError as exc:
+        _warn_once("block_t", f"TB を決められない: {exc}")
+        return False
+    if _threadgroup_bytes(resolved_tb, q.dtype) > _METAL_THREADGROUP_LIMIT:
+        _warn_once(
+            "tg_bytes",
+            f"TB={resolved_tb} ({q.dtype}) が threadgroup メモリ上限を超える",
+        )
         return False
     return True
 

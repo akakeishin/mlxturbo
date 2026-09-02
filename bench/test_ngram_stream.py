@@ -205,13 +205,17 @@ def test_prefetch_disabled_is_noop(tmp_path):
     rng = np.random.default_rng(5)
     ids = rng.integers(0, ROWS, size=500).astype(np.int64)
     new.prefetch(ids)
-    assert new._cache_gen.n == 0
+    # prefetch が無効なら行キャッシュ (既定 4M 行 = 419MB) は一度も確保しない
+    # (B-7)。以前は空の生成物 (n==0) を無条件に確保していた。
+    assert new._cache_gen is None
     # backend=mmap のときも常に off (StreamNGram.__init__ の契約)
     mmap_stream = StreamNGram(sidecar, backend="mmap")
     assert mmap_stream.prefetch_enabled is False
 
     gid = mx.array(ids.reshape(1, -1))
     _assert_bit_identical(new(gid), ref(gid))
+    # 通常の __call__ 経由でもキャッシュは育たない (prefetch 無効のまま)
+    assert new._cache_gen is None
 
 
 def test_cache_full_clears_and_stays_correct(tmp_path):
@@ -220,6 +224,9 @@ def test_cache_full_clears_and_stays_correct(tmp_path):
     sidecar, _ = _build_synthetic_sidecar(tmp_path)
     ref = _RefStreamNGram(sidecar)
     new = StreamNGram(sidecar, backend="pread", n_threads=4, cache_rows=50)
+    new.prefetch_enabled = True  # 既定 off (B-7 以降、行キャッシュは prefetch
+    # が有効なときだけ育つ)。ここは「満杯 -> 全消し」の世代差し替えそのものを
+    # 確認したいので、通常の __call__ でもキャッシュへ書き込ませる
     rng = np.random.default_rng(6)
     for _ in range(30):
         ids = rng.integers(0, ROWS, size=200).astype(np.int64)  # cap の 4 倍

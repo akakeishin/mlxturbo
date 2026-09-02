@@ -655,18 +655,37 @@ def _knob_wide(ctx):
     「連結で N が変わると qmv のカーネル変種が変わり、加算順の違いが
     最終 ulp を動かす疑い (tok/step 2.44 -> 2.23 の低下と時期が一致)」で、
     **単独 A/B の記録は無い**。出力が変わりうるので対照は要求しない。
+
+    `SL.SwitchGLU.__call__` の統合ディスパッチ (`fused.py` の `dispatched`)
+    は verify -> glu -> gather_sort -> wide -> stock の優先順で、
+    `gather_sort` は「素通し条件を持たない」(有効なら常にそこで確定する)。
+    既定は `MLXTURBO_SORT_MIN=16` 経由で `_MOE_DISPATCH_SORT_MIN` が
+    None でなくなっているので、`enable_wide_projections` で連結を仕込んでも
+    `wide()` には一度も到達しない -- 上の「単独 A/B の記録は無い」はこれが
+    理由 (measured のではなく測れていなかった)。A はこの gather_sort 分岐を
+    一時的に退避して `wide()` (連結 + `wide()` 自身の内部ソート、閾値は
+    `_MOE_DISPATCH_WIDE_SORT_MIN` 既定 64) を通す。B は連結を外し
+    (`disable_wide_projections`、D-2 の修正込みで `_fused_w/_fused_s/_fused_b`
+    も外れる)、退避した gather_sort を戻す -- つまり比較は「連結 + 内部
+    ソート」対「素の 3 gather + gather_sort(16)」になる。`MLXTURBO_SORT_MIN=0`
+    のような環境変数はプロセス全体の既定を変えてしまうので使わず、この
+    knob の中だけでモジュール属性を退避・復元する。
     """
     from mlxturbo import fused
 
     eng = ctx["eng"]
     applied = {"on": False}
+    stashed_sort_min = {"value": None}
 
     def apply(variant):
         if variant == "A" and not applied["on"]:
+            stashed_sort_min["value"] = fused._MOE_DISPATCH_SORT_MIN
+            fused._MOE_DISPATCH_SORT_MIN = None
             fused.enable_wide_projections(eng.model)
             applied["on"] = True
         elif variant == "B" and applied["on"]:
             fused.disable_wide_projections(eng.model)
+            fused._MOE_DISPATCH_SORT_MIN = stashed_sort_min["value"]
             applied["on"] = False
 
     return apply

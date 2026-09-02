@@ -135,10 +135,13 @@ def _pack_quantized(lin):
     """Take (weight, scales, biases, group_size, bits) out of a linear layer.
 
     A layer that is not quantized is out of scope for the fused kernel, so return
-    None.
+    None. Same for a non-affine mode (mxfp4/nvfp4) -- those have no `biases`
+    (fast_qmm.py:382 rejects it the same way), and the kernel assumes affine.
     """
 
-    if "scales" not in lin:
+    if "scales" not in lin or "biases" not in lin:
+        return None
+    if getattr(lin, "mode", "affine") != "affine":
         return None
     return (lin["weight"], lin["scales"], lin["biases"], lin.group_size, lin.bits)
 
@@ -695,10 +698,19 @@ def disable_wide_projections(model, mtp=None) -> int:
             (getattr(layer, "linear_attn", None), "_wide_in"),
             (getattr(layer, "self_attn", None), "_wide_qkv"),
             (getattr(layer, "mlp", None), "_wide_shared"),
-            (getattr(layer, "mlp", None), "_wide_experts"),
         ):
             if mod is not None and getattr(mod, attr, None) is not None:
                 setattr(mod, attr, None)
+                n += 1
+        # experts の連結は mlp.switch_mlp に _fused_w/_fused_s/_fused_b として
+        # 置かれる (enable_wide_projections:760)。dispatched() の wide() は
+        # `hasattr(self, "_fused_w")` で見るので、setattr(..., None) では
+        # 属性自体が残って hasattr が True のままになる -- delattr で消す。
+        mlp = getattr(layer, "mlp", None)
+        sw = getattr(mlp, "switch_mlp", None) if mlp is not None else None
+        if sw is not None and getattr(sw, "_fused_w", None) is not None:
+            for attr in ("_fused_w", "_fused_s", "_fused_b"):
+                delattr(sw, attr)
                 n += 1
     return n
 
