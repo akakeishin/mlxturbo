@@ -1,7 +1,7 @@
-"""decode forward 1 回の GPU カーネル内訳を測る (Metal System Trace)。
+"""decode forward 1 回の GPU 区間内訳を測る (Metal System Trace)。
 
-うちの forward が GPU 時間 24.0ms、mlx-serve が 18.1ms で、差 6ms がどの
-カーネルにあるかをカーネル区間の突き合わせで特定するための道具。
+うちの forward が GPU 時間 24.0ms、mlx-serve が 18.1ms で、差 6ms がどこに
+あるかを GPU 区間の突き合わせで特定するための道具。
 
 xctrace の作法 (docs/research/KERNEL-BRIEF-DECODE-BW.md の記録どおり):
   record: `xcrun xctrace record --template 'Metal System Trace' --attach <pid>`
@@ -9,24 +9,33 @@ xctrace の作法 (docs/research/KERNEL-BRIEF-DECODE-BW.md の記録どおり):
   export: `xcrun xctrace export --xpath
           '/trace-toc/run[@number="1"]/data/table[@schema="metal-gpu-intervals"]'`
           schema 名に確信が無ければ `toc` サブコマンドで一覧を見る。
-          export の XML は同じ値を id/ref で重複排除するので、export は
-          これを解決してからカーネル区間 (name, start, duration) を拾う。
-          列名 (どのタグが名前/開始/長さか) は実物の trace でしか確定
-          できないため、先頭行のタグ一覧を毎回 stderr に出す。ヒューリス
-          ティックが外れたら --name-field/--start-field/--duration-field
-          で上書きする。
 
-record と export は GPU と xctrace を実際に動かす。**別計測が GPU を
-使っている間は叩かないこと。** --dry-run を付けると xctrace に渡す
-コマンド列を表示するだけで実行しない。summarize と diff は JSON だけを
-扱うので GPU を使わない。
+実物の export XML (2026-09-02、実 trace で確認済み。以下は前提ではなく事実):
+  ルートは <trace-query-result> -> <node xpath='...'> -> <schema name=
+  "metal-gpu-intervals"> (列定義は <col><mnemonic>...</mnemonic>...</col> の
+  並びで、これが行内の列順そのもの) と、続く <row> 群。<table> 要素は無い。
+  <row> の子は型名の要素で列順に並ぶが、`duration` 型のタグが 2 回
+  (区間長そのものと CPU→GPU の start-latency) 出るなど、**タグ名だけでは
+  列を特定できない**。schema の <col> 順で列インデックスを引く。
+  同じ値は初出で `id="N"`、以後 `ref="N"` で参照される (ref 解決が必須)。
+  カーネル名 (shader 名) はこの schema には無い
+  (metal-shader-profiler-intervals は別 schema で 0 行のことがある)。
+  取れるのは「プロセス x チャネル (Vertex/Fragment/Compute) x 区間」で、
+  区間には event-depth (ネストの深さ) が付く。
+
+record と export (xctrace 実行あり) は GPU と xctrace を実際に動かす。
+**別計測が GPU を使っている間は叩かないこと。** --dry-run を付けると
+xctrace に渡すコマンド列を表示するだけで実行しない。既に export 済みの XML
+があるなら export に --xml で渡せば xctrace を一切呼ばない (この経路は GPU
+を使わない)。summarize と diff は JSON だけを扱うので GPU を使わない。
 
     uv run python tools/gpu_trace_kernels.py record --attach 12345 \\
         --tag decode-ours --time-limit 20s
-    uv run python tools/gpu_trace_kernels.py record --tag decode-serve -- \\
-        .venv/bin/python tools/verify_width_cost.py --widths 1 --reps 40
     uv run python tools/gpu_trace_kernels.py export \\
-        --trace bench/results/traces/decode-ours.trace --window
+        --trace bench/results/traces/decode-ours.trace
+    uv run python tools/gpu_trace_kernels.py export \\
+        --xml bench/results/traces/decode-ours-metal-gpu-intervals.xml \\
+        --process python --channel Compute
     uv run python tools/gpu_trace_kernels.py diff \\
         --a bench/results/traces/decode-ours-summary.json \\
         --b bench/results/traces/decode-serve-summary.json
@@ -39,10 +48,10 @@ import json
 import re
 import shlex
 import shutil
+import statistics
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
-from collections import defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -51,19 +60,23 @@ if str(REPO_ROOT) not in sys.path:
 
 TRACES_DIR = REPO_ROOT / "bench" / "results" / "traces"
 
-_START_CANDIDATES = ("start-time", "start_time", "start", "timestamp", "time")
-_DURATION_CANDIDATES = ("duration", "dur")
-_NAME_CANDIDATES = ("name", "label", "kernel")
-
 _UNIT_NS = {"ns": 1.0, "us": 1e3, "µs": 1e3, "ms": 1e6, "s": 1e9}
 _TIME_FMT_RE = re.compile(r"([\d.]+)\s*(ns|us|µs|ms|s)\b")
 
-# diff でカーネル名を突き合わせるための正規化: テンプレート/引数と末尾の
-# 番号を落として「同じカーネルの別インスタンス」をまとめる。
-_TEMPLATE_OR_ARGS_RE = re.compile(r"[<(].*$")
-_TRAILING_NUM_RE = re.compile(r"[_\d]+$")
+# metal-gpu-intervals の schema で今回使う列 (mnemonic 名、col の並び順で
+# 引く。タグ名では duration が 2 回出るなど区別が付かないため)。
+MNEM_START = "start"
+MNEM_DURATION = "duration"
+MNEM_CHANNEL = "channel-name"
+MNEM_DEPTH = "event-depth"
+MNEM_PROCESS = "process"
+MNEM_ENCODER = "encoder-id"
+MNEM_CMDBUFFER = "cmdbuffer-id"
+REQUIRED_MNEMONICS = (MNEM_START, MNEM_DURATION, MNEM_CHANNEL, MNEM_DEPTH,
+                       MNEM_PROCESS, MNEM_ENCODER, MNEM_CMDBUFFER)
 
-BIG_GAP_MS = 1.0  # summarize (b) のアイドル分布しきい値
+IDLE_GAP_MS = 0.5   # summarize (b) のアイドル分布しきい値 (固定、仕様どおり)
+DEFAULT_GAP_MS = 2.0  # summarize (c) のセグメント区切り既定値
 
 
 # --------------------------------------------------------------------------
@@ -103,7 +116,7 @@ def _print_cmd(cmd: list[str]) -> None:
 
 
 # --------------------------------------------------------------------------
-# export: xctrace の XML (id/ref 重複排除つき) をカーネル区間に変換
+# export: xctrace の XML (id/ref 重複排除つき) を GPU 区間に変換
 # --------------------------------------------------------------------------
 
 
@@ -111,9 +124,9 @@ def _load_id_registry(root: ET.Element) -> dict[str, ET.Element]:
     """文書全体を 1 回舐めて id -> 要素 の対応表を作る。
 
     xctrace の export XML は同じ値の 2 回目以降を `ref="N"` で参照し、
-    最初の出現だけが `id="N"` を持つ。id は定義が参照より先に出る前提
-    (実測どおりだが未確認) なので、先に全体を registry 化してから各行を
-    読む形にして順序に依存しないようにしてある。
+    最初の出現だけが `id="N"` を持つ。id は定義が参照より先に出る
+    (実 trace で確認済み) が、念のため先に全体を registry 化してから
+    各行を読む形にして順序に依存しないようにしてある。
     """
     registry: dict[str, ET.Element] = {}
     for elem in root.iter():
@@ -145,12 +158,11 @@ def _elem_value(elem: ET.Element) -> tuple[str, str | None]:
 
 
 def _parse_time_ns(text: str, fmt: str | None) -> float | None:
-    """start-time/duration の列を ns の float に変換する。
+    """start/duration 列を ns の float に変換する。
 
-    xctrace の実測では生テキストが ns 整数、fmt が "12.3 ms" のような
-    表示用文字列という組み合わせが通例 (未確認、次回の実物 trace で要検証)。
-    生テキストが数値ならそれを ns として採用し、ダメなら fmt から
-    単位付きで読み直す。
+    実 trace では生テキストが ns 整数、fmt が "12.3 ms" のような表示用
+    文字列という組み合わせ (確認済み)。生テキストが数値ならそれを ns
+    として採用し、ダメなら fmt から単位付きで読み直す (保険)。
     """
     if text:
         try:
@@ -166,164 +178,207 @@ def _parse_time_ns(text: str, fmt: str | None) -> float | None:
     return None
 
 
-def _row_columns(row: ET.Element, registry: dict[str, ET.Element]
-                  ) -> list[tuple[str, str, str | None]]:
-    cols = []
-    for child in list(row):
-        resolved = _resolve(child, registry)
-        text, fmt = _elem_value(resolved)
-        cols.append((resolved.tag, text, fmt))
-    return cols
+def _find_data_node(root: ET.Element, schema_name: str | None) -> ET.Element:
+    """<node xpath='...'><schema name="...">...</schema><row>...</row>... を
+    持つ <node> を返す。schema_name が指定されていればそれに一致するものを
+    優先し、無ければ最初に見つかった <node> を使う。
+    """
+    nodes = root.findall(".//node")
+    if not nodes:
+        raise ValueError("<node> が見つからない (export 済み XML か確認)")
+    if schema_name:
+        for node in nodes:
+            schema = node.find("schema")
+            if schema is not None and schema.get("name") == schema_name:
+                return node
+    return nodes[0]
 
 
-def _pick_numeric(cols: list[tuple[str, str, str | None]],
-                   override: str | None, candidates: tuple[str, ...]
-                   ) -> float | None:
-    if override:
-        for tag, text, fmt in cols:
-            if tag == override:
-                return _parse_time_ns(text, fmt)
-        return None
-    for cand in candidates:
-        for tag, text, fmt in cols:
-            if cand in tag.lower():
-                v = _parse_time_ns(text, fmt)
-                if v is not None:
-                    return v
-    return None
-
-
-def _pick_name(cols: list[tuple[str, str, str | None]],
-                override: str | None) -> str | None:
-    if override:
-        for tag, text, fmt in cols:
-            if tag == override:
-                return fmt or text or None
-    for cand in _NAME_CANDIDATES:
-        for tag, text, fmt in cols:
-            if cand in tag.lower() and (fmt or text):
-                return fmt or text
-    # 専用の name/label 列が無い場合: <string> 型の列のうち最後のもの
-    # (track/queue/thread の後に具体的なカーネル名が来ることが多い、という
-    # ヒューリスティック。外れたら --name-field で上書き)
-    strings = [(fmt or text) for tag, text, fmt in cols
-               if tag.lower() == "string" and (fmt or text)]
-    return strings[-1] if strings else None
-
-
-def parse_kernel_intervals(
-    xml_path: Path,
-    name_field: str | None = None,
-    start_field: str | None = None,
-    duration_field: str | None = None,
+def parse_intervals(
+    xml_path: Path, schema_name: str = "metal-gpu-intervals",
 ) -> tuple[list[dict], list[str]]:
-    """export 済み XML からカーネル区間 [{name, start_ms, duration_ms}] を読む。
+    """export 済み XML から GPU 区間を読む。
 
-    戻り値の 2 つ目は先頭行の列タグ一覧 (診断用)。空リストなら <table><row>
-    が見つかっていない = xpath / schema を間違えている。
+    戻り値の 1 つ目は各区間 dict のリスト:
+      start_ms, duration_ms, channel, depth (event-depth, int),
+      pid (int|None), process (表示名、例 "Claude Helper (1635)"),
+      encoder_id, cmdbuffer_id (どちらも fmt 表示、例 "0x8cd6da407")
+    2 つ目は schema の列 mnemonic 一覧 (診断用)。
+
+    列はタグ名ではなく schema の <col> 並び順 (mnemonic) で特定する。
     """
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    registry = _load_id_registry(root)
+    node = _find_data_node(root, schema_name)
 
-    table = root.find(".//table")
-    if table is None:
-        raise ValueError("<table> が見つからない (--schema / --xpath を確認)")
-    rows = table.findall("row")
-    if not rows:
-        rows = list(table.iter("row"))
+    schema = node.find("schema")
+    if schema is None:
+        raise ValueError("<schema> が見つからない (export 済み XML か確認)")
+    mnemonics = [c.findtext("mnemonic") for c in schema.findall("col")]
+    missing = [m for m in REQUIRED_MNEMONICS if m not in mnemonics]
+    if missing:
+        raise ValueError(f"必要な列が無い: {missing} (実際の列: {mnemonics})")
+    idx = {m: i for i, m in enumerate(mnemonics)}
+
+    registry = _load_id_registry(root)
+    rows = node.findall("row")
 
     intervals: list[dict] = []
-    sample_tags: list[str] = []
-    for i, row in enumerate(rows):
-        cols = _row_columns(row, registry)
-        if i == 0:
-            sample_tags = [c[0] for c in cols]
-        start_ns = _pick_numeric(cols, start_field, _START_CANDIDATES)
-        dur_ns = _pick_numeric(cols, duration_field, _DURATION_CANDIDATES)
-        name = _pick_name(cols, name_field)
-        if start_ns is None or dur_ns is None or name is None:
+    n_bad_rows = 0
+    for row in rows:
+        children = list(row)
+        if len(children) != len(mnemonics):
+            n_bad_rows += 1
+            continue  # 列数が schema と合わない行は壊れているとみなして飛ばす
+
+        start_el = _resolve(children[idx[MNEM_START]], registry)
+        dur_el = _resolve(children[idx[MNEM_DURATION]], registry)
+        chan_el = _resolve(children[idx[MNEM_CHANNEL]], registry)
+        depth_el = _resolve(children[idx[MNEM_DEPTH]], registry)
+        proc_el = _resolve(children[idx[MNEM_PROCESS]], registry)
+        enc_el = _resolve(children[idx[MNEM_ENCODER]], registry)
+        cmdbuf_el = _resolve(children[idx[MNEM_CMDBUFFER]], registry)
+
+        start_ns = _parse_time_ns(*_elem_value(start_el))
+        dur_ns = _parse_time_ns(*_elem_value(dur_el))
+        if start_ns is None or dur_ns is None:
             continue
+
+        chan_text, chan_fmt = _elem_value(chan_el)
+        channel = chan_fmt or chan_text or None
+
+        depth_text, _ = _elem_value(depth_el)
+        try:
+            depth = int(depth_text)
+        except ValueError:
+            depth = None
+
+        pid_el = proc_el.find("pid")
+        pid = None
+        if pid_el is not None:
+            pid_text, _ = _elem_value(pid_el)
+            try:
+                pid = int(pid_text)
+            except ValueError:
+                pid = None
+        process = proc_el.get("fmt")
+
+        enc_text, enc_fmt = _elem_value(enc_el)
+        encoder_id = enc_fmt or enc_text or None
+        cmdbuf_text, cmdbuf_fmt = _elem_value(cmdbuf_el)
+        cmdbuffer_id = cmdbuf_fmt or cmdbuf_text or None
+
         intervals.append({
-            "name": name,
             "start_ms": start_ns / 1e6,
             "duration_ms": dur_ns / 1e6,
+            "channel": channel,
+            "depth": depth,
+            "pid": pid,
+            "process": process,
+            "encoder_id": encoder_id,
+            "cmdbuffer_id": cmdbuffer_id,
         })
-    return intervals, sample_tags
+
+    if n_bad_rows:
+        print(f"列数が schema と合わない行を {n_bad_rows} 件飛ばした", file=sys.stderr)
+    return intervals, mnemonics
+
+
+def filter_intervals(intervals: list[dict], pid: int | None = None,
+                      process: str | None = None,
+                      channel: str | None = "Compute") -> list[dict]:
+    """pid (完全一致) / process (部分一致、大小無視) / channel (完全一致、
+    大小無視) で区間を絞る。どれも None/空なら素通し。
+    """
+    out = intervals
+    if channel:
+        needle = channel.lower()
+        out = [iv for iv in out if (iv.get("channel") or "").lower() == needle]
+    if pid is not None:
+        out = [iv for iv in out if iv.get("pid") == pid]
+    if process:
+        needle = process.lower()
+        out = [iv for iv in out if needle in (iv.get("process") or "").lower()]
+    return out
 
 
 # --------------------------------------------------------------------------
-# summarize: (a) カーネル別集計 (b) アイドル (c) GPU/壁時計比 (d) window 分解
+# summarize: (a) 区間数/busy/span/busy比、(b) 隙間分布、(c) セグメント
+# (「forward 1 回」候補) ごとの中央値と中央値セグメントの duration 分布。
+# 重なり (nesting) は event-depth 0 だけを数える。
 # --------------------------------------------------------------------------
 
 
-def summarize(intervals: list[dict], gap_ms: float = 3.0, window: bool = False,
-              wall_ms: float | None = None, top_n: int = 40) -> dict:
-    if not intervals:
-        return {"n_intervals": 0, "total_gpu_ms": 0.0, "top_kernels": [],
-                 "idle": {"total_idle_ms": 0.0, "n_gaps": 0,
-                          "n_gaps_gt_1ms": 0, "mean_gap_gt_1ms_ms": 0.0}}
+def _empty_summary(gap_ms: float) -> dict:
+    return {
+        "n_intervals": 0,
+        "total_busy_ms": 0.0,
+        "span_ms": 0.0,
+        "busy_span_ratio": None,
+        "idle": {"total_idle_ms": 0.0, "n_gaps": 0,
+                 "n_gaps_gt_idle_ms": 0, "mean_gap_gt_idle_ms": 0.0,
+                 "max_gap_gt_idle_ms": 0.0},
+        "segments": {"gap_ms": gap_ms, "n_segments": 0},
+    }
 
-    ivs = sorted(intervals, key=lambda x: x["start_ms"])
-    total_gpu_ms = sum(iv["duration_ms"] for iv in ivs)
-    span_start = ivs[0]["start_ms"]
-    span_end = max(iv["start_ms"] + iv["duration_ms"] for iv in ivs)
+
+def summarize(intervals: list[dict], gap_ms: float = DEFAULT_GAP_MS,
+              top_n: int = 20) -> dict:
+    n_total = len(intervals)
+    depth0 = sorted((iv for iv in intervals if iv.get("depth") == 0),
+                     key=lambda x: x["start_ms"])
+    n_skipped = n_total - len(depth0)
+    if n_skipped:
+        print(f"event-depth != 0 (ネスト) を {n_skipped} 件除外して集計",
+              file=sys.stderr)
+
+    if not depth0:
+        return _empty_summary(gap_ms)
+
+    total_busy_ms = sum(iv["duration_ms"] for iv in depth0)
+    span_start = depth0[0]["start_ms"]
+    span_end = max(iv["start_ms"] + iv["duration_ms"] for iv in depth0)
     span_ms = span_end - span_start
+    busy_span_ratio = (total_busy_ms / span_ms) if span_ms > 0 else None
 
-    if wall_ms is None:
-        wall = span_ms
-        print("wall_ms 未指定: カーネル区間の span で代用 (--wall-ms で正確な"
-              "壁時計を渡すとよい)", file=sys.stderr)
-    else:
-        wall = wall_ms
-
-    top_kernels = _kernel_breakdown(ivs, top_n)
-
-    gaps = []
+    # (b) 隙間: 前の区間の end から次の区間の start までが正の分だけ
+    gaps: list[float] = []
     cur_end = span_start
-    for iv in ivs:
+    for iv in depth0:
         gap = iv["start_ms"] - cur_end
         if gap > 0:
             gaps.append(gap)
         cur_end = max(cur_end, iv["start_ms"] + iv["duration_ms"])
-    big_gaps = [g for g in gaps if g > BIG_GAP_MS]
+    big_gaps = [g for g in gaps if g > IDLE_GAP_MS]
     idle = {
         "total_idle_ms": sum(gaps),
         "n_gaps": len(gaps),
-        "n_gaps_gt_1ms": len(big_gaps),
-        "mean_gap_gt_1ms_ms": (sum(big_gaps) / len(big_gaps)) if big_gaps else 0.0,
+        "n_gaps_gt_idle_ms": len(big_gaps),
+        "mean_gap_gt_idle_ms": (sum(big_gaps) / len(big_gaps)) if big_gaps else 0.0,
+        "max_gap_gt_idle_ms": max(big_gaps) if big_gaps else 0.0,
+        "idle_threshold_ms": IDLE_GAP_MS,
     }
 
-    result = {
-        "n_intervals": len(ivs),
-        "total_gpu_ms": total_gpu_ms,
+    segments = _segment_breakdown(depth0, gap_ms, top_n)
+
+    return {
+        "n_intervals": len(depth0),
+        "total_busy_ms": total_busy_ms,
         "span_ms": span_ms,
-        "wall_ms": wall,
-        "gpu_wall_ratio": (total_gpu_ms / wall) if wall else None,
-        "top_kernels": top_kernels,
+        "busy_span_ratio": busy_span_ratio,
         "idle": idle,
+        "segments": segments,
     }
-    if window:
-        result["window"] = _window_breakdown(ivs, gap_ms, top_n)
-    return result
 
 
-def _kernel_breakdown(ivs: list[dict], top_n: int) -> list[dict]:
-    by_name: dict[str, list[float]] = defaultdict(list)
-    for iv in ivs:
-        by_name[iv["name"]].append(iv["duration_ms"])
-    rows = [{"name": n, "total_ms": sum(d), "count": len(d), "mean_ms": sum(d) / len(d)}
-            for n, d in by_name.items()]
-    rows.sort(key=lambda r: -r["total_ms"])
-    return rows[:top_n]
-
-
-def _window_breakdown(ivs: list[dict], gap_ms: float, top_n: int) -> dict:
-    """隙間が gap_ms 以上でセグメントに区切り、中央値セグメントと同じ
-    カーネル数を持つセグメント群の平均を「1 forward」の内訳として返す。
+def _segment_breakdown(depth0: list[dict], gap_ms: float, top_n: int) -> dict:
+    """隙間が gap_ms 以上でセグメントに区切る (= 「forward 1 回」の候補)。
+    セグメントごとの (区間数, busy ms, span ms) の中央値と、span_ms が
+    その中央値に最も近い「中央値セグメント」の区間 duration 分布 (上位
+    top_n 件、降順) を返す。
     """
-    segments: list[list[dict]] = [[ivs[0]]]
-    for prev, cur in zip(ivs, ivs[1:]):
+    segments: list[list[dict]] = [[depth0[0]]]
+    for prev, cur in zip(depth0, depth0[1:]):
         gap = cur["start_ms"] - (prev["start_ms"] + prev["duration_ms"])
         if gap >= gap_ms:
             segments.append([cur])
@@ -334,101 +389,76 @@ def _window_breakdown(ivs: list[dict], gap_ms: float, top_n: int) -> dict:
     for seg in segments:
         s0 = seg[0]["start_ms"]
         e0 = max(iv["start_ms"] + iv["duration_ms"] for iv in seg)
-        gpu_ms = sum(iv["duration_ms"] for iv in seg)
+        busy_ms = sum(iv["duration_ms"] for iv in seg)
         seg_stats.append({
-            "start_ms": s0, "end_ms": e0, "n_kernels": len(seg),
-            "gpu_ms": gpu_ms, "idle_ms": max(0.0, (e0 - s0) - gpu_ms),
+            "start_ms": s0, "end_ms": e0,
+            "n_intervals": len(seg), "busy_ms": busy_ms, "span_ms": e0 - s0,
         })
 
-    order = sorted(range(len(seg_stats)),
-                    key=lambda i: (seg_stats[i]["end_ms"] - seg_stats[i]["start_ms"],
-                                   seg_stats[i]["n_kernels"]))
-    median_idx = order[len(order) // 2]
-    typical_n = seg_stats[median_idx]["n_kernels"]
-    typical_idx = [i for i, s in enumerate(seg_stats) if s["n_kernels"] == typical_n]
+    median_n = statistics.median(s["n_intervals"] for s in seg_stats)
+    median_busy = statistics.median(s["busy_ms"] for s in seg_stats)
+    median_span = statistics.median(s["span_ms"] for s in seg_stats)
 
-    sums: dict[str, list[float]] = defaultdict(list)
-    counts: dict[str, list[int]] = defaultdict(list)
-    for i in typical_idx:
-        by_name: dict[str, list[float]] = defaultdict(list)
-        for iv in segments[i]:
-            by_name[iv["name"]].append(iv["duration_ms"])
-        for n, d in by_name.items():
-            sums[n].append(sum(d))
-            counts[n].append(len(d))
-    per_forward = [{"name": n, "mean_total_ms": sum(v) / len(v),
-                     "mean_count": sum(counts[n]) / len(counts[n])}
-                    for n, v in sums.items()]
-    per_forward.sort(key=lambda r: -r["mean_total_ms"])
+    # 「中央値セグメント」= span_ms が中央値に最も近いもの (同着は先に出た方)
+    median_idx = min(range(len(seg_stats)),
+                      key=lambda i: (abs(seg_stats[i]["span_ms"] - median_span), i))
+    median_seg_durations = sorted(
+        (iv["duration_ms"] for iv in segments[median_idx]), reverse=True)
 
     return {
         "gap_ms": gap_ms,
         "n_segments": len(segments),
-        "segments": seg_stats,
+        "median_n_intervals": median_n,
+        "median_busy_ms": median_busy,
+        "median_span_ms": median_span,
         "median_segment_index": median_idx,
-        "typical_kernel_count": typical_n,
-        "n_typical_segments": len(typical_idx),
-        "per_forward_kernels": per_forward[:top_n],
+        "median_segment": seg_stats[median_idx],
+        "median_segment_top_duration_ms": median_seg_durations[:top_n],
     }
 
 
 # --------------------------------------------------------------------------
-# diff: 2 つの summary の top_kernels をカーネル名 (完全一致 -> 正規化名) で
-# 突き合わせる
+# diff: カーネル名が無いので、2 つの summary のセグメント統計 (busy/span/
+# 隙間/区間数) を突き合わせる。
 # --------------------------------------------------------------------------
 
 
-def normalize_name(name: str) -> str:
-    n = _TEMPLATE_OR_ARGS_RE.sub("", name)
-    n = _TRAILING_NUM_RE.sub("", n)
-    n = n.strip().rstrip(":_")
-    return n or name
+def _get_path(d: dict, *path):
+    cur = d
+    for p in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(p)
+    return cur
 
 
-def diff_summaries(summary_a: dict, summary_b: dict, top_n: int = 40) -> dict:
-    ka = {r["name"]: r["total_ms"] for r in summary_a.get("top_kernels", [])}
-    kb = {r["name"]: r["total_ms"] for r in summary_b.get("top_kernels", [])}
+_DIFF_METRICS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("n_intervals", ("n_intervals",)),
+    ("total_busy_ms", ("total_busy_ms",)),
+    ("span_ms", ("span_ms",)),
+    ("busy_span_ratio", ("busy_span_ratio",)),
+    ("idle_total_idle_ms", ("idle", "total_idle_ms")),
+    ("idle_n_gaps", ("idle", "n_gaps")),
+    ("idle_n_gaps_gt_idle_ms", ("idle", "n_gaps_gt_idle_ms")),
+    ("idle_mean_gap_gt_idle_ms", ("idle", "mean_gap_gt_idle_ms")),
+    ("idle_max_gap_gt_idle_ms", ("idle", "max_gap_gt_idle_ms")),
+    ("segments_n_segments", ("segments", "n_segments")),
+    ("segments_median_n_intervals", ("segments", "median_n_intervals")),
+    ("segments_median_busy_ms", ("segments", "median_busy_ms")),
+    ("segments_median_span_ms", ("segments", "median_span_ms")),
+)
 
-    matched = set(ka) & set(kb)
-    rows = [{"name": n, "total_a_ms": ka[n], "total_b_ms": kb[n],
-              "delta_ms": ka[n] - kb[n], "names_a": [n], "names_b": [n]}
-             for n in matched]
 
-    def bucket(d: dict[str, float], used: set[str]) -> dict[str, list[tuple[str, float]]]:
-        out: dict[str, list[tuple[str, float]]] = defaultdict(list)
-        for n, v in d.items():
-            if n in used:
-                continue
-            out[normalize_name(n)].append((n, v))
-        return out
-
-    ba = bucket(ka, matched)
-    bb = bucket(kb, matched)
-    for norm in set(ba) | set(bb):
-        a_items = ba.get(norm, [])
-        b_items = bb.get(norm, [])
-        total_a = sum(v for _, v in a_items)
-        total_b = sum(v for _, v in b_items)
-        rows.append({
-            "name": norm, "total_a_ms": total_a, "total_b_ms": total_b,
-            "delta_ms": total_a - total_b,
-            "names_a": [n for n, _ in a_items], "names_b": [n for n, _ in b_items],
-        })
-
-    rows.sort(key=lambda r: -abs(r["delta_ms"]))
-    only_a = [r["name"] for r in rows if r["total_b_ms"] == 0 and r["total_a_ms"] > 0]
-    only_b = [r["name"] for r in rows if r["total_a_ms"] == 0 and r["total_b_ms"] > 0]
-
-    total_a = summary_a.get("total_gpu_ms")
-    total_b = summary_b.get("total_gpu_ms")
-    return {
-        "total_gpu_ms_a": total_a,
-        "total_gpu_ms_b": total_b,
-        "delta_total_ms": (total_a - total_b) if (total_a is not None and total_b is not None) else None,
-        "kernels": rows[:top_n],
-        "only_a": only_a,
-        "only_b": only_b,
-    }
+def diff_summaries(summary_a: dict, summary_b: dict) -> dict:
+    rows = []
+    for label, path in _DIFF_METRICS:
+        va = _get_path(summary_a, *path)
+        vb = _get_path(summary_b, *path)
+        delta = None
+        if isinstance(va, (int, float)) and isinstance(vb, (int, float)):
+            delta = va - vb
+        rows.append({"metric": label, "a": va, "b": vb, "delta": delta})
+    return {"metrics": rows}
 
 
 # --------------------------------------------------------------------------
@@ -471,34 +501,52 @@ def cmd_record(args: argparse.Namespace) -> None:
 
 
 def cmd_export(args: argparse.Namespace) -> None:
-    trace = Path(args.trace)
-    xpath = args.xpath or (
-        f'/trace-toc/run[@number="{args.run}"]/data/table[@schema="{args.schema}"]')
-    xml_out = Path(args.xml_out) if args.xml_out else trace.parent / f"{trace.stem}-{args.schema}.xml"
+    if args.xml:
+        xml_out = Path(args.xml)
+        if not xml_out.exists():
+            raise SystemExit(f"{xml_out} が無い")
+        trace = Path(args.trace) if args.trace else xml_out
+        if args.dry_run:
+            print(f"--xml {xml_out} 指定: xctrace export は呼ばない "
+                  f"(--dry-run は無視、このままパースする)", file=sys.stderr)
+    else:
+        if not args.trace:
+            raise SystemExit("--trace か --xml のどちらかが要る")
+        trace = Path(args.trace)
+        xpath = args.xpath or (
+            f'/trace-toc/run[@number="{args.run}"]/data/table[@schema="{args.schema}"]')
+        xml_out = (Path(args.xml_out) if args.xml_out
+                    else trace.parent / f"{trace.stem}-{args.schema}.xml")
 
-    cmd = build_export_cmd(trace, xpath, xml_out)
-    _print_cmd(cmd)
-    if args.dry_run:
-        return
+        cmd = build_export_cmd(trace, xpath, xml_out)
+        _print_cmd(cmd)
+        if args.dry_run:
+            return
 
-    xml_out.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(cmd, check=True)
+        xml_out.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(cmd, check=True)
 
-    intervals, sample_tags = parse_kernel_intervals(
-        xml_out, name_field=args.name_field, start_field=args.start_field,
-        duration_field=args.duration_field)
-    print(f"先頭行の列タグ: {sample_tags}", file=sys.stderr)
-    print(f"カーネル区間 {len(intervals)} 件をパース", file=sys.stderr)
-    if not intervals:
-        print("0 件: --name-field/--start-field/--duration-field を先頭行の"
-              "列タグに合わせて指定し直すこと", file=sys.stderr)
+    intervals, mnemonics = parse_intervals(xml_out, schema_name=args.schema)
+    print(f"schema の列: {mnemonics}", file=sys.stderr)
+    print(f"GPU 区間 {len(intervals)} 件をパース", file=sys.stderr)
 
-    summary = summarize(intervals, gap_ms=args.gap_ms, window=args.window,
-                         wall_ms=args.wall_ms, top_n=args.top_n)
+    filtered = filter_intervals(intervals, pid=args.pid, process=args.process,
+                                 channel=args.channel)
+    print(f"フィルタ後 (channel={args.channel!r} pid={args.pid} "
+          f"process={args.process!r}): {len(filtered)} 件", file=sys.stderr)
+    if not filtered:
+        print("0 件: --pid/--process/--channel を見直すこと (--process には "
+              "\"python\" や \"mlx-serve\" のような部分文字列を渡す)", file=sys.stderr)
+
+    summary = summarize(filtered, gap_ms=args.gap_ms, top_n=args.top_n)
     summary["trace"] = str(trace)
+    summary["xml"] = str(xml_out)
     summary["schema"] = args.schema
+    summary["filter"] = {"pid": args.pid, "process": args.process,
+                          "channel": args.channel}
 
-    out_json = Path(args.out_json) if args.out_json else trace.parent / f"{trace.stem}-summary.json"
+    out_json = (Path(args.out_json) if args.out_json
+                else xml_out.parent / f"{xml_out.stem}-summary.json")
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(summary, ensure_ascii=False, indent=1))
     print(f"summary -> {out_json}")
@@ -506,14 +554,13 @@ def cmd_export(args: argparse.Namespace) -> None:
     if args.raw_json:
         raw_path = Path(args.raw_json)
         raw_path.parent.mkdir(parents=True, exist_ok=True)
-        raw_path.write_text(json.dumps(intervals, ensure_ascii=False, indent=1))
-        print(f"raw intervals -> {raw_path}")
+        raw_path.write_text(json.dumps(filtered, ensure_ascii=False, indent=1))
+        print(f"raw intervals (フィルタ後) -> {raw_path}")
 
 
 def cmd_summarize(args: argparse.Namespace) -> None:
     intervals = json.loads(Path(args.raw_json).read_text())
-    summary = summarize(intervals, gap_ms=args.gap_ms, window=args.window,
-                         wall_ms=args.wall_ms, top_n=args.top_n)
+    summary = summarize(intervals, gap_ms=args.gap_ms, top_n=args.top_n)
     out_json = Path(args.out_json)
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(summary, ensure_ascii=False, indent=1))
@@ -523,7 +570,7 @@ def cmd_summarize(args: argparse.Namespace) -> None:
 def cmd_diff(args: argparse.Namespace) -> None:
     summary_a = json.loads(Path(args.a).read_text())
     summary_b = json.loads(Path(args.b).read_text())
-    result = diff_summaries(summary_a, summary_b, top_n=args.top_n)
+    result = diff_summaries(summary_a, summary_b)
     result["a"] = args.a
     result["b"] = args.b
     text = json.dumps(result, ensure_ascii=False, indent=1)
@@ -550,7 +597,7 @@ def cmd_toc(args: argparse.Namespace) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="GPU カーネル単位のプロファイル道具 (xctrace / Metal System Trace)")
+        description="GPU 区間単位のプロファイル道具 (xctrace / Metal System Trace)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("record", help="xctrace で Metal System Trace を録る (attach か launch)")
@@ -569,38 +616,35 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true", help="xctrace コマンドを表示するだけ")
     p.set_defaults(func=cmd_record)
 
-    p = sub.add_parser("export", help="trace からカーネル区間を書き出し、summarize まで自動で流す")
-    p.add_argument("--trace", required=True)
+    p = sub.add_parser("export", help="trace (または既存 XML) から GPU 区間を書き出し、summarize まで自動で流す")
+    p.add_argument("--trace", default=None, help="--xml 未指定なら必須。--xml 指定時は summary の trace 欄に残すだけ")
+    p.add_argument("--xml", default=None,
+                    help="xctrace export 済みの XML を直接渡す。指定時は xctrace を一切呼ばない (GPU 不使用)")
     p.add_argument("--schema", default="metal-gpu-intervals")
     p.add_argument("--run", type=int, default=1)
-    p.add_argument("--xpath", default=None, help="既定は --run / --schema から組む")
-    p.add_argument("--xml-out", default=None, help="書き出した生 XML の保存先 (既定 trace 隣)")
-    p.add_argument("--out-json", default=None, help="summary の書き出し先 (既定 trace 隣)")
-    p.add_argument("--raw-json", default=None, help="生のカーネル区間も別途保存 (再 summarize 用)")
-    p.add_argument("--name-field", default=None, help="ヒューリスティックが外れたときの列タグ上書き")
-    p.add_argument("--start-field", default=None)
-    p.add_argument("--duration-field", default=None)
-    p.add_argument("--gap-ms", type=float, default=3.0, help="--window のセグメント区切り")
-    p.add_argument("--window", action="store_true", help="1 forward 単位への分解も出す")
-    p.add_argument("--wall-ms", type=float, default=None, help="壁時計 (未指定ならカーネル span で代用)")
-    p.add_argument("--top-n", type=int, default=40)
-    p.add_argument("--dry-run", action="store_true", help="xctrace export コマンドを表示するだけ")
+    p.add_argument("--xpath", default=None, help="既定は --run / --schema から組む (--xml 指定時は無視)")
+    p.add_argument("--xml-out", default=None, help="書き出した生 XML の保存先 (既定 trace 隣、--xml 指定時は無視)")
+    p.add_argument("--out-json", default=None, help="summary の書き出し先 (既定 xml 隣)")
+    p.add_argument("--raw-json", default=None, help="フィルタ後の生区間も別途保存 (再 summarize 用)")
+    p.add_argument("--pid", type=int, default=None, help="この pid だけに絞る (完全一致)")
+    p.add_argument("--process", default=None, help="プロセス名の部分一致 (例 \"python\" / \"mlx-serve\")")
+    p.add_argument("--channel", default="Compute", help="gpu-channel-name の完全一致 (既定 Compute。空文字で無効化)")
+    p.add_argument("--gap-ms", type=float, default=DEFAULT_GAP_MS, help="forward 1 回とみなすセグメント区切りの隙間しきい値")
+    p.add_argument("--top-n", type=int, default=20, help="中央値セグメントの duration 上位何件を出すか")
+    p.add_argument("--dry-run", action="store_true", help="xctrace export コマンドを表示するだけ (--xml 指定時は無視)")
     p.set_defaults(func=cmd_export)
 
     p = sub.add_parser("summarize", help="export が吐いた raw intervals JSON から summary を作り直す")
     p.add_argument("--raw-json", required=True)
     p.add_argument("--out-json", required=True)
-    p.add_argument("--gap-ms", type=float, default=3.0)
-    p.add_argument("--window", action="store_true")
-    p.add_argument("--wall-ms", type=float, default=None)
-    p.add_argument("--top-n", type=int, default=40)
+    p.add_argument("--gap-ms", type=float, default=DEFAULT_GAP_MS)
+    p.add_argument("--top-n", type=int, default=20)
     p.set_defaults(func=cmd_summarize)
 
-    p = sub.add_parser("diff", help="2 つの summary JSON をカーネル名で突き合わせる")
+    p = sub.add_parser("diff", help="2 つの summary JSON のセグメント統計 (busy/span/隙間/区間数) を突き合わせる")
     p.add_argument("--a", required=True)
     p.add_argument("--b", required=True)
     p.add_argument("--out-json", default=None)
-    p.add_argument("--top-n", type=int, default=40)
     p.set_defaults(func=cmd_diff)
 
     p = sub.add_parser("toc", help="trace の table 一覧 (schema 名) を確認する")

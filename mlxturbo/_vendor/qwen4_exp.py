@@ -562,15 +562,23 @@ class Attention(nn.Module):
         """sdpa に渡す最終的な mask を組むシーム。
 
         既定は「sparse があれば causal を捨てて sparse だけを見る」という
-        本家の規約。バッチ経路は左パディングとの連言を取ったり、dead slot
-        台帳から組み直したりするためにここを差し替える。
+        本家の規約。2026-09-02: bool のまま返すよう変更。sdpa vector カーネル
+        は bool マスクだとキー読み込みをスキップできるが、旧実装の加算
+        マスク (0 / finfo.min) は finfo.min が sdpa の finite_min 判定に
+        一致してしまい、スキップが効いていなかった (17k で全キーを読んでいた)。
+        バッチ経路は左パディングとの連言を取ったり、dead slot 台帳から
+        組み直したりするためにここを差し替える。
         """
         if sparse is None:
             return mask
+        if mask is None or isinstance(mask, str):
+            return sparse
+        if mask.dtype == mx.bool_:
+            return mask & sparse
+        # 加算マスク (float) が来る経路: 現状は無いはずだが、あれば bool と
+        # 混ぜずに従来どおり加算に落とす。
         neg = mx.finfo(dtype).min if hasattr(mx, "finfo") else -1e9
         add = mx.where(sparse, mx.array(0, dtype), mx.array(neg, dtype))
-        if mask is None or isinstance(mask, str):
-            return add
         return mask + add
 
     def _qkv(self, x, positions, rope, cache):

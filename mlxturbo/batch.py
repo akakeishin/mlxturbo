@@ -498,9 +498,9 @@ def _install_model_patches(BatchAttnCache):
             # Nothing to combine: fall back to the stock rule (when sparse is
             # present, causal is thrown away)
             return _ORIG["Attention._final_mask"](self, mask, sparse, cache, S, dtype)
-        # A bool mask that carries left padding; take the conjunction here
-        neg = mx.finfo(dtype).min if hasattr(mx, "finfo") else -1e9
-        return mx.where(mask & sparse, mx.array(0, dtype), mx.array(neg, dtype))
+        # A bool mask that carries left padding; take the conjunction here.
+        # 2026-09-02: stays bool (stock rule no longer converts to additive).
+        return mask & sparse
 
     # ---- Qwen4ExpModel: actually distribute the mask ------------------
     def make_masks(self, h, cache):

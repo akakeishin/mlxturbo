@@ -59,9 +59,9 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              **prefill_s** で見る (decode には効かない)。代償は checkpoint
              粒度が粗くなること。
 
-`bool-mask`  sdpa に渡す疎マスクを bool にする (現行は fp32 の加算マスク)。
-             **集合が同じなので品質は変わらない**。合格条件: 17k の ms/token が
-             改善すること。改善したら既定を bool に変える。
+`bool-mask`  sdpa に渡す疎マスク。A は bool (2026-09-02 に既定化)、B は旧
+             fp32 加算マスクの再現。**集合が同じなので品質は変わらない**。
+             結果 (2026-09-01): 17k で ms/token -7% (`bench/results/bool-mask-17k.json`)。
 
 `prefill-attn` prefill の gather + softmax を 1 本の Metal カーネルに畳む
              (段 P1、MLXTURBO_PREFILL_ATTN、既定 off)。A がカーネル、
@@ -608,16 +608,13 @@ def _knob_wide(ctx):
 
 
 def _knob_bool_mask(ctx):
-    """A = bool マスク / B = 加算マスク (現行)。
+    """2026-09-02 に既定を bool にした。A = bool (新既定) / B = 加算 (旧経路の再現)。
 
-    `Attention._final_mask` はいま `where(sparse, 0, -inf)` で fp32 の加算
-    マスクを作って sdpa に渡している。MLX の sdpa は **bool マスクも取れる**
-    (`mx.fast.scaled_dot_product_attention` の docstring: "If the mask is an
-    array it can be a boolean or additive mask")。
-
+    `Attention._final_mask` は `where(sparse, 0, -inf)` で fp32 の加算マスクを
+    作って sdpa に渡していたが、MLX 0.32.2 の sdpa vector カーネルは加算値が
+    `finfo.min` (= finite_min) だと `>=` 判定でキー読み込みをスキップできず、
+    bool マスクの `bmask[0]` 判定だけがスキップする (17k で全キーを読んでいた)。
     **集合はまったく同じなので品質は変わらない。**変わるのはマスクの表現だけ。
-    17k で attention が帯域下限の 25% しか出ていない理由が「加算マスクを
-    実体化して渡すと融合経路から落ちる」なら、これだけで戻る。
 
     QSA を切る実験 (`--knob qsa`) と同じ「マスクが重いのか」を測るが、
     こちらは**品質が動かないのでそのまま採用できる**。
@@ -625,18 +622,20 @@ def _knob_bool_mask(ctx):
     import mlx.core as mx
     import mlx_lm.models.qwen4_exp as Q
 
-    orig = Q.Attention._final_mask
+    orig = Q.Attention._final_mask  # 既定 = bool (2026-09-02〜)
 
-    def bool_mask(self, mask, sparse, cache, S, dtype):
+    def additive_mask(self, mask, sparse, cache, S, dtype):
+        # 旧経路の再現: fp32 の加算マスク (0 / finfo.min)
         if sparse is None:
             return mask
+        neg = mx.finfo(dtype).min if hasattr(mx, "finfo") else -1e9
+        add = mx.where(sparse, mx.array(0, dtype), mx.array(neg, dtype))
         if mask is None or isinstance(mask, str):
-            return sparse
-        # 左パディング等の bool マスクが来たら連言。加算に落とさない
-        return mask & sparse
+            return add
+        return mask + add
 
     def apply(variant):
-        Q.Attention._final_mask = bool_mask if variant == "A" else orig
+        Q.Attention._final_mask = orig if variant == "A" else additive_mask
 
     return apply
 
