@@ -890,3 +890,12 @@ checkpoint、n-gram 行取得、最初のサンプルまでの固定費が 100 m
 どこか。次は `--log-level debug` 相当の時刻印 (受信 / template 後 / 照合後 / 生成開始 / 最初のトークン)
 を 1 リクエストぶん取って部品和 ≈ 壁時計を確認する。50k の 1.33 s は delta の forward が kv に
 比例して伸びる分 (attention + indexer) で、こちらは decode の kv 罰と同じ帰属。
+
+## 訂正: sdpa の幅 2 分割は 8/31 から本番に入っていた (2026-09-02 23:30)
+
+`Attention.__call__` の「S × gqa_factor > 32 なら幅 2 に分けて sdpa を呼ぶ」は commit 7222fce
+(2026-08-31) で無条件に入っていた。上の「短文脈で 1 ラウンド 10 ms の取り分」は**既に取れている分**で、
+新しい取り分ではない (マイクロは分割の無い素の状態を測っていた)。今回足したのは knob
+(`MLXTURBO_SDPA_SPLIT`、既定 on)、gather 経路 (`_gather_tile_attn`) への同じ分割、発火カウンタ、CPU 検査。
+gather 経路は union ≤ 0.20·kv でしか走らないので、実効はほぼ無い。**decode +6 ms の説明にはならない。**
+残る本命は HC 融合カーネルの 96 層不発火 (上の節)。sdpa-split の A/B 連鎖 (chain34) は取り下げた。
