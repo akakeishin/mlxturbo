@@ -404,6 +404,38 @@ def _knob_pipeline(ctx):
     return apply
 
 
+
+def _knob_fast_qmm(ctx):
+    """A = 検証フォワードの密 qmm を MMA タイルへ / B = stock (既定)。
+
+    `mlxturbo/fast_qmm.py`。記録は **「M=3 で 164GB/s、fast_qmm が適格なのに
+    in-model で負ける」という未解決の謎** (`docs/BACKLOG.md`)。単体では
+    qkv -22% / lm_head -33% が出るのに、モデルに入れると負ける。
+
+    **そして前提が変わっている。**記録に「depth 既定が 1 に変わって M=2 に
+    なったので前提そのものが変わっている」とある。窓の下限は `M_MIN=3` で、
+    **M=2 なら fast_qmm はそもそも発火しない。**
+
+    つまり見るべきは 2 つ:
+    1. いまの既定 (17k で depth 1 = M 2) で**発火するのか** — しないなら
+       この knob は何もしない knob で、A/B は 0 になるはず
+    2. `M_MIN=2` まで下げたときに勝つのか — 記録は「M=2 は stock が勝つ」
+
+    ここでは 1 だけを見る。**A が 0 なら「発火していない」ことの確認**で、
+    2 の測定は別途 `MLXTURBO_QMM_M_MIN` を振る話になる。
+
+    貪欲なので出力は変わらない。判定は ms/round。
+    """
+    from mlxturbo import fast_qmm as fq
+
+    def apply(variant):
+        fq.disable()
+        if variant == "A":
+            fq.enable(ctx["eng"].model)
+
+    return apply
+
+
 def _knob_indexer_cache(ctx):
     """A = 確保方式 (現行) / B = 毎更新 concat (2026-09-01 以前)。
 
@@ -666,6 +698,7 @@ KNOBS = {
     "moe-route": (_knob_moe_route, ["A", "C", "B"], False, "B"),
     "hc-prefill": (_knob_hc_prefill, ["A", "C", "B"], False, "C"),
     "pipeline": (_knob_pipeline, ["A", "B"], False, "B"),
+    "fast-qmm": (_knob_fast_qmm, ["A", "B"], False, "B"),
     "null": (_knob_null, ["A", "B"], True, "B"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
@@ -894,6 +927,9 @@ def main() -> int:
         # MLXTURBO_PIPELINE は generate_stream の decode ループの中でしか
         # 読まれない (spec_flash.py:1264)。prefill には触らない。
         "pipeline",
+        # fast_qmm は検証フォワードの密 qmm だけを差し替える。prefill は
+        # fast_qmm 自身の窓判定で素通りする (M_MIN=3..8 の窓)。
+        "fast-qmm",
     }
     if args.prefill_once and args.knob not in DECODE_ONLY_KNOBS:
         print(f"knob={args.knob} は prefill に影響しうるので --prefill-once は"
