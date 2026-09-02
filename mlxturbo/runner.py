@@ -44,6 +44,49 @@ import mlx.core as mx
 from ._mlx_compat import TextModelArgs, resolve_local_model_path
 from .spec import PREFILL_STEP_SIZE, ChatSession, SpecEngine
 
+# [gen-trace] (debug-only, see FlashSpecRunner.generate / _log_gen_trace
+# below). This module has no access to server.py's STATE.debug_log (that
+# flag lives on the server's own dataclass), and FlashSpecRunner.generate is
+# on the per-request hot path, so per CLAUDE.md discipline we do not want an
+# os.environ.get() call inside it. Instead this constant is read exactly
+# once, at import time (= server/cli startup), and generate() only ever
+# branches on it. Set MLXTURBO_GEN_TRACE=1 before starting the process to
+# turn the trace on; unset/anything else keeps it off with zero added cost
+# beyond a handful of `if` checks around already-present time.perf_counter()
+# calls.
+_GEN_TRACE = os.environ.get("MLXTURBO_GEN_TRACE") == "1"
+
+
+def _log_gen_trace(t_entry: float, t_cache: float, t0: float, t_first: float, t_queue: float) -> None:
+    """Debug-only breakdown of one ``FlashSpecRunner.generate()`` call's
+    pre-first-token latency, split across 5 ``time.perf_counter()`` points:
+
+    t_entry (function entry, before the seed/sampler setup) / t_cache
+    (immediately after the inline session/LCP/tail-resume check has decided
+    ``prompt_cache`` -- the same job ``server.py``'s
+    ``_try_trim_session_cache``/``_try_checkpoint_restore_session_cache`` do
+    for the caller's own session pool, just inlined here) / t0 (right before
+    ``self.engine.generate_stream(...)`` is called) / t_first (the first
+    ``next(gen)`` returned) / t_queue (right after that first round's tokens
+    were handed to ``on_tokens`` -- i.e. queued for the server to pick up).
+
+    This exists to localize the fixed ~300ms gap ``_log_ttft_trace``'s
+    d_gen->e_first_token bucket sees in mlxturbo/server.py even on a fully
+    cache-hit request (reused=all, new=0) -- see
+    bench/results/logs/ttft-trace-driver.log and the docstring of
+    ``_log_ttft_trace``. Printed at most once per ``generate()`` call
+    (immediately after the first decode round), and only when
+    ``_GEN_TRACE`` is set -- see the module-level comment above.
+    """
+
+    print(
+        "[gen-trace] "
+        f"entry→cache {(t_cache - t_entry) * 1000:.1f} ms, "
+        f"cache→t0 {(t0 - t_cache) * 1000:.1f} ms, "
+        f"t0→first {(t_first - t0) * 1000:.1f} ms, "
+        f"first→queue {(t_queue - t_first) * 1000:.1f} ms"
+    )
+
 
 class Runner(Protocol):
     """``SUPPORTED_SAMPLING_PARAMS`` (class attribute, set of str) declares
@@ -258,6 +301,11 @@ class FlashSpecRunner:
         logit_bias: dict | None = None, logprobs: bool = False,
         top_logprobs: int = 0, **extra
     ):
+        # [gen-trace] (a) function entry -- see _log_gen_trace/_GEN_TRACE
+        # above. Captured unconditionally (perf_counter() is cheap and this
+        # runs once per request, not per token); only the print at the
+        # bottom of the first decode round is gated on _GEN_TRACE.
+        t_a_entry = time.perf_counter()
         if seed is not None:
             mx.random.seed(seed)
         sampler = _position_local_sampler(temp, top_p, top_k, min_p, logit_bias)
@@ -320,6 +368,14 @@ class FlashSpecRunner:
                 prompt_cache = self.engine.model.make_cache()
                 checkpoints = []
 
+        # [gen-trace] (b) prompt_cache has just been decided -- the inline
+        # session/LCP/tail-resume check above (this function's equivalent of
+        # server.py's _try_trim_session_cache/
+        # _try_checkpoint_restore_session_cache, just inlined rather than a
+        # separate call) is done. Still unconditional/cheap, same reasoning
+        # as t_a_entry.
+        t_b_cache = time.perf_counter()
+
         remaining_prompt = prompt_ids[reused:]
         ids = mx.array(remaining_prompt)[None]
 
@@ -328,6 +384,7 @@ class FlashSpecRunner:
         ttft = None
         accepted = rounds = 0
         tail_out = None
+        first_round = True
         gen = self.engine.generate_stream(
             ids,
             max_tokens,
@@ -346,6 +403,12 @@ class FlashSpecRunner:
                 step_tokens = next(gen)
                 if ttft is None:
                     ttft = time.perf_counter() - t0
+                # [gen-trace] (d) the first next(gen) has just returned.
+                # Gated on _GEN_TRACE (not just first_round) so that when the
+                # trace is off, no extra perf_counter() call is added to any
+                # decode round at all -- see the module-level comment above.
+                if _GEN_TRACE and first_round:
+                    t_d_first = time.perf_counter()
                 tokens.extend(step_tokens)
                 if logprob_rows is not None:
                     # ラウンドごとに畳む。語彙長のベクトルを最後まで溜めると
@@ -359,6 +422,14 @@ class FlashSpecRunner:
                     logprob_rows.clear()
                 if on_tokens:
                     on_tokens(step_tokens)
+                # [gen-trace] (e) the first round's tokens have just been
+                # handed to on_tokens (queued for the server to pick up).
+                # Printed here, once, right after -- see _log_gen_trace.
+                if _GEN_TRACE and first_round:
+                    _log_gen_trace(
+                        t_a_entry, t_b_cache, t0, t_d_first, time.perf_counter()
+                    )
+                    first_round = False
         except StopIteration as stop:
             if stop.value is not None:
                 accepted, rounds, tail_out = stop.value

@@ -2636,11 +2636,24 @@ def _log_ttft_trace(t: dict) -> None:
     off the generation queue) / f_first_sse (right after that item's SSE
     chunk was written out).
 
+    Two more points, ``d_submit``/``d_run``, are optional — ``_start_generation``
+    only records them when it is passed this same ``t`` (see its docstring):
+    ``d_submit`` (just inside that function, right before
+    ``STATE.executor.submit(worker)``) and ``d_run`` (the first statement of
+    ``worker()``, once the executor thread actually picked the job up). When
+    both are present, the gap between them (the executor's own queuing wait)
+    is folded into the ``gen→first_token`` bucket's line as ``submit→run``,
+    since it is a sub-interval of ``d_gen``..``e_first_token``.
+
     This exists to localize a gap the harness (``bench/vs_mlx_serve.py`` /
     ``bench/self_snapshot.py``'s ``stream_once``) sees between its own
     client-side TTFT and the ``ttft_s`` this server reports in
     ``_log_gen_stats`` (measured from inside ``runner.generate`` — pure model
     compute, none of the request-handling overhead this function reports on).
+    For what's inside ``runner.generate`` itself, see ``mlxturbo.runner``'s
+    ``[gen-trace]``/``_log_gen_trace`` (gated by ``MLXTURBO_GEN_TRACE=1``
+    rather than ``--log-level debug``, since that module has no access to
+    ``STATE``).
     Silent no-op unless ``--log-level debug`` was passed at startup — this is
     checked via a bool set once at startup (``STATE.debug_log``), never via
     getenv on this per-request path.
@@ -2654,12 +2667,15 @@ def _log_ttft_trace(t: dict) -> None:
         return (t1 - t0) * 1000 if t0 is not None and t1 is not None else float("nan")
 
     total = _ms("a_start", "f_first_sse")
+    gen_bucket = f"gen→first_token {_ms('d_gen', 'e_first_token'):.1f} ms"
+    if "d_submit" in t and "d_run" in t:
+        gen_bucket += f" (submit→run {_ms('d_submit', 'd_run'):.1f} ms)"
     print(
         "[ttft-trace] "
         f"parse→template {_ms('a_start', 'b_template'):.1f} ms, "
         f"template→select {_ms('b_template', 'c_select'):.1f} ms, "
         f"select→gen {_ms('c_select', 'd_gen'):.1f} ms, "
-        f"gen→first_token {_ms('d_gen', 'e_first_token'):.1f} ms, "
+        f"{gen_bucket}, "
         f"first_token→sse {_ms('e_first_token', 'f_first_sse'):.1f} ms, "
         f"total {total:.1f} ms"
     )
@@ -3062,10 +3078,26 @@ def _start_generation(
     tools_for_parsing=None,
     session=None,
     runner=None,
+    t_trace: dict | None = None,
     **sampling_kwargs,
 ):
     """Submit the worker to STATE.executor and return (queue, Future, stop
     Event, raw_token_count).
+
+    ``t_trace`` is optional and, when passed, is the same dict
+    ``_openai_stream``/``_log_ttft_trace`` already thread through this call
+    (see their docstrings) — only that caller currently passes it. When
+    given, two more points are recorded into it, both ``time.perf_counter()``:
+    ``d_submit`` (right before ``STATE.executor.submit(worker)``, i.e. just
+    inside this function, not the caller's own ``d_gen`` a moment earlier —
+    ``_build_streaming_pipeline`` runs in between) and ``d_run`` (the first
+    statement inside ``worker()``, i.e. once the executor thread has actually
+    picked the job up and is about to call ``runner.generate``). The gap
+    between them is the executor's own queuing/scheduling wait, reported by
+    ``_log_ttft_trace`` as ``submit→run``. ``worker()`` runs on the executor
+    thread and writes into this same dict; that is safe here because nothing
+    reads ``d_run`` until well after (only once the first queue item has
+    already come back), so there is no read/write race in practice.
 
     ``session`` is the session (ChatSession/FallbackSession) that
     ``_select_session`` assigned for this request — the caller selects it
@@ -3100,6 +3132,12 @@ def _start_generation(
     )
 
     def worker():
+        # [ttft-trace]: d_run -- the executor thread has picked this job up
+        # and is about to call runner.generate (see this function's own
+        # docstring for the submit/run split this feeds _log_ttft_trace's
+        # submit→run bucket).
+        if t_trace is not None:
+            t_trace["d_run"] = time.perf_counter()
         try:
             res = (runner or STATE.runner).generate(
                 prompt_ids,
@@ -3119,10 +3157,14 @@ def _start_generation(
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as an SSE error event
             on_done("error", exc)
 
-    # Submit to the generation-only thread (executor). The async side picks up
-    # results through the queue with asyncio.to_thread(q.get) (that is only a
-    # queue.Queue wait, unrelated to MLX's thread pinning, so a general-purpose
-    # thread pool is fine there).
+    # [ttft-trace]: d_submit -- right before handing the job to the executor
+    # (see this function's own docstring). Submit to the generation-only
+    # thread (executor). The async side picks up results through the queue
+    # with asyncio.to_thread(q.get) (that is only a queue.Queue wait,
+    # unrelated to MLX's thread pinning, so a general-purpose thread pool is
+    # fine there).
+    if t_trace is not None:
+        t_trace["d_submit"] = time.perf_counter()
     future = STATE.executor.submit(worker)
     return q, future, cancel_event, raw_token_count
 
@@ -3896,6 +3938,7 @@ async def _openai_stream(
                 tools_for_parsing,
                 session=session,
                 runner=runner,
+                t_trace=t_trace,
                 **(sampling_params or {}),
             )
         try:
