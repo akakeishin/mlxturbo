@@ -65,6 +65,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from . import _fire
+
 _KERNELS: dict[tuple, Any] = {}
 
 # 1 行 = 1 simdgroup。threadgroup にまとめる行数
@@ -157,6 +159,7 @@ def rms_norm_gated(
 ) -> mx.array:
     """`RMSNormGated.__call__` の中身を 1 本のカーネルで計算する。"""
 
+    _fire.bump("rms_norm_gated")
     dv = x.shape[-1]
     rows = prod(x.shape[:-1])
     kernel = _get_kernel(dv, float(eps), activation)

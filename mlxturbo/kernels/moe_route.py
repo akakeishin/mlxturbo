@@ -53,6 +53,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from . import _fire
+
 _KERNELS: dict[tuple, Any] = {}
 
 
@@ -153,6 +155,7 @@ def route(logits: mx.array, top_k: int):
     (モジュール docstring の「順序について」を参照)。
     """
 
+    _fire.bump("moe_route")
     n = logits.shape[-1]
     lead = logits.shape[:-1]
     rows = prod(lead) if lead else 1
