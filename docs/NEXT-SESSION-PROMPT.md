@@ -12,7 +12,9 @@ mlxturbo (`/Users/ht/dev/fastmlx`) が対戦相手 mlx-serve (`~/dev/mlx-serve`)
 調査済み (同ファイル)。並列デコード (continuous batching) も対象。
 
 **読む順**: `docs/research/LANES-2026-09.md` → `docs/research/SESSION-2026-09-02-CATCHUP.md`
-(本日の実測の全記録) → `CLAUDE.md` の計測の作法。
+(本日の実測の全記録) → `docs/research/REVIEW-2026-09-02-INDEPENDENT.md` (独立レビュー。
+受理率を落とす MTP キャッシュの欠陥 A-1 と壊れた契約テスト 2 本はレーンより先に直す) →
+`CLAUDE.md` の計測の作法。
 
 ## 現在地 (2026-09-02、条件を揃えた単独測定。フルテストの最新値は
 `bench/results/self-snapshot-*-0902f*.json` と CATCHUP 末尾の表)
