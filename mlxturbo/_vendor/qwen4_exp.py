@@ -887,7 +887,32 @@ class Attention(nn.Module):
         # 返す) の実行で `UnboundLocalError` になった (2026-09-03、
         # `--knob prefill-attn --ctx 17000` の実測で踏んだ)。
         tile = getattr(self, "_gather_attn_tile", 0)
-        if getattr(self, "_prefill_attn", False):
+
+        # **2026-09-03 追加修正 (17k の in-model A/B で発覚)。**上の kv_len
+        # しきい値だけで `_prefill_attn` を分岐させると、decode/verify 幅
+        # (S < `_pa.MIN_S`、カーネル自身が辞退する幅) でも比のガードを
+        # 素通りしてしまい、`_prefill_attn` の有無で decode 幅の経路が
+        # 変わってしまっていた (両方とも最終的に `_gather_tile_attn` へ落ちる
+        # 点は同じでも、**そこへ至る判定基準が違う** --- 比のガード無しで
+        # 素通りする分、比のガードなら弾かれていたはずの呼び出しまで
+        # `_gather_tile_attn` を通っていた)。実測: 17k prefill_attn A/B で
+        # prefill_s -1.5% (kernel 発火 48 回、想定どおり) の一方、
+        # decode の ms/tok が **+3〜5% 悪化**。原因は decode 幅がこの分岐の
+        # 差だけで余分に `_gather_tile_attn` を通っていたこと。
+        #
+        # 直し方: S がカーネルの下限に満たない (= どのみちカーネルは辞退する)
+        # ときは、`_prefill_attn` の値に関係なく比のガード側 (else 節) を通す。
+        # これで **decode/verify 幅は `_prefill_attn` の有無に関わらず
+        # 完全に同じ経路**になる (比のガード → 通れば `_gather_tile_attn`、
+        # 通らなければ dense マスク)。kv_len しきい値によるカーネル用の分岐は
+        # prefill 幅 (S >= MIN_S) のときだけ効く。
+        prefill_attn_on = getattr(self, "_prefill_attn", False)
+        if prefill_attn_on:
+            from mlxturbo.kernels import prefill_attn as _pa
+
+            prefill_attn_on = S >= _pa.MIN_S
+
+        if prefill_attn_on:
             min_kv = int(
                 os.environ.get("MLXTURBO_PREFILL_ATTN_MIN_KV", "12288")
             )
