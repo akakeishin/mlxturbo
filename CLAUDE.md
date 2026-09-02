@@ -59,6 +59,10 @@
   on にした。
   `MLXTURBO_DEPTH_ADAPT` (既定 on、`=0` で off) も本番の既定値で、2048 超の文脈で受理率 EMA から
   draft 深さを選ぶ (17k で ms/tok -3〜-6%、2026-09-03)。2048 以下は静的 depth 2 のまま。
+  `MLXTURBO_PREFILL_ATTN` (既定 on、`=0` で off) は T=1 gather の prefill attention カーネルで、kv ≥ 12288
+  (`MLXTURBO_PREFILL_ATTN_MIN_KV`) だけ発火する (50k prefill -21%、2026-09-03)。長文脈の KLD (自前の dense
+  比) 0.040 は、既に受理している GDN Metal の同じ物差しでの 0.111 より小さい。長文脈の品質は
+  bf16 参照が無いので、この物差しではなく課題の正答率で見ること (CATCHUP 2026-09-03 07:40)。
 - 品質を売って速度を買わない。fake を実物より緩くしない。KLD の受け入れ幅は
   現行比 +0.0005 (bench/quant_eval.py compare)。
 

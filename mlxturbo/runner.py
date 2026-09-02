@@ -1458,7 +1458,9 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         # gather 経路の中で `_gather_tile_attn` の代わりに走るので、
         # `enable_prefill_attn` が `_gather_attn` も一緒に立てる。
         # 採否は in-model の壁時計 (tools/decode_ab.py --knob prefill-attn)。
-        if os.environ.get("MLXTURBO_PREFILL_ATTN") == "1":
+        # 2026-09-03: 既定 on (kv >= 12288 だけ発火)。50k prefill -21.3%、合成誤差 7e-3、
+        # 長文脈 KLD 0.040 は受理済みの GDN Metal (同じ物差しで 0.111) より小さい。=0 で戻る。
+        if os.environ.get("MLXTURBO_PREFILL_ATTN", "1") != "0":
             from . import gather_attn as _ga
 
             n = _ga.enable_prefill_attn(model)

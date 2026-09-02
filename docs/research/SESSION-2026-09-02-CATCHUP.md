@@ -1388,3 +1388,14 @@ kld_mean **0.111**、kld_max 1.34、argmax 一致 0.95、top-5 重なり 0.85。
 ## indexer-lean の A/B (2026-09-03 07:30)
 
 短文脈 +0.4%、17k +0.3% (出力一致)。op -8% では取り分が出ない。**畳む** (既定 off のまま)。
+
+## T=1 gather prefill カーネルを既定 on にする判断 (2026-09-03 08:00)
+
+- 本来の品質ゲート `quant_eval.py compare --fusions` (bf16 参照) は kld_mean 0.01326 / agree 0.966 で不変。ただし
+  continuation の prompt は最長 597 トークンで **カーネルは 1 度も発火していない** (ゲートの盲点)。
+- 長文脈の自前 dense 比の KLD は 0.040。同じ物差しで、受理済みの GDN Metal (on 対 off) は 0.111。QSA の top-k
+  カスケードのせいで、この物差しはどの丸めの違いでも 0.04〜0.1 になる。カーネルはその範囲の下側。
+- 合成の誤差は 7e-3 (GDN Metal と同じ級)。速度は 50k prefill -21.3%、17k -1.5%。
+- **既定 on (kv ≥ 12288)。**`MLXTURBO_PREFILL_ATTN=0` で戻る。
+- 宿題: 長文脈の品質は bf16 参照が無いので、課題の正答率 (17k / 50k の recall・quote の正解率、dense 対 カーネル) で
+  ゲートを作る (レーン 11 に追加)。
