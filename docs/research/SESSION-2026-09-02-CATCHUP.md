@@ -827,3 +827,25 @@ MLX 0.32.2 `scaled_dot_product_attention.cpp:703`: S ≤ 8 の vector カーネ�
   程度。残りは indexer 等 (`tools/qsa_prefill_split.py --S 1,2,4` で内訳待ち)。
 - 実装 (`MLXTURBO_SDPA_SPLIT`、幅 32//gqa=2 で分けて呼ぶ) は Sonnet に出した。判定は in-model A/B
   (`decode_ab --knob sdpa-split --only short`、17k の depth 1/2 再測)、KLD +0.0005 以内。
+
+## 融合カーネル 1 回の費用、直列連鎖 (2026-09-02 22:30、`tools/kernel_chain_cost.py`、N=200、ABBA×3、熱の状態は不明)
+
+| 部品 (S=1 の本番 shape) | 融合 us/回 | 素の op us/回 | 比 |
+|---|---|---|---|
+| HC gated residual (pre+post の 2 カーネル) | **44.3** | 139.9 | 0.32 |
+| GDN recurrent step (`with_states` 対 mlx_lm) | 29.6 | 17.5 | 1.69 |
+| GDN prework (融合 1 発 対 素の約 10 op) | 38.6 | 33.4 | 1.15 |
+| RMSNormGated | 5.6 | 11.2 | 0.50 |
+| 床: `mx.fast.rms_norm` / `y+1` / 自前 2560 要素加算 | 4.2 / 3.2 / 3.0 | | |
+
+読み方:
+- **HC は融合しても 1 回 44 us。**触るデータは hyper 20 KB + 低ランク重み約 1.2 MB で、帯域の床は
+  3 us。10 倍以上遅い = カーネルの効率 (並列度、load のベクトル化) の問題。1 層 2 回 × 48 層 = 96 回
+  なら forward で 4.2 ms、これを 1 ms 以下にできれば decode の 6 ms の半分。
+- GDN step の `with_states` (rollback 用の状態書き出し) は mlx_lm の 1.7 倍。36 回で +0.4 ms。
+- **ただし `--count-forward` (capture 下の S=1 forward) では HC カーネルの呼び出しが 2 回しか
+  数えられなかった** (hc_pre ×1、hc_post ×1)。96 回のはずなので、(a) 本番の decode 経路
+  (`_staged_forward`) が HC の融合を素通ししている (GDN 融合と同じ現象)、(b) 適格判定 (D-4 で
+  bits/group_size の一致を要求) で大半の層が素の op に落ちている、(c) 数え方の漏れ、のどれかを
+  先に決める。(a)(b) なら decode は素の HC (140 us × 96 = 13 ms 相当が重なりつつ走っている) を
+  払っていることになり、6 ms の説明そのものになる。
