@@ -33,11 +33,35 @@ kv がまだ閾値未満だったり cache の型が合わなかったりする�
 無意味な結果なので**、`prefill_attn()` の実行回数を数えて `kernel_fired` に
 出し、0 なら警告する (`tools/verify_prefill_attn.py` の counted 手法と同じ)。
 
-モデルは 1 回だけ読む。GPU を使うので実行は biglock 経由:
+## --q-mode: 「経路自体の丸めの揺らぎ」との切り分け
 
+既定 (``--q-mode kernel``) は上の手順どおり、q を段 P1 の T=1 カーネル
+(`MLXTURBO_PREFILL_ATTN=1`) にする。カーネルの KLD (17k で mean 0.04) が
+「カーネルという経路そのものの非ビット一致」に由来するのか、それとも
+「dense のままでも chunk 境界の位置が変わればこの程度は揺れる」という
+経路に依らない丸めの揺らぎなのかは、このカーネル単独の計測だけでは
+切り分けられない。
+
+``--q-mode chunk:<N>`` は q も p と同じ dense 経路 (prefill_attn は on に
+しない) のまま、chunk 幅だけ ``N`` に変える対照群 --- p と q の意味論は
+厳密に同じ causal dense attention で、prefill をどの位置で区切るかだけが
+違う (chunk 境界が動くと、pooled cache の差分計算や sdpa split の呼び出し
+粒度が変わるので、浮動小数の加算順もそのぶんだけ動く)。ここで出る KLD が
+カーネルの KLD (0.04 級) と同じ桁なら、カーネルの KLD は経路に内在する
+揺らぎの範囲内という判定になる。1 桁以上小さければ (0.001 級)、カーネル
+固有の何かが効いている ("不採用" 側の根拠になる)。
+
+    # 既定: カーネル vs dense (p は --chunk、q はカーネル・同じ --chunk)
     tools/biglock.sh .venv/bin/python tools/kld_prefill_attn.py \\
         --model ~/models/ddalcu-mlxlm --ngram ~/models/ddalcu-ngram \\
         --ctxs 17000,25000
+
+    # 対照群: dense vs dense、chunk 幅だけ 2048 -> 4096 (p は --chunk のまま)
+    tools/biglock.sh .venv/bin/python tools/kld_prefill_attn.py \\
+        --model ~/models/ddalcu-mlxlm --ngram ~/models/ddalcu-ngram \\
+        --ctxs 17000 --q-mode chunk:4096
+
+モデルは 1 回だけ読む。GPU を使うので実行は biglock 経由。
 """
 
 from __future__ import annotations
@@ -160,6 +184,31 @@ def _verdict(kld_mean: float) -> str:
     return "要確認"
 
 
+def _parse_q_mode(spec: str) -> tuple[str, int | None]:
+    """``--q-mode`` を解釈する。
+
+    - ``"kernel"``: 既定。q = `enable_prefill_attn` (段 P1 T=1 カーネル)。
+    - ``"chunk:<N>"``: q も p と同じ dense 経路 (prefill_attn off) のまま、
+      chunk 幅だけ ``N`` にする対照群。戻り値の 2 要素目が q 側の chunk 幅。
+
+    戻り値は ``("kernel", None)`` または ``("chunk", N)``。
+    """
+    if spec == "kernel":
+        return "kernel", None
+    if spec.startswith("chunk:"):
+        n_str = spec[len("chunk:") :]
+        try:
+            n = int(n_str)
+        except ValueError:
+            raise ValueError(
+                f"--q-mode chunk:<N> の N が整数でない: {n_str!r}"
+            ) from None
+        if n <= 0:
+            raise ValueError(f"--q-mode chunk:<N> の N は正の整数にすること: {n}")
+        return "chunk", n
+    raise ValueError(f"--q-mode は 'kernel' か 'chunk:<N>' のどちらか (got {spec!r})")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="prefill attention 融合カーネル (MLXTURBO_PREFILL_ATTN) の"
@@ -175,7 +224,20 @@ def main() -> int:
     ap.add_argument(
         "--tail", type=int, default=64, help="最終チャンクの末尾何位置で分布を比べるか"
     )
-    ap.add_argument("--chunk", type=int, default=2048, help="prefill チャンク幅")
+    ap.add_argument(
+        "--chunk", type=int, default=2048,
+        help="p 側 (常に dense) の prefill チャンク幅。--q-mode kernel では"
+        " q 側もこれと同じ幅を使う",
+    )
+    ap.add_argument(
+        "--q-mode",
+        default="kernel",
+        help="q (比較対象) 側の作り方。'kernel' (既定): enable_prefill_attn"
+        " (段 P1 T=1 カーネル、--chunk と同じ幅)。'chunk:<N>': q も dense の"
+        " まま (prefill_attn off) chunk 幅だけ N にする対照群 --- p/q の意味論"
+        " は厳密に同じで、chunk 境界が動くことによる dense 自身の丸めの揺らぎ"
+        " だけを、カーネルの KLD と同じ物差しで見る",
+    )
     ap.add_argument(
         "--topk",
         type=int,
@@ -196,6 +258,11 @@ def main() -> int:
         return 1
     if args.tail <= 0:
         print("--tail は正の整数にすること")
+        return 1
+    try:
+        q_mode, q_mode_chunk = _parse_q_mode(args.q_mode)
+    except ValueError as e:
+        print(str(e))
         return 1
 
     if args.ngram:
@@ -236,8 +303,10 @@ def main() -> int:
     from _bench_text import long_prompts  # noqa: E402
     import prefill_anatomy as PA  # noqa: E402  (pending() を借りる)
 
+    q_chunk_resolved = q_mode_chunk if q_mode == "chunk" else args.chunk
     print(
-        f"model={args.model} ngram={args.ngram} ctxs={ctxs} chunk={args.chunk}"
+        f"model={args.model} ngram={args.ngram} ctxs={ctxs} q_mode={args.q_mode}"
+        f" chunk(p)={args.chunk} chunk(q)={q_chunk_resolved}"
         f" tail={args.tail} topk={args.topk}",
         flush=True,
     )
@@ -246,7 +315,9 @@ def main() -> int:
         "kind": "kld-prefill-attn",
         "model": args.model,
         "ngram": args.ngram,
-        "chunk": args.chunk,
+        "q_mode": args.q_mode,
+        "chunk": args.chunk,  # p 側 (= 従来どおりの意味)。後方互換で残す
+        "q_chunk": q_chunk_resolved,
         "tail": args.tail,
         "topk": args.topk,
         "ctxs": {},
@@ -282,32 +353,57 @@ def main() -> int:
         del cache_p
         mx.clear_cache()
 
-        # (2) 分布 q: enable_prefill_attn (= MLXTURBO_PREFILL_ATTN=1 と同じ状態)。
-        # カーネルが実際に発火した回数を数える (0 なら比較そのものが無意味)。
-        fired = [0]
-        orig_kernel_fn = prefill_attn_kernel.prefill_attn
+        if q_mode == "kernel":
+            # (2a) 分布 q: enable_prefill_attn (= MLXTURBO_PREFILL_ATTN=1 と
+            # 同じ状態)。カーネルが実際に発火した回数を数える
+            # (0 なら比較そのものが無意味)。
+            fired = [0]
+            orig_kernel_fn = prefill_attn_kernel.prefill_attn
 
-        def _counted(*a, **kw):
-            fired[0] += 1
-            return orig_kernel_fn(*a, **kw)
+            def _counted(*a, **kw):
+                fired[0] += 1
+                return orig_kernel_fn(*a, **kw)
 
-        prefill_attn_kernel.prefill_attn = _counted
-        n_layers = enable_prefill_attn(model)
-        try:
+            prefill_attn_kernel.prefill_attn = _counted
+            n_layers = enable_prefill_attn(model)
+            try:
+                cache_q = model.make_cache()
+                logits_q = _run_prefill(
+                    model, cache_q, ids, args.chunk, args.tail, PA.pending
+                )
+            finally:
+                prefill_attn_kernel.prefill_attn = orig_kernel_fn
+                disable_prefill_attn(model)
+            del cache_q
+            mx.clear_cache()
+            q_chunk = args.chunk
+        else:
+            # (2b) 対照群: q も p と全く同じ dense 経路 (prefill_attn は
+            # 一度も on にしない)。違うのは chunk 幅だけ。p の意味論と
+            # 厳密に同じなので、ここで出る KLD は「経路 (カーネル) に
+            # 内在する非ビット一致」ではなく「chunk 境界が動くことによる
+            # dense 自身の丸めの揺らぎ」だけを表す --- カーネルの KLD
+            # (kernel_fired>0 の行) と同じ物差しで比べるための対照群。
+            disable_gather_attn(model)
+            n_layers = 0
+            fired = [0]
+            q_chunk = q_mode_chunk
             cache_q = model.make_cache()
-            logits_q = _run_prefill(model, cache_q, ids, args.chunk, args.tail, PA.pending)
-        finally:
-            prefill_attn_kernel.prefill_attn = orig_kernel_fn
-            disable_prefill_attn(model)
-        del cache_q
-        mx.clear_cache()
+            logits_q = _run_prefill(
+                model, cache_q, ids, q_chunk, args.tail, PA.pending
+            )
+            del cache_q
+            mx.clear_cache()
 
         stats = _kld_stats(logits_p, logits_q, args.topk)
         stats["kv"] = int(ids.shape[1])
+        stats["q_mode"] = args.q_mode
+        stats["p_chunk"] = args.chunk
+        stats["q_chunk"] = q_chunk
         stats["prefill_attn_layers"] = n_layers
         stats["kernel_fired"] = fired[0]
         stats["verdict"] = _verdict(stats["kld_mean"])
-        if fired[0] == 0:
+        if q_mode == "kernel" and fired[0] == 0:
             print(
                 "  ★カーネルが1度も発火していない"
                 " (kv が閾値未満、または eligible() が別の理由で弾いている可能性。"
@@ -316,8 +412,9 @@ def main() -> int:
             )
             ok_overall = False
         print(
-            f"  positions={stats['positions']} kernel_fired={fired[0]}/"
-            f"{n_layers} layers"
+            f"  positions={stats['positions']} q_mode={args.q_mode}"
+            f" p_chunk={stats['p_chunk']} q_chunk={stats['q_chunk']}"
+            f" kernel_fired={fired[0]}/{n_layers} layers"
             f" kld_mean={stats['kld_mean']:.6f} kld_max={stats['kld_max']:.6f}"
             f" argmax_agree={stats['argmax_agree_rate']:.4f}"
             f" top5_overlap={stats['top5_overlap_mean']:.4f}"
