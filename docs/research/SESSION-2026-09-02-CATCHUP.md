@@ -1214,3 +1214,14 @@ snapshot の参照が無ければ **KV の更新は in-place** (増分・時間�
 ピーク増分を `MLXTURBO_ROUND_TRACE` に足して 17k / 50k で確かめる (実装中)。
 素の forward の kv 罰は 4k → 50k で +3 ms しかない (attention 層 +2 ms が主)。実 decode の +8.5 ms/tok との
 差が、この投機ラウンド側の候補 (KV コピー、S=2 の verify、draft の MTP) にある。
+
+## T=1 gather prefill カーネルの長文脈 KLD (2026-09-03 02:50、`bench/results/kld-prefill-attn.json`、末尾 64 位置、top-256)
+
+| ctx | 発火 | kld_mean | kld_max | argmax 一致 | top-5 重なり |
+|---|---|---|---|---|---|
+| 17k | 48 (12 層 × 4) | **0.0398** | 1.19 | 1.00 | 0.88 |
+| 25k | 96 (12 層 × 8) | 0.0175 | 0.61 | 0.98 | 0.88 |
+
+受け入れ幅 (+0.0005) の 30〜80 倍。合成の誤差 7e-3 では説明できない大きさで、**可視集合の解釈 (末尾の未確定
+ブロックの扱い) か GQA の対応が dense 経路と違う疑い**。速度 (-21% at 50k) は正しさが付くまで採用しない。
+`MLXTURBO_PREFILL_ATTN` は既定 off のまま。原因調査中。
