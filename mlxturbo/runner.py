@@ -1482,6 +1482,18 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         if os.environ.get("MLXTURBO_PLE_HOIST") == "1":
             print(f"{log_prefix} ple_hoist 有効 (n-gram 埋め込みを層ループ前に一括計算、{n} 層)")
 
+        # QSA indexer の decode/verify 幅 (S<=8) 費用を減らす (段 X1 の
+        # pooled キャッシュに続く 2 個目のキャッシュ、block_starts/block_end
+        # と pooled の fp32 キャスト)。enable_indexer_lean_default 自身が
+        # MLXTURBO_INDEXER_LEAN=1 をゲートに持っているので、ここでは呼ぶ
+        # だけで安全 (既定 off が保たれる、`enable_fast_rope` と同じ作法)。
+        # 値は変えない (ビット不変)。採否は tools/decode_ab.py --knob
+        # indexer-lean の in-model 計測で決める (このファイルの変更時点では
+        # 未実施 -- mlxturbo/indexer_lean.py 参照)。
+        from . import indexer_lean
+
+        indexer_lean.enable_indexer_lean_default(model, log_prefix=log_prefix)
+
 
 def set_wired_limit_default(log_prefix: str = "") -> int | None:
     """GPU の推奨ワーキングセット上限まで重みを wire する (常駐させる)。

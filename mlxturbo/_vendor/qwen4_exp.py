@@ -375,6 +375,11 @@ class QSAIndexer(nn.Module):
         それ以外は ``(keep_block, n_blocks, kv_len, q_col)`` を返す。
         ``keep_block`` は (B, S, n_blocks) の bool で、まだトークン幅へは
         展開していない。
+
+        ``self._indexer_lean`` (MLXTURBO_INDEXER_LEAN、既定 off、
+        `mlxturbo/indexer_lean.py`) が立っていて decode/verify 幅 (S<=8) の
+        ときだけ、block_starts/block_end と pooled の fp32 キャストを
+        `cache` 側でキャッシュする経路 (`lean`) を通る。値は変えない。
         """
         B, S, _ = x.shape
         qk = self.index_qk_proj(x)
@@ -392,7 +397,27 @@ class QSAIndexer(nn.Module):
             return None
 
         n_blocks = kv_len // self.compress_ratio
-        block_starts = mx.arange(n_blocks) * self.compress_ratio
+
+        # MLXTURBO_INDEXER_LEAN (既定 off、`mlxturbo/indexer_lean.py`):
+        # decode/verify 幅 (S<=8) だけ、block_starts/block_end と pooled の
+        # fp32 キャストを `_IndexerCache` 側でキャッシュする
+        # (`docs/research/SESSION-2026-09-02-CATCHUP.md` 末尾、indexer が
+        # sdpa の 3 倍という実測を受けた op 数削減)。値は変えない --- どちらも
+        # 「同じ入力なら毎回同じ結果になる決定的な計算」を、値が変わらない
+        # 回にはやり直さないだけ。prefill 幅 (S>8) は素の経路のまま
+        # (`lean` が False になる)。pooled キャッシュ自体 (段 X1) が off の
+        # ときは pooled_fp32 の前提が崩れるので、そちらが on のときだけ使う。
+        lean = (
+            S <= 8
+            and cache is not None
+            and getattr(self, "_pooled_cache", True)
+            and getattr(self, "_indexer_lean", False)
+        )
+        if lean:
+            block_starts, block_end = cache.block_grid(n_blocks, self.compress_ratio)
+        else:
+            block_starts = mx.arange(n_blocks) * self.compress_ratio
+            block_end = block_starts + self.compress_ratio - 1
 
         # 段 X1: ブロックは compress_ratio トークン分が揃った時点で内容が
         # 確定し (mean・k_layernorm はブロック内で閉じている)、rope の角度も
@@ -400,6 +425,7 @@ class QSAIndexer(nn.Module):
         # ブロックぶんだけ計算して cache に積み増せば、毎回全ブロックを
         # 作り直すのとビット一致する (`docs/research/KERNEL-PROGRAM.md` 段 X1、
         # `tools/micro_indexer.py` の実測で pooled 関連が indexer の 45.5%)。
+        pooled_f32 = None
         if cache is not None and getattr(self, "_pooled_cache", True):
 
             def _new_pooled_blocks(start: int, end: int):
@@ -413,7 +439,10 @@ class QSAIndexer(nn.Module):
                 cos_seg, sin_seg = rope(starts[None, :])
                 return _rope_partial(seg, cos_seg, sin_seg)
 
-            pooled = cache.pooled(n_blocks, _new_pooled_blocks)
+            if lean:
+                pooled_f32 = cache.pooled_fp32(n_blocks, _new_pooled_blocks)
+            else:
+                pooled = cache.pooled(n_blocks, _new_pooled_blocks)
         else:
             pooled = raw_k[:, : n_blocks * self.compress_ratio].reshape(
                 B, n_blocks, self.compress_ratio, self.head_dim
@@ -431,12 +460,13 @@ class QSAIndexer(nn.Module):
 
         # scores: sum over heads of relu(q.k), per block
         scores = mx.einsum(
-            "bshd,bnd->bsnh", q.astype(mx.float32), pooled.astype(mx.float32)
+            "bshd,bnd->bsnh",
+            q.astype(mx.float32),
+            pooled_f32 if pooled_f32 is not None else pooled.astype(mx.float32),
         )
         scores = mx.maximum(scores, 0).sum(axis=-1) / math.sqrt(self.head_dim)
 
         # a block is only a candidate if it lies entirely in the query's past
-        block_end = block_starts + self.compress_ratio - 1
         visible = block_end[None, None, :] <= q_col[None, :, None]
         scores = mx.where(visible, scores, -mx.inf)
 
@@ -1844,6 +1874,20 @@ class _IndexerCache(_BaseCache):
         self.offset = 0
         self._pooled = None
         self._pooled_n = 0
+        # MLXTURBO_INDEXER_LEAN (`mlxturbo/indexer_lean.py`、既定 off):
+        # decode/verify 幅 (S<=8) だけの経路で毎回作り直していた 2 つの
+        # キャッシュ。どちらも「n_blocks (または _pooled_n) だけで決まる
+        # 決定的な計算」で、raw キーの中身 (splice/rollback で変わりうる)
+        # には依存しない。`_bs`/`_be` は伸びるだけのキャッシュで、`keys` の
+        # setter で明示的に無効化しなくても常に正しい (`block_grid` の
+        # docstring 参照)。`_pooled_f32`/`_pooled_f32_n` は `_pooled_n` との
+        # 突き合わせだけで鮮度が分かるので、setter でリセットするのは
+        # 大きい配列を持ち回らないための衛生上の措置 (無くても正しい)。
+        self._bs = None          # block_starts の伸びるキャッシュ
+        self._be = None          # block_end (= block_starts + compress_ratio - 1)
+        self._bs_n = 0           # 上 2 つがカバーしている n_blocks
+        self._pooled_f32 = None  # pooled の fp32 キャストのキャッシュ
+        self._pooled_f32_n = 0   # ↑が対応する _pooled_n (ズレたら作り直す)
 
     @property
     def keys(self):
@@ -1860,6 +1904,53 @@ class _IndexerCache(_BaseCache):
         # なら丸ごと捨てて次回に作り直す。
         self._pooled = None
         self._pooled_n = 0
+        # pooled の fp32 キャストも道連れで捨てる (`_pooled_n` との突き合わせ
+        # だけで自動的に鮮度が分かるので必須ではないが、大きい配列を無駄に
+        # 持ち回らないための衛生上の措置)。block_starts/block_end (`_bs`/
+        # `_be`) は raw キーの値に依存しない純粋な計算なので、ここではあえて
+        # 触らない (`block_grid` の docstring 参照)。
+        self._pooled_f32 = None
+        self._pooled_f32_n = 0
+
+    def block_grid(self, n_blocks: int, compress_ratio: int):
+        """``(block_starts, block_end)`` を返す (MLXTURBO_INDEXER_LEAN、
+        decode/verify 幅 (S<=8) のみ、``QSAIndexer._pooled_and_top`` 参照)。
+
+        ``block_starts = arange(n_blocks) * compress_ratio`` (``block_end``
+        はその ``+ compress_ratio - 1``) は **n_blocks の接頭辞として安定**
+        --- 小さい n_blocks で計算した値は、大きい n_blocks で計算した値の
+        先頭部分と完全に一致する。したがって新しく確定した分だけ計算して
+        末尾に足せばよく (段 X1 の pooled キャッシュと同じ考え方)、縮んだ
+        呼び出しが来てもスライスするだけで正しい値になる --- ``pooled`` の
+        ように ``keys`` の setter で明示的に無効化する必要が無い。
+        """
+        if n_blocks > self._bs_n:
+            new_starts = mx.arange(self._bs_n, n_blocks) * compress_ratio
+            new_end = new_starts + compress_ratio - 1
+            if self._bs is None:
+                self._bs, self._be = new_starts, new_end
+            else:
+                self._bs = mx.concatenate([self._bs, new_starts], axis=0)
+                self._be = mx.concatenate([self._be, new_end], axis=0)
+            self._bs_n = n_blocks
+        if n_blocks == self._bs_n:
+            return self._bs, self._be
+        return self._bs[:n_blocks], self._be[:n_blocks]
+
+    def pooled_fp32(self, n_blocks: int, make_new) -> mx.array:
+        """``pooled(n_blocks, make_new)`` の fp32 キャストをキャッシュして
+        返す (MLXTURBO_INDEXER_LEAN、decode/verify 幅 (S<=8) のみ)。
+
+        ``_pooled`` はブロックが新しく確定した回だけ差し替わる (``pooled``
+        参照)。fp32 キャストは同じ bf16 値を同じ規則でアップキャストする
+        だけで値を変えないので、``_pooled_n`` が前回と同じならキャストし
+        直さずそのまま返す。
+        """
+        p = self.pooled(n_blocks, make_new)
+        if self._pooled_f32 is None or self._pooled_f32_n != self._pooled_n:
+            self._pooled_f32 = p.astype(mx.float32)
+            self._pooled_f32_n = self._pooled_n
+        return self._pooled_f32
 
     def pooled(self, n_blocks: int, make_new) -> mx.array:
         """rope 済み pooled キーを、確定済みブロックは使い回して返す。

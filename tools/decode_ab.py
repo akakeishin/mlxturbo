@@ -149,6 +149,28 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              合格条件: **tok/round (複数プロンプト x 512 の平均) が
              改善すること。**上がらなければ既定 off に戻す。ms/token も
              併せて見る。
+
+`indexer-lean` QSA indexer の decode/verify 幅 (S<=8) 費用を減らす
+             (MLXTURBO_INDEXER_LEAN、既定 off、`mlxturbo/indexer_lean.py`)。
+             `docs/research/SESSION-2026-09-02-CATCHUP.md` 末尾: S=2 の
+             attention 1 層で indexer が 228〜307us と sdpa 本体 (71us) の
+             3 倍、12 層で 2.7 ms/round。`_IndexerCache.block_grid`/
+             `.pooled_fp32` が、ブロックが新しく確定した回だけ変わる 2 つ
+             (block_starts/block_end、pooled の fp32 キャスト) を n_blocks
+             (または `_pooled_n`) が前回と同じならキャッシュから返す。
+             `tools/indexer_ops.py` (CPU、合成モデル) の実測: 定常状態
+             (ブロック境界をまたがない decode ラウンド) で 1 層あたり
+             mx/mx.array ディスパッチ -5 (-8〜8.5%、内訳は arange 1 +
+             array.__mul__ 1 + array.__add__ 1 + array.__sub__ 1 +
+             array.astype 1)。境界をまたぐ回 (compress_ratio/S 回に 1 回)
+             は base と同数 (delta 0、退化なし)。**値は変えない**
+             (`indexer_ops.py` が lean on/off の `__call__` 返り値とキャッシュ
+             状態のビット一致を検査する)。prefill 幅 (S>8) では `lean` が
+             常に False になるので経路が変わらない (`DECODE_ONLY_KNOBS`)。
+             合格条件: **ms/token が短・長の両方で改善すること** (出力は
+             ビット同一のはずなので対照が効く --- control_identical=True)。
+             in-model の壁時計 A/B は未実施 (このファイルの変更時点では
+             CPU 検査のみ)。
 """
 
 from __future__ import annotations
@@ -743,6 +765,30 @@ def _knob_pooled_cache(ctx):
     return apply
 
 
+def _knob_indexer_lean(ctx):
+    """A = block_starts/block_end + pooled fp32 キャストをキャッシュ (既定 off、
+    2026-09-03) / B = 毎回作り直し (現行既定)。
+
+    `mlxturbo.indexer_lean.enable_indexer_lean`/`disable_indexer_lean` を
+    素通しするだけ (`pooled-cache` と同じ形)。値はビット不変 (`_IndexerCache
+    .block_grid`/`.pooled_fp32` はどちらも「決定的な計算を、値が変わらない
+    回にはやり直さない」だけ) なので対照 (出力一致) がそのまま効く。
+    decode/verify 幅 (S<=8) だけが対象で prefill 幅では経路が変わらない
+    (`QSAIndexer._pooled_and_top` の `lean` 判定)。
+    """
+    from mlxturbo.indexer_lean import disable_indexer_lean, enable_indexer_lean
+
+    model = ctx["eng"].model
+
+    def apply(variant):
+        if variant == "A":
+            enable_indexer_lean(model)
+        else:
+            disable_indexer_lean(model)
+
+    return apply
+
+
 def _knob_stage_every(ctx):
     """段階投入の間隔 (`spec_flash._STAGE_EVERY`)。既定 2。
 
@@ -1242,6 +1288,7 @@ KNOBS = {
     "null": (_knob_null, ["A", "B"], True, "B"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
+    "indexer-lean": (_knob_indexer_lean, ["A", "B"], True, "B"),
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),
     "prefill-group": (_knob_prefill_group, ["2", "4", "8"], True, "4"),
     "prefill-pipeline": (_knob_prefill_pipeline, ["A", "B"], True, "B"),
@@ -1545,6 +1592,12 @@ def main() -> int:
         # チャンク幅 (既定 2048、`mlxturbo/spec.py` の PREFILL_STEP_SIZE)
         # は常にこれを大きく越えるので、prefill 幅では発火しない。
         "sdpa-split",
+        # indexer-lean (`QSAIndexer._pooled_and_top` の `lean` 判定) は
+        # `S <= 8` をコードで明示的に要求する。prefill のチャンク幅は常に
+        # それを越えるので、on にしても prefill 幅の経路は 1 op も変わらない
+        # (`pooled-cache`/`indexer-cache` と違い、こちらは decode/verify 幅
+        # 限定の枝を新設した knob なので prefill には触れようがない)。
+        "indexer-lean",
     }
     if args.prefill_once and args.knob not in DECODE_ONLY_KNOBS:
         print(f"knob={args.knob} は prefill に影響しうるので --prefill-once は"
