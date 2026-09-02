@@ -192,6 +192,96 @@ def run_case(name, budget, prompts, expect_pass=True):
     return ok == expect_pass
 
 
+def run_coordinator_join_case() -> bool:
+    """`mlxturbo.batch.BatchCoordinator` (レーン 5 のスケジューラ、
+    docs/research/LANES-2026-09.md 「レーン 5」) の途中参加。
+
+    `run_case` の A/B/C は下の層 (`BatchGenerator`/`BatchAttnCache` の
+    merge/filter/extract/extend) がキャッシュを正しく持ち回れるかを見ている。
+    ここで見るのはその 1 段上 -- `BatchCoordinator._drive()` が、走行中の
+    admission (`A`) の途中で inbox に届いた新しい admission (`B`) を実際に
+    `gen.insert()` へ届けているか。届けそこねても `run_case` はそもそも
+    B を投入しない (`BatchGenerator.insert` を直接呼ぶだけ) ので、この段の
+    欠陥はここでしか見えない。
+
+    A を 3 トークン (3 ラウンド) 出させてから B を投入し、両方とも単独参照
+    (`seq_generate`) と完全一致することを見る。budget を大きくとって
+    (32) 2 行を同居させても物理列数が budget を超えない (QSA 不活性) 組み
+    合わせを選ぶ -- QSA 活性下の不一致は `run_case` のケース C で別に
+    確認済みの話で、ここで割ると「途中参加の配線」と「QSA の既知の制限」の
+    どちらが原因か切り分けられなくなる。
+    """
+    import concurrent.futures
+    import threading
+
+    from mlxturbo import batch as fb
+
+    budget = 32
+    chunk = budget
+    model = build(budget)
+
+    prompt_a, max_tokens_a = [1, 2, 3], 10   # 3+10=13 <= 32 -> pool
+    prompt_b, max_tokens_b = [20, 21], 6     # 2+6=8   <= 32 -> pool
+    # 同居 (B-3): longest_prompt=3, longest_tokens=10, 和 13 <= 32 -> 入る
+    ref_a = seq_generate(model, prompt_a, chunk, n=max_tokens_a)
+    ref_b = seq_generate(model, prompt_b, chunk, n=max_tokens_b)
+
+    def submit(coord, prompt, max_tokens, on_tokens=None):
+        fut: "concurrent.futures.Future" = concurrent.futures.Future()
+        adm = fb.Admission(
+            prompt_ids=list(prompt),
+            max_tokens=max_tokens,
+            sampler=None,
+            logits_processors=[],
+            tier="pool",
+            on_tokens=on_tokens,
+            on_done=None,
+            cancel_event=None,
+            future=fut,
+        )
+        coord.submit(adm)
+        return adm, fut
+
+    print("\n### coordinator join: A が 3 トークン出してから B を投入")
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        coord = fb.BatchCoordinator(
+            model, executor, max_batch=4, prefill_step_size=chunk, eos_ids=[]
+        )
+        reached = threading.Event()
+        count_a = [0]  # 別変数で数える。adm_a 自体は下の代入が終わるまで
+        # 名前として存在しない -- on_tokens はその前に (submit() 内の
+        # coord.submit() が駆動スレッドを起こした直後に) 呼ばれうるので、
+        # ここで adm_a.tokens を直接参照すると NameError の競合になる
+
+        def on_a(toks):
+            count_a[0] += len(toks)
+            if count_a[0] >= 3:
+                reached.set()
+
+        adm_a, fut_a = submit(coord, prompt_a, max_tokens_a, on_a)
+        if not reached.wait(timeout=30):
+            raise TimeoutError("A が 3 トークン出す前にタイムアウトした")
+        # まだ A は生成中 (max_tokens_a=10 > 3) のうちに B を投げる --
+        # 走行中バッチへの正真正銘の途中参加になる
+        adm_b, fut_b = submit(coord, prompt_b, max_tokens_b)
+        fut_a.result(timeout=30)
+        fut_b.result(timeout=30)
+    finally:
+        executor.shutdown(wait=True)
+
+    ok = True
+    same_a = adm_a.tokens == ref_a
+    same_b = adm_b.tokens == ref_b
+    ok &= same_a and same_b
+    print(f"  {'OK' if same_a else 'NG'} A (先行, 途中参加を経ても不変): "
+          f"got={adm_a.tokens} ref={ref_a}")
+    print(f"  {'OK' if same_b else 'NG'} B (途中参加): "
+          f"got={adm_b.tokens} ref={ref_b}")
+    print(f"  => {'一致' if ok else '不一致'}")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gpu", action="store_true", help="CPU ではなく GPU で回す")
@@ -220,6 +310,7 @@ def main():
         run_case("B. QSA 活性・同長", 8, equal),
         run_case("C. QSA 活性・長さ不揃い (既知の不一致)", 8, unequal,
                  expect_pass=False),
+        run_coordinator_join_case(),
     ]
     print("\n=== 全ケース想定どおり ===" if all(results)
           else "\n=== 想定と違うケースあり ===")

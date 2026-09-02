@@ -1551,7 +1551,6 @@ def maybe_build_batch_coordinator(
         return None
 
     from . import batch as _batch
-    from .spec import PREFILL_STEP_SIZE
 
     if (
         primary_runner is not None
@@ -1568,15 +1567,17 @@ def maybe_build_batch_coordinator(
         )
 
     _batch.enable_batch_cache()
+    resolved_prefill_step_size = prefill_step_size or _batch.default_join_prefill_chunk()
     coordinator = _batch.BatchCoordinator(
         model,
         executor,
         max_batch=max_batch,
-        prefill_step_size=prefill_step_size or PREFILL_STEP_SIZE,
+        prefill_step_size=resolved_prefill_step_size,
         eos_ids=eos_ids,
     )
     print(
-        f"{log_prefix} 継続バッチング有効 (--max-batch {max_batch}, FallbackRunner 限定)。"
+        f"{log_prefix} 継続バッチング有効 (--max-batch {max_batch}, FallbackRunner 限定、"
+        f" 待ち窓なし・毎 tick 途中参加、join prefill chunk={resolved_prefill_step_size})。"
         " QSA が有効になりうるリクエスト (プロンプト長 + max_tokens が"
         " indexer_budget を超えうるもの) は自動で単独実行に倒します"
         " (mlxturbo/batch.py の classify() 参照)"

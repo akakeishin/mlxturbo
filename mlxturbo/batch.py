@@ -646,12 +646,62 @@ def disable_batch_cache() -> None:
 # forgone speed opportunity (equal-length long prompts always run one at a
 # time here), not a correctness gap — classify()'s solo/pool split is sound
 # again now that the co-resident-budget gap above is closed at admission time.
+#
+# ---- admission timing (docs/research/LANES-2026-09.md レーン 5, 2026-09-02) --
+#
+# There has never been an artificial "wait for a companion" window here (that
+# exists only in `batch_spec.py`'s `BatchSpecCoordinator`, and for a
+# different reason — see that module). The first admission of either tier
+# starts on the very next `_drive()` iteration, no delay. What changed in
+# lane 5 is how often a *later* same-tier arrival gets a chance to join an
+# already-running generator: `_drive()` used to hand control to
+# `gen.next_generated()`, which internally loops `BatchGenerator._next()`
+# until it has produced at least one decode token — during that internal
+# loop (which can span several prefill chunks while the first row's own
+# prompt is still being processed) the inbox is not visited. `_drive()` now
+# calls `gen.next()` directly, one `_next()` tick per outer-loop iteration,
+# so the inbox — and therefore admission of a newly-arrived same-tier row —
+# is checked every tick, including ticks that are pure prefill and produce
+# no decode token yet. `_next()` itself already interleaves one decode round
+# for whatever is in `_generation_batch` with one `prefill_step_size`-sized
+# prefill chunk for whatever is in `_prompt_batch` (mlx_lm's own design, see
+# `PromptProcessingBatch`/`GenerationBatch` in `mlx_lm.generate`); this
+# module does not reimplement that interleaving, only exposes its natural
+# tick boundary to the scheduler above. `default_join_prefill_chunk()` below
+# controls how big that per-tick prefill chunk is (512 by default,
+# `MLXTURBO_JOIN_PREFILL_CHUNK` to override) — smaller than
+# `spec.PREFILL_STEP_SIZE` (2048) because this chunk size doubles as "how
+# long a newcomer's own prefill can hold up the next decode round for every
+# other co-resident row".
 
+import os
 import queue as _queue
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+
+def default_join_prefill_chunk() -> int:
+    """Default ``prefill_step_size`` for :class:`BatchCoordinator`'s own
+    ``BatchGenerator`` (docs/research/LANES-2026-09.md レーン 5, 2026-09-02).
+
+    ``mlxturbo.spec.PREFILL_STEP_SIZE`` (2048) is tuned for a single prompt's
+    own prefill throughput and was, until this change, also what this
+    coordinator used. Under continuous batching that value doubles as the
+    chunk size a newly-joining row's own prefill is cut into (see `_drive`'s
+    per-tick loop below) -- a large chunk here means a newcomer's first
+    prefill step can hold up every already-decoding row's next token for a
+    correspondingly long stretch. 512 (vllm-mlx's own default for this same
+    role) keeps that stall bounded while still being large enough that a
+    short prompt still finishes in one chunk. ``MLXTURBO_JOIN_PREFILL_CHUNK``
+    overrides it -- the one new knob this change adds (CLAUDE.md)."""
+
+    try:
+        v = int(os.environ.get("MLXTURBO_JOIN_PREFILL_CHUNK", "512"))
+    except ValueError:
+        v = 512
+    return max(1, v)
 
 
 def _indexer_budget(model) -> int | None:
@@ -903,7 +953,23 @@ class BatchCoordinator:
                         continue
                     break
 
-                for r in gen.next_generated():
+                # 1 tick = BatchGenerator._next() 1 回。すでに `mode` を
+                # "pool"/"solo" に固定して以降の毎ラウンド、上のブロックで
+                # inbox を非ブロッキングで見て新入りを admit している。ここを
+                # `gen.next_generated()` にすると、その内部の while ループが
+                # 「生成トークンが出るまで」何回でも `_next()` を回してしまい
+                # (最初の 1 行がまだ複数チャンクの prefill 中でトークンが
+                # 1 つも出ていない間) inbox に戻れない。`gen.next()` を直接
+                # 1 tick だけ呼ぶことで、prefill 中の tick でも (生成
+                # トークンが 0 本の ROUND でも) 上のループに戻って inbox を
+                # 見られるようにする -- vllm-mlx 型の「毎 tick の途中参加」。
+                # `_next()` 自体は decode 1 ラウンドと prefill 最大
+                # `prefill_step_size` トークンを 1 回の呼び出しに同居させる
+                # ので、interleave の中身自体は元から BatchGenerator 任せで
+                # 変わっていない (mlxturbo/batch.py が新たに書いたコードでは
+                # ない)。
+                _prompt_responses, generation_responses = gen.next()
+                for r in generation_responses:
                     adm = live.get(r.uid)
                     if adm is None:
                         continue
