@@ -1366,3 +1366,11 @@ dense 対 dense (chunk 幅違い) で同じ規模の反転が出るかで判定�
 - 冷 prefill は -1.5〜-4% (detokenizer の 300 ms + 冷却)。対相手 4k 1.19x / 17k 1.09x / 50k 1.09x 負け。
 - decode は反復 1 回の tok/step の揺れの範囲 (17k は 1.71、前回 1.75)。対相手 4k -7% / 17k -16% / 50k +43%。
 - これが「既知を片付けた」時点の基準 (gather カーネルと indexer の op 整理は未採用)。
+
+## dense 対 dense の対照 (chunk 2048 対 4096)、17k (2026-09-03 07:05、`bench/results/kld-dense-chunk4096.json`)
+
+kld_mean **0.374**、kld_max 5.19、argmax 一致 0.92、top-5 重なり 0.84。カーネル (0.040) の 1 桁上。
+**ただし対照として汚れている**: QSA は現在のチャンク内を因果で全部見せ、それ以前の確定ブロックから top-k を
+選ぶので、chunk 幅を変えると「全部見える」範囲が倍になり、可視集合の意味論そのものが変わる
+(`MLXTURBO_PREFILL_CHUNK=4096` が in-model で負けた記録にも、この意味論の差が混ざっていた可能性)。
+丸めだけが違う対照 (GDN Metal の on/off、端数チャンクの畳み込み on/off) で取り直す。
