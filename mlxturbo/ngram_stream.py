@@ -255,8 +255,8 @@ class StreamNGram:
 
     prefetch: prefill プロンプトの行 id は最初から全部わかっているので、
     `prefetch()` に渡すと先読みが始まる。呼び出しは即時に返る。
-    `MLXTURBO_NGRAM_PREFETCH=1` で有効化できる (既定 off)。backend ごとに
-    中身が違う:
+    `MLXTURBO_NGRAM_PREFETCH=0/1` で明示できる (既定は mmap で on、pread で off)。
+    backend ごとに中身が違う:
 
     - backend=pread: 専用のバックグラウンドスレッドが行キャッシュ
       (`_NGramCacheGen`) を埋めておく。`__call__` はキャッシュに乗っている
@@ -310,7 +310,8 @@ class StreamNGram:
         self.sb = m.get("scale_bytes", self.ngrp * 2)
         rows_bin = self.dir / "rows.bin"
 
-        self.backend = backend or os.environ.get("FASTMLX_NGRAM_BACKEND", "pread")
+        # 既定は mmap (2026-09-03: 8k / 17k prefill で pread より -6%。`=pread` で旧経路)
+        self.backend = backend or os.environ.get("FASTMLX_NGRAM_BACKEND", "mmap")
         if self.backend not in ("mmap", "pread"):
             raise ValueError(f"backend は mmap/pread のどちらか ({self.backend})")
         # `_gather_pread` の「64 行未満は行ごと submit / それ以上はスライス
@@ -371,7 +372,11 @@ class StreamNGram:
             self._mmap_prefetch_threads: list[threading.Thread] = []
             self._mmap_prefetch_lock = threading.Lock()
 
-        self.prefetch_enabled = os.environ.get("MLXTURBO_NGRAM_PREFETCH", "0") == "1"
+        # mmap は既定 on (背景の madvise が冷 pread 257 ms/チャンクを隠す、2026-09-03)、
+        # pread は既定 off (行キャッシュ 419 MB を確保する割に -0.4〜-0.9% で差が無い、B-7)。
+        # `MLXTURBO_NGRAM_PREFETCH=0/1` で明示できる。
+        _pf_default = "1" if self.backend == "mmap" else "0"
+        self.prefetch_enabled = os.environ.get("MLXTURBO_NGRAM_PREFETCH", _pf_default) == "1"
         self.reset_stats()
 
         # `install()` は今のこのインスタンスへの参照を呼び手に返さない (現状
@@ -826,14 +831,12 @@ def install(model, sidecar: str | Path) -> None:
         n += 1
     if n == 0:
         raise ValueError("PLE 層が見つからない")
-    # The backend can also be decided by an environment variable, so always
-    # print which one was taken. If FASTMLX_NGRAM_BACKEND=mmap is left in the
-    # environment, fetching 16 rows becomes 5-7x slower. The output is identical,
-    # so if it runs silently the only thing that shifts is the numbers we publish
+    # backend は環境変数でも決まるので、どちらを取ったか必ず出す。出力は同一で、
+    # 違うのは速度だけ (mmap は prefill で -6%、decode 幅の 16 行取得は要確認)
     if stream.backend == "pread":
         how = f"backend=pread threads={stream.n_threads}"
     else:
-        how = "backend=mmap (既定は pread。FASTMLX_NGRAM_BACKEND を確認すること)"
+        how = "backend=mmap (既定。FASTMLX_NGRAM_BACKEND=pread で旧経路)"
     print(
         f"[mlxturbo] n-gram をサイドカー参照に差し替えた "
         f"({n} 層, {stream.bits}bit, RAM 0, {how}) <- {stream.dir}"

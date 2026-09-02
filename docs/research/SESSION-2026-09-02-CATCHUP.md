@@ -1733,3 +1733,13 @@ HC の elementwise は compile しても動かない。GEMM 床 234 ms + traffic
 
 `mx.fast.metal_kernel` の経路で steel と同じ効率が出た (入場料は払えた)。写しは機械抽出 1507 行 (`kernels/_steel_flat.py`、NAX 記号ゼロを assert)。
 mmap 17k の 1 巡目: pread 31.8 s → mmap 29.6 s (-6.9%)。
+
+### 2026-09-03 08:20 PLE mmap の 17k 確認 (別プロセス、順序を逆に pread → mmap → pread → mmap)
+
+| run | pread prefill_s | mmap prefill_s | 差 |
+|---|---|---|---|
+| 1 | 31.90 / 31.77 | 29.59 / 29.66 | -6.9% |
+| 2 | 31.10 / 31.19 | 29.01 / 29.04 | -6.8% |
+
+8k の -6% と合わせて 4 対とも揃った。**既定を mmap + 背景 madvise に切り替えた** (`FASTMLX_NGRAM_BACKEND=mmap`、
+`MLXTURBO_NGRAM_PREFETCH` は mmap で on / pread で off)。decode 幅 (16 行取得) の確認は chain85 (短 3 本 × 512、A B B A)。

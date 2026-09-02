@@ -217,11 +217,11 @@ def test_prefetch_disabled_is_noop(tmp_path):
     # prefetch が無効なら行キャッシュ (既定 4M 行 = 419MB) は一度も確保しない
     # (B-7)。以前は空の生成物 (n==0) を無条件に確保していた。
     assert new._cache_gen is None
-    # backend=mmap も同じ環境変数 (MLXTURBO_NGRAM_PREFETCH) で決まる。この
-    # テストでは未設定なので既定 off のまま (mmap 固有の無効化は無い --
-    # 有効化した場合の挙動は test_mmap_prefetch_* 系で確認する)
+    # backend=mmap も同じ環境変数 (MLXTURBO_NGRAM_PREFETCH) で決まるが、
+    # 既定は mmap で on / pread で off (2026-09-03)。有効化した場合の挙動は
+    # test_mmap_prefetch_* 系で確認する
     mmap_stream = StreamNGram(sidecar, backend="mmap")
-    assert mmap_stream.prefetch_enabled is False
+    assert mmap_stream.prefetch_enabled is True
     mmap_stream.close()
 
     gid = mx.array(ids.reshape(1, -1))
@@ -364,7 +364,7 @@ def test_preadv_disabled_by_env_var(tmp_path, monkeypatch):
     assert stream_default._use_preadv == hasattr(os, "preadv")
 
 
-def test_prefetch_ngram_span_matches_real_forward(tmp_path):
+def test_prefetch_ngram_span_matches_real_forward(tmp_path, monkeypatch):
     """`mlxturbo/spec_flash.py` の `_prefetch_ngram_span` (次の 1 eval 境界
     ぶんの n-gram 先読み) が計算する行 id が、実際の prefill フォワード
     (直前文脈をキャッシュ `pc[3]` から引く経路) がその境界で要求する行 id と
@@ -396,10 +396,12 @@ def test_prefetch_ngram_span_matches_real_forward(tmp_path):
     sidecar, _ = _build_synthetic_sidecar(
         tmp_path, rows=200_000, dim=dim, bits=4, group_size=dim
     )
+    # 行キャッシュ (hits) は pread backend の仕組みなので、既定 (mmap) ではなく pread を明示する
+    monkeypatch.setenv("FASTMLX_NGRAM_BACKEND", "pread")
     NS.install(model, sidecar)
     stream = ple_emb.ngram_embedding
     assert isinstance(stream, NS.StreamNGram)
-    stream.prefetch_enabled = True  # 既定 off。ここは先読み自体を確認する
+    stream.prefetch_enabled = True  # pread は既定 off。ここは先読み自体を確認する
 
     ctx_len = ple_emb.context_len  # TINY: ngram_size=3 -> 2
     start, length, total_len = 5, 4, 12
@@ -493,10 +495,12 @@ def test_gather_mmap_matches_naive_indexing(tmp_path):
         stream.close()
 
 
-def test_mmap_prefetch_disabled_by_default(tmp_path):
-    """backend=mmap も既定 (env var 未設定) では prefetch_enabled=False で
-    prefetch() は何もしない (madvise を一度も呼ばない)。"""
+def test_mmap_prefetch_disabled_by_env_var(tmp_path, monkeypatch):
+    """backend=mmap は既定で prefetch_enabled=True だが、
+    `MLXTURBO_NGRAM_PREFETCH=0` なら prefetch() は何もしない (madvise を一度も
+    呼ばない)。"""
     sidecar, _ = _build_synthetic_sidecar(tmp_path)
+    monkeypatch.setenv("MLXTURBO_NGRAM_PREFETCH", "0")
     stream = StreamNGram(sidecar, backend="mmap")
     try:
         assert stream.prefetch_enabled is False
