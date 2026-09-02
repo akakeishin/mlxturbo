@@ -378,6 +378,32 @@ def _knob_hc_prefill(ctx):
     return apply
 
 
+
+def _knob_pipeline(ctx):
+    """A = 楽観パイプライン (次ラウンドの draft を先に組む) / B = 無効 (既定)。
+
+    `spec_flash.generate_stream` が毎ラウンド `MLXTURBO_PIPELINE` を読むので、
+    env を差し替えるだけで切り替わる (1=通常、2=組むが毎回捨てる切り分け用、
+    0=無効)。
+
+    **`CLAUDE.md` に「楽観先組みは 3 回失敗して棄却済み」と記録されている。**
+    「作って捨てる」遅延グラフは規模を問わず MLX の暗黙 eval に罰される、という
+    決定則の根拠になっている項目。**その判定は 2026-09-02 に直したハーネス
+    (長文脈で A 側に +5.6% の下駄) より前のもの**なので測り直す。
+
+    ただし前提が構造的 (捨てるグラフを MLX が罰する) なので、下駄の 5.6% で
+    ひっくり返る種類ではない可能性が高い。**それでも数字を持っておく価値はある。**
+
+    貪欲なので出力は変わらない。判定は ms/round と tok/round。
+    """
+    import os
+
+    def apply(variant):
+        os.environ["MLXTURBO_PIPELINE"] = "1" if variant == "A" else "0"
+
+    return apply
+
+
 def _knob_indexer_cache(ctx):
     """A = 確保方式 (現行) / B = 毎更新 concat (2026-09-01 以前)。
 
@@ -639,6 +665,7 @@ KNOBS = {
     "rms-norm-gated": (_knob_rms_norm_gated, ["A", "C", "B"], True, "B"),
     "moe-route": (_knob_moe_route, ["A", "C", "B"], False, "B"),
     "hc-prefill": (_knob_hc_prefill, ["A", "C", "B"], False, "C"),
+    "pipeline": (_knob_pipeline, ["A", "B"], False, "B"),
     "null": (_knob_null, ["A", "B"], True, "B"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
