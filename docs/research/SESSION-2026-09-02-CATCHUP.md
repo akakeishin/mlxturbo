@@ -899,3 +899,36 @@ checkpoint、n-gram 行取得、最初のサンプルまでの固定費が 100 m
 (`MLXTURBO_SDPA_SPLIT`、既定 on)、gather 経路 (`_gather_tile_attn`) への同じ分割、発火カウンタ、CPU 検査。
 gather 経路は union ≤ 0.20·kv でしか走らないので、実効はほぼ無い。**decode +6 ms の説明にはならない。**
 残る本命は HC 融合カーネルの 96 層不発火 (上の節)。sdpa-split の A/B 連鎖 (chain34) は取り下げた。
+
+## QSA attention 1 層の内訳 (2026-09-02 23:50、`tools/qsa_prefill_split.py`、full attention の最初の層、実モデル)
+
+prefill 幅 S=2048 (部品和 ≈ 壁時計、±3%):
+
+| kv | indexer | マスク | sdpa | その他 (qkv+gate+o_proj) | 層の壁時計 | ×12 層 |
+|---|---|---|---|---|---|---|
+| 2048 | 0.9 | 0.00 | 10.5 | 19.2 | 29.8 | 358 |
+| 8192 | 3.0 | 0.07 | 40.8 | 19.9 | 64.0 | 768 |
+| 16896 | 6.7 | 0.00 | 87.2 | 21.2 | 116.7 | 1400 |
+
+- **sdpa が 75% (kv=16.9k)、indexer は 6%。**「indexer が sdpa と同じ大きさ」の疑い (上の節) は
+  外れ。以前の tracer の 163 ms/層は熱か別の内訳で、この測り方では 117 ms/層。
+- sdpa は合成マイクロ (84 ms) と一致。kv に比例。17k 以上の prefill attention を縮める手は
+  **選択ブロックだけ計算する T=1 の gather カーネル**しかない (dense は計算上限に張り付き)。
+  見込み: 末尾チャンクで sdpa 87 → 30 ms/層 なら 12 層で -0.7 s/チャンク、17k 全体で -1.5〜2 s (5%)、
+  50k で -15% 前後。
+- その他 (qkv 14 ms) は S=2048 の射影 75 GFLOP で 5 TFLOPS 相当。素の qmm としては低い。
+  中身 (q/k/v 射影、qk norm、rope、gate の split) の分離は未着手。
+
+decode 幅 S=1 (部品ごとの eval 同期 0.2 ms が乗るので部品和は壁時計の 2〜3 倍。**壁時計だけ読む**):
+
+| kv | 経路 | 層の壁時計 ms | ×12 層 ms |
+|---|---|---|---|
+| 4096 | dense | 0.67 | 8.1 |
+| 17000 | gather | 0.76 | 9.1 |
+| 25000 | gather | 0.84 | 10.1 |
+| 50000 | gather | 0.84 | 10.1 |
+
+- S=1 の attention 層は 12 層で 8〜10 ms と、forward 24 ms の 3 分の 1。kv 4k → 50k で +2 ms しか
+  伸びない。**decode の kv 罰 (+8.5 ms/tok) は attention 層以外にある** (indexer の増分キャッシュ、
+  verify 幅 S=2 の経路、n-gram、MoE の重み読み)。S=2/4 の結果 (chain35) と合わせて帰属する。
+- S=1 では 17k 以上で gather 経路 (段 3(b)) が実際に走っている (union 2048 ≤ 0.2·kv)。
