@@ -207,7 +207,11 @@ def main() -> int:
     import mlxturbo  # noqa: F401  (arch_registry の meta_path フックを張る)
     from mlx_lm import load
 
-    from mlxturbo.gather_attn import disable_prefill_attn, enable_prefill_attn
+    from mlxturbo.gather_attn import (
+        disable_gather_attn,
+        disable_prefill_attn,
+        enable_prefill_attn,
+    )
     from mlxturbo.kernels import prefill_attn as prefill_attn_kernel
     from mlxturbo import runner as mlxturbo_runner
 
@@ -259,8 +263,20 @@ def main() -> int:
         )[None]
         print(f"  実 kv={ids.shape[1]}", flush=True)
 
-        # (1) 分布 p: disable_prefill_attn (= 本番の既定、カーネル off)
-        disable_prefill_attn(model)
+        # (1) 分布 p: 完全に dense へ戻す (= 本番の既定、カーネル off)。
+        #
+        # **2026-09-03 訂正。**以前はここで `disable_prefill_attn(model)` を
+        # 呼んでいたが、`mlxturbo/gather_attn.py` の docstring どおり
+        # `disable_prefill_attn` は「`enable_prefill_attn` だけを打ち消す
+        # (gather 経路は残す)」規約で、`_gather_attn` を False に戻さない。
+        # `--ctxs` に複数の長さを渡す通常の使い方では、1 つ前の ctx の
+        # `enable_prefill_attn` (line 279 相当) が `_gather_attn=True` を
+        # 立てたまま残り、2 番目以降の ctx の「p (off のはず)」が実際には
+        # 汎用 gather 経路 (`_gather_tile_attn`) を通ってしまっていた
+        # (先頭の ctx だけは `_gather_attn` が未設定なので無傷)。
+        # `disable_gather_attn` は `_gather_attn`/`_prefill_attn` の両方を
+        # 落とすので、こちらが本来の「dense へ完全に戻す」呼び方。
+        disable_gather_attn(model)
         cache_p = model.make_cache()
         logits_p = _run_prefill(model, cache_p, ids, args.chunk, args.tail, PA.pending)
         del cache_p
