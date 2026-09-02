@@ -1521,3 +1521,13 @@ recall: dense 1/6、kernel 0/6。quote: 両方 0/6。dense がほぼ 0 なので
 - 反復 1 回なので decode の ±5% は揺れの範囲。prefill の 1.13x は安定した差。
 残差の帰属 (今日の分析から): prefill は MoE の gather_qmm (相手と同じ op) 以外の、GDN の 20% 超過、HC の素の op 列、
 PLE の行取得 (4%)、attention の射影。decode は HC の 4.7 ms と attention 層の小さい op (indexer 2.7 ms/round)。
+
+## 長文脈の品質ゲート、17k (2026-09-03 13:40、`tools/longctx_quality.py --ctxs 17000 --n 8`、thinking off)
+
+| 課題 | dense 正答率 | kernel 正答率 | 回答一致率 |
+|---|---|---|---|
+| recall (合言葉) | **1.000** | **1.000** | 0.875 |
+| quote (次の文) | 0.625 | 0.625 | 0.875 |
+
+kernel (発火 384 回 = 12 層 × 4 チャンク × 8 問) は dense と同じ正答率。回答が違った 1/8 は quote の別解。
+**課題の正答率では gather カーネルの品質劣化は見えない。既定 on を裏付ける。**50k は走行中。
