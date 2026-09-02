@@ -1067,8 +1067,9 @@ class GatedDeltaNet(nn.Module):
         # 1 dispatch に畳んだ decode/verify 幅専用の経路 (mlxturbo/kernels/
         # gdn_prework.py)。mask 付き (バッチの右パディング) と長い prefill 幅
         # は対象外で、その場合は下の素の経路に落ちる。既定 off。
+        _gdn_prework_on = getattr(self, "_gdn_prework", False)
         if (
-            getattr(self, "_gdn_prework", False)
+            _gdn_prework_on
             and mask is None
             and cache is not None
             and not self.training
@@ -1095,6 +1096,14 @@ class GatedDeltaNet(nn.Module):
                 cache[1] = state
                 cache.advance(S)
                 return self.out_proj(self.norm(out, z).reshape(B, S, -1))
+        elif _gdn_prework_on:
+            # 有効化されているのに上の 4 条件 (mask/cache/training/lengths)
+            # で eligible() まで届かなかった。この 4 条件は今まで無言だった
+            # ので (eligible() 自身の ~20 条件と違い)、理由を 1 度だけ出す
+            # (2026-09-02、gdn_prework 空振り調査で見つかった穴)。
+            from mlxturbo.kernels import gdn_prework as gp
+
+            gp.explain_gate_miss(mask, cache, self.training)
 
         if mask is not None:
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)

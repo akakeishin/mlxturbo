@@ -319,6 +319,47 @@ def eligible(
     return True
 
 
+def explain_gate_miss(mask, cache, training: bool) -> None:
+    """呼び出し側 (``GatedDeltaNet.__call__`` / ``spec_flash.capture()`` の
+    ``gdn``) にある外側のガード (``mask is None``・``cache is not None``・
+    ``not training``・``cache.lengths is None``) で ``eligible()`` に届く前に
+    弾かれた理由を 1 度だけ知らせる。
+
+    `eligible()` 自身の約 20 条件は `_warn_once` で理由が出るようになった
+    (2026-09-02、BACKLOG.md の B-8) が、**その手前にあるこの 4 条件は今まで
+    無言のままだった。** `_gdn_prework=True` にしても発火カウンタが 0 のまま
+    のとき、原因が `eligible()` の内側か手前かをここで区別する
+    (2026-09-02、gdn_prework が投機の検証フォワードで一度も発火しない事例の
+    調査で見つかった穴)。呼び出し側は「有効化されているのにここに来た」
+    ときだけ呼ぶこと (無効時に毎回呼ぶと無意味な print になる)。
+    """
+    if mask is not None:
+        _warn_once(
+            "gate_mask",
+            "外側のガード: mask が None でない"
+            " (バッチの右パディングなど) ので eligible() まで届かない",
+        )
+        return
+    if cache is None:
+        _warn_once("gate_cache", "外側のガード: cache が None なので eligible() まで届かない")
+        return
+    if training:
+        _warn_once(
+            "gate_training",
+            "外側のガード: self.training が True なので eligible() まで届かない"
+            " (model.eval() 漏れの疑い)",
+        )
+        return
+    if getattr(cache, "lengths", None) is not None:
+        _warn_once(
+            "gate_lengths",
+            "外側のガード: cache.lengths が None でない"
+            " (バッチの右パディング) ので eligible() まで届かない",
+        )
+        return
+    # ここに来た = 4 条件は全部通っていた (= 呼び出し側の判定ミス)。
+
+
 def fused_gdn_prework(
     mixed_qkv: mx.array,
     conv_state: mx.array,
@@ -395,4 +436,7 @@ def fused_gdn_prework(
     return q_out, k_out, v_out, g_out, beta_out, conv_state_out
 
 
-__all__ = ["eligible", "fused_gdn_prework", "MAX_S", "MAX_M", "MAX_TG_BYTES"]
+__all__ = [
+    "eligible", "fused_gdn_prework", "explain_gate_miss",
+    "MAX_S", "MAX_M", "MAX_TG_BYTES",
+]

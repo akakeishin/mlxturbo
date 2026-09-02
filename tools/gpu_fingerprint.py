@@ -4,7 +4,7 @@
 一方、2026-09-02 に足した融合カーネル群の `eligible()` はどれも
 ``mx.default_device() == mx.gpu`` を要求するので、CPU の検査は**それらの
 GPU 分岐を一度も通らない**。ここは同じ「合成モデル」という性質を保った
-まま GPU に置き、次の 5 つの knob それぞれについて
+まま GPU に置き、次の knob それぞれについて
 
   1. 発火したこと (`kernels._fire.snapshot()` が増える、または同等の
      呼び出しカウンタが増える)
@@ -17,11 +17,16 @@ GPU 分岐を一度も通らない**。ここは同じ「合成モデル」と�
 
 対象 (どれも既定 off、on にして検査する):
 
-    hc-write     mlxturbo.fused.enable_hc_write (DecoderLayer._combine)
-    gdn-prework  mlxturbo/kernels/gdn_prework.py
-    prefill-attn mlxturbo/kernels/prefill_attn.py
-    gdn-blocked  mlxturbo/kernels/gated_delta_blocked.py
-    moe-verify   mlxturbo/kernels/moe_verify_gather.py
+    hc-write          mlxturbo.fused.enable_hc_write (DecoderLayer._combine)
+    gdn-prework        mlxturbo/kernels/gdn_prework.py (model() 直叩き)
+    gdn-prework(capture) 同上だが spec_flash.capture()+_staged_forward 経由
+                       (投機の検証フォワードが実際に通る経路。実機 GDN 形
+                       n_k=16 の境界も使う)
+    prefill-attn       mlxturbo/kernels/prefill_attn.py
+    gdn-blocked        mlxturbo/kernels/gated_delta_blocked.py
+    moe-verify         mlxturbo/kernels/moe_verify_gather.py
+    rms-norm-gated     mlxturbo.fused.enable_rms_norm_gated (env ゲート無し)
+    moe-route          mlxturbo.fused.enable_moe_route (env ゲート無し)
 
 ## dtype の選び方
 
@@ -202,6 +207,102 @@ def check_gdn_prework() -> dict:
             "note": "bf16 decode x5、絶対値ゲート (cache 経由で伝播するため)"}
 
 
+def _build_real_gdn_shape(budget: int):
+    """`build()` と同じ作り方だが、linear_* を実機 Flash-Next の形
+    (n_k=16, n_v=48, dk=dv=128, conv_kernel=4, conv_dim=10240) に差し替える。
+
+    `check_gdn_prework` の TINY 形 (n_k=2) は `eligible()` の
+    `2*n_k<=32 simdgroup` の境界を一度も踏まない。実機はちょうど
+    `2*n_k=32` の境界そのものなので、境界条件を別で確かめる。
+    """
+    import mlx_lm.models.qwen4_exp as Q
+    from mlx.utils import tree_map
+
+    cfg = dict(TINY, indexer_budget=budget)
+    cfg.update(
+        linear_num_key_heads=16,
+        linear_num_value_heads=48,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+    )
+    mx.random.seed(0)
+    model = Q.Model(Q.ModelArgs(model_type="qwen4_exp", text_config=cfg))
+    model.update(
+        tree_map(
+            lambda a: mx.random.normal(a.shape) * 0.05 if a.dtype == mx.float32 else a,
+            model.parameters(),
+        )
+    )
+    mx.eval(model.parameters())
+    model.eval()
+    return model
+
+
+def check_gdn_prework_capture() -> dict:
+    """`gdn_prework` を **`spec_flash.capture()` + `_staged_forward` 経由**
+    (投機の検証フォワードが実際に通る経路) で確かめる。
+
+    `check_gdn_prework` は `model(...)` を直接呼ぶだけで、`capture()` が
+    `GatedDeltaNet.__call__` ごと差し替える経路を一度も通らない。
+    2026-09-01 に実際に起きた事故 (`mlxturbo/kernels/_fire.py` の docstring
+    参照: capture() の差し替えで投機の検証フォワードに融合が一度も届かず、
+    発火 0 のまま「効果なし」と誤判定した) はこちらの経路でしか再現しない。
+
+    実機の GDN 形 (n_k=16 で `2*n_k<=32` の境界ちょうど) を使い、S=1..3 の
+    複数呼び出し (検証フォワードの幅) を通す。
+    """
+    from mlxturbo import spec_flash
+
+    model = _build_real_gdn_shape(8)
+    _cast_bf16_except(model, ("A_log", "dt_bias"))
+
+    gdn0 = model.model.layers[2].linear_attn
+    shape_ok = (gdn0.n_k, gdn0.n_v, gdn0.dk, gdn0.conv_dim) == (16, 48, 128, 10240)
+
+    ids = [(i * 7 + 3) % TINY["vocab_size"] for i in range(20)]
+
+    def run(use_capture: bool):
+        cache = model.make_cache()
+        model(mx.array(ids)[None], cache=cache)
+        logits = []
+        widths = (1, 2, 3, 1, 2)
+        if use_capture:
+            with spec_flash.capture(model):
+                for i, s in enumerate(widths):
+                    toks = [[(i * 3 + j) % TINY["vocab_size"] for j in range(s)]]
+                    lg = spec_flash._staged_forward(model, mx.array(toks), cache)
+                    mx.eval(lg)
+                    logits.append(lg[:, -1])
+        else:
+            for i, s in enumerate(widths):
+                toks = [[(i * 3 + j) % TINY["vocab_size"] for j in range(s)]]
+                lg = model(mx.array(toks), cache=cache)
+                mx.eval(lg)
+                logits.append(lg[:, -1])
+        return logits
+
+    base_logits = run(False)
+
+    fused.enable_gdn_prework_kernel()
+    _fire.reset()
+    try:
+        on_logits = run(True)
+        fired = _fire.snapshot().get("gdn_prework", 0)
+    finally:
+        fused.disable_gdn_prework_kernel()
+
+    diff = max(_diff(a, b)[0] for a, b in zip(base_logits, on_logits))
+    rel = max(_diff(a, b)[1] for a, b in zip(base_logits, on_logits))
+    # check_gdn_prework と同じ緩めの絶対値ゲート (bf16 sigmoid が参照とビット
+    # 一致しない分 + cache 経由の伝播)。
+    ok = shape_ok and fired > 0 and diff < 0.5
+    return {"name": "gdn-prework(capture)", "fired": fired, "diff": diff, "rel": rel,
+            "ok": ok,
+            "note": "実機 GDN 形 (n_k=16 境界) x capture()+_staged_forward、S=1..3"
+                    + ("" if shape_ok else "  ★形が実機と不一致★")}
+
+
 def check_gdn_blocked() -> dict:
     """`gated_delta_blocked.gated_delta_update_blocked`。fp32 で通る
     (`eligible` は q/k/v の dtype を制約しない)。prefill 幅 (T>=64) が必須。
@@ -313,6 +414,81 @@ def check_moe_verify() -> dict:
             "note": "bf16、SparseMoeBlock 実形状 (K=2560/H=640/E=512)、allclose 型誤差"}
 
 
+def check_rms_norm_gated() -> dict:
+    """`fused.enable_rms_norm_gated`。`RMSNormGated.__call__` を無条件で
+    差し替えるだけ (env ゲート無し) で、`spec_flash.capture()` が触るのは
+    `GatedDeltaNet.__call__`/`PLELayer._short_conv`/`GatedResidual.__call__`
+    の 3 つだけなので、この置き換えは capture() の影響を受けない
+    (`GatedDeltaNet.__call__` 内から `self.norm(out, z)` として素通しで
+    呼ばれるだけ)。capture()+_staged_forward 経由でも発火することを確認する。
+
+    `eligible()` は x/weight が fp16/bf16 であることを要求する
+    (`mlxturbo/kernels/rms_norm_gated.py`)。TINY は既定 fp32 で組まれる
+    ので bf16 に落としてから使う。
+    """
+    from mlxturbo import spec_flash
+
+    model = build(8)
+    _cast_bf16_except(model, ())
+    ids = [(i * 7 + 3) % TINY["vocab_size"] for i in range(20)]
+
+    cache = model.make_cache()
+    model(mx.array(ids)[None], cache=cache)
+    base = model(mx.array([[1]]), cache=cache)
+    mx.eval(base)
+
+    fused.enable_rms_norm_gated()
+    _fire.reset()
+    try:
+        cache2 = model.make_cache()
+        model(mx.array(ids)[None], cache=cache2)
+        with spec_flash.capture(model):
+            on = spec_flash._staged_forward(model, mx.array([[1]]), cache2)
+            mx.eval(on)
+        fired = _fire.snapshot().get("rms_norm_gated", 0)
+    finally:
+        fused.disable_rms_norm_gated()
+
+    diff, rel = _diff(base, on)
+    ok = fired > 0
+    return {"name": "rms-norm-gated", "fired": fired, "diff": diff, "rel": rel, "ok": ok,
+            "note": "capture()+_staged_forward 経由、env ゲート無しの無条件差し替え"}
+
+
+def check_moe_route() -> dict:
+    """`fused.enable_moe_route`。`SparseMoeBlock.__call__` を無条件で差し替える
+    だけ (env ゲート無し) で、capture() が触る 3 メソッドに含まれないので
+    capture() の影響を受けない。capture()+_staged_forward 経由でも発火する
+    ことを確認する。
+    """
+    from mlxturbo import spec_flash
+
+    model = build(8)
+    ids = [(i * 7 + 3) % TINY["vocab_size"] for i in range(20)]
+
+    cache = model.make_cache()
+    model(mx.array(ids)[None], cache=cache)
+    base = model(mx.array([[1]]), cache=cache)
+    mx.eval(base)
+
+    fused.enable_moe_route()
+    _fire.reset()
+    try:
+        cache2 = model.make_cache()
+        model(mx.array(ids)[None], cache=cache2)
+        with spec_flash.capture(model):
+            on = spec_flash._staged_forward(model, mx.array([[1]]), cache2)
+            mx.eval(on)
+        fired = _fire.snapshot().get("moe_route", 0)
+    finally:
+        fused.disable_moe_route()
+
+    diff, rel = _diff(base, on)
+    ok = fired > 0
+    return {"name": "moe-route", "fired": fired, "diff": diff, "rel": rel, "ok": ok,
+            "note": "capture()+_staged_forward 経由、env ゲート無しの無条件差し替え"}
+
+
 def main() -> int:
     if not mx.metal.is_available():
         print("Metal が使えないのでこの検査は走らせられない")
@@ -322,9 +498,12 @@ def main() -> int:
     checks = [
         check_hc_write,
         check_gdn_prework,
+        check_gdn_prework_capture,
         check_prefill_attn,
         check_gdn_blocked,
         check_moe_verify,
+        check_rms_norm_gated,
+        check_moe_route,
     ]
 
     results = []

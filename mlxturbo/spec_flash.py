@@ -272,8 +272,9 @@ def capture(model, light: bool = False):
         # conv 窓を切り出すのに使う) は前処理カーネルが返さないので、ここで
         # 組み直す (concat だけで、融合の対象である conv1d/silu/rms_norm の
         # 再計算ではない)。
+        _gdn_prework_on = getattr(self, "_gdn_prework", False)
         if (
-            getattr(self, "_gdn_prework", False)
+            _gdn_prework_on
             and mask is None
             and cache is not None
             and not self.training
@@ -298,6 +299,12 @@ def capture(model, light: bool = False):
                 cache[1] = states_all[:, -1]
                 cache.advance(S)
                 return self.out_proj(self.norm(out, z).reshape(B, S, -1))
+        elif _gdn_prework_on:
+            # _vendor/qwen4_exp.py 側と同じ穴埋め (BACKLOG.md B-8 は eligible()
+            # 内部の条件だけを直していて、この手前の 4 条件は無言のままだった)。
+            from .kernels import gdn_prework as gp
+
+            gp.explain_gate_miss(mask, cache, self.training)
 
         if mask is not None:
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
