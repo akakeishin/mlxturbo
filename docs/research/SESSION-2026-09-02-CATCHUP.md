@@ -1663,3 +1663,9 @@ decode 側は HC 4.7 ms / indexer 2.7 ms に手が無く、-7% は当面残る�
   見込みに対して) と整合。
 - 残る MoE の伸びしろは dense 比 1.19 の 16% (= prefill の 6%) で、gather_qmm の区間タイル効率そのもの。取るには
   grouped GEMM のカーネル。**優先度は下げる** (Python 側の手は使い切った)。
+
+## attention qkv の連結、prefill 幅だけ (`--knob wide-attn`)、8k (2026-09-03 18:40)
+
+prefill_s A +0.3%、decode ±0、出力一致。**取り分なし**。q/k/v/gate の 4 本を 1 本にしても M=2048 の qmm は
+既に同じ効率で走っている (5 TFLOPS 相当の「射影 19 ms/層」は qmm 以外 (rope、qk-norm、gate の split、
+reshape) の小物の合算)。畳む (既定 off のまま)。17k は確認だけ。
