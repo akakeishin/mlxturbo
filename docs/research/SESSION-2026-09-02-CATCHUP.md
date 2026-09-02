@@ -1167,3 +1167,19 @@ ms/round +0.6%、出力一致。前提 (PLE 層 1 つ) どおり取り分なし�
 
 prefill_s +0.1%、ms/round -0.1%、出力一致。**畳む** (既定 off のまま)。相談役の仮説 3 は前提 (PLE 5 層) が
 外れていた。同期 1 回の位置を動かしても取り分は無い。
+
+## KV キャッシュの全長コピー、実モデルの探針 (2026-09-03 01:50、scratchpad/kv_copy_probe.py、biglock 単独)
+
+| ctx | KV 実体 (12 層 K/V) | S=1 forward 壁 | ステップ 1 回のピークメモリ増分 | `update_and_fetch` 1 層 (同期込み) |
+|---|---|---|---|---|
+| 4k | 95 MB | 32.2 ms | **130 MB** | 243 us (keys 4.2 MB) |
+| 17k | 415 MB | 36.9 ms | **519 MB** | 322 us (17.5 MB) |
+| 50k | 1226 MB | 46.1 ms | **1495 MB** | 519 us (51.3 MB) |
+
+ピーク増分が KV 実体の 1.2 倍で伸びる = **ステップごとに KV 全体を写している**。forward 壁の 4k → 50k
++14 ms のうち、1.2 GB の読み書き (≈ 6 ms) がこれ。**ただし**この探針は各 rep の前に `_restore(caches, snap)`
+で snapshot に戻しており、snapshot が古いバッファの参照を持つので donation が効かずコピーになるのは
+当然でもある。本番の decode (KV は snapshot しない、rollback は GDN 状態だけ) で同じことが起きるかは、
+復元なしで連続 step する `--no-restore` 版 (chain53) で決める。そちらでも増分が KV 比例なら、原因は
+`update_and_fetch` の view 返し (`self.keys[..., :offset, :]`) か capture/rollback が持つ参照で、
+`mx.slice_update` を donation が効く形に組み直す (相手は Zig 側の refcount 共有で払っていない項目)。
