@@ -1183,3 +1183,19 @@ prefill_s +0.1%、ms/round -0.1%、出力一致。**畳む** (既定 off のま�
 復元なしで連続 step する `--no-restore` 版 (chain53) で決める。そちらでも増分が KV 比例なら、原因は
 `update_and_fetch` の view 返し (`self.keys[..., :offset, :]`) か capture/rollback が持つ参照で、
 `mx.slice_update` を donation が効く形に組み直す (相手は Zig 側の refcount 共有で払っていない項目)。
+
+## TTFT の内訳、ctx 0 と 4k (2026-09-03 02:05、`--log-level debug` の `[ttft-trace]`、`bench/results/logs/ttft-trace-driver.log`)
+
+| リクエスト | ハーネス TTFT | runner の ttft | `[ttft-trace]` gen→first_token | 生成前 (parse→gen) |
+|---|---|---|---|---|
+| ctx 0 冷 (new=27) | 0.52 s | 0.19 | 498 ms | 19 ms (template 初回) |
+| ctx 0 完全ヒット (reused=27 new=0) | 0.30 s | **0.00** | **305 ms** | 1 ms |
+| ctx 0 温 (reused=58 new=23) | 0.45 s | 0.16 | 452 ms | 1 ms |
+| 4k 冷 (new=3827) | 7.91 s | 7.61 | 7904 ms | 5 ms |
+| 4k 温 (reused=3858 new=18) | 0.46 s | 0.15 | 458 ms | 4 ms |
+
+**完全ヒットで runner の時計が 0.00 s でも、ハンドラは最初のトークンを 300 ms 後に受け取る。**
+温ヒットも 450 = 150 (runner) + 300。つまり **リクエストごとに固定 300 ms** が「executor への投入 → runner の
+t0」か「runner の最初の yield → ハンドラのキュー受信」にある。tokenize / template / セッション照合は 1〜5 ms
+で無罪。これを潰せば温 TTFT 0.45 → 0.15 s (相手 0.87 の 6 倍速)、冷 ctx 0 も 0.5 → 0.2 s。内訳の時刻印
+(`[gen-trace]`) を足して次に測る。
