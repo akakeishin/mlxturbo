@@ -1,4 +1,4 @@
-# 次のセッション用プロンプト (2026-09-02 夜版。Fable 親、実装は Sonnet)
+# 次のセッション用プロンプト (2026-09-03 深夜版。Fable 親、実装は Sonnet)
 
 以下をそのまま新セッションの最初の入力にする。
 
@@ -50,14 +50,29 @@ CATCHUP 末尾の表。冷えた状態のフルテストは実装を直してか
 却下 (既定 off のまま): n-gram 先読み、fast rope、GDN 前処理融合、RMSNormGated 融合、
 MoE router 融合、union gather (真の union が 6 割)、wide 連結。理由と数字は CATCHUP。
 
+## 深夜 (2026-09-03 01:50) に決まったこと
+
+- 小さい結果 (mlxturbo だけ、冷、反復なし): 冷 TTFT 4k 7.18 / 17k 32.5 / 50k 119 s、decode 50.6 / 48.7 /
+  42.4 tok/s。対相手 (朝の値) prefill 1.24 / 1.11 / 1.10x 負け、decode 4k -8% / 17k -13%、50k +38%。
+- HC 融合カーネルは 97 層中 1 層しか発火していなかったが、97 層で発火させると +8 ms **悪化** (効率が低い)。
+  HC の真の費用は S=1 で最大 4.7 ms (スタブ比較)。書き直し (1 回 80 → 20 us) がレーン 1 の手。
+  `MLXTURBO_HC_INJECT_BF16=1` で 97 層発火を試せる (既定 off)。
+- sdpa の幅 2 分割は 8/31 から本番に入っていた (新しい取り分ではない)。knob 化だけした。
+- prefill attention 1 層の内訳 (kv=16.9k): sdpa 75%、indexer 6%。dense は計算上限。T=1 gather カーネルだけが手。
+- レーン 9 (forward の構造) とレーン 10 (投機の tok/round) を追加。`DepthController`
+  (`MLXTURBO_DEPTH_ADAPT=1`、既定 off) と `MLXTURBO_REBIT=head=4` (速度比較用) を配線済み。A/B は連鎖待ち。
+- レーン 5: 非投機の継続バッチングを毎 tick の途中参加に (コミット済み)。ゲート計測 `bench/parallel_join_gate.py` は未実走。
+- ユーザー方針: Qwen3.8 Flash だけ見る。overnight tier は指示があるまで走らせない。多日レーン → フルテストの順。
+
 ## 残っているレーン (順に)
 
-1. レーン 1: `tools/kernel_chain_cost.py` の結果で、融合カーネルの寄与が 3 ms 以上なら書き直し、
-   1 ms 未満なら `mx.compile` で層をまとめる実験へ。
-2. レーン 5: 並列デコードの実装 (待ち窓の撤去、途中参加、chunked prefill の差し込み)。
-3. ベンチ overnight tier の実走 (冷えた機体、一晩)。
-4. 相手の QSA prefill 経路と MLX 写しの改造箇所の調査結果 (CATCHUP に追記される) を読んで、
-   17k 以上の prefill で残る差の帰属を決める。
+1. レーン 1: HC カーネルの書き直し (連鎖 ≤ 20 us/回、in-model で -2 ms 以上)。
+2. レーン 10: depth-adapt の A/B (`decode_ab --knob depth-adapt`、短文脈 + 17k)。
+3. レーン 3: T=1 gather prefill カーネル (多日。ゲート: 合成で dense sdpa の 2 倍、kv=16.9k S=2048)。
+4. レーン 9: 層単位 mx.compile、attention 層の射影・indexer の op 整理。lm_head 4-bit は真 bf16 から焼き直す。
+5. レーン 5: `bench/parallel_join_gate.py` の実走、batch_spec 側の途中参加の判断。
+6. レーン 8: 温 TTFT の生成前 0.3 s (`--log-level debug` の `[ttft-trace]`)、decode の kv 罰 (`qsa_prefill_split --chain`)。
+7. フルテスト (対 mlx-serve、冷) は多日レーンの後。overnight tier はユーザーの指示で。
 
 ## 守ること (CLAUDE.md に加えて、今日踏んだ罠)
 
