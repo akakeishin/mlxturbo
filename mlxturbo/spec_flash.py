@@ -331,7 +331,7 @@ def _depth_adapt_min_pos_default(ctx_limit: int) -> int:
 _DEPTH_CAP_CTX_LIMIT = 2048
 
 
-def _depth_cap_default(pos: int) -> int:
+def _depth_cap_default(pos: int, ctx_limit: int | None = None) -> int:
     """DepthController.choose がこの位置で探索する depth の上限 (m の範囲)。
 
     env (MLXTURBO_DEPTH_CAP) が最優先。無ければ文脈長 2048 を境に
@@ -345,7 +345,8 @@ def _depth_cap_default(pos: int) -> int:
             v = 0
         if v >= 1:
             return min(v, _DEPTH_CONTROLLER_MAX)
-    return 2 if pos > _DEPTH_CAP_CTX_LIMIT else 3
+    limit = _DEPTH_CAP_CTX_LIMIT if ctx_limit is None else ctx_limit
+    return 2 if pos >= limit else 3
 
 
 def _depth_cost_params(pos: int) -> tuple[float, float]:
@@ -420,7 +421,9 @@ class DepthController:
                  prior: float = _DEPTH_EMA_PRIOR,
                  explore_every: int | None = None,
                  stale_rounds: int = _DEPTH_STALE_ROUNDS_DEFAULT,
-                 margin: float | None = None):
+                 margin: float | None = None,
+                 ctx_limit: int | None = None):
+        self.ctx_limit = ctx_limit  # None なら 2048 (engine から depth_ctx_limit を渡す)
         self.max_depth = max_depth
         self.beta = beta if beta is not None else _depth_beta_default()
         self.prior = prior
@@ -553,7 +556,7 @@ class DepthController:
         depth を増やすと実測では負けると分かった (E(m)/T(m) の差はサンプル
         数の少ない a[]/cost_ema の推定誤差に埋もれやすい) ため。
         """
-        cap = min(_depth_cap_default(pos), self.max_depth)
+        cap = min(_depth_cap_default(pos, self.ctx_limit), self.max_depth)
         self.round_count += 1
         if self.explore_every > 0 and self.round_count % self.explore_every == 0:
             return cap
@@ -1140,7 +1143,9 @@ class FlashSpecEngine:
         # 作り直さない)。_effective_depth / generate() / generate_stream()
         # の verify 後で観測する。
         self._depth_adapt = MLXTURBO_DEPTH_ADAPT
-        self._depth_controller = DepthController() if self._depth_adapt else None
+        self._depth_controller = (
+            DepthController(ctx_limit=self.depth_ctx_limit) if self._depth_adapt else None
+        )
         # controller を使い始める最小位置 (既定 = depth_ctx_limit そのもの
         # -- 静的規則が depth 2 を返す短文脈側は静的規則のまま)。
         # _depth_adapt が off でも計算しておいて害はない (未使用のまま)。
