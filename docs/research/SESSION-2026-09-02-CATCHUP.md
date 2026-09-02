@@ -1312,3 +1312,13 @@ runner 内 154 ms + 外 345 ms。**runner でも executor でもなく、worker 
   部品は indexer** (pooled スコア、argpartition、keep ブロック構築の小さい op 列)。op 整理の対象。
 - decode の kv 罰 (+8.5 ms/tok ≈ +15 ms/round) のうち attention 層で説明できるのは +3 ms。残りの帰属は
   ラウンド全体の built / eval の内訳 (`[round]` trace) で追う。
+
+## decode の kv 罰の帰属、ラウンド間隔で (2026-09-03 05:20、`[round]` trace、`--knob null --tokens 64`)
+
+ラウンドの CPU 側の刻み (eval_done 4.7 / verify_done 5.4 / drafts_submitted 7.1 / rollback 7.2 ms) は 17k と 50k で
+ほぼ同じ。**ラウンド間隔は 17k 43 ms、50k 45〜46.5 ms (+2〜3 ms)** で、attention 層の kv 比例 (+3.3 ms/round、
+上の節) と一致する。小さい結果で見えた「50k で +8.5 ms/tok」は、120 s の prefill 直後の熱と tok/step の揺れ
+(反復 1 回) が大半で、**本物の kv 罰は +3 ms/round (7%) 程度**。帰属は indexer (228 → 307 us/層) と
+gather 経路のマスク/選択 (25k 以上で 136〜185 us/層)。相手の kv 罰 +3.0 ms (ubench) と同じ桁で、
+「うちは 2 倍」という朝の読みは熱の混入だった。レーン 8 の decode 側はこれで閉じる。
+indexer の 228 us/層 (kv に依らない分) は decode 全体で 2.7 ms/round あり、op 整理の対象として残す。
