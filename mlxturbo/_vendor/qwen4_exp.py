@@ -850,12 +850,51 @@ class Attention(nn.Module):
         # 上書きでき、測り直し方は docs/research/KERNEL-PROGRAM.md の段 C。
         kv_len = offset + S
         n_blocks = kv_len // cr
+
+        # **2026-09-03 修正。**この比のガードは `_gather_tile_attn` (union を
+        # 実際に take_along_axis で集めて書く経路) 向けに作った --- union が
+        # 大きいと「集めて書いて読み直す」費用が密の 1 回読みに近づくので、
+        # union の上限 (`rows * token_budget`) を kv_len と比べて弾く。
+        # `_prefill_attn` (段 P1、`mlxturbo/kernels/prefill_attn.py`) は
+        # union を作らない別の算法 (T=1、クエリごとに直接 gather + online
+        # softmax) なので、この比はそもそも無関係な尺度になる。実際、
+        # `enable_prefill_attn` は `_gather_attn_tile` を設定しないため
+        # tile=0 (rows=S) になり、prefill 幅 (S=2048) では
+        # `bound = S * (token_budget//cr)` が kv_len よりずっと大きくなって
+        # **常に** ここで弾かれていた (= カーネルへ一度も届かない)。
+        # 合成マイクロベンチ (`tools/qsa_gather_micro.py`、
+        # `docs/research/LANES-2026-09.md` レーン 3) の実測では、この
+        # カーネルは kv が小さいと dense より遅く (kv=8192 で 1.43 倍遅い)、
+        # kv≈11k を境に有利になる (kv=16896 で 1.50 倍速い)。そこで
+        # `_prefill_attn` が立っているときは比のガードの代わりに kv_len の
+        # しきい値だけで判定する (既定 12288、`MLXTURBO_PREFILL_ATTN_MIN_KV`)。
+        #
+        # **フォールバックの注記**: この分岐に入ると、以降でカーネルが
+        # (形/dtype/cache 種別で) 不適格と判った場合は比のガード無しで
+        # `_gather_tile_attn` まで落ちる。適格性は呼び出し中に変わらない
+        # 形/dtype/cache 種別だけで決まるので実質起きないが、万一起きても
+        # 正しさの問題ではなく速度の問題 (比のガードが弾くはずだった重い
+        # tile-attn 呼び出しが 1 回余分に走るだけ)。
+        # `tile` は下の (フォールバック側の) 従来 tile-attn 経路が無条件に
+        # 参照する (`_prefill_attn` 分岐で早期 return しなかった場合、カーネル
+        # 不適格でここまで落ちてくる)。**分岐の外で必ず定義すること** ---
+        # 一度 else 節の中だけに置いたら、`_prefill_attn=True` かつカーネル
+        # 不適格 (例: 検証幅 S=2 が MIN_S=64 未満で `PA.eligible` が False を
+        # 返す) の実行で `UnboundLocalError` になった (2026-09-03、
+        # `--knob prefill-attn --ctx 17000` の実測で踏んだ)。
         tile = getattr(self, "_gather_attn_tile", 0)
-        rows = tile if 0 < tile < S else S
-        bound = rows * (self.indexer.token_budget // cr)
-        if bound * cr > _gather_max_ratio(
-                self.head_dim, kv_len, self.n_kv_heads) * kv_len:
-            return None
+        if getattr(self, "_prefill_attn", False):
+            min_kv = int(
+                os.environ.get("MLXTURBO_PREFILL_ATTN_MIN_KV", "12288")
+            )
+            if kv_len < min_kv:
+                return None
+        else:
+            rows = tile if 0 < tile < S else S
+            bound = rows * (self.indexer.token_budget // cr)
+            if bound * cr > _gather_max_ratio(
+                    self.head_dim, kv_len, self.n_kv_heads) * kv_len:
+                return None
 
         # 集めるだけの価値があるかを**ホスト側の算数だけ**で判定する。
         #

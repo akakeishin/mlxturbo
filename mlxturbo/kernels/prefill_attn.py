@@ -76,9 +76,20 @@ MIN_S = 64
 # K/V タイル + 選択ブロックの添字列 + simdgroup ごとの本数がここに載る。
 MAX_TG_BYTES = 30 * 1024
 
-# K/V タイルに載せる列数の目安。head_dim 256 / bf16 で BB=4 ブロック
-# (compress_ratio 4 なら 16 列) = K と V で 16KB。
-_TARGET_COLS = 16
+# K/V タイルに載せる列数の目安。head_dim 256 / bf16 なら BB=6 ブロック
+# (compress_ratio 4 なら 24 列) = K と V で 24576 バイト (MAX_TG_BYTES 以内)。
+#
+# **2026-09-03、in-model 判定で本番へ配線 (合成マイクロベンチ候補 (i) と同じ内容)。**
+# 元は 16 列 (BB=4)。`tools/qsa_gather_micro.py` の内訳計測
+# (`docs/research/LANES-2026-09.md` レーン 3) で、K/V の threadgroup 段階 load が
+# 全体の 65-70% を占め、タイルを広げる (16→24 列) と barrier 回数が減って
+# load が 11% 縮むことを確認。合成 (kv=16896, S=2048, dense sdpa 基準比):
+# 元 (16 列) 1.41 倍 → 24 列 1.50 倍、誤差は両方とも相対 7.3e-3 (許容 1.5e-2 以内)
+# で変化なし。24 列を超える (32-128 列) は head_dim=256/bf16 では threadgroup
+# メモリの壁 (32KB) を超えるため不可能 --- 24 列が物理上限に近い。
+# 分割案 (score/softmax を狭い register で処理) は逆に遅くなったため不採用
+# (LANES-2026-09.md 参照)。
+_TARGET_COLS = 24
 
 _KERNELS: dict[tuple, Any] = {}
 _warned: set = set()
