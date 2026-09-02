@@ -1432,3 +1432,13 @@ MLX の capture はモデルの全バッファ (91 GB) を含めて記録する�
 **50k の冷 prefill が相手より速くなった** (94 対 108 s)。17k は 1.06x まで詰まった。朝 (9/2 11:09) からの合算:
 冷 prefill 4k -17% / 17k -18% / 50k -42%、温 TTFT 3 倍速、decode 4k +6% / 17k +16% / 50k +26%。
 これが仮説 A/B に入る前の基準。
+
+## rerank on/off と draft の hit@2 (2026-09-03 09:30、`bench/results/draft-rerank-short.json`、短文脈 3 本 × 512)
+
+- rerank on (A) 対 off (B): ms/round **-5.2%** (A が速い)、tok/round -0.4% (差なし)。粗い 2-bit lm_head での候補絞りは
+  受理率を削っていない。**仮説 7 (rerank が受理率を削る) は棄却。rerank on のまま。**
+- draft の 1 段目: hit@1 = 0.59〜0.70、hit@2 = 0.74〜0.87 (rounds 233〜258)。**hit@2 − hit@1 = 14〜17 ポイント**。
+  木 (top-2 を両方 verify) の上限は 1 段目の受理 +0.17。tok/round 2.2 → 2.4〜2.5 (+10%) の見込みだが、verify 幅が
+  +1 (S=3 → 4) で MoE の重み読みと attention が +5 ms/round (+13%) 増えるので **ms/tok は同着〜負け**。長文脈
+  (depth 1、S=2 → 3) も同様。**仮説 5 (木) は畳む。**取り分が出るのは verify 幅の 1 行追加費用が 2 ms を切った場合
+  (MoE の重み読みが支配的な今の構造では無理)。
