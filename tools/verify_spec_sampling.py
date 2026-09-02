@@ -90,10 +90,10 @@ def sequential(logits, drafts, sampler):
 
 def speculative(eng, logits, drafts, sampler):
     dr = [mx.array([[d]]) for d in drafts]
-    toks, _hypers, _hit = eng._verify(
+    _toks, _hypers, _hit, vals = eng._verify(
         _Cap(logits.shape[1]), logits, dr, 1.0, sampler=sampler
     )
-    return tuple(int(t.item()) for t in toks)
+    return tuple(vals)
 
 
 def chi2_two_sample(a: Counter, b: Counter, min_expected=5.0):
@@ -194,9 +194,9 @@ def main() -> int:
         _orig = SF.FlashSpecEngine._verify
 
         def _broken(self, cap, lg, dr, temp, precomputed=None, sampler=None):
-            toks, hypers, hit = _orig(self, cap, lg, dr, temp, precomputed, sampler)
+            toks, hypers, hit, vals = _orig(self, cap, lg, dr, temp, precomputed, sampler)
             # 採用した全位置に位置 0 のサンプルを使う
-            return [toks[0]] * len(toks), hypers, hit
+            return [toks[0]] * len(toks), hypers, hit, [vals[0]] * len(vals)
 
         SF.FlashSpecEngine._verify = _broken
 

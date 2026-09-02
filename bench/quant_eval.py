@@ -70,6 +70,12 @@ def _load(model_ref: str, ngram: str | None = None, rebit_spec: str | None = Non
         from mlxturbo.ngram_stream import install
 
         install(model, ngram)
+    # engine を直叩きなので server.py の _load() を経由しない -- 常駐条件を
+    # 本番と揃えるため、ここで自前で wire する
+    # (mlxturbo/runner.py の set_wired_limit_default 参照)。
+    from mlxturbo.runner import set_wired_limit_default
+
+    set_wired_limit_default(log_prefix="[quant_eval]")
     if fusions:
         # 出荷経路 (build_runner) が起動時に通す融合・置き換えと同じものを
         # 当てる。これを呼ばないと MLXTURBO_GDN_METAL 等の knob は

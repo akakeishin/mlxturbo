@@ -2204,7 +2204,12 @@ def test_flash_spec_generate_stream_zero_tokens_prefills_without_yield(monkeypat
     import mlxturbo.spec_flash as spec_flash_module
 
     class FakeModel:
-        model = SimpleNamespace()
+        # generate_stream の最終チャンク forward は body (.model) と lm_head を
+        # 別々に呼ぶ (lm_head は末尾 1 行だけ)。__call__ (body+head 一括) は
+        # 経路上もう使われないが、他のフェイク利用箇所と形を揃えて残す。
+        @staticmethod
+        def model(ids, cache=None):
+            return mx.zeros((1, ids.shape[1], 4))
 
         @staticmethod
         def make_cache():
@@ -2213,6 +2218,10 @@ def test_flash_spec_generate_stream_zero_tokens_prefills_without_yield(monkeypat
         @staticmethod
         def __call__(ids, cache=None):
             return mx.zeros((1, ids.shape[1], 4))
+
+        @staticmethod
+        def lm_head(x):
+            return mx.zeros((1, x.shape[1], 4))
 
     @contextmanager
     def fake_capture(_model, light: bool = False):

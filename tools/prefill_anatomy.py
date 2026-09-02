@@ -470,7 +470,7 @@ def main() -> int:
 
     import mlxturbo  # noqa: F401
     import mlx_lm.models.qwen4_exp as Q
-    from mlxturbo.runner import enable_default_fusions
+    from mlxturbo.runner import enable_default_fusions, set_wired_limit_default
     from mlxturbo.spec_flash import _PREFILL_GROUP, _group_prefill_forward
 
     model, tok = load(os.path.expanduser(args.model))
@@ -479,6 +479,10 @@ def main() -> int:
 
         install(model, os.path.expanduser(args.ngram))
     enable_default_fusions(model, log_prefix="[prefill-anatomy]")
+    # engine を直叩きなので server.py の _load() を経由しない -- 常駐条件を
+    # 本番と揃えるため、ここで自前で wire する
+    # (mlxturbo/runner.py の set_wired_limit_default 参照)。
+    set_wired_limit_default(log_prefix="[prefill-anatomy]")
 
     ta = model.args.text
     ple = model.model.layers[model.model.ple_layers[0]].ple

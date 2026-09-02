@@ -1403,6 +1403,45 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         if os.environ.get("MLXTURBO_FAST_ROPE") == "1":
             print(f"{log_prefix} fast_rope 有効 (QK-norm 後の rope を mx.fast.rope へ、{n} 層)")
 
+        # PLE (n-gram) の埋め込みを 48 層ループの前にまとめて計算する。
+        # enable_ple_hoist 自身が MLXTURBO_PLE_HOIST=1 をゲートに持っている
+        # ので、ここでは呼ぶだけで安全 (既定 off が保たれる)。ビット一致
+        # (テーブル呼び出しの入出力は素の経路と同一の値を通すだけ)。
+        n = fused.enable_ple_hoist(model)
+        if os.environ.get("MLXTURBO_PLE_HOIST") == "1":
+            print(f"{log_prefix} ple_hoist 有効 (n-gram 埋め込みを層ループ前に一括計算、{n} 層)")
+
+
+def set_wired_limit_default(log_prefix: str = "") -> int | None:
+    """GPU の推奨ワーキングセット上限まで重みを wire する (常駐させる)。
+
+    mlxturbo-serve (mlxturbo/server.py の `_load`) が起動時に一度だけ設定
+    しているのと同じ処理。mlx_lm の `stream_generate` は生成のたびに
+    `wired_limit()` で巻くが、FlashSpecEngine/SpecEngine を直接叩く経路
+    (tools/decode_ab.py、tools/verify_width_cost.py の `build_runner`、
+    tools/prefill_anatomy.py、tools/qsa_prefill_split.py、
+    bench/quant_eval.py の `_load` など、server.py を経由しない道具全般)
+    はそれを通らない。wire しないと macOS がページを退避・圧縮でき、
+    読み出しが劣化する (docs/research/KERNEL-BRIEF-MOE-GDN.md: lm_head
+    常駐 109GB/s vs 非常駐 315GB/s) -- 常駐条件が本番と違ったまま計測する
+    ことになるので、これらの道具はモデル読み込み直後にこれを呼ぶこと。
+
+    `mx.device_info` (新 API) を優先し、無い mlx バージョンでは非推奨の
+    `mx.metal.device_info` にフォールバックする。
+
+    設定できたら wired limit のバイト数を返す。Metal の無い環境など、
+    設定に失敗した場合は None を返すだけで例外は投げない (道具の起動を
+    止めない -- server.py の既存の except 節と同じ方針)。
+    """
+    try:
+        device_info = getattr(mx, "device_info", None) or mx.metal.device_info
+        rec = device_info()["max_recommended_working_set_size"]
+        mx.set_wired_limit(rec)
+        print(f"{log_prefix} wired limit を {rec / 2**30:.0f}GiB に設定")
+        return rec
+    except Exception as e:  # noqa: BLE001  wire できない環境でも起動は続ける
+        print(f"{log_prefix} wired limit 設定失敗 (続行): {e}")
+        return None
 
 
 def build_runner(

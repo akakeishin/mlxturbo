@@ -83,9 +83,13 @@ def build_runner(args):
 
     # 出荷経路と同じ融合を当てる (decode_ab.py と同じ理由: gather のソートなど
     # 既定 knob が入らないまま測ると閾値がずれる)。
-    from mlxturbo.runner import enable_default_fusions
+    from mlxturbo.runner import enable_default_fusions, set_wired_limit_default
 
     enable_default_fusions(model, log_prefix="[verify_width_cost]")
+    # engine を直叩きなので server.py の _load() を経由しない -- 常駐条件を
+    # 本番と揃えるため、ここで自前で wire する
+    # (mlxturbo/runner.py の set_wired_limit_default 参照)。
+    set_wired_limit_default(log_prefix="[verify_width_cost]")
 
     mtp_path = args.mtp or os.path.join(model_path, "mtp.safetensors")
     q = {"group_size": 64, "bits": args.mtp_bits} if args.mtp_bits else None
@@ -238,7 +242,7 @@ def main() -> int:
                     with capture(model) as cap:
                         lg = _staged_forward(model, rpair, caches)
                     mx.eval(lg)
-                    toks, _hypers, _hit = eng._verify(cap, lg, drafts, 0.0)
+                    toks, _hypers, _hit, _vals = eng._verify(cap, lg, drafts, 0.0)
                     rollback(
                         model, caches, cap, pre,
                         keep=len(toks), total=rpair.shape[1],

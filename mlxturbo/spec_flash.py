@@ -1321,10 +1321,19 @@ class FlashSpecEngine:
         ``pair`` は [cur, d1, ..., dk]。位置 j の logits は pair[j] の次の
         トークンを与える。d1 から順に一致する限り採用し、外れたところで
         打ち切ってその位置のトークンを代わりに出す。最後まで当たれば k+1 個出る。
+
+        戻り値は ``(toks, hypers, hit, vals)`` の 4 つ組 (以前は 3 つ組)。
+        ``vals`` は ``toks`` と同じ順序・長さの Python int リスト。呼び手が
+        欲しいのはほぼ常に int で、下の各分岐はどのみち同期して ``.tolist()``
+        済みの Python int を持っているので、それをそのまま返す。呼び手側で
+        ``toks`` を mx.array のままスライスして ``.item()`` を打つと、評価済み
+        配列に対する新しいスライス演算 (新しい遅延ノード) を都度作ることになり、
+        ラウンドごとに余分な dispatch + 同期が挟まる。
         """
         if not drafts:
-            toks = [self._sample(lg[:, 0], temp, sampler)]
-            return toks, [cap.hyper[:, 0:1]], 0
+            tok = self._sample(lg[:, 0], temp, sampler)
+            toks = [tok]
+            return toks, [cap.hyper[:, 0:1]], 0, [int(tok.item())]
         if temp > 0 or sampler is not None:
             # 位置 j のサンプルは lg[:, j] にしか依存しない (j-1 の採否は
             # 「どこで打ち切るか」を決めるだけ) ので、全位置を先に引いて
@@ -1346,14 +1355,14 @@ class FlashSpecEngine:
                     lg.astype(mx.float32) / temp).reshape(1, k + 1)
             dv = mx.concatenate(drafts, axis=1)
             mx.eval(samp, dv)
-            vals = samp[0].tolist()
+            all_vals = samp[0].tolist()
             dvals = dv[0].tolist()
             hit = 0
-            while hit < k and vals[hit] == dvals[hit]:
+            while hit < k and all_vals[hit] == dvals[hit]:
                 hit += 1
             toks = [samp[:, j:j + 1] for j in range(hit + 1)]
             hypers = [cap.hyper[:, j:j + 1] for j in range(hit + 1)]
-            return toks, hypers, hit
+            return toks, hypers, hit, all_vals[: hit + 1]
 
         # greedy はドラフト位置ごとに .item() で同期せず、argmax と一致判定を
         # まとめて 1 回の同期で取る (1 ラウンドあたり最大 depth+1 回 -> 1 回)。
@@ -1366,14 +1375,14 @@ class FlashSpecEngine:
             nxt_all = mx.argmax(lg, axis=-1)          # (1, k+1)
             dv = mx.concatenate(drafts, axis=1)       # (1, k)
             mx.eval(nxt_all, dv)
-        vals = nxt_all[0].tolist()
+        all_vals = nxt_all[0].tolist()
         dvals = dv[0].tolist()
         hit = 0
-        while hit < k and vals[hit] == dvals[hit]:
+        while hit < k and all_vals[hit] == dvals[hit]:
             hit += 1
         toks = [nxt_all[:, j:j + 1] for j in range(hit + 1)]
         hypers = [cap.hyper[:, j:j + 1] for j in range(hit + 1)]
-        return toks, hypers, hit
+        return toks, hypers, hit, all_vals[: hit + 1]
 
     def _prime_draft_cache(self, ids, hyper):
         """Run the tail of the prompt through the MTP head once ("priming"),
@@ -1435,7 +1444,13 @@ class FlashSpecEngine:
         model = self.model
         caches = caches or model.make_cache()
         with capture(model) as cap:
-            logits = model(ids, cache=caches)
+            # hidden はプロンプト全幅で forward する (cap.hyper が全幅ぶん
+            # 要る -- _prime_draft_cache に渡すため)。lm_head は最後の 1
+            # トークンぶんの行にしか使わない (`cur` は logits[:, -1] からしか
+            # 作らない) ので、そこだけ通す。以前は全幅の logits
+            # (プロンプト長 x vocab) を作って捨てていた。
+            h = model.model(ids, cache=caches)
+            logits = self._head(h[:, -1:])
             mx.eval(logits)
         hyper_prev = cap.hyper[:, -1:]
         mtp_cache = self._prime_draft_cache(ids, cap.hyper)
@@ -1473,7 +1488,7 @@ class FlashSpecEngine:
                 lg = model(pair, cache=caches)
                 mx.eval(lg)
             rounds += 1
-            toks, hypers, hit = self._verify(cap, lg, drafts, 0.0)
+            toks, hypers, hit, vals = self._verify(cap, lg, drafts, 0.0)
             accepted += hit
             if _adapt_eligible:
                 round_ms = (time.perf_counter() - _round_t0) * 1000.0
@@ -1481,7 +1496,7 @@ class FlashSpecEngine:
             keep = len(toks)
             rollback(model, caches, cap, pre, keep=keep, total=total,
                      ids_kept=pair[:, :keep])
-            vals = [int(t.item()) for t in toks][: max_tokens - len(out)]
+            vals = vals[: max_tokens - len(out)]
             out.extend(vals)
             cur, hyper_prev = toks[-1], hypers[-1]
         return out[:max_tokens], accepted, rounds
@@ -1780,9 +1795,12 @@ class FlashSpecEngine:
                     # (実測: 診断で確認)。no-op 時 (checkpoints=None または
                     # chunk 長 1 以下、generate()/検証プローブがこちら) は
                     # head_result が空 tuple で返り、tail_split は False の
-                    # まま従来の分岐に合流する。副次効果として分割時は最終
-                    # チャンクの lm_head が 1 トークン分に縮む (従来は
-                    # チャンク全幅の logits を作って末尾だけ使っていた)。
+                    # まま従来の分岐に合流する。lm_head は checkpoints の
+                    # 有無に関わらず、この最終チャンクの hidden の末尾 1 行
+                    # にしか通さない (hidden 自体は下で全幅 forward する --
+                    # cap.hyper が全幅ぶん要るため)。以前は checkpoints=None
+                    # のときだけチャンク全幅 (最大 PREFILL_STEP_SIZE) の
+                    # logits を作って末尾だけ使っていた。
                     def _forward_head(head):
                         with capture(model, light=True) as cap0:
                             h0 = model.model(head, cache=caches)
@@ -1811,7 +1829,8 @@ class FlashSpecEngine:
                     # argument). The decode loop's verification forward
                     # (below, T<=2) stays on full capture as before
                     with capture(model, light=True) as cap:
-                        logits = model(chunk, cache=caches)
+                        h = model.model(chunk, cache=caches)
+                        logits = self._head(h[:, -1:])
                         mx.eval(logits)
                     if _pf:
                         _t = _pf.log(f"tail forward i={i} j={j}", _t)
@@ -1848,10 +1867,14 @@ class FlashSpecEngine:
                         _pf.log(f"checkpoint i={i}", _t)
             # mx.contiguous, not a bare slice: a slice keeps its parent
             # buffer alive, and these two outlive the call (they are published
-            # as the session's tail for a later diff-0 resume). The last
-            # chunk's ``logits`` is (1, chunk_len, vocab) -- 2GB at
-            # PREFILL_STEP_SIZE with this vocabulary -- so holding a view of it
-            # in every pooled session would retain gigabytes per slot.
+            # as the session's tail for a later diff-0 resume). ``cap.hyper``
+            # is (1, chunk_len, hc*d) for the whole last chunk -- up to
+            # PREFILL_STEP_SIZE wide -- so holding a bare slice view of it in
+            # every pooled session would retain that much per slot.
+            # ``logits`` itself is already just the last row (the lm_head
+            # above only ever runs on ``h[:, -1:]``), but stays
+            # ``mx.contiguous`` too so it does not keep the last chunk's
+            # (possibly wide) hidden-state graph alive.
             hyper_tail0 = mx.contiguous(cap.hyper[:, -1:])
             logits_tail = mx.contiguous(logits[:, -1])
             if max_tokens == 0:
@@ -1994,8 +2017,9 @@ class FlashSpecEngine:
             if timers:
                 phase["verify"] += time.perf_counter() - ts
                 ts = time.perf_counter()
-            toks, hypers, hit = self._verify(cap, lg, drafts, temp, sampler=sampler,
-                                             precomputed=(nxt_all, dv))
+            toks, hypers, hit, vals = self._verify(
+                cap, lg, drafts, temp, sampler=sampler,
+                precomputed=(nxt_all, dv))
             accepted += hit
             if _adapt_eligible:
                 # このラウンドで実際に引いた深さ (drafts はここでは
@@ -2007,7 +2031,6 @@ class FlashSpecEngine:
                 round_ms = (time.perf_counter() - _round_t0) * 1000.0
                 self._depth_controller.observe(hit, len(drafts), round_ms)
 
-            vals = [int(t.item()) for t in toks]
             cut = next((k for k, v in enumerate(vals) if v in eos), None)
             if cut is not None:
                 toks, hypers, vals = toks[: cut + 1], hypers[: cut + 1], vals[: cut + 1]

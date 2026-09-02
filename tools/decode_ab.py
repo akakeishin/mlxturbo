@@ -1338,9 +1338,13 @@ def main() -> int:
     # 入らないまま測っていた (fable-advisor 指摘)。同一ハーネス内の相対比較
     # なら符号は生き残るが、閾値や交差点は構成で動く。
     from mlxturbo.kernels import _fire
-    from mlxturbo.runner import enable_default_fusions
+    from mlxturbo.runner import enable_default_fusions, set_wired_limit_default
 
     enable_default_fusions(model, log_prefix="[decode_ab]")
+    # engine を直叩きなので server.py の _load() を経由しない --
+    # 常駐条件を本番と揃えるため、ここで自前で wire する
+    # (mlxturbo/runner.py の set_wired_limit_default 参照)。
+    set_wired_limit_default(log_prefix="[decode_ab]")
     mtp_path = args.mtp or os.path.join(model_path, "mtp.safetensors")
     q = {"group_size": 64, "bits": args.mtp_bits} if args.mtp_bits else None
     mtp = mtp_flash.load_flash_mtp(os.path.expanduser(mtp_path),
