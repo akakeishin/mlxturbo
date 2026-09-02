@@ -891,6 +891,9 @@ def main() -> int:
     DECODE_ONLY_KNOBS = {
         "hc-write", "moe-verify", "gdn-prework", "depth", "null",
         "rms-norm-gated", "moe-route",
+        # MLXTURBO_PIPELINE は generate_stream の decode ループの中でしか
+        # 読まれない (spec_flash.py:1264)。prefill には触らない。
+        "pipeline",
     }
     if args.prefill_once and args.knob not in DECODE_ONLY_KNOBS:
         print(f"knob={args.knob} は prefill に影響しうるので --prefill-once は"
