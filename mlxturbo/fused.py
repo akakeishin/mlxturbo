@@ -1249,6 +1249,47 @@ def disable_fast_rope(model) -> int:
     return n
 
 
+def enable_ple_hoist(model) -> int:
+    """全 PLE 層の n-gram 埋め込みを層ループの前にまとめて計算する
+    (``Qwen4ExpModel._prelude`` / ``_hoist_ple`` の ``_ple_hoist`` 分岐、
+    `mlxturbo/_vendor/qwen4_exp.py`)。
+
+    PLE の入力は隠れ状態 h に依らず ids と直前文脈だけで決まるので、48 層の
+    ループへ入る前に全部計算できる。素の経路は PLE 層 (Flash-Next で 5 層)
+    それぞれの ``ple_embedding(ids, prev_ctx)`` 呼び出しが n-gram テーブル側の
+    GPU->CPU 同期 (``mlxturbo/ngram_stream.py`` の ``StreamNGram.__call__`` の
+    ``np.array(gid.reshape(-1))``) を挟み、それが `_staged_forward` の 2 層
+    ごとの async_eval 投入をその境界で断ち切っていた。まとめて計算すれば、
+    サイドカーが全 PLE 層で共有されている構成 (``ngram_stream.install()`` 後の
+    ``StreamNGram``/``RamNGram``) では同期は 1 forward で 1 回になる。
+
+    実験的な分岐なので、この関数を呼ぶだけでは何も起きない --- 環境変数
+    `MLXTURBO_PLE_HOIST=1` が立っているときだけ ``_ple_hoist`` を立てる
+    (`enable_fast_rope` と同じ作法)。PLE 層を持たないモデルでは何もしない。
+
+    戻り値は対象になった PLE 層数 (0 なら対象外)。
+    """
+    import os
+
+    if os.environ.get("MLXTURBO_PLE_HOIST") != "1":
+        return 0
+    m = getattr(model, "model", model)
+    n = len(getattr(m, "ple_layers", None) or [])
+    if n:
+        m._ple_hoist = True
+    return n
+
+
+def disable_ple_hoist(model) -> int:
+    """`enable_ple_hoist` を打ち消す。戻り値は 1 (外した) / 0 (元々 off)。
+    A/B で交互に測るために要る。"""
+    m = getattr(model, "model", model)
+    if getattr(m, "_ple_hoist", False):
+        m._ple_hoist = False
+        return 1
+    return 0
+
+
 __all__ = [
     "enable_gather_sort",
     "enable_gdn_blocked_kernel",
@@ -1279,4 +1320,6 @@ __all__ = [
     "disable_fast_rope",
     "enable_sdpa_split",
     "disable_sdpa_split",
+    "enable_ple_hoist",
+    "disable_ple_hoist",
 ]

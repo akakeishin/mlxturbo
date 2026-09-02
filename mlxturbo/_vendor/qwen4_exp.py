@@ -10,6 +10,10 @@
 #      the reference implementation)
 #   6. With FASTMLX_NGRAM_DISK=1, do not hold the n-gram table (read rows from
 #      disk instead)
+#   7. With `Qwen4ExpModel._ple_hoist` set (mlxturbo/fused.py:enable_ple_hoist,
+#      gated by MLXTURBO_PLE_HOIST=1), precompute every PLE layer's n-gram
+#      embedding before the layer loop instead of once per PLE layer inside it
+#      (see `_prelude`/`_hoist_ple`/`PLELayer.__call__`)
 # (mlx-lm proper has no MTP module, so a strict load fails. MTP is extracted
 #  into a sidecar with mlxturbo/convert_flash.py extract-mtp and used from there.)
 # Resolution: importing `mlxturbo` makes `mlxturbo/_arch_registry.py` install a
@@ -1566,7 +1570,19 @@ class PLELayer(nn.Module):
     def __call__(
         self, hidden: mx.array, ids: mx.array, prev_ctx: mx.array, cache
     ) -> mx.array:
-        emb = self.ple_embedding(ids, prev_ctx).astype(hidden.dtype)
+        # `MLXTURBO_PLE_HOIST=1` (`Qwen4ExpModel._hoist_ple`): the caller may
+        # have precomputed this layer's n-gram embedding before the layer loop
+        # and stashed it here (same attribute-injection idiom as `_wide_qkv` /
+        # `_gather_stats` elsewhere in this file). Consume-and-clear so a
+        # value never lingers into a forward that does not hoist (e.g.
+        # `spec_flash._group_prefill_forward`, which calls this directly and
+        # never sets the attribute).
+        hoisted = getattr(self, "_hoisted_emb", None)
+        if hoisted is not None:
+            self._hoisted_emb = None
+            emb = hoisted.astype(hidden.dtype)
+        else:
+            emb = self.ple_embedding(ids, prev_ctx).astype(hidden.dtype)
         key = self.norm_key(self.key_proj(emb))
         key = key.reshape(*key.shape[:-1], self.hc, self.d)
         value = self.value_proj(emb)
@@ -1672,6 +1688,64 @@ class Qwen4ExpModel(nn.Module):
         `_tail_window`。"""
         pc[3] = _tail_window(pc, cat, ctx_len)
 
+    def _hoist_ple(self, ids, prev_ctx) -> None:
+        """全 PLE 層ぶんの n-gram 埋め込みを層ループの前にまとめて計算し、
+        各 `PLELayer` へ `_hoisted_emb` として渡す (`_ple_hoist` が立っている
+        ときだけ `_prelude` から呼ばれる。既定は呼ばれない = 素の経路)。
+
+        PLE の入力は隠れ状態 h に依らず ids と直前文脈だけで決まる
+        (`PLELayer.__call__` 参照) ので、48 層のループへ入る前に全部計算できる。
+        素の経路では PLE 層 (Flash-Next で約 5 層) それぞれの
+        `ple_embedding(ids, prev_ctx)` 呼び出しが n-gram テーブル側の
+        GPU->CPU 同期 (`mlxturbo/ngram_stream.py` の `StreamNGram.__call__` の
+        `np.array(gid.reshape(-1))`、resident 経路では `_ShardedEmbedding` の
+        `np.unique` も同様) を挟み、それが `mlxturbo/spec_flash.py` の
+        `_staged_forward` が 2 層ごとに挟む `async_eval` 投入をその境界で
+        断ち切っていた。
+
+        テーブルが全 PLE 層で共有されている構成 (`ngram_stream.install()` 後の
+        `StreamNGram`/`RamNGram` --- 全層に同一インスタンスが差し込まれる)
+        では、gid を全層ぶん連結してから 1 回だけ呼ぶので、その同期は
+        1 forward で 1 回になる。共有されていない構成 (サイドカー未 install の
+        素の `_ShardedEmbedding`、層ごとに別テーブル) では層ごとに呼ぶしかない
+        --- それでも層ループより前に前倒しする分だけ非同期投入は途切れにくく
+        なるが、同期の回数そのものは変わらない。
+
+        ハッシュ計算 (`NGramEmbedding.ngram_ids`) は `layer_multipliers`/
+        vocab オフセットが層ごとに違う (`NGramEmbedding.__init__` の
+        `ple_layer_index`) ので共有できず、層ごとに計算する。テーブル呼び出し
+        の入出力は素の経路 (`NGramEmbedding.__call__`) と同一の値を通すだけ
+        なのでビット一致は保たれる。
+        """
+        ple_modules = [self.layers[i].ple for i in self.ple_layers]
+        if not ple_modules:
+            return
+
+        n_new = ids.shape[1]
+        history = mx.concatenate([prev_ctx, ids], axis=1)
+        # 層ごとの gid (層ごとに違う layer_multipliers/vocab オフセットを使う
+        # ので、この計算だけは共有できない)
+        gids = [pl.ple_embedding.ngram_ids(history)[:, -n_new:] for pl in ple_modules]
+
+        tables = [pl.ple_embedding.ngram_embedding for pl in ple_modules]
+        shared = len(tables) > 1 and all(t is tables[0] for t in tables[1:])
+
+        if shared:
+            sizes = [g.shape[-1] for g in gids]
+            cat = mx.concatenate(gids, axis=-1)
+            # 同期はここで 1 回だけ (StreamNGram.__call__ / _ShardedEmbedding
+            # のどちらも gid 全体を丸ごと受け取ってから 1 回だけ host に降りる)
+            flat = tables[0](cat)  # (B, n_new, sum(heads), dim)
+            idx = 0
+            for pl, g, n_heads in zip(ple_modules, gids, sizes):
+                part = flat[..., idx : idx + n_heads, :]
+                idx += n_heads
+                pl._hoisted_emb = part.reshape(*g.shape[:2], -1)
+        else:
+            for pl, g in zip(ple_modules, gids):
+                emb = pl.ple_embedding.ngram_embedding(g)
+                pl._hoisted_emb = emb.reshape(*g.shape[:2], -1)
+
     def _prelude(self, ids, h, cache):
         """層ループの前段。``(mask, conv_mask, prev_ctx)`` を返す。
 
@@ -1697,6 +1771,8 @@ class Qwen4ExpModel(nn.Module):
                 self._store_ngram_ctx(
                     pc, mx.concatenate([prev_ctx, ids], axis=1), ctx_len
                 )
+            if getattr(self, "_ple_hoist", False):
+                self._hoist_ple(ids, prev_ctx)
         return mask, conv_mask, prev_ctx
 
     def __call__(self, ids: mx.array, cache=None, input_embeddings=None):

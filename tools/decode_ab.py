@@ -249,6 +249,48 @@ def _knob_fast_rope(ctx):
     return apply
 
 
+def _knob_ple_hoist(ctx):
+    """PLE (n-gram) 埋め込みの層ループ前一括計算 (`MLXTURBO_PLE_HOIST`、既定
+    off)。A = 有効 / B = 無効 (既定)。
+
+    PLE の入力は隠れ状態 h に依らず ids と直前文脈だけで決まる
+    (`mlxturbo/_vendor/qwen4_exp.py` の `PLELayer.__call__`) ので、48 層の
+    ループへ入る前にまとめて計算できる。素の経路は PLE 層 (Flash-Next で
+    5 層) それぞれの `ple_embedding(ids, prev_ctx)` 呼び出しが n-gram
+    テーブル側の GPU->CPU 同期 (`StreamNGram.__call__` の
+    `np.array(gid.reshape(-1))`) を挟み、それが `_staged_forward` の 2 層
+    ごとの async_eval 投入をその境界で断ち切っていた。まとめて計算すれば、
+    サイドカーが全 PLE 層で共有されている構成 (`--ngram` install 後) では
+    その同期は 1 forward で 1 回になる。
+
+    `ngram-prefetch` (先読みでキャッシュを温める) とは別の仕組み --- あちらは
+    ディスク I/O の待ちを隠す狙いで、17k の in-model A/B で取り分 0% だった
+    (`docs/research/SESSION-2026-09-02-CATCHUP.md`)。こちらは I/O 待ちでは
+    なく、同期そのものが `_staged_forward` の async_eval 投入を断ち切る回数を
+    減らす狙いなので、別の勝ち筋のはず --- ただし実測は本 knob で取ること。
+
+    テーブル呼び出しの入出力は素の経路と同一の値を通すだけなので出力は
+    一致するはず (`control_identical=True`)。prefill (chunk-major の末尾
+    チャンク、`Qwen4ExpModel.__call__` 経由) にも効くので `DECODE_ONLY_KNOBS`
+    には入れない (`_group_prefill_forward` の layer-major 経路は `_prelude`
+    を呼ばないので対象外のまま、ビットは動かない)。
+    """
+    from mlxturbo import fused
+
+    os.environ["MLXTURBO_PLE_HOIST"] = "1"  # enable 側のゲートを開ける
+    eng = ctx["eng"]
+
+    def apply(variant):
+        if variant == "A":
+            n = fused.enable_ple_hoist(eng.model)
+            if n == 0:
+                raise ValueError("ple-hoist: PLE 層が見つからない (PLE 無しのモデル?)")
+        else:
+            fused.disable_ple_hoist(eng.model)
+
+    return apply
+
+
 def _knob_gdn_prework(ctx):
     """A = GDN 前処理の融合カーネル on / B = off (既定)。
 
@@ -1147,6 +1189,9 @@ KNOBS = {
     "qsa-tail": (_knob_qsa_tail, ["A", "B"], True, "B"),
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
     "fast-rope": (_knob_fast_rope, ["A", "B"], False, "B"),
+    # A = PLE 埋め込みを層ループ前に一括計算 / B = 素 (既定)。判定は決めていない
+    # (第 1 段は実測前)。出力一致は要求する (control_identical=True)。
+    "ple-hoist": (_knob_ple_hoist, ["A", "B"], True, "B"),
     "gdn-prework": (_knob_gdn_prework, ["A", "B"], False, "B"),
     "gdn-blocked": (_knob_gdn_blocked, ["A", "B"], False, "B"),
     "gdn-metal": (_knob_gdn_metal, ["A", "B"], False, "B"),
