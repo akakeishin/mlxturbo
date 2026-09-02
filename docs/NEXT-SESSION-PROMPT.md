@@ -72,10 +72,8 @@ GPU は `tools/biglock.sh` で 1 本ずつ直列。親の連鎖スクリプト�
 下の順番を手で流せばよい (コマンドは各行に書いた)。
 
 GPU の待ち行列 (順に):
-1. **HC カーネルの検証** (Sonnet agent が biglock で走行中、`mlxturbo/kernels/hyper_connection.py` 未コミット)。
-   判定: `tools/kernel_chain_cost.py` の HC 項目 ≤ 20 us/回、`scratchpad/hc_modes_inmodel.py --ctx 0 --widths 1,2`
-   で kernel 列が plain 23.9 ms を 2 ms 以上下回る。合格ならコミットして `MLXTURBO_HC_INJECT_BF16` を既定 on。
-   不合格なら差分は knob の裏に残して既定 off のまま。終わったら親が `bench/results/logs/hc.done` を置く。
+1. **HC カーネルの検証: 済 (畳んだ)**。連鎖 41 us、in-model で素より 7.6 ms 遅い。差分はコミット済みで
+   既定 off。次の手は HC の低ランク射影を隣の行列積に畳む案と、`MLXTURBO_HC=compiled` の A/B。
 2. モデル無しの仮説マイクロ `scratchpad/hyp_micros.py` (KV の slice 代入が全長コピーか、MoE decode の take+qmm)。
    結果は `bench/results/logs/hyp-micros.log`。N に比例するコピーが出たら `mx.slice_update` で直す (レーン 11)。
 3. depth 適応 margin 版の 17k A/B (`decode_ab --knob depth-adapt --only long --ctx 17000 --tokens 512 --prefill-once`)。
@@ -106,7 +104,10 @@ CLAUDE.md の knob の段落も直す。フルテスト (対 mlx-serve) と over
 3. **フルベンチ (対 mlx-serve)**: A/B が落ち着いた時点で。**mlx-serve は最新版を取り直してビルドし直す**
    (`git -C ~/dev/mlx-serve pull` → `scripts/build-mlx.sh` / `zig build`、`--mtp` の既定や knob の変更を
    `[spec-stats]` のログで確認)。冷えた機体で 0/4k/17k/25k/32k/50k、必要なら 100k を 1 本。
-   overnight tier (`bench/suite/run.py --tier overnight`) はこの節目でユーザーに聞いてから。
+   **overnight tier はやらない** (ユーザー方針 2026-09-03 08:00)。フルベンチで課題が見つかったら、もう一度
+   仮説検証に戻る。
+4. **フルベンチの後**: Qwen3.8-27B 4-bit と Qwen3.6-35B-A3B 4-bit を検証に加える (量子化ビットは揃える)。
+   まず Qwen 系を仕上げる。Gemma はその後。
 
 ## 残っているレーン (順に)
 
