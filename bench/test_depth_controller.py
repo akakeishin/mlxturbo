@@ -14,9 +14,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mlxturbo.spec_flash import (
     DepthController,
+    _depth_adapt_min_pos_default,
     _depth_beta_default,
     _depth_cap_default,
     _depth_cost_params,
+    _depth_explore_every_default,
 )
 
 
@@ -89,6 +91,10 @@ def test_choose_matches_bruteforce_argmax():
     """choose() が探索する範囲 (cap まで) を総当たりした結果と一致する。"""
     ctl = DepthController()
     ctl.a[0], ctl.a[1], ctl.a[2] = 0.6, 0.9, 0.2
+    # 「たった今観測した」ことにして、選択時の陳腐化平均 (_effective_a、
+    # 2026-09-03 の搾取の罠対策) が効かないようにする -- このテストが見たいのは
+    # E(m)/T(m) の argmax 計算そのもので、陳腐化の扱いは別テストの対象。
+    ctl.last_observed_round[0] = ctl.last_observed_round[1] = ctl.last_observed_round[2] = 0
     for pos in (0, 4000):
         t1, dt = _depth_cost_params(pos)
         cap = _depth_cap_default(pos)
@@ -139,6 +145,9 @@ def test_cost_ema_shifts_choice_away_from_linear_model():
     # beta=0 で位置別 a[] を凍結し、費用 EMA だけの効果を見る
     ctl = DepthController(beta=0.0)
     ctl.a[0] = ctl.a[1] = ctl.a[2] = 0.5
+    # 「たった今観測した」ことにして陳腐化平均 (_effective_a) を避ける
+    # (このテストは費用 EMA だけの効果を見たい)
+    ctl.last_observed_round[0] = ctl.last_observed_round[1] = ctl.last_observed_round[2] = 0
 
     # cold start (cost_ema が空): 線形モデル T1=25, dT=7 のままだと depth 1
     assert ctl.choose(0) == 1
@@ -171,3 +180,76 @@ def test_cost_ema_extrapolates_from_nearest_observed_depth():
     assert ctl._cost_for(3, 0) == 40.0 + dt
     # depth=2 (観測済み): EMA そのもの
     assert ctl._cost_for(2, 0) == 40.0
+
+
+def test_depth_adapt_min_pos_switches_regime(monkeypatch):
+    """`_effective_depth` (FlashSpecEngine) が controller を使い始める境界。
+
+    既定は ctx_limit そのもの: pos < min_pos は静的規則 (`choose_depth`)
+    のまま、pos >= min_pos だけ controller を使う (2026-09-03、短文脈 A/B で
+    位置別 EMA の搾取の罠がまだ静的 depth 2 に負けていたための切り分け)。
+    `FlashSpecEngine` はモデルが要るのでこのファイルの対象外 -- ここでは
+    境界そのものと env 上書きを検証する (`_effective_depth` のドキュメント
+    参照)。
+    """
+    monkeypatch.delenv("MLXTURBO_DEPTH_ADAPT_MIN_POS", raising=False)
+    ctx_limit = 2048
+    min_pos = _depth_adapt_min_pos_default(ctx_limit)
+    assert min_pos == ctx_limit
+    # 境界ちょうどで切り替わる: 直前は静的規則側、境界以降は controller 側
+    assert (ctx_limit - 1) < min_pos
+    assert ctx_limit >= min_pos
+
+    # 境界は文脈長 (ctx_limit) が変われば追随する (モデルごとの
+    # depth_ctx_limit をそのまま使う設計)
+    assert _depth_adapt_min_pos_default(500) == 500
+
+    monkeypatch.setenv("MLXTURBO_DEPTH_ADAPT_MIN_POS", "512")
+    assert _depth_adapt_min_pos_default(ctx_limit) == 512
+    # 無効な値 (負、非数値) は既定 (ctx_limit) に落ちる
+    monkeypatch.setenv("MLXTURBO_DEPTH_ADAPT_MIN_POS", "-1")
+    assert _depth_adapt_min_pos_default(ctx_limit) == ctx_limit
+    monkeypatch.setenv("MLXTURBO_DEPTH_ADAPT_MIN_POS", "not-a-number")
+    assert _depth_adapt_min_pos_default(ctx_limit) == ctx_limit
+
+
+def test_depth_explore_every_env_override(monkeypatch):
+    monkeypatch.delenv("MLXTURBO_DEPTH_EXPLORE", raising=False)
+    assert _depth_explore_every_default() == 32
+    monkeypatch.setenv("MLXTURBO_DEPTH_EXPLORE", "10")
+    assert _depth_explore_every_default() == 10
+    assert DepthController().explore_every == 10
+    # 0 は「無効化」として尊重する (負や非数値は既定に落ちる)
+    monkeypatch.setenv("MLXTURBO_DEPTH_EXPLORE", "0")
+    assert _depth_explore_every_default() == 0
+    monkeypatch.setenv("MLXTURBO_DEPTH_EXPLORE", "-5")
+    assert _depth_explore_every_default() == 32
+
+
+def test_periodic_explore_forces_cap_and_updates_a1():
+    """搾取の罠の再現と手当て: depth 1 の受理だけが続くと a[1] は一度も
+    観測されずに古い (低い) 値のまま居座り、choose() は二度と深くを選ばない
+    ---はずだが、explore_every ラウンドに 1 回、choose() は期待値計算を
+    無視して cap を強制する。そのラウンドで observe() すれば a[1] が更新される。
+    """
+    ctl = DepthController(beta=0.0, explore_every=4)  # beta=0: a[] を手で固定
+    ctl.a[0], ctl.a[1] = 0.95, 0.05  # depth 1 は魅力的、depth 2 以降は不魅力的
+    ctl.last_observed_round[0] = ctl.last_observed_round[1] = 0  # 陳腐化平均を避ける
+    cap = _depth_cap_default(0)
+    assert cap >= 2
+
+    # 3 ラウンド分は explore_every の倍数に当たらないので、a[1] が低いまま
+    # 通常どおり depth 1 に居座る
+    depths = [ctl.choose(0) for _ in range(3)]
+    assert depths == [1, 1, 1]
+    assert ctl.observations[1] == 0
+    assert ctl.last_observed_round[1] == 0  # まだ再観測されていない
+
+    # 4 回目 (round_count が explore_every=4 の倍数) は cap を強制する
+    depth4 = ctl.choose(0)
+    assert depth4 == cap
+
+    # 強制探索ラウンドで実際に observe すれば、居座っていた a[1] が更新される
+    ctl.observe(n_accepted=cap, depth=cap)
+    assert ctl.observations[1] == 1
+    assert ctl.last_observed_round[1] == 4

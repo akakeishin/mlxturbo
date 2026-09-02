@@ -240,6 +240,60 @@ def _depth_beta_default() -> float:
     return _DEPTH_EMA_BETA_DEFAULT
 
 
+# 2026-09-03 の 2 回目の短文脈 A/B (bench/results/depth-adapt2-short.json):
+# 費用モデルを直しても依然 +3.6% 負け。原因は位置別 EMA 側の「搾取の罠」--
+# depth 1 を選び続ける限り a[1] 以降は一度も観測されず、古い (低い) 値に
+# 固定されたままなので、たとえ実際の受理率が回復していても depth を
+# 上げる理由が二度と出てこない。2 つの手当て:
+#
+#   (1) explore_every ラウンドに 1 回、期待値計算を無視して cap を強制する
+#       (下 choose() 参照)。これで a[1] 以降が定期的に必ず更新される。
+#   (2) 最後の観測から stale_rounds 経った (または一度も観測していない)
+#       位置は、選択時 (choose 呼び出し時) だけ事前値 0.85 との平均に戻す
+#       (_effective_a 参照)。self.a 自体は書き換えない -- 観測が来れば
+#       そのまま元の EMA から続きを更新する。「低く出たまま化石化する」の
+#       ではなく、時間が経つほど「分からない」に寄っていく形にする。
+_DEPTH_EXPLORE_EVERY_DEFAULT = 32
+_DEPTH_STALE_ROUNDS_DEFAULT = 64
+
+
+def _depth_explore_every_default() -> int:
+    """periodic re-exploration の周期 (ラウンド数)。MLXTURBO_DEPTH_EXPLORE が
+    最優先、無ければ 32。0 (または負) を指定すると無効化する。"""
+    env = os.environ.get("MLXTURBO_DEPTH_EXPLORE")
+    if env:
+        try:
+            v = int(env)
+        except ValueError:
+            v = None
+        if v is not None and v >= 0:
+            return v
+    return _DEPTH_EXPLORE_EVERY_DEFAULT
+
+
+def _depth_adapt_min_pos_default(ctx_limit: int) -> int:
+    """``FlashSpecEngine._effective_depth`` が controller を使い始める最小
+    位置。既定は ``ctx_limit`` (= 静的規則 ``choose_depth`` が depth 1 に
+    落とす境界) そのもの -- 静的規則が depth 2 を返す短文脈側では、
+    controller ではなく静的規則をそのまま使う。
+
+    2026-09-03 の短文脈 A/B (bench/results/depth-adapt2-short.json) で、
+    費用モデルを直したあとも位置別 EMA の搾取の罠でまだ静的 depth 2 に
+    負けていた。17k の長文脈側は 1 回目の A/B (費用モデルが壊れていた版)
+    でも -6.0% と勝っていたので、まず静的規則が甘くなる長文脈だけに
+    controller を絞る。MLXTURBO_DEPTH_ADAPT_MIN_POS で境界を上書きできる。
+    """
+    env = os.environ.get("MLXTURBO_DEPTH_ADAPT_MIN_POS")
+    if env:
+        try:
+            v = int(env)
+        except ValueError:
+            v = -1
+        if v >= 0:
+            return v
+    return ctx_limit
+
+
 # choose() が探索する depth の上限 (cap) の既定の境界。choose_depth 側の
 # DEPTH_CONTEXT_LIMIT (既定 = モデルの indexer_budget) とは別の定数 --
 # こちらは相手の規則にならって文脈長 2048 に固定してある。in-model の
@@ -315,6 +369,17 @@ class DepthController:
     張り付いて既定の静的 depth 2 に ms/tok で負けたため、絶対値としては
     使わなくした。
 
+    費用モデルを直した後の 2 回目の短文脈 A/B
+    (bench/results/depth-adapt2-short.json) でもまだ負けていて、原因は
+    位置別 EMA の**搾取の罠**だった -- depth 1 を選び続けると a[1] 以降が
+    一度も観測されず、古い値のまま固定されて二度と深く選ばれない。
+    ``explore_every`` ラウンドに 1 回 cap を強制する周期的な再探索と、
+    ``stale_rounds`` 経った位置を選択時だけ事前値に寄せる減衰
+    (``_effective_a``) の 2 つで手当てしてある。呼び出し側
+    (``FlashSpecEngine._effective_depth``) 側でも、静的規則が depth 2 を
+    返す短文脈では controller 自体を使わない配線にしてあり (env
+    MLXTURBO_DEPTH_ADAPT_MIN_POS)、この 2 つは独立に効く。
+
     副作用を持たない (発火の記録は呼び出し側の責務 --
     ``FlashSpecEngine._effective_depth`` を参照)。単体テストが直接構成できる
     よう、依存はコンストラクタ引数だけに閉じてある。
@@ -322,9 +387,12 @@ class DepthController:
 
     def __init__(self, max_depth: int = _DEPTH_CONTROLLER_MAX,
                  beta: float | None = None,
-                 prior: float = _DEPTH_EMA_PRIOR):
+                 prior: float = _DEPTH_EMA_PRIOR,
+                 explore_every: int | None = None,
+                 stale_rounds: int = _DEPTH_STALE_ROUNDS_DEFAULT):
         self.max_depth = max_depth
         self.beta = beta if beta is not None else _depth_beta_default()
+        self.prior = prior
         self.a = [prior] * max_depth
         # 検査用: 各位置が何回観測されたか (単体テストと分布確認に使う)。
         self.observations = [0] * max_depth
@@ -332,6 +400,18 @@ class DepthController:
         # だけを持つ (「観測が無い」を空扱いで区別する)。
         self.cost_ema: dict[int, float] = {}
         self.cost_observations: dict[int, int] = {}
+        # 搾取の罠の手当て (上のモジュールコメント参照)。round_count は
+        # choose() の呼び出し回数そのもの (= このコントローラが実際に相談
+        # された回数) を数える論理時計 -- 実ラウンド数と厳密に 1:1 ではない
+        # (draft の先組みで 1 ラウンドずれることがある) が、周期性と
+        # 経過判定には十分。
+        self.explore_every = (
+            explore_every if explore_every is not None
+            else _depth_explore_every_default()
+        )
+        self.stale_rounds = stale_rounds
+        self.round_count = 0
+        self.last_observed_round: list[int | None] = [None] * max_depth
 
     def observe(self, n_accepted: int, depth: int,
                 round_ms: float | None = None) -> None:
@@ -357,6 +437,7 @@ class DepthController:
                 break
             self.a[i] = (1.0 - self.beta) * self.a[i] + self.beta * obs
             self.observations[i] += 1
+            self.last_observed_round[i] = self.round_count
         if round_ms is not None and round_ms >= 0:
             self._observe_cost(depth, round_ms)
 
@@ -368,12 +449,18 @@ class DepthController:
         )
         self.cost_observations[depth] = self.cost_observations.get(depth, 0) + 1
 
-    def expected_tokens(self, m: int) -> float:
-        """E(m) = 1 + sum(i<m) prod(j<=i) a[j] の閉じた式。"""
+    def expected_tokens(self, m: int, a: list[float] | None = None) -> float:
+        """E(m) = 1 + sum(i<m) prod(j<=i) a[j] の閉じた式。
+
+        ``a`` を省略すると ``self.a`` (生の EMA) をそのまま使う。``choose``
+        は古い位置を事前値へ寄せた ``_effective_a()`` のスナップショットを
+        渡す。
+        """
+        src_a = self.a if a is None else a
         total = 1.0
         prod = 1.0
         for i in range(m):
-            prod *= self.a[i]
+            prod *= src_a[i]
             total += prod
         return total
 
@@ -394,13 +481,40 @@ class DepthController:
         nearest = min(self.cost_ema, key=lambda k: abs(k - m))
         return self.cost_ema[nearest] + dt * (m - nearest)
 
+    def _effective_a(self) -> list[float]:
+        """``choose`` が使う a[] のスナップショット。
+
+        最後の観測から ``stale_rounds`` 以上経った位置 (一度も観測して
+        いない位置を含む) は、``self.a`` を書き換えずに**この呼び出しの
+        中でだけ**事前値との平均に戻す -- 「一度低く (または高く) 出た
+        まま、二度と検証されず居座る」搾取の罠を防ぐ。観測が実際に来れば
+        ``observe`` が ``self.a`` を元の EMA からそのまま更新するので、
+        ここでの平均化が学習した値を消すことはない。
+        """
+        out = list(self.a)
+        for i in range(self.max_depth):
+            last = self.last_observed_round[i]
+            if last is None or (self.round_count - last) >= self.stale_rounds:
+                out[i] = (out[i] + self.prior) / 2.0
+        return out
+
     def choose(self, pos: int) -> int:
-        """E(m)/T(m) を最大にする m (1..cap) を返す。"""
+        """E(m)/T(m) を最大にする m (1..cap) を返す。
+
+        ``explore_every`` ラウンドに 1 回 (``explore_every>0`` のとき)、
+        期待値計算を無視して cap そのものを強制する -- depth 1 に居座って
+        いる間は position>=1 の a[] が一度も観測されない (搾取の罠) ので、
+        定期的に深く引いて更新の機会を作る。
+        """
         cap = min(_depth_cap_default(pos), self.max_depth)
+        self.round_count += 1
+        if self.explore_every > 0 and self.round_count % self.explore_every == 0:
+            return cap
+        a = self._effective_a()
         best_m, best_score = 1, -1.0
         for m in range(1, cap + 1):
             cost = self._cost_for(m, pos)
-            score = self.expected_tokens(m) / cost if cost > 0 else 0.0
+            score = self.expected_tokens(m, a) / cost if cost > 0 else 0.0
             if score > best_score:
                 best_score, best_m = score, m
         return best_m
@@ -979,6 +1093,10 @@ class FlashSpecEngine:
         # の verify 後で観測する。
         self._depth_adapt = MLXTURBO_DEPTH_ADAPT
         self._depth_controller = DepthController() if self._depth_adapt else None
+        # controller を使い始める最小位置 (既定 = depth_ctx_limit そのもの
+        # -- 静的規則が depth 2 を返す短文脈側は静的規則のまま)。
+        # _depth_adapt が off でも計算しておいて害はない (未使用のまま)。
+        self._depth_adapt_min_pos = _depth_adapt_min_pos_default(self.depth_ctx_limit)
         # draft-rerank (mlx-serve の設計の移植): trunk lm_head の 2bit 再量子化で
         # 全語彙を粗く読み、正確な top-32 だけを trunk のヘッドの行で再採点する。
         # 粗い top-32 に真の argmax が入っている限り draft は trunk と一致し、
@@ -1068,10 +1186,16 @@ class FlashSpecEngine:
         (DEPTH_CONTEXT_LIMIT の注記を参照)。政策そのものは
         `choose_depth` (純関数) に閉じてある。
 
-        `MLXTURBO_DEPTH_ADAPT=1` のときだけ、代わりに `self._depth_controller`
-        (受理率 EMA) が選ぶ。既定 (off) の経路は 1 ビットも変わらない。
+        `MLXTURBO_DEPTH_ADAPT=1` のときも、`pos < self._depth_adapt_min_pos`
+        (既定 = depth_ctx_limit、静的規則が depth 2 を返す短文脈) では
+        静的規則のまま。controller を使うのは `pos >= self._depth_adapt_min_pos`
+        (静的規則が depth 1 に落とす長文脈) だけ -- 2026-09-03 の短文脈 A/B
+        で、位置別 EMA の搾取の罠 (depth 1 に居る間は a[1] 以降が更新
+        されない) がまだ静的 depth 2 に負けていたため、まず静的規則が
+        甘くなる領域だけに controller を絞った。既定 (adapt off、または
+        pos が境界未満) の経路は 1 ビットも変わらない。
         """
-        if self._depth_adapt:
+        if self._depth_adapt and pos >= self._depth_adapt_min_pos:
             m = self._depth_controller.choose(pos)
             _fire.bump(f"depth_adapt_{m}")
             return m
@@ -1280,10 +1404,20 @@ class FlashSpecEngine:
             # は挟まない -- 下の mx.eval(lg) が元々あった同期点なので、
             # ここで測っても新たな同期は増えない)。既定 off では
             # perf_counter() を 1 回余計に呼ぶだけで、mx.eval の追加は無い。
-            _round_t0 = time.perf_counter() if self._depth_adapt else None
+            # _round_pos は _effective_depth に渡すのと同じ式 -- ここでは
+            # まだ len(out) を更新していないので、この round の draft を
+            # 選んだときの pos と一致する (controller を実際に使ったかどうか
+            # の判定に使う。observe をその regime にだけ絞るのが目的:
+            # cost_ema は文脈長で費用が違うので、短文脈の実測を長文脈の
+            # 判断に混ぜると壊れる)。
+            _round_pos = ids.shape[1] + len(out)
+            _adapt_eligible = (
+                self._depth_adapt and _round_pos >= self._depth_adapt_min_pos
+            )
+            _round_t0 = time.perf_counter() if _adapt_eligible else None
             drafts = self._draft_chain(
                 cur, hyper_prev, mtp_cache,
-                self._effective_depth(ids.shape[1] + len(out)),
+                self._effective_depth(_round_pos),
             )
             pair = mx.concatenate([cur] + drafts, axis=1)
             total = pair.shape[1]
@@ -1294,7 +1428,7 @@ class FlashSpecEngine:
             rounds += 1
             toks, hypers, hit = self._verify(cap, lg, drafts, 0.0)
             accepted += hit
-            if self._depth_adapt:
+            if _adapt_eligible:
                 round_ms = (time.perf_counter() - _round_t0) * 1000.0
                 self._depth_controller.observe(hit, len(drafts), round_ms)
             keep = len(toks)
@@ -1732,6 +1866,13 @@ class FlashSpecEngine:
         while len(out) < max_tokens:
             # depth-adapt の費用 EMA 用 (generate() と同じ理由 -- 既存の
             # 同期点で測るだけで、新たな mx.eval は増やさない)。
+            # _round_pos はこの round の drafts を選んだときの pos と一致
+            # する (next_drafts 経由でも、前ラウンド末尾で
+            # `base_pos + n + len(out) + len(vals)` として計算した値が、
+            # out.extend(vals) 後のここでの len(out) と揃うので同じ式になる。
+            # generate() 側のコメントも参照)。observe を controller が
+            # 実際に相談された regime にだけ絞る (cost_ema が文脈長で
+            # 意味が違う値を混ぜないため)。
             #
             # 制約: MLXTURBO_PIPELINE 有効時、`pending` 経由のラウンドは
             # このラウンドの GPU 仕事が実は**前のラウンドの余り時間**で
@@ -1739,7 +1880,11 @@ class FlashSpecEngine:
             # 実際の depth 依存コストを過小評価する。pipeline は既定 off
             # かつ depth-adapt との組み合わせは今回のゲート対象外なので、
             # 単純な「ループ先頭から hit 確定まで」のまま許容している。
-            _round_t0 = time.perf_counter() if self._depth_adapt else None
+            _round_pos = base_pos + n + len(out)
+            _adapt_eligible = (
+                self._depth_adapt and _round_pos >= self._depth_adapt_min_pos
+            )
+            _round_t0 = time.perf_counter() if _adapt_eligible else None
             if timers:
                 ts = time.perf_counter()
             if pending is not None:
@@ -1805,7 +1950,7 @@ class FlashSpecEngine:
             toks, hypers, hit = self._verify(cap, lg, drafts, temp, sampler=sampler,
                                              precomputed=(nxt_all, dv))
             accepted += hit
-            if self._depth_adapt:
+            if _adapt_eligible:
                 # このラウンドで実際に引いた深さ (drafts はここでは
                 # pending/next_drafts のどちらから来ても、このラウンドで
                 # 検証フォワードにかけた本数そのもの)。round_ms は
