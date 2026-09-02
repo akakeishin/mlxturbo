@@ -76,7 +76,7 @@ from .kernels import _fire
 # PRIME_WINDOW+1 positions. tools/decode_ab.py's prime-window knob mutates the
 # module attribute directly instead of going through the env var -- see that
 # knob's docstring.
-PRIME_WINDOW = int(os.environ.get("MLXTURBO_PRIME_WINDOW", "2048") or "2048")
+PRIME_WINDOW = int(os.environ.get("MLXTURBO_PRIME_WINDOW", "512") or "512")  # 2026-09-03: 4k で prefill -2.2%、tok/round -0.8% → 512 を既定に
 # Trailing prefill chunks whose hyper state generate_stream retains. Two chunks
 # of PREFILL_STEP_SIZE always cover PRIME_WINDOW+1 positions.
 HYPER_KEEP_CHUNKS = 2
