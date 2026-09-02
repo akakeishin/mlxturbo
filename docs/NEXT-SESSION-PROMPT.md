@@ -76,8 +76,10 @@ GPU の待ち行列 (2026-09-03 03:20 時点の状態):
   (17k -4%、既定 on)、T=1 gather 17k/50k (50k -21.3%) **ただし長文脈 KLD が 0.04 / 0.017 で幅外 → 原因調査中、
   既定 off のまま**、lm_head 4-bit 本焼き (KLD +0.0047、速度比較用に限定)、hc-compiled (取り分なし)、G=8 (-1.2%、
   畳む)、PLE hoist (差なし、畳む)、prefill 8k の内訳 (MoE 43% / GDN 27% / PLE 4.4%)、TTFT 内訳 (固定 300 ms 発見)。
-- 走行中 / 直近: n-gram 先読みの prefill A/B (8k)、`[gen-trace]` で固定 300 ms の内訳、ラウンドごとの
-  ピークメモリ (投機ラウンドの KV コピー疑い)、gather カーネルの分布ずれの原因。
+- 済 (05:30): n-gram 先読み (8k -0.9%、畳む)、固定 300 ms = リクエストごとの detokenizer 構築 → 修正済み
+  (温 TTFT 0.45 → 0.15 s、完全ヒット 0.003 s)、投機ラウンドの KV コピーは無し (棄却)、decode の kv 罰は
+  +3 ms/round で attention 層 (indexer + gather マスク) に帰属、レーン 8 は閉じた。
+- 走行中: gather カーネルの分布ずれ (KLD 0.04) の原因調査、indexer の op 整理 (`MLXTURBO_INDEXER_LEAN`)。
 - その後: 小さいベンチ (mlxturbo だけ、冷、新しい冷却条件の基準) → 仮説 A/B (draft の hit@2、rerank off、
   厳密棄却サンプリング、indexer の op 整理、group_size 128) → mlx-serve 最新版でフルベンチ → 27B / 35B-A3B。
 
