@@ -668,3 +668,9 @@ tok/round 同じ。3 本とも A が 25 s 以上遅く、熱 (B が 41〜60 s �
 逆転の余地はない。**レーン 2 (行数・N の連結でタイル水増しを減らす) は棄却で確定。**
 D-2 の並び替えバグは直したが、連結そのものが gather_qmm の効率を落とす。
 MoE 超過 1.07 s の帰属は `tools/moe_routing_skew.py` (chain32 で実行待ち) に絞る。
+
+## draft depth 1 対 2、17k、bool マスク後 (2026-09-02 19:40)
+
+ms/tok depth1 27.6 対 depth2 30.3 (**depth1 が -8.9%**)。tok/round は depth2 が 2.001 対 1.669 で
+高いが、ms/round が +23.9% で相殺を超える。bool マスクで 17k の decode が速くなっても、
+2048 超で depth 1 に落とす現行の方針は変えない。
