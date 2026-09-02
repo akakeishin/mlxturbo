@@ -263,11 +263,14 @@ class StreamNGram:
       行をそのまま返し、乗っていない行だけ pread する。キャッシュへの
       書き込みは `_cache_lock` で守られているので `__call__` と並走しても
       壊れない (同じ行を二重に読んでも結果は同じなので、そこは守らない)。
-    - backend=mmap: `_madvise_prefetch` が対象行のページに
-      `MADV_WILLNEED` を打つだけ (`_gather_mmap` にキャッシュは無い --
-      ページキャッシュそのものが既にキャッシュなので二重に持たない)。
-      madvise はアドバイスを渡すだけの軽い syscall なので専用スレッドを
-      立てず、呼び出しスレッドで同期的に打ってすぐ返る。
+    - backend=mmap: 専用のバックグラウンドスレッドが `_madvise_prefetch`
+      を呼んで対象行のページに `MADV_WILLNEED` を打つ (`_gather_mmap` に
+      キャッシュは無い -- ページキャッシュそのものが既にキャッシュなので
+      二重に持たない)。madvise 1 回は軽い syscall だが、1 チャンクぶん
+      (32,768 行) 束ねて打つと 160-370ms かかる実測があるため
+      (`_madvise_prefetch` docstring)、pread と同様に背景スレッドへ追い
+      出している。直近 2 本まで追跡し、それより古い先読みが終わっていなくても
+      待たずに次を積む (`close()` は追跡している分だけ join する)。
 
     呼び出し側 (`mlxturbo/spec_flash.py` の `_prefetch_ngram_span`) は
     プロンプト全体を一度にではなく、**次の 1 eval 境界ぶんだけ**、直前境界の
@@ -357,6 +360,16 @@ class StreamNGram:
             # (madvise(2) 自体が無い OS) では mmap オブジェクトにこの属性が
             # 生えないので None のままにし、prefetch は黙って何もしない
             self._madvise_fn = getattr(self._mmap_obj, "madvise", None)
+            # 1 チャンク (32,768 行) ぶんの madvise 発行は実測 160-370ms
+            # かかる (`_madvise_prefetch` docstring) ので、pread backend と
+            # 同様に背景スレッドへ追い出す。前の先読みの完了を待たずに次を
+            # 積めるよう、直近 2 本まで追跡する (それ以上は古い方を join 対象
+            # から外す -- スレッド自体はデーモンなので実行は止めない。
+            # `_mmap_prefetch_lock` は複数スレッドから同時に `prefetch()` が
+            # 呼ばれてもこのリストの出し入れが競合しないようにするためだけの
+            # もので、madvise の発行自体はロックの外で行う)
+            self._mmap_prefetch_threads: list[threading.Thread] = []
+            self._mmap_prefetch_lock = threading.Lock()
 
         self.prefetch_enabled = os.environ.get("MLXTURBO_NGRAM_PREFETCH", "0") == "1"
         self.reset_stats()
@@ -391,6 +404,18 @@ class StreamNGram:
                 t.join(timeout=1.0)
             except Exception:
                 pass
+        # backend=mmap: 直近 2 本まで追跡している madvise 背景スレッド
+        # (`prefetch()`) をここで join する。`_prefetch_thread` (直近 1 本)
+        # と重複しうるが、`Thread.join()` は完了済み/2 回目でも例外を出さない
+        # ので無害。捨てられた (2 本の枠から溢れた) 古いスレッドは追跡対象
+        # から外れているのでここでは待たない -- デーモンスレッドなので
+        # プロセス終了はブロックしない
+        for mt in getattr(self, "_mmap_prefetch_threads", None) or []:
+            if mt.is_alive():
+                try:
+                    mt.join(timeout=1.0)
+                except Exception:
+                    pass
         pool = getattr(self, "_pool", None)
         if pool is not None:
             try:
@@ -621,38 +646,29 @@ class StreamNGram:
         out[order] = out_sorted
         return out
 
-    def _madvise_prefetch(self, ids64: np.ndarray) -> None:
+    def _madvise_prefetch(self, ids64: np.ndarray, chunk_bytes: int | None = None) -> None:
         """`ids64` の行が乗っているページに `MADV_WILLNEED` を打ち、
-        カーネルにバックグラウンドで先読みさせる。madvise はアドバイスを
-        渡すだけの軽い syscall で、呼び出しはすぐ返る (実際の読み込みは
-        カーネル側で非同期に進む) ので、pread backend の
-        `_prefetch_worker` と違って専用スレッドを立てる必要が無い。
-
-        行ごとに 1 回 madvise を打つと 1 チャンク (32,768 行) で 32,768 回の
-        syscall になるので、行のバイト範囲を `_MADVISE_CHUNK_BYTES` (16KB)
-        境界に丸めてから隣接/重複する範囲をまとめる。n-gram の行 id はハッシュで
-        ほぼ一様に散っているので実際にまとまる本数は少なく (16KB に約 163
-        行分の余地があっても、32,768 行 / 320M 行という疎さでは同じ 16KB に
-        2 つ以上乗る確率は低い、実測でも 32,768 行が約 32,000 区間にしか
-        減らない)、正しさには影響しない (mmap の madvise は重複した範囲に
-        何度打っても副作用が無い)。
+        カーネルにバックグラウンドで先読みさせる。madvise 1 回あたりは
+        アドバイスを渡すだけの軽い syscall (5-9us) だが、**束にすると軽くない**:
+        1 チャンク (32,768 行) は行ごとに打つと 32,768 回の syscall になる。
+        行のバイト範囲を `chunk_bytes` (既定 `_MADVISE_CHUNK_BYTES`, 16KB)
+        境界に丸めてから隣接/重複する範囲をまとめて呼び出し回数を減らすが、
+        n-gram の行 id はハッシュでほぼ一様に散っているので 16KB では実質
+        減らない (16KB に約 163 行分の余地があっても、32,768 行 / 320M 行と
+        いう疎さでは同じ 16KB に 2 つ以上乗る確率は低く、実測でも 32,768 行
+        が約 32,000 区間にしか減らない)。`chunk_bytes` を大きくすると
+        (行が乗っていない範囲まで) 読み過ぎる代わりに区間数が減る -- この
+        損得は `tools/ngram_pread_bench.py --mmap --madvise-chunk-bytes` で
+        測れる。まとめすぎても正しさには影響しない (mmap の madvise は
+        重複した範囲に何度打っても副作用が無い)。
 
         **実測 (`tools/ngram_pread_bench.py --mmap`、実サイドカー、
-        2026-09-03): この「まとめても減らない」せいで、1 チャンク 32,768 行
-        ぶんの madvise 発行そのものに 160-370ms かかる (syscall 1 回あたり
-        5-9us x 約 32,000 回)。madvise 自体は軽い syscall で背景スレッドは
-        要らない、という前提はここで崩れる -- 1 回あたりは軽くても、束ねて
-        1 チャンクぶん打つと合計は無視できない。呼び出しはこの `prefetch()`
-        から同期的に行われる (専用スレッドは立てない設計のまま) ので、この
-        時間はそのまま呼び出し元のスレッドの壁時計に乗る。`_prefetch_ngram_span`
-        は直前境界の `mx.eval` 投入直前に呼ぶ設計なので、この 160-370ms は
-        次境界の `mx.eval` 投入をその分だけ遅らせる (GPU 実行 3.4-3.8s に対し
-        4-11%)。冷条件での読み出し自体は劇的に速くなる (同ベンチで 冷 mmap
-        単体 2.2-2.7s -> mmap+madvise 冷 19-35ms) ので、madvise 発行の遅延を
-        差し引いても正味は大幅な改善に見えるが、**この発行コストを飲み込んで
-        なお勝つかは in-model A/B で確認すること** (このモジュールの CPU
-        micro だけでは、次境界の GPU 実行と実際にどれだけ重なるかまでは
-        分からない)。
+        2026-09-03): 16KB 丸めでも 1 チャンク 32,768 行ぶんの madvise 発行
+        そのものに 160-370ms かかる (syscall 1 回あたり 5-9us x 約 32,000
+        回)。「1 回あたりは軽いので同期呼び出しで十分」という最初の想定は
+        ここで崩れた。**このメソッド自体は同期のままなので、呼び出し元
+        (`prefetch()`) 側で背景スレッドへ追い出している -- このメソッドを
+        直接同期で呼ぶと、その分だけ呼び出し元スレッドの壁時計に乗る。
         """
         if self._madvise_fn is None or not hasattr(mmap, "MADV_WILLNEED"):
             return
@@ -660,7 +676,7 @@ class StreamNGram:
         if n == 0:
             return
         rec = self.rec
-        chunk = _MADVISE_CHUNK_BYTES
+        chunk = chunk_bytes if chunk_bytes is not None else _MADVISE_CHUNK_BYTES
         uniq = np.unique(ids64)  # 昇順。starts は rec>0 なのでこの順のまま単調非減少
         byte_lo = uniq * rec
         byte_hi = byte_lo + rec
@@ -686,8 +702,17 @@ class StreamNGram:
 
         backend=pread: バックグラウンドスレッドが `_gather_pread` して
         行キャッシュ (`_NGramCacheGen`) に積む (従来どおり)。
-        backend=mmap: スレッドを立てず、その場で `_madvise_prefetch` を
-        呼ぶだけ (madvise 自体が軽いので同期呼び出しで十分)。
+        backend=mmap: バックグラウンドスレッドが `_madvise_prefetch` を
+        呼ぶ (2026-09-03 に同期呼び出しから変更: 1 チャンクぶんの madvise
+        発行そのものが 160-370ms かかると実測で分かったため、
+        `_madvise_prefetch` docstring 参照)。`_gather_mmap` は先読みの完了を
+        待たない -- madvise はあくまでヒントで、`_mmap_view` への読み出しは
+        いつ呼んでも (先読みが済んでいても途中でも) 同期的に正しく動く
+        (page fault がその場で起きるだけ)。前の先読みがまだ走っている間に
+        次の `prefetch()` が来ても待たずに新しいスレッドを積む -- 直近 2 本
+        までは `close()` が join するが、それを超えた古い方は追跡から外れる
+        (デーモンスレッドなので放置しても実行は止まらず、プロセス終了も
+        ブロックしない)。
         """
         if not self.prefetch_enabled:
             return
@@ -696,13 +721,26 @@ class StreamNGram:
             return
         self.stats["prefetch_rows"] += ids64.size
         if self.backend == "mmap":
-            self._madvise_prefetch(ids64)
-            self.stats["prefetch_done"] += 1
-            self._prefetch_thread = None
+            t = threading.Thread(
+                target=self._madvise_prefetch_worker, args=(ids64,), daemon=True
+            )
+            with self._mmap_prefetch_lock:
+                self._mmap_prefetch_threads.append(t)
+                while len(self._mmap_prefetch_threads) > 2:
+                    self._mmap_prefetch_threads.pop(0)  # 古い方から追跡を外す
+            self._prefetch_thread = t  # pread backend と同じ慣習: 直近の 1 本
+            t.start()
             return
         t = threading.Thread(target=self._prefetch_worker, args=(ids64,), daemon=True)
         self._prefetch_thread = t
         t.start()
+
+    def _madvise_prefetch_worker(self, ids64: np.ndarray) -> None:
+        """`_madvise_prefetch` を背景スレッドで走らせるラッパー。"""
+        try:
+            self._madvise_prefetch(ids64)
+        finally:
+            self.stats["prefetch_done"] += 1
 
     def _prefetch_worker(self, ids64: np.ndarray) -> None:
         # prefetch() は呼び出し時点で prefetch_enabled を確認済みだが、

@@ -20,13 +20,19 @@
 に詳しい経緯がある)。
   uv run python tools/ngram_pread_bench.py --sidecar ~/models/ddalcu-ngram --preadv
 
---mmap: `mlxturbo/ngram_stream.py` の `StreamNGram` を直に使い、4 経路
-(pread / preadv / mmap / mmap+madvise 先読み後) を 1 チャンク相当の行数
-(既定 32768 = 2048 トークン x 16) で温 (同じ行を 2 回目) / 冷 (別の行、
-mmap+madvise だけは madvise を打ってから `--prefetch-delay` 秒待って読む)
-で比べる。sysctl vm.swapusage を前後で出す (32GB のファイルを mmap しても
-常駐はページキャッシュ任せで RSS/swap を無条件には食わないはずなのを見るため)。
+--mmap: `mlxturbo/ngram_stream.py` の `StreamNGram` を直に使い、まず 3 経路
+(pread / preadv / mmap、先読み無し) を 1 チャンク相当の行数 (既定 32768 =
+2048 トークン x 16) で温 (同じ行を 2 回目) / 冷 (別の行) 比べたあと、
+`_madvise_prefetch` の丸め粒度 (`--madvise-chunk-bytes`、既定 16KB/64KB/256KB)
+を振って、粒度ごとに区間数 (syscall 回数) / 発行そのものの時間 (submit) /
+`--prefetch-delay` 秒待ってからの冷取得時間を出す (mmap backend の
+`prefetch()` は背景スレッド化されている -- `_madvise_prefetch` を直接
+同期呼び出しで測らないと、この発行コストは見えなくなる)。sysctl vm.swapusage
+を前後で出す (32GB のファイルを mmap しても常駐はページキャッシュ任せで
+RSS/swap を無条件には食わないはずなのを見るため)。
   uv run python tools/ngram_pread_bench.py --sidecar ~/models/ddalcu-ngram --mmap
+  uv run python tools/ngram_pread_bench.py --sidecar ~/models/ddalcu-ngram --mmap \
+      --madvise-chunk-bytes 16384 65536 262144 1048576
 """
 
 from __future__ import annotations
@@ -162,11 +168,67 @@ def _swapusage() -> str:
         return f"(sysctl 失敗: {e})"
 
 
-def bench_mmap_backend(
-    sidecar: Path, rows: int, rec: int, n: int, threads: int, prefetch_delay: float,
+def bench_madvise_granularity(
+    mmap_s, rows: int, rec: int, n: int, prefetch_delay: float, granularities: list[int],
 ) -> None:
-    """StreamNGram の 4 経路 (pread / preadv / mmap / mmap+madvise 先読み後)
-    を、1 チャンク相当 (既定 32768 行) で温/冷 それぞれ比べる。
+    """`_madvise_prefetch` の丸め粒度 (`chunk_bytes`) を振って、発行そのものの
+    費用 (syscall 回数 x 1 回あたり 5-10us) と、粒度を上げて読み過ぎることで
+    冷取得がどう変わるかを見る。行 id はハッシュでほぼ一様に散っているため、
+    粒度を上げても行の集約自体はあまり進まない (むしろ 1 区間あたりの
+    読み過ぎ量が増えるだけ) と予想されるが、それを実測で確かめる。
+
+    `prefetch()` ではなく `_madvise_prefetch` を直接・同期で呼ぶ -- mmap
+    backend の `prefetch()` は 2026-09-03 に背景スレッド化されたので、
+    `prefetch()` 経由で測るとスレッド起動コストしか見えず、知りたい
+    「madvise 発行そのものの費用」が測れなくなったため。
+    """
+    rng = np.random.default_rng()  # 種固定なし
+
+    def fresh_ids() -> np.ndarray:
+        return rng.integers(0, rows, size=n).astype(np.int64)
+
+    print(
+        f"\n=== madvise 粒度スイープ (chunk_bytes): 1 回で {n} 行, "
+        f"待ち {prefetch_delay:.1f}s (record_bytes={rec}) ==="
+    )
+    print(f"{'chunk_bytes':>12s} {'区間数':>8s} {'submit(ms)':>12s} {'冷取得(ms)':>12s}")
+
+    real_madvise = mmap_s._madvise_fn
+    for chunk in granularities:
+        count = 0
+
+        def counting_madvise(option, start, length, _real=real_madvise):
+            nonlocal count
+            count += 1
+            _real(option, start, length)
+
+        mmap_s._madvise_fn = counting_madvise
+        ids = fresh_ids()
+        t0 = time.perf_counter()
+        mmap_s._madvise_prefetch(ids, chunk_bytes=chunk)
+        submit_ms = (time.perf_counter() - t0) * 1000.0
+        mmap_s._madvise_fn = real_madvise
+
+        time.sleep(prefetch_delay)
+        t0 = time.perf_counter()
+        mmap_s._gather_mmap(ids)
+        cold_ms = (time.perf_counter() - t0) * 1000.0
+
+        print(f"{chunk:>12,d} {count:>8,d} {submit_ms:>12.2f} {cold_ms:>12.2f}")
+
+
+def bench_mmap_backend(
+    sidecar: Path,
+    rows: int,
+    rec: int,
+    n: int,
+    threads: int,
+    prefetch_delay: float,
+    madvise_granularities: list[int],
+) -> None:
+    """StreamNGram の 3 経路 (pread / preadv / mmap、先読み無し) を、1 チャンク
+    相当 (既定 32768 行) で温/冷 それぞれ比べたあと、madvise の粒度スイープ
+    (`bench_madvise_granularity`) を続けて出す。
 
     実装をそのまま使う (再実装しない) ので、ここで出る数字は
     `mlxturbo/ngram_stream.py` の `_gather_pread` / `_gather_mmap` /
@@ -178,9 +240,6 @@ def bench_mmap_backend(
     乗った状態)。
     冷: 毎回新しく引いた行集合を初回だけ計測 (ページキャッシュに乗っていない
     見込みが高い状態。320M 行からランダムに引くので条件間の重複はほぼ無い)。
-    mmap+madvise: 新しい行集合に `prefetch()` (= `_madvise_prefetch`) を打ち、
-    `--prefetch-delay` 秒待ってから読む。madvise がカーネル側の非同期読み込みを
-    間に合わせられていれば、冷の素の mmap より速く、温に近い値が出るはず。
     """
     from mlxturbo.ngram_stream import StreamNGram
 
@@ -225,39 +284,10 @@ def bench_mmap_backend(
     cold_ms = (time.perf_counter() - t0) * 1000.0
     results["preadv"] = dict(warm=warm_ms, cold=cold_ms)
 
-    # --- mmap + madvise 先読み ---
-    # 「先読み無し mmap」より先に測る。先読み無し mmap の冷条件は 32768 行
-    # ぶんの page fault が直列に走る一番重い区間で、直後の計測に I/O queue の
-    # 混雑を持ち越しうる (実際、先に置いたときは madvise submit が 350ms 台に
-    # 膨らみ、素の pread cold より遅く出た。単体の madvise loop だけを測ると
-    # 100ms 前後だったので、これは madvise 自体の費用ではなく直前の重い
-    # 区間からの持ち越しだった)。順序をここで固定し、素の mmap 冷は最後に回す。
-    #
-    # 温: 先読み対象と同じ行を先読み直後に読む (ほぼ即座なので madvise の
-    # 効果を切り分けるにはあまり意味が無いが、「先読み分は無条件に速い」の
-    # 対照として置く)
-    warm_ids = fresh_ids()
-    t0 = time.perf_counter()
-    mmap_s.prefetch(warm_ids)
-    submit_warm_ms = (time.perf_counter() - t0) * 1000.0
-    t0 = time.perf_counter()
-    mmap_s._gather_mmap(warm_ids)
-    warm_ms = (time.perf_counter() - t0) * 1000.0
-    # 冷: 新しい行集合に madvise を打ってから prefetch_delay 秒待って読む --
-    # 待っている間にカーネルがどこまで先読みを終えているかがそのまま出る
-    cold_ids = fresh_ids()
-    t0 = time.perf_counter()
-    mmap_s.prefetch(cold_ids)
-    submit_cold_ms = (time.perf_counter() - t0) * 1000.0
-    time.sleep(prefetch_delay)
-    t0 = time.perf_counter()
-    mmap_s._gather_mmap(cold_ids)
-    cold_ms = (time.perf_counter() - t0) * 1000.0
-    results["mmap+madvise"] = dict(
-        warm=warm_ms, cold=cold_ms, submit_warm=submit_warm_ms, submit_cold=submit_cold_ms
-    )
-
-    # --- mmap (先読み無し) --- 最後に置く (上のコメント参照)
+    # --- mmap (先読み無し) --- 粒度スイープの前に測る。スイープの各区間は
+    # それぞれ prefetch_delay 秒の sleep を挟むので、直前の重い区間からの
+    # I/O queue の持ち越しは起きにくい (それでも一番重いのはこの区間自体
+    # なので、これより後に何かを測るなら間に置かないよう注意)
     warm_ids = fresh_ids()
     mmap_s._gather_mmap(warm_ids)
     t0 = time.perf_counter()
@@ -269,16 +299,12 @@ def bench_mmap_backend(
     cold_ms = (time.perf_counter() - t0) * 1000.0
     results["mmap"] = dict(warm=warm_ms, cold=cold_ms)
 
-    print(f"\n{'経路':<16s} {'温 (ms)':>10s} {'冷 (ms)':>10s}   備考")
-    for name in ("pread", "preadv", "mmap", "mmap+madvise"):
+    print(f"\n{'経路':<16s} {'温 (ms)':>10s} {'冷 (ms)':>10s}")
+    for name in ("pread", "preadv", "mmap"):
         r = results[name]
-        note = ""
-        if name == "mmap+madvise":
-            note = (
-                f"madvise submit: 温 {r['submit_warm']:.2f}ms / "
-                f"冷 {r['submit_cold']:.2f}ms (待ち {prefetch_delay:.1f}s 込みでない)"
-            )
-        print(f"{name:<16s} {r['warm']:>10.2f} {r['cold']:>10.2f}   {note}")
+        print(f"{name:<16s} {r['warm']:>10.2f} {r['cold']:>10.2f}")
+
+    bench_madvise_granularity(mmap_s, rows, rec, n, prefetch_delay, madvise_granularities)
 
     pread_s.close()
     mmap_s.close()
@@ -308,10 +334,10 @@ def main():
     )
     ap.add_argument(
         "--mmap", action="store_true",
-        help="StreamNGram の 4 経路 (pread / preadv / mmap / mmap+madvise 先読み後) "
-             "を 1 チャンク相当の行数で温/冷 比べる (mlxturbo/ngram_stream.py の"
-             "実装をそのまま使う)。--mmap-rows / --mmap-threads / --prefetch-delay"
-             "で調整できる",
+        help="StreamNGram の 3 経路 (pread / preadv / mmap、先読み無し) を "
+             "1 チャンク相当の行数で温/冷 比べたあと、madvise の粒度スイープを "
+             "出す (mlxturbo/ngram_stream.py の実装をそのまま使う)。--mmap-rows / "
+             "--mmap-threads / --prefetch-delay / --madvise-chunk-bytes で調整できる",
     )
     ap.add_argument(
         "--mmap-rows", type=int, default=32768,
@@ -324,8 +350,14 @@ def main():
     )
     ap.add_argument(
         "--prefetch-delay", type=float, default=3.0,
-        help="--mmap 時、mmap+madvise の冷条件で madvise を打ってから読むまで"
-             "待つ秒数 (先読みが間に合っているかを見る)",
+        help="--mmap 時、madvise 粒度スイープの各条件で madvise を打ってから"
+             "読むまで待つ秒数 (先読みが間に合っているかを見る)",
+    )
+    ap.add_argument(
+        "--madvise-chunk-bytes", type=int, nargs="+", default=[16384, 65536, 262144],
+        help="--mmap 時、_madvise_prefetch の丸め粒度スイープに使う chunk_bytes "
+             "の候補 (既定 16KB/64KB/256KB)。大きくすると読み過ぎる代わりに"
+             "区間数 (=syscall 回数) が減る",
     )
     args = ap.parse_args()
 
@@ -336,7 +368,8 @@ def main():
 
     if args.mmap:
         bench_mmap_backend(
-            sidecar, rows, rec, args.mmap_rows, args.mmap_threads, args.prefetch_delay
+            sidecar, rows, rec, args.mmap_rows, args.mmap_threads, args.prefetch_delay,
+            args.madvise_chunk_bytes,
         )
         return
 

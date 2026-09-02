@@ -14,6 +14,7 @@ import mmap as mmap_module
 import os
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -512,49 +513,162 @@ def test_mmap_prefetch_disabled_by_default(tmp_path):
         stream.close()
 
 
-def test_mmap_prefetch_enabled_via_env_calls_madvise_synchronously(tmp_path, monkeypatch):
+def test_mmap_prefetch_returns_immediately_and_runs_madvise_in_background(tmp_path, monkeypatch):
     """`MLXTURBO_NGRAM_PREFETCH=1` で backend=mmap も prefetch_enabled=True に
-    なり、`prefetch()` が (pread と違って) 専用スレッドを立てずにその場で
-    madvise を打って即座に戻ることを確認する。呼び出し後 `_prefetch_thread`
-    は None のまま (join すべきスレッドが無い) で、統計 (prefetch_rows /
-    prefetch_done) はどちらも即座に確定する。"""
+    なり、`prefetch()` が背景スレッドで `_madvise_prefetch` を走らせて即座に
+    戻ることを確認する (2026-09-03 に同期呼び出しから変更: 1 チャンクぶんの
+    madvise 発行だけで 160-370ms かかると実測で分かったため)。
+
+    わざと遅い `_madvise_fn` (バリアで明示的に合図するまでブロックする) を
+    差し込み、`prefetch()` の呼び出し自体はその完了を待たずに戻ることを
+    タイムアウト付きで確認してから、バリアを解放してスレッドを完了させ、
+    統計 (prefetch_rows は即座に、prefetch_done はスレッド完了後に) を見る。
+    """
     monkeypatch.setenv("MLXTURBO_NGRAM_PREFETCH", "1")
     sidecar, _ = _build_synthetic_sidecar(tmp_path)
     stream = StreamNGram(sidecar, backend="mmap")
     try:
         assert stream.prefetch_enabled is True
         calls = []
-        stream._madvise_fn = lambda option, start, length: calls.append((option, start, length))
+        release = threading.Event()
+        entered = threading.Event()
+
+        def slow_madvise(option, start, length):
+            entered.set()
+            release.wait(timeout=5.0)
+            calls.append((option, start, length))
+
+        stream._madvise_fn = slow_madvise
         rng = np.random.default_rng(23)
         ids = rng.integers(0, ROWS, size=500).astype(np.int64)
+
+        t_call = time.perf_counter()
         stream.prefetch(ids)
+        call_dt = time.perf_counter() - t_call
+        assert call_dt < 0.5, f"prefetch() が背景スレッドを待ってしまった ({call_dt}s)"
+        # prefetch_rows は呼び出し即座に積まれる (スレッド完了を待たない)
+        assert stream.stats["prefetch_rows"] == 500
+        assert stream.stats["prefetch_done"] == 0  # まだスレッドはブロック中
+
+        assert entered.wait(timeout=5.0), "背景スレッドが madvise へ入らなかった"
+        assert stream._prefetch_thread is not None
+        assert stream._prefetch_thread.is_alive()
+        assert not calls  # まだバリアで止まっている
+
+        release.set()
+        stream._prefetch_thread.join(timeout=5.0)
+        assert not stream._prefetch_thread.is_alive()
         assert calls, "madvise が一度も呼ばれなかった"
         assert all(c[0] == mmap_module.MADV_WILLNEED for c in calls)
-        assert stream.stats["prefetch_rows"] == 500
         assert stream.stats["prefetch_done"] == 1
-        assert stream._prefetch_thread is None  # 背景スレッドを立てない
     finally:
         stream._madvise_fn = getattr(stream._mmap_obj, "madvise", None)
         stream.close()
 
 
-def test_mmap_prefetch_does_not_change_call_output(tmp_path, monkeypatch):
-    """madvise はあくまでアドバイスで、prefetch を挟んでも __call__ の
-    出力 (行の中身) は変わらない -- pread 経路の参照実装とビット一致し続ける
-    ことを確認する。"""
+def test_mmap_gather_does_not_wait_for_in_flight_prefetch(tmp_path, monkeypatch):
+    """`_gather_mmap` (__call__ 経由) は、同じ行への先読みがまだ背景スレッドで
+    走っている最中でも待たずに正しい結果を返す -- madvise はヒントに過ぎず、
+    `_mmap_view` への読み出しはいつ呼んでも同期的に正しく動く (page fault が
+    その場で起きるだけ) という設計を確認する。"""
     monkeypatch.setenv("MLXTURBO_NGRAM_PREFETCH", "1")
     sidecar, _ = _build_synthetic_sidecar(tmp_path)
     ref = _RefStreamNGram(sidecar)
     stream = StreamNGram(sidecar, backend="mmap")
     try:
-        assert stream.prefetch_enabled is True
+        release = threading.Event()
+
+        def blocking_madvise(option, start, length):
+            release.wait(timeout=5.0)
+
+        stream._madvise_fn = blocking_madvise
         rng = np.random.default_rng(24)
         ids = rng.integers(0, ROWS, size=3000).astype(np.int64)
-        stream.prefetch(ids)  # 同期的に madvise を打つだけ。ここで完了している
+        stream.prefetch(ids)  # 背景スレッドが blocking_madvise で止まっているはず
+        assert stream._prefetch_thread.is_alive()
+
+        # 先読みが終わっていない状態で __call__ しても結果は変わらない
         gid = mx.array(ids.reshape(1, -1))
         _assert_bit_identical(stream(gid), ref(gid))
+
+        release.set()
+        stream._prefetch_thread.join(timeout=5.0)
     finally:
+        stream._madvise_fn = getattr(stream._mmap_obj, "madvise", None)
         stream.close()
+
+
+def test_mmap_prefetch_queue_caps_at_two_and_drops_oldest(tmp_path, monkeypatch):
+    """3 回連続で `prefetch()` を (前のスレッドが終わる前に) 呼ぶと、追跡する
+    背景スレッドは直近 2 本までに保たれ、一番古い 1 本目は追跡から外れる
+    (スレッド自体は放置されるだけで、例外にはならない)。"""
+    monkeypatch.setenv("MLXTURBO_NGRAM_PREFETCH", "1")
+    sidecar, _ = _build_synthetic_sidecar(tmp_path)
+    stream = StreamNGram(sidecar, backend="mmap")
+    try:
+        release = threading.Event()
+
+        def blocking_madvise(option, start, length):
+            release.wait(timeout=5.0)
+
+        stream._madvise_fn = blocking_madvise
+        rng = np.random.default_rng(25)
+
+        threads = []
+        for _ in range(3):
+            ids = rng.integers(0, ROWS, size=50).astype(np.int64)
+            stream.prefetch(ids)
+            threads.append(stream._prefetch_thread)
+
+        assert len(stream._mmap_prefetch_threads) == 2
+        # 追跡に残っているのは直近 2 本 (2 番目・3 番目)
+        assert stream._mmap_prefetch_threads == threads[1:]
+        assert threads[0] not in stream._mmap_prefetch_threads
+        # 1 本目は追跡から外れただけで、実際にはまだ (バリアで) 生きている
+        assert threads[0].is_alive()
+
+        release.set()
+        for t in threads:
+            t.join(timeout=5.0)
+            assert not t.is_alive()
+    finally:
+        stream._madvise_fn = getattr(stream._mmap_obj, "madvise", None)
+        stream.close()
+
+
+def test_mmap_close_joins_tracked_prefetch_threads(tmp_path, monkeypatch):
+    """`close()` が、追跡している (直近 2 本までの) mmap 先読みスレッドを
+    実際に join することを確認する -- ブロックする `_madvise_fn` を解放して
+    から close() を呼び、戻ってきた時点でスレッドが完了していることを見る。
+    """
+    monkeypatch.setenv("MLXTURBO_NGRAM_PREFETCH", "1")
+    sidecar, _ = _build_synthetic_sidecar(tmp_path)
+    stream = StreamNGram(sidecar, backend="mmap")
+    release = threading.Event()
+    calls = []
+
+    def slow_madvise(option, start, length):
+        release.wait(timeout=5.0)
+        calls.append(1)
+
+    stream._madvise_fn = slow_madvise
+    rng = np.random.default_rng(26)
+    ids = rng.integers(0, ROWS, size=100).astype(np.int64)
+    stream.prefetch(ids)
+    t = stream._prefetch_thread
+    assert t.is_alive()
+
+    release.set()  # close() が呼ぶ join がこのスレッドを待てるようにする
+    stream.close()
+    assert not t.is_alive()
+    # `_madvise_prefetch` は行のバイト範囲を 16KB 単位にまとめてから区間ごとに
+    # `_madvise_fn` を呼ぶので、100 行がまたがる区間の数だけ呼ばれる (>= 1 回)。
+    # ここで見たいのは「close() が背景スレッドの完了を実際に待つこと」なので
+    # 呼び出し回数自体は問わない
+    assert calls, "madvise が一度も呼ばれなかった"
+    assert stream._closed is True
+
+    stream.close()  # 2 回目も例外を出さない (多重呼び出し耐性)
 
 
 def test_madvise_prefetch_merges_adjacent_ranges(tmp_path):
