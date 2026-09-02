@@ -40,9 +40,16 @@ from vs_mlx_serve import (  # noqa: E402
 def main() -> int:
     install_term_handler()
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
+    ap.add_argument("--model", required=True,
+                    help="mlxturbo 側のモデル。--serve-bin を指定したときは"
+                         " プロンプトを組むトークナイザとしてのみ使う")
     ap.add_argument("--ngram", default=None)
     ap.add_argument("--mtp", default=None)
+    ap.add_argument("--serve-bin", default=None,
+                    help="指定すると mlxturbo ではなく mlx-serve を単独で測る。"
+                         "**手順は完全に同じにする** — 対戦ハーネス (A→B→B→A) と"
+                         "単独測定で 35% 食い違ったので、その切り分けに使う")
+    ap.add_argument("--serve-model", default=None)
     ap.add_argument("--port", type=int, default=8140)
     ap.add_argument("--ctxs", default="0,4000,17000,50000")
     ap.add_argument("--tokens", type=int, default=256)
@@ -75,17 +82,27 @@ def main() -> int:
                       f" (問いが {len(QUESTIONS)} 本しかない)。--reps を下げること",
                       flush=True)
 
-    argv = [sys.executable, "-m", "mlxturbo.server",
-            "--model", os.path.expanduser(args.model),
-            "--host", "127.0.0.1", "--port", str(args.port)]
-    if args.ngram:
-        argv += ["--ngram", os.path.expanduser(args.ngram)]
-    if args.mtp:
-        argv += ["--mtp", os.path.expanduser(args.mtp)]
+    if args.serve_bin:
+        if not args.serve_model:
+            print("--serve-bin を使うときは --serve-model も要る")
+            return 1
+        label = "mlx-serve"
+        argv = [os.path.expanduser(args.serve_bin), "--serve",
+                "--model", os.path.expanduser(args.serve_model),
+                "--host", "127.0.0.1", "--port", str(args.port), "--mtp"]
+    else:
+        label = "mlxturbo"
+        argv = [sys.executable, "-m", "mlxturbo.server",
+                "--model", os.path.expanduser(args.model),
+                "--host", "127.0.0.1", "--port", str(args.port)]
+        if args.ngram:
+            argv += ["--ngram", os.path.expanduser(args.ngram)]
+        if args.mtp:
+            argv += ["--mtp", os.path.expanduser(args.mtp)]
 
     rows = []
-    print(f"生成 {args.tokens} トークン、文脈 {ctxs}、各 {args.reps} 回の中央値\n")
-    with Server("mlxturbo", argv, args.port):
+    print(f"[{label}] 生成 {args.tokens} トークン、文脈 {ctxs}、各 {args.reps} 回の中央値\n")
+    with Server(label, argv, args.port):
         mid = model_id(args.port)
         # 温め: カーネルの初回コンパイルを済ませる。**測定と別のプロンプトで。**
         stream_once(args.port, [{"role": "user", "content": SHORT}], 8, mid)
@@ -115,7 +132,8 @@ def main() -> int:
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
-        json.dump(dict(rows=rows, tokens=args.tokens, reps=args.reps), f,
+        json.dump(dict(engine=label, rows=rows, tokens=args.tokens,
+                       reps=args.reps), f,
                   ensure_ascii=False, indent=2)
     print(f"\n書き出し: {args.out}")
     return 0
