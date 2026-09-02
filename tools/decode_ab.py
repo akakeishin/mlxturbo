@@ -1380,6 +1380,50 @@ def _knob_prime_window(ctx):
     return apply
 
 
+def _knob_moe_combine(ctx):
+    """A = ルータ重みを down_proj の入力 (SwiGLU 出力) に先掛けしてから
+    down_proj を通し、top_k 軸の和を出力側で取る (MLXTURBO_MOE_COMBINE_FOLD、
+    既定 off、`SparseMoeBlock._combine_fold`) / B = 素の経路 (switch_mlp の
+    出力 (rows, top_k, hidden_size) を実体化してから w を掛けて sum、既定)。
+
+    動機: prefill 8k の内訳 (`tools/prefill_anatomy.py --ctx 8000`、
+    `docs/research/SESSION-2026-09-02-CATCHUP.md` の「prefill 短文脈の内訳、
+    8k」) で MoE 48 層中「ルータ重み + top-K 縮約」が 142ms/チャンク
+    (効率 9.9%) と最大だった。down_proj は bias 無しの線形写像なので A/B は
+    数式上は同じ値になるはずだが、w を掛ける位置が変わるぶん量子化 4bit +
+    bf16 の積和順が動く (`control_identical=False`)。
+    `bench/test_moe_combine_fold.py` が合成モデルで A/B の出力の RMS 相対
+    誤差が 1e-2 以内であることを確認済み。
+
+    有効な間は switch_mlp.__call__ (mlx_lm.models.switch_layers.SwitchGLU)
+    を経由しない (gate_proj/up_proj/down_proj を直接呼ぶ) ため、同じ
+    SwitchGLU.__call__ に載っている他の knob (`wide`/`moe-verify` など) の
+    効果を素通りする -- 単独で測ること。
+
+    **prefill に効くので `DECODE_ONLY_KNOBS` には入れない**
+    (`--prefill-once` は使えない)。
+
+    合格条件: **17k / 8k の prefill 壁時計 (prefill_s) が縮み、かつ
+    tok/round (複数プロンプト x 512 の平均) の低下が無いこと。**KLD も
+    併せて見る (積和順が変わるカーネルが受理率を落として差し引きで負けた
+    前例が複数あるため)。
+    """
+    import os
+
+    from mlxturbo import fused
+
+    os.environ["MLXTURBO_MOE_COMBINE_FOLD"] = "1"  # enable 側のゲートを開ける
+    eng = ctx["eng"]
+
+    def apply(variant):
+        if variant == "A":
+            fused.enable_moe_combine_fold(eng.model)
+        else:
+            fused.disable_moe_combine_fold(eng.model)
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
@@ -1428,6 +1472,7 @@ KNOBS = {
     # A = batch_min_rows=64 (既定) / B = 10**9 (常に行ごと旧経路)。判定は prefill_s
     "ngram-batch": (_knob_ngram_batch, ["A", "B"], True, "A"),
     "prime-window": (_knob_prime_window, ["2048", "512"], False, "2048"),
+    "moe-combine": (_knob_moe_combine, ["A", "B"], False, "B"),
 }
 
 

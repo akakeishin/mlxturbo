@@ -1197,6 +1197,66 @@ def disable_moe_verify_gather() -> None:
     _MOE_DISPATCH_VERIFY_ON = False
 
 
+def enable_moe_combine_fold(model) -> int:
+    """SparseMoeBlock の重み付き和を down_proj の前に畳む
+    (``SparseMoeBlock._combine_fold`` 分岐、`mlxturbo/_vendor/qwen4_exp.py`
+    の `_moe_combine_fold`)。素の経路は switch_mlp の出力
+    (rows, top_k, hidden_size)=(rows, top_k, 2560) を実体化してから router
+    重み w を掛けて sum するが、down_proj は bias 無しの線形写像なので、w を
+    down_proj の「入力」(SwiGLU 出力、(rows, top_k, moe_intermediate_size)
+    =(rows, top_k, 640)) に先掛けしても数式上は同じ結果になる。乗算が触る
+    実体は 4 分の 1 で済む (top_k 軸の和自体は down_proj の出力側で
+    `sum(axis=-2)` のまま取るので、その実体化は残る)。
+
+    実測 (prefill 8k、`tools/prefill_anatomy.py --ctx 8000`、
+    `bench/results/logs/prefill-anatomy-8k-0903.log`、
+    `docs/research/SESSION-2026-09-02-CATCHUP.md` の「prefill 短文脈の内訳、
+    8k」): MoE 48 層の内訳で「ルータ重み + top-K 縮約」が 142ms/チャンク
+    (効率 9.9%) と最大。
+
+    数式上は等価だが bf16 の丸め順が変わるため出力はビット不一致 (積和の
+    結合順が変わるだけ、bench/test_moe_combine_fold.py で許容誤差 1e-2 を
+    確認)。この経路は switch_mlp.__call__ を経由しない (gate_proj/up_proj/
+    down_proj を直接呼ぶ) ため、有効な間は同じ SwitchGLU.__call__ に載って
+    いる他の 3 経路 (enable_wide_projections の連結射影 / enable_gather_sort
+    のソート閾値変更 / enable_moe_glu / enable_moe_verify_gather) を素通り
+    する -- ソート判定・並べ替え自体は `_moe_combine_fold` が
+    `MLXTURBO_SORT_MIN` を読んで自前で再現しているので正しさは保たれるが、
+    それらのカーネル差し替えの効果は乗らない。
+
+    実験的な分岐なので、この関数を呼ぶだけでは何も起きない -- 環境変数
+    `MLXTURBO_MOE_COMBINE_FOLD=1` が立っているときだけ `_combine_fold` を
+    立てる (呼び出し側が env var を忘れても既定 off が保たれるように、
+    ゲートを関数自身の中に持たせている。`enable_moe_verify_gather` /
+    `enable_fast_rope` と同じ作法)。prefill に効く変更なので decode_ab の
+    DECODE_ONLY には入れない。
+
+    戻り値は適用した層数 (MoE 層は全 48 層)。
+    """
+    import os
+
+    if os.environ.get("MLXTURBO_MOE_COMBINE_FOLD") != "1":
+        return 0
+    n = 0
+    for layer in model.model.layers:
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None and hasattr(mlp, "switch_mlp"):
+            mlp._combine_fold = True
+            n += 1
+    return n
+
+
+def disable_moe_combine_fold(model) -> int:
+    """`enable_moe_combine_fold` を打ち消す。戻り値は外した数。A/B で交互に測るために要る。"""
+    n = 0
+    for layer in model.model.layers:
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None and getattr(mlp, "_combine_fold", False):
+            mlp._combine_fold = False
+            n += 1
+    return n
+
+
 def enable_fast_rope(model) -> int:
     """decode の attention 層で QK-norm 後の rope を `mx.fast.rope` 1 dispatch
     に畳む (``Attention._qkv`` の ``_fast_rope`` 分岐、

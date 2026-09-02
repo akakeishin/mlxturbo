@@ -1319,6 +1319,68 @@ class GatedDeltaNet(nn.Module):
 
 # ------------------------------------------------------------------------- MoE
 
+# mlxturbo: MLXTURBO_MOE_COMBINE_FOLD=1 (既定 off、mlxturbo.fused.enable_moe_combine_fold
+# が SparseMoeBlock インスタンスへ `_combine_fold=True` を立てて有効化する)。
+# 素の経路は `(switch_mlp(x, idx) * w[..., None]).sum(-2)` で、switch_mlp の
+# 出力 (rows, top_k, hidden_size)=(rows, top_k, 2560) を一度実体化してから
+# ルータ重み w を掛けて top_k 軸を潰す (prefill 8k の実測でここが 142ms、
+# MoE 48 層の内訳で最大。docs/research/SESSION-2026-09-02-CATCHUP.md)。
+# down_proj は bias 無しの線形写像なので、w を down_proj の「入力」
+# (SwiGLU 出力、(rows, top_k, moe_intermediate_size)=(rows, top_k, 640)) に
+# 先掛けしてから down_proj を通しても数学的には同じ結果になる。640 は
+# 2560 の 1/4 なので、乗算が触る実体は 4 分の 1 で済む (和自体は down_proj
+# の出力側で `sum(axis=-2)` のまま取るので、その実体化は残る)。
+# switch_mlp.__call__ (mlx_lm.models.switch_layers.SwitchGLU) をそのまま
+# 呼ぶと down_proj の入力に w を差し込む隙が無いため、gate_proj/up_proj/
+# down_proj を自前で呼び、SwitchGLU.__call__ 自身と同じソート判定・並べ替え
+# (`_gather_sort`/`_scatter_unsort` 相当) をここで再現する。並べ替えると
+# インデックス列だけでなく w もインデックス列と同じ並べ替え (`order`) で
+# 揃える必要がある (switch_layers._gather_sort は order を外に返さず
+# inv_order だけを返すため、ここでは argsort を直接呼んで order も手元に
+# 残す)。bf16 の丸め順が変わるため出力はビット不一致 (積和の結合順が
+# 変わるだけで、down_proj が線形なので誤差は丸め誤差の範囲、
+# bench/test_moe_combine_fold.py で許容誤差を確認)。採否は
+# tools/decode_ab.py --knob moe-combine の in-model 計測で決める。
+_MOE_COMBINE_SORT_MIN_RAW = int(os.environ.get("MLXTURBO_SORT_MIN", "16"))
+# enable_gather_sort と同じ規約: 0 (無効化) のときは switch_layers の素の
+# 閾値 64 に戻す (runner.py の `if sort_min: fused.enable_gather_sort(...)`
+# と同じ読み方をここでも独立に行う -- fused.py への逆依存を避けるため)。
+_MOE_COMBINE_SORT_MIN = _MOE_COMBINE_SORT_MIN_RAW if _MOE_COMBINE_SORT_MIN_RAW else 64
+
+
+def _moe_combine_fold(switch_mlp: SwitchGLU, x: mx.array, idx: mx.array,
+                       w: mx.array) -> mx.array:
+    """ルータ重み `w` を down_proj の入力 (SwiGLU 出力) に掛けてから
+    down_proj を通し、top_k 軸の和は down_proj の出力側で取る。
+    `MLXTURBO_SORT_MIN` の並べ替え済み経路・未ソート経路のどちらでも
+    正しく動く (どちらのブランチも `switch_mlp(x, idx) * w[..., None]` の
+    結果と数式上は同じ値を返す、丸め誤差を除く)。"""
+    *_, top_k = idx.shape
+    xx = mx.expand_dims(x, (-2, -3))
+    do_sort = idx.size >= _MOE_COMBINE_SORT_MIN
+    if do_sort:
+        idx_flat = idx.flatten()
+        order = mx.argsort(idx_flat)
+        inv_order = mx.argsort(order)
+        idx_s = idx_flat[order]
+        xx = xx.flatten(0, -3)[order // top_k]
+        w_s = w.flatten()[order][:, None, None]
+    else:
+        idx_s = idx
+        w_s = w[..., None, None]
+    x_up = switch_mlp.up_proj(xx, idx_s, sorted_indices=do_sort)
+    x_gate = switch_mlp.gate_proj(xx, idx_s, sorted_indices=do_sort)
+    # SwiGLU 出力 (..., moe_intermediate_size) に w を先掛けしてから
+    # down_proj へ渡す。gather_qmm は量子化スケール/バイアス (bf16 由来) と
+    # x の dtype が揃っている必要があるため、掛けた直後に x.dtype へ戻す
+    # (素の経路も乗算後は最終的に x.dtype に戻すので、丸め位置が動くだけ)。
+    act = (switch_mlp.activation(x_up, x_gate) * w_s).astype(x.dtype)
+    out = switch_mlp.down_proj(act, idx_s, sorted_indices=do_sort)
+    if do_sort:
+        out = out[inv_order]
+        out = mx.unflatten(out, 0, idx.shape)
+    return out.squeeze(-2).sum(axis=-2)
+
 
 class SparseMoeBlock(nn.Module):
     def __init__(self, args: TextArgs):
@@ -1345,11 +1407,16 @@ class SparseMoeBlock(nn.Module):
             idx = mx.concatenate(
                 [idx, mx.full((*idx.shape[:-1], 1), 512, dtype=idx.dtype)], axis=-1)
             w = mx.concatenate([w, sg], axis=-1)
+            if getattr(self, "_combine_fold", False):
+                return _moe_combine_fold(self.switch_mlp, x, idx, w).astype(x.dtype)
             return (self.switch_mlp(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
         logits = self.gate(x.astype(mx.float32))
         idx = mx.argpartition(-logits, self.top_k - 1, axis=-1)[..., : self.top_k]
         w = mx.softmax(mx.take_along_axis(logits, idx, axis=-1), axis=-1, precise=True)
-        out = (self.switch_mlp(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
+        if getattr(self, "_combine_fold", False):
+            out = _moe_combine_fold(self.switch_mlp, x, idx, w).astype(x.dtype)
+        else:
+            out = (self.switch_mlp(x, idx) * w[..., None]).sum(axis=-2).astype(x.dtype)
         wide = getattr(self, "_wide_shared", None)
         if wide is None:
             return out + mx.sigmoid(self.shared_expert_gate(x)) * self.shared_expert(x)
