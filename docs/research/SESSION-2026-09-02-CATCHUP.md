@@ -1723,3 +1723,13 @@ advisor の「最終チャンクは 1 トークンあたり 2.1 倍」は 4k で
 prefill_s A 14.013 / B 14.026 (-0.1%)、tok/round 同一。発火は確認済み (env と enable を knob が両方立てる、行数ゲート 64 に対し 2048 行)。
 HC の elementwise は compile しても動かない。GEMM 床 234 ms + traffic 床 105 ms = 340 ms に対し実測 380〜423 ms なので、
 残りは 1 割強しか無く、その 1 割も op 起動でなく traffic だった。畳む。knob は既定 off のまま残す。
+
+### 2026-09-03 08:10 P3 第 1 段: steel 平坦化の dense qmm クローン (`tools/moe_grouped_gemm_micro.py --stage dense`)
+
+| 形 | M | K | N | stock ms | clone ms | 比 | ビット一致 |
+|---|---|---|---|---|---|---|---|
+| gate/up | 20480 | 2560 | 640 | 5.998 | 5.997 | 1.000 | yes |
+| down | 20480 | 640 | 2560 | 5.936 | 5.972 | 1.006 | yes |
+
+`mx.fast.metal_kernel` の経路で steel と同じ効率が出た (入場料は払えた)。写しは機械抽出 1507 行 (`kernels/_steel_flat.py`、NAX 記号ゼロを assert)。
+mmap 17k の 1 巡目: pread 31.8 s → mmap 29.6 s (-6.9%)。
