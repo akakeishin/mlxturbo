@@ -318,6 +318,47 @@ def test_batch_min_rows_default_and_override(tmp_path):
     assert got_forced_naive.tobytes() == want.tobytes()
 
 
+@pytest.mark.skipif(not hasattr(os, "preadv"), reason="os.preadv が無い環境")
+def test_gather_pread_preadv_matches_legacy_pread(tmp_path):
+    """`_use_preadv` (os.preadv で buf に直書き) と旧経路 (os.pread +
+    np.frombuffer) が、行ごと submit 経路 (< batch_min_rows) とスライス分割
+    経路 (>= batch_min_rows) の両方でビット一致することを確認する。
+
+    `StreamNGram` はこの環境 (os.preadv あり) では既定で `_use_preadv=True`
+    になるはず -- それも合わせて確認する。
+    """
+    sidecar, rec = _build_synthetic_sidecar(tmp_path, rows=2000)
+    stream = StreamNGram(sidecar, backend="pread", n_threads=4)
+    assert stream._use_preadv is True  # この環境の既定 (FASTMLX_NGRAM_PREADV 未設定)
+
+    rng = np.random.default_rng(9)
+    for n in (1, 5, 63, 64, 65, 500, 1999):  # batch_min_rows=64 をまたぐ行数
+        ids = rng.integers(0, 2000, size=n).astype(np.int64)
+
+        stream._use_preadv = False
+        want = stream._gather_pread(ids)
+
+        stream._use_preadv = True
+        got = stream._gather_pread(ids)
+
+        assert got.tobytes() == want.tobytes(), n
+
+
+def test_preadv_disabled_by_env_var(tmp_path, monkeypatch):
+    """`FASTMLX_NGRAM_PREADV=0` で `_use_preadv` が False になり、
+    `os.preadv` がこの環境に無いふりをしても (hasattr 相当) 同様に False に
+    なることを確認する (どちらも旧経路へのフォールバック)。"""
+    sidecar, _ = _build_synthetic_sidecar(tmp_path, rows=100)
+
+    monkeypatch.setenv("FASTMLX_NGRAM_PREADV", "0")
+    stream_off = StreamNGram(sidecar, backend="pread", n_threads=2)
+    assert stream_off._use_preadv is False
+
+    monkeypatch.delenv("FASTMLX_NGRAM_PREADV", raising=False)
+    stream_default = StreamNGram(sidecar, backend="pread", n_threads=2)
+    assert stream_default._use_preadv == hasattr(os, "preadv")
+
+
 def test_prefetch_ngram_span_matches_real_forward(tmp_path):
     """`mlxturbo/spec_flash.py` の `_prefetch_ngram_span` (次の 1 eval 境界
     ぶんの n-gram 先読み) が計算する行 id が、実際の prefill フォワード

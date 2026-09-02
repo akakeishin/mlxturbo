@@ -215,6 +215,32 @@ class StreamNGram:
     The mmap path is kept so it can be reverted to if this regresses. Switch with
     `FASTMLX_NGRAM_BACKEND=mmap` or `backend="mmap"`.
 
+    `_gather_pread` の中身自体も `os.preadv` (macOS 11+) が使えるなら使う
+    (既定 on)。`os.preadv(fd, buffers, offset)` は offset を 1 個しか取らない
+    readv のベクタ化版で、**1 つの連続領域を複数バッファへ分けて読む**もの
+    であり、別々のオフセットにある行を 1 回の呼び出しでまとめて読むことは
+    できない (試すと `preadv(fd, [buf_a, buf_b], off)` は off から連続する
+    2 レコード分を返すだけで、2 つ目のバッファに別の行が入ったりはしない --
+    2026-09-03 に 10 行の合成ファイルで確認済み)。n-gram の行 id はハッシュ
+    出力で 320M 行にほぼ一様に散らばるため、隣接ペアの期待値は
+    32,768 行あたり約 3 組 (birthday paradox) しかなく、束ねる土台がほぼ無い。
+    したがって「複数行を 1 syscall にまとめる」効果は無い。使っているのは
+    別の効果で、`os.pread` は毎回新しい `bytes` を確保してから `buf[i]` へ
+    コピーする一方、`os.preadv` は呼び出し側のバッファへ直接書けるので、
+    行ごとの「malloc + memcpy」が 1 回減る (syscall 数は行数のまま変わらない)。
+    CPU micro (`tools/ngram_pread_bench.py --preadv`、実サイドカー、
+    pread/preadv を毎回 interleave で交互に測り、片方だけがページキャッシュの
+    温まりの恩恵を受け続けないよう試行ごとに実行順も入れ替える、2026-09-03)
+    では 1 チャンク相当 (32768 行、12 スレッド) で 10 回中 10 回 preadv が
+    勝ち、152ms->137ms (中央値、-11%)。8/16 スレッドでも同様に勝ち
+    (-12%/-3%)。decode 相当 (48 行) でも 0.50ms->0.46ms (-9%) で勝ち。
+    最初にスレッド順を固定して測ったとき (interleave なし) は後に測った側
+    (=先に測った側がページキャッシュを温めていた側) が過大に有利に出ていた
+    ので、この数字は interleave 版のみを信用すること。ビット一致は確認済み。
+    `FASTMLX_NGRAM_PREADV=0` で旧経路 (`os.pread`) に戻せる。
+    `hasattr(os, "preadv")` が False の環境 (Python 3.7 未満相当) では
+    自動的に旧経路。
+
     prefetch: prefill プロンプトの行 id は最初から全部わかっているので、
     `prefetch()` に渡すと専用のバックグラウンドスレッドが行キャッシュ
     (`_NGramCacheGen`) を埋めておく。`__call__` はキャッシュに乗っている行を
@@ -279,6 +305,11 @@ class StreamNGram:
             # the point of parallelizing
             self._pool = ThreadPoolExecutor(max_workers=self.n_threads)
             self._fd = os.open(str(rows_bin), os.O_RDONLY)
+            # `_gather_pread` の読み方 (os.preadv/os.pread の選択)。クラス
+            # docstring 参照。preadv が無い環境では自動的に旧経路
+            self._use_preadv = hasattr(os, "preadv") and (
+                os.environ.get("FASTMLX_NGRAM_PREADV", "1") != "0"
+            )
 
             # 行キャッシュ。既定 4M 行 = 400MB (50k プロンプト = 80万行が
             # 入る)。満杯になったら世代ごと全消し (単純さ優先)。
@@ -377,15 +408,23 @@ class StreamNGram:
         rec_bytes = self.rec
         buf = np.empty((n, rec_bytes), dtype=np.uint8)
         fd = self._fd
+        use_preadv = self._use_preadv
 
         if n < self.batch_min_rows:
-            def read_one(i: int, row_id) -> None:
-                # os.pread releases the GIL, so the disk I/O really does run in
-                # parallel here. The destination buf[i] is disjoint per row, so
-                # there is no contention
-                buf[i] = np.frombuffer(
-                    os.pread(fd, rec_bytes, int(row_id) * rec_bytes), dtype=np.uint8
-                )
+            if use_preadv:
+                def read_one(i: int, row_id) -> None:
+                    # os.preadv releases the GIL like os.pread, and writes
+                    # straight into buf[i] instead of allocating a new bytes
+                    # object first (class docstring has the measurements)
+                    os.preadv(fd, [buf[i]], int(row_id) * rec_bytes)
+            else:
+                def read_one(i: int, row_id) -> None:
+                    # os.pread releases the GIL, so the disk I/O really does run in
+                    # parallel here. The destination buf[i] is disjoint per row, so
+                    # there is no contention
+                    buf[i] = np.frombuffer(
+                        os.pread(fd, rec_bytes, int(row_id) * rec_bytes), dtype=np.uint8
+                    )
 
             futures = [
                 self._pool.submit(read_one, i, row_id) for i, row_id in enumerate(flat)
@@ -394,12 +433,18 @@ class StreamNGram:
                 f.result()
             return buf
 
-        def read_range(lo: int, hi: int) -> None:
-            for i in range(lo, hi):
-                row_id = int(flat[i])
-                buf[i] = np.frombuffer(
-                    os.pread(fd, rec_bytes, row_id * rec_bytes), dtype=np.uint8
-                )
+        if use_preadv:
+            def read_range(lo: int, hi: int) -> None:
+                for i in range(lo, hi):
+                    row_id = int(flat[i])
+                    os.preadv(fd, [buf[i]], row_id * rec_bytes)
+        else:
+            def read_range(lo: int, hi: int) -> None:
+                for i in range(lo, hi):
+                    row_id = int(flat[i])
+                    buf[i] = np.frombuffer(
+                        os.pread(fd, rec_bytes, row_id * rec_bytes), dtype=np.uint8
+                    )
 
         n_th = min(self.n_threads, n)
         step = -(-n // n_th)  # ceil div
