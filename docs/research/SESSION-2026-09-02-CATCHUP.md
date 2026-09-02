@@ -1648,3 +1648,18 @@ decode 側は HC 4.7 ms / indexer 2.7 ms に手が無く、-7% は当面残る�
   疑い (確認中)。G 個のチャンクの hidden を連結して MoE を 1 回で呼べば、M/E=160 (G=4) で水増し 1.22 → MoE -13%、
   G=8 で 1.10 → -22%。prefill 全体で **-6〜-9%**。これは Python だけの変更で、数値は不変 (行の順序が変わるだけ)。
 - bf16 の専門家常駐 (gather_mm) は遅く、量子化の形を変えても dense qmm の 11.2 TFLOPS が上限。
+
+## gather_qmm のトークン数依存 (モデル無し、2026-09-03 18:20、scratchpad/moe_gather_micro2.py)
+
+| MoE 1 回の行数 | M/E | gather_qmm (ソート済み) | 2048 tok 換算 | dense qmm | 比 |
+|---|---|---|---|---|---|
+| 2048 tok | 40 | 9.00 ms (7.5 TFLOPS) | 9.00 | 5.97 | 1.51 |
+| 8192 tok (G=4 の連結) | 160 | 27.5 ms (9.8 TFLOPS) | **6.88** | 23.1 | 1.19 |
+| 16384 tok (G=8) | 320 | 52.4 ms (10.3 TFLOPS) | 6.54 | 46.1 | 1.14 |
+
+- `_group_prefill_forward` は既に G=4 チャンクの行を連結して MoE を 1 回で呼んでいる (`ycat = layer.mlp(xcat)`) ので、
+  本番の MoE 行列積は 2048 tok 換算 6.9 ms/本 (dense 比 1.19)。`prefill_anatomy` の 9.2 ms/本 (効率 65%) は
+  チャンク単体の呼び出しを測っていて、本番より悪く見せていた。G=8 の -1.2% (6.88 → 6.54 = MoE -5% = prefill -2% の
+  見込みに対して) と整合。
+- 残る MoE の伸びしろは dense 比 1.19 の 16% (= prefill の 6%) で、gather_qmm の区間タイル効率そのもの。取るには
+  grouped GEMM のカーネル。**優先度は下げる** (Python 側の手は使い切った)。
