@@ -1355,6 +1355,31 @@ def _knob_ngram_batch(ctx):
     return apply
 
 
+def _knob_prime_window(ctx):
+    """prefill 末尾で MTP head を暖める窓幅 (`spec_flash.PRIME_WINDOW`)。既定 2048。
+
+    `_prime_draft_cache` は末尾 min(PRIME_WINDOW, len) トークンぶんだけ MTP head を
+    先回りして回し、decode 開始時点で draft キャッシュを空でなくしておく
+    (docstring の言葉で言えば「窓で費用を文脈長に依らなくする」)。窓を狭めれば
+    prefill 末尾の費用 (17k 冷 prefill で 0.25s、4k なら TTFT の 3.6%) は減るが、
+    暖める文脈が短くなるぶん最初の数ラウンドの受理率が落ちうる。**prefill に
+    効くので `DECODE_ONLY_KNOBS` には入れない** (`--prefill-once` は使えない)。
+
+    出力は変わりうる (`control_identical=False`) -- draft の暖まり方が変わると
+    受理・棄却の分岐点が動き、以降の生成トークン列が分岐しうるため。
+
+    判定の物差し: **prefill_s (= TTFT) が減り、かつ tok/round の低下が 2%
+    未満なら、小さい窓を既定にする。**どちらか片方しか満たさない場合は
+    その場で決めない (`depth` knob と同じ扱い)。
+    """
+    import mlxturbo.spec_flash as SF
+
+    def apply(variant):
+        SF.PRIME_WINDOW = int(variant)
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
@@ -1402,6 +1427,7 @@ KNOBS = {
     "ngram-prefetch": (_knob_ngram_prefetch, ["A", "B"], True, "A"),
     # A = batch_min_rows=64 (既定) / B = 10**9 (常に行ごと旧経路)。判定は prefill_s
     "ngram-batch": (_knob_ngram_batch, ["A", "B"], True, "A"),
+    "prime-window": (_knob_prime_window, ["2048", "512"], False, "2048"),
 }
 
 

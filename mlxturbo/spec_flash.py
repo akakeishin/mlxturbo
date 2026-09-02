@@ -71,7 +71,12 @@ from .kernels import _fire
 # of prompt length -- this model's ceiling is 262144 tokens, where priming the
 # whole prompt would cost both minutes of TTFT and gigabytes of retained hyper
 # state. Measured at 2048: 32k prompt, acceptance 0.574 -> 0.827.
-PRIME_WINDOW = 2048
+# Overridable via MLXTURBO_PRIME_WINDOW (read once at import time). Must stay
+# <= 2 * PREFILL_STEP_SIZE - 1 or HYPER_KEEP_CHUNKS below no longer covers
+# PRIME_WINDOW+1 positions. tools/decode_ab.py's prime-window knob mutates the
+# module attribute directly instead of going through the env var -- see that
+# knob's docstring.
+PRIME_WINDOW = int(os.environ.get("MLXTURBO_PRIME_WINDOW", "2048") or "2048")
 # Trailing prefill chunks whose hyper state generate_stream retains. Two chunks
 # of PREFILL_STEP_SIZE always cover PRIME_WINDOW+1 positions.
 HYPER_KEEP_CHUNKS = 2
