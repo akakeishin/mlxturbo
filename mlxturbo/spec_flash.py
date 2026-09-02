@@ -461,6 +461,11 @@ _PREFILL_TAIL_CHUNKS = int(os.environ.get("MLXTURBO_PREFILL_TAIL_CHUNKS", "1"))
 # コメント。取り分は小さく、メモリ側の危険は実在するので、測ってから決める。
 _PREFILL_PIPELINE = os.environ.get("MLXTURBO_PREFILL_PIPELINE") == "1"
 
+# 端数チャンク (幅 < step) をレイヤー主導グループに畳み込むか。既定 on
+# (commit b80d7e2 の挙動)。"0" で畳み込み前 (端数は常に chunk-major で
+# 単独処理) に戻る。A/B は tools/decode_ab.py の knob `fold-tail`。
+_PREFILL_FOLD_TAIL = os.environ.get("MLXTURBO_PREFILL_FOLD_TAIL", "1") != "0"
+
 if _PREFILL_GROUP > 1 and os.environ.get("MLXTURBO_PREFILL_CHUNK"):
     # MLXTURBO_PREFILL_CHUNK を立てると big != step になり、下の group 経路の
     # 条件が外れて layer-major prefill が**黙って無効化**される。チャンク幅の
@@ -1210,7 +1215,7 @@ class FlashSpecEngine:
                     group_chunks = [
                         ids[:, i + k * step : i + (k + 1) * step] for k in range(g)
                     ]
-                    if g < _PREFILL_GROUP:
+                    if _PREFILL_FOLD_TAIL and g < _PREFILL_GROUP:
                         # このグループの直後に来る幅を覗く。ちょうど端数
                         # (step < after < 2*step) なら、上限 G を超えない
                         # うちに同じ _group_prefill_forward 呼び出しへ畳み込む。
@@ -1221,7 +1226,8 @@ class FlashSpecEngine:
                                 ids[:, i + g * step : i + g * step + frac_len]
                             )
                 elif (
-                    _PREFILL_GROUP > 1
+                    _PREFILL_FOLD_TAIL
+                    and _PREFILL_GROUP > 1
                     and big == step
                     and remaining > step
                     and remaining - step < step

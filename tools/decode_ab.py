@@ -731,6 +731,23 @@ def _knob_prefill_pipeline(ctx):
     return apply
 
 
+def _knob_fold_tail(ctx):
+    """端数チャンクをレイヤー主導グループに畳み込むか (b80d7e2)。
+    A = 畳む (既定) / B = 畳まない (commit 前の chunk-major 単独)。
+
+    17k (16869 tok) のフェーズ別トレースで、端数チャンク 485 tok が
+    4.49 ms/tok (グループは 2.45-2.79 ms/tok) だったのが動機。畳み込みは
+    チャンク境界 (grid) を変えないので出力はビット一致するはず。
+    判定は prefill_s。
+    """
+    import mlxturbo.spec_flash as SF
+
+    def apply(variant):
+        SF._PREFILL_FOLD_TAIL = variant == "A"
+
+    return apply
+
+
 def _knob_ngram_layout(ctx):
     """n-gram サイドカーのレイアウト。A = interleaved (`StreamNGram`、ディスク
     参照) / B = separate (`RamNGram`、RAM 常駐)。
@@ -934,6 +951,7 @@ KNOBS = {
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),
     "prefill-group": (_knob_prefill_group, ["2", "4", "8"], True, "4"),
     "prefill-pipeline": (_knob_prefill_pipeline, ["A", "B"], True, "B"),
+    "fold-tail": (_knob_fold_tail, ["A", "B"], True, "A"),
     "qsa": (_knob_qsa, ["A", "B"], False, "A"),
     "bool-mask": (_knob_bool_mask, ["A", "B"], False, "B"),
     "gather-attn": (_knob_gather_attn, ["A", "B"], False, "B"),
