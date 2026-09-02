@@ -303,3 +303,36 @@ T=2048 (B=1、Hk=16、Hv=48、Dk=Dv=128、bf16) の壁時計、交互 20 回:
 逐次 min 4.98 / mean 6.04 ms、Metal 移植 min 3.14 / mean 3.81 ms (**x1.59**)。
 36 層 x 8 チャンクで 17k prefill あたり約 0.6 s (1.8%) の見込み。in-model A/B
 (`--knob gdn-metal`、prefill_s) で採否を決める。
+
+## 17k decode の文脈罰は gather 経路の有無に依らない (2026-09-02 12:58、同じ熱状態)
+
+forward_split S=1 ctx 17k: gather off (dense マスク) eval 32.3 ms、gather on 31.3 ms。
+どちらも相手 (21.0) より 10 ms 大きい。**罰は両経路に共通の部分** (indexer:
+pooled スコア + argpartition + keep マスク構築、KV/indexer キャッシュの更新) にある。
+xctrace のカーネル区間で相手と突き合わせる。
+
+## prefill のフェーズ別トレース (2026-09-02 13:02、17k = 16869 tok、熱い状態、4 本目)
+
+`MLXTURBO_PREFILL_TRACE=1`。壁時計 49.3 s (熱い。冷えていれば 35 s 前後)。
+
+| 区間 | ms | 1 トークンあたり |
+|---|---|---|
+| group build+async i=0 g=4 (8192 tok) | 20106 | 2.45 |
+| group eval | 1082 | |
+| group build+async i=8192 g=3 (6144 tok) | 17165 | 2.79 |
+| group eval | 992 | |
+| **tail forward 485 tok (端数チャンク)** | **2180** | **4.49** |
+| **tail forward 2048 tok (最終チャンク、split + checkpoint + lm_head 込み)** | **7540** | **3.68** |
+| prime (MTP、2048) | 229 | |
+| first token | 8 | |
+| 区間和 - 壁時計 | -7 | |
+
+読み方: チャンクの外に「見えない 6-8 s」があるわけではなく、**末尾 2 チャンクが
+高い**。理由は (a) 末尾ほど kv が大きく attention が伸びる (chunk 7 の解剖: attention
+1954 ms)、(b) 端数チャンク 485 tok は MoE の行数が少なく (専門家あたり 9.5 行)
+効率が落ちる、(c) 末尾は chunk-major で MoE の連結が無い (2048 行 = 専門家あたり
+40 行) うえに段階投入も無い (解剖: chunk-major 6883 vs layer-major 6505)、
+(d) split / checkpoint / lm_head。
+
+手: 端数チャンクをグループに入れる (~1 s)、最終チャンクも layer-major で流す
+(~0.4 s)、attention を真の union で集める (kv 依存を消す。最大)、GDN Metal (0.6 s)。

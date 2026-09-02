@@ -1188,24 +1188,59 @@ class FlashSpecEngine:
                 _t = _pf.log("prefetch", _t)
             while i < n:
                 remaining = n - i
-                # 前方の等長 2048 チャンクだけレイヤー主導でグループ処理する
+                # 前方の等長 2048 チャンクはレイヤー主導でグループ処理する
                 # (チャンク境界は従来と同一 grid なので出力はビット一致)。
-                # 末尾側 (端数チャンクと最終チャンク) は従来経路のまま —
-                # checkpoint の粒度が要るのは分岐が起きやすい末尾だから。
+                # グループと最終チャンクの間に残る端数チャンク (幅 < step) は
+                # 単独だと MoE の専門家あたり行数が薄く gather_qmm の効率が
+                # 落ちるので、直前のグループに余裕 (< _PREFILL_GROUP) があれば
+                # そのグループの最後のチャンクとして畳み込み、余裕が無ければ
+                # 端数だけの g=1 グループとして _group_prefill_forward に通す
+                # (どちらも chunk-major より段階投入と MoE の呼び出し経路が
+                # 揃うぶん有利なはず)。最終チャンク (BPE 境界 checkpoint 用の
+                # 分割がある) だけは従来経路のまま — checkpoint の粒度が
+                # 要るのはそこだけだから。
                 # MLXTURBO_PREFILL_CHUNK 指定時は旧 knob を優先して無効化。
                 g = min(
                     _PREFILL_GROUP,
                     (remaining - _PREFILL_TAIL_CHUNKS * step) // step,
                 )
+                group_chunks = None
+                frac_len = 0  # 端数チャンクをこの回に含めるときの幅 (0 なら無し)
                 if _PREFILL_GROUP > 1 and big == step and g >= 2:
                     group_chunks = [
                         ids[:, i + k * step : i + (k + 1) * step] for k in range(g)
                     ]
+                    if g < _PREFILL_GROUP:
+                        # このグループの直後に来る幅を覗く。ちょうど端数
+                        # (step < after < 2*step) なら、上限 G を超えない
+                        # うちに同じ _group_prefill_forward 呼び出しへ畳み込む。
+                        after = remaining - g * step
+                        if step < after < 2 * step:
+                            frac_len = after - step
+                            group_chunks.append(
+                                ids[:, i + g * step : i + g * step + frac_len]
+                            )
+                elif (
+                    _PREFILL_GROUP > 1
+                    and big == step
+                    and remaining > step
+                    and remaining - step < step
+                ):
+                    # 直前にグループが無い (無いか、上限 G で畳み込めない) 端数
+                    # 単体。g=1 のグループとして _group_prefill_forward に通す。
+                    frac_len = remaining - step
+                    group_chunks = [ids[:, i : i + frac_len]]
+                if group_chunks is not None:
+                    consumed = sum(c.shape[1] for c in group_chunks)
+                    gn = len(group_chunks)
                     if _pf:
                         _t = time.perf_counter()
                     hys = _group_prefill_forward(model, group_chunks, caches)
                     if _pf:
-                        _t = _pf.log(f"group build i={i} g={g}", _t)
+                        label = f"group build i={i} g={gn}"
+                        if frac_len:
+                            label += f" tokens={consumed}"
+                        _t = _pf.log(label, _t)
                     hys = hys[-HYPER_KEEP_CHUNKS:]
                     states = [
                         st for c in caches
@@ -1228,19 +1263,19 @@ class FlashSpecEngine:
                         if _pf:
                             # 非同期投入なので、ここでの dur は GPU 完了を
                             # 待っていない (build+async の意)
-                            _t = _pf.log(f"group eval i={i} g={g} build+async", _t)
+                            _t = _pf.log(f"group eval i={i} g={gn} build+async", _t)
                     else:
                         mx.eval(*hys)
                         for st in states:
                             mx.eval(st)
                         if _pf:
-                            _t = _pf.log(f"group eval i={i} g={g}", _t)
+                            _t = _pf.log(f"group eval i={i} g={gn}", _t)
                         mx.clear_cache()
                         if _pf:
-                            _t = _pf.log(f"clear_cache i={i} g={g}", _t)
+                            _t = _pf.log(f"clear_cache i={i} g={gn}", _t)
                     hyper_chunks.extend(hys)
                     del hyper_chunks[:-HYPER_KEEP_CHUNKS]
-                    i += g * step
+                    i += consumed
                     if checkpoints is not None:
                         if _pf:
                             _t = time.perf_counter()
@@ -1249,7 +1284,7 @@ class FlashSpecEngine:
                         )
                         del checkpoints[:-CHECKPOINT_RETENTION]
                         if _pf:
-                            _pf.log(f"checkpoint i={i} g={g}", _t)
+                            _pf.log(f"checkpoint i={i} g={gn}", _t)
                     continue
                 if remaining > step:
                     j = i + min(big, remaining - step)

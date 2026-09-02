@@ -165,7 +165,43 @@ def check_copies() -> bool:
     diff = _max_diff(_cache_arrays(c1), _cache_arrays(c2))
     group_ok = diff < 5e-6
     print(f"group_prefill_forward == chunk-major: {group_ok} (max|diff|={diff:.3e})")
-    return staged_ok and group_ok
+
+    # 写し 2b: 端数チャンク折込み (spec_flash.py の group+端数 fold-in)。
+    #
+    # 上の group_ok は等幅チャンク (10,10,10,10) だけなので、末尾を短く
+    # 切った可変幅グループ ("フル 2 個 + 端数 7" = spec_flash.py の
+    # group+端数+最終と同じ形) を通しても chunk-major と一致するかを別に
+    # 見る。fold-in は「直前グループの最後のチャンクとして幅の違うものを
+    # 足す」だけなので、_group_prefill_forward 自体を変えていないが、
+    # 可変幅を実際に流すのはここが初めてなので回帰ゲートとして足す。
+    frac_chunks = [
+        mx.array(ids_list[0:10])[None],
+        mx.array(ids_list[10:20])[None],
+        mx.array(ids_list[20:27])[None],  # 端数 (幅 7 < 10)
+    ]
+    c1, c2 = model.make_cache(), model.make_cache()
+    for ch in frac_chunks:
+        model(ch, cache=c1)
+    SF._group_prefill_forward(model, frac_chunks, c2)
+    diff = _max_diff(_cache_arrays(c1), _cache_arrays(c2))
+    frac_ok = diff < 5e-6
+    print(
+        f"group_prefill_forward (端数を含む可変幅) == chunk-major: {frac_ok} "
+        f"(max|diff|={diff:.3e})"
+    )
+
+    # 写し 2c: g=1 (直前グループが無い/上限 G で畳み込めない端数単体を
+    # g=1 のグループとして _group_prefill_forward に通す新経路)。1 チャンク
+    # だけでも chunk-major と一致することを見る。
+    single = [mx.array(ids_list[27:37])[None]]
+    c1, c2 = model.make_cache(), model.make_cache()
+    for ch in single:
+        model(ch, cache=c1)
+    SF._group_prefill_forward(model, single, c2)
+    diff = _max_diff(_cache_arrays(c1), _cache_arrays(c2))
+    g1_ok = diff < 5e-6
+    print(f"group_prefill_forward (g=1) == chunk-major: {g1_ok} (max|diff|={diff:.3e})")
+    return staged_ok and group_ok and frac_ok and g1_ok
 
 
 def check_causal() -> bool:
