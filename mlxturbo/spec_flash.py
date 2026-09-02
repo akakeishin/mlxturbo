@@ -213,8 +213,32 @@ MLXTURBO_DEPTH_ADAPT = os.environ.get("MLXTURBO_DEPTH_ADAPT") == "1"
 # DepthController が保持する位置別 EMA の本数。MLXTURBO_DEPTH_CAP がこれを
 # 超えて指定されても、ここで頭打ちにする (相手の上限が 6 なので余裕を見て 8)。
 _DEPTH_CONTROLLER_MAX = 8
-_DEPTH_EMA_BETA = 0.15
 _DEPTH_EMA_PRIOR = 0.85
+# 位置別 a[] の EMA の既定 beta。相手と同じ 0.15 で短文脈 A/B を取ったところ
+# (bench/results/depth-adapt-short.json、2026-09-03)、最初の数ラウンドの
+# 不的中だけで a[0] が急落して depth 1 に張り付き、静的 depth 2 比で
+# ms/tok が +3.3% 悪化した。もっと緩く動かすため既定を下げてある。
+# MLXTURBO_DEPTH_BETA で上書き可。
+_DEPTH_EMA_BETA_DEFAULT = 0.1
+# 深さごとの実測ラウンド費用 (ms/round) の EMA の beta。位置別 a[] の beta
+# (上、env で変えられる) とは別物 -- こちらは相手の受理率 EMA に合わせて
+# 固定 0.15 のまま (env での上書きは今のところ要らない、必要になったら足す)。
+_DEPTH_COST_EMA_BETA = 0.15
+
+
+def _depth_beta_default() -> float:
+    """位置別 a[] の EMA の beta。MLXTURBO_DEPTH_BETA が最優先、無ければ
+    _DEPTH_EMA_BETA_DEFAULT (0.1)。"""
+    env = os.environ.get("MLXTURBO_DEPTH_BETA")
+    if env:
+        try:
+            v = float(env)
+        except ValueError:
+            v = 0.0
+        if v > 0:
+            return v
+    return _DEPTH_EMA_BETA_DEFAULT
+
 
 # choose() が探索する depth の上限 (cap) の既定の境界。choose_depth 側の
 # DEPTH_CONTEXT_LIMIT (既定 = モデルの indexer_budget) とは別の定数 --
@@ -241,12 +265,20 @@ def _depth_cap_default(pos: int) -> int:
 
 
 def _depth_cost_params(pos: int) -> tuple[float, float]:
-    """DepthController.choose が使う 1 ラウンドの費用モデル T(m) = T1 + m*dT
-    の (T1, dT) (ms)。既定は verify_width_cost の実測
-    (docs/research/SESSION-2026-09-02-CATCHUP.md: 短文脈 S=1 25.2 / S=2 33.1
-    / S=3 39.8、17k は S=1 30.4 / S=2 39.3 -- 差分から T1≈25/dT≈7 と
-    T1≈30/dT≈9 を採った)。MLXTURBO_DEPTH_COST="T1,dT" で文脈長によらず
-    固定できる。
+    """線形の費用モデル T(m) = T1 + m*dT の (T1, dT) (ms)。
+
+    2026-09-03 の短文脈 A/B (bench/results/depth-adapt-short.json) で、この
+    線形モデルの絶対値 (T1=25, dT=7) が実測より深さを過大に罰っていると
+    分かった (実測の 1 段あたりの費用は +4.5ms 前後)。そのため
+    ``DepthController`` はもう T(m) 全体をこの式では組まない --
+    実測 (``cost_ema``) が無い深さの cold start にだけこの式を使い、
+    実測が育ったあとは dT を**補外の傾き**としてだけ使う
+    (``DepthController._cost_for`` 参照)。
+
+    既定は verify_width_cost の実測 (docs/research/SESSION-2026-09-02-CATCHUP.md:
+    短文脈 S=1 25.2 / S=2 33.1 / S=3 39.8、17k は S=1 30.4 / S=2 39.3 --
+    差分から T1≈25/dT≈7 と T1≈30/dT≈9 を採った) をそのまま初期値に使う。
+    MLXTURBO_DEPTH_COST="T1,dT" で文脈長によらず固定できる。
     """
     env = os.environ.get("MLXTURBO_DEPTH_COST")
     if env:
@@ -263,15 +295,25 @@ class DepthController:
 
     位置ごとの条件付き受理率 ``a[i]`` (i = 0..max_depth-1、「ドラフトの
     チェーンが位置 i まで届いたとき、位置 i も的中する確率」) を EMA
-    (既定 beta=0.15、未観測の事前値 0.85) で保持する。``choose(pos)`` は
-    期待受理トークン数 E(m) を 1 ラウンドの費用 T(m) で割った値が最大の
-    m (= depth) を、``m in 1..cap`` の範囲で返す:
+    (既定 beta=0.1、``_depth_beta_default`` / MLXTURBO_DEPTH_BETA、未観測の
+    事前値 0.85) で保持する。``choose(pos)`` は期待受理トークン数 E(m) を
+    1 ラウンドの費用 T(m) で割った値が最大の m (= depth) を、
+    ``m in 1..cap`` の範囲で返す:
 
         E(m) = 1 + sum(i = 0..m-1) prod(j = 0..i) a[j]
-        T(m) = T1 + m * dT
 
-    ``cap``/``T1``/``dT`` は文脈長 (``pos``) から ``_depth_cap_default`` /
-    ``_depth_cost_params`` が決める (env で上書き可)。
+    ``cap`` は文脈長 (``pos``) から ``_depth_cap_default`` が決める (env で
+    上書き可)。T(m) は**実測優先**: ``observe(..., round_ms=...)`` で深さ
+    ``depth`` のラウンド費用を渡すたび ``cost_ema[depth]`` を EMA
+    (beta=0.15 固定) で更新する。``choose`` は観測のある深さはその EMA を
+    そのまま使い、観測の無い深さは「観測のある最も近い深さの EMA +
+    dT * (m - 最も近い深さ)」で補外する (``_cost_for`` 参照)。線形モデル
+    T1 + m*dT (``_depth_cost_params``) は、まだ何も観測が無い cold start の
+    ときの初期値としてだけ使う -- 2026-09-03 の短文脈 A/B
+    (bench/results/depth-adapt-short.json) で、この式の絶対値が実測より
+    深さを過大に罰っていて (dT=7 は実測 +4.5ms 前後より重い)、depth 1 に
+    張り付いて既定の静的 depth 2 に ms/tok で負けたため、絶対値としては
+    使わなくした。
 
     副作用を持たない (発火の記録は呼び出し側の責務 --
     ``FlashSpecEngine._effective_depth`` を参照)。単体テストが直接構成できる
@@ -279,22 +321,31 @@ class DepthController:
     """
 
     def __init__(self, max_depth: int = _DEPTH_CONTROLLER_MAX,
-                 beta: float = _DEPTH_EMA_BETA,
+                 beta: float | None = None,
                  prior: float = _DEPTH_EMA_PRIOR):
         self.max_depth = max_depth
-        self.beta = beta
+        self.beta = beta if beta is not None else _depth_beta_default()
         self.a = [prior] * max_depth
         # 検査用: 各位置が何回観測されたか (単体テストと分布確認に使う)。
         self.observations = [0] * max_depth
+        # 深さごとの実測ラウンド費用 (ms) の EMA。キーは観測済みの depth
+        # だけを持つ (「観測が無い」を空扱いで区別する)。
+        self.cost_ema: dict[int, float] = {}
+        self.cost_observations: dict[int, int] = {}
 
-    def observe(self, n_accepted: int, depth: int) -> None:
-        """検証ラウンドの結果で ``a`` を更新する。
+    def observe(self, n_accepted: int, depth: int,
+                round_ms: float | None = None) -> None:
+        """検証ラウンドの結果で ``a`` (と、渡されれば費用 EMA) を更新する。
 
         ``depth`` はそのラウンドで実際に引いたドラフト数、``n_accepted`` は
         そのうち採用された数 (0..depth)。位置 ``i < n_accepted`` は的中 (1)、
         ``i == n_accepted`` (depth 未満なら) は不的中 (0)、それより先の位置は
         「ドラフトのチェーンがそこで既に切れていて検証されていない」ので
         未観測のまま触らない。
+
+        ``round_ms`` (省略可): このラウンドの実測費用 (ms、呼び出し側が
+        draft 構築から verify の同期までを ``time.perf_counter()`` の差で
+        測る)。渡されたときだけ ``depth`` の費用 EMA も更新する。
         """
         limit = min(depth, self.max_depth)
         for i in range(limit):
@@ -306,6 +357,16 @@ class DepthController:
                 break
             self.a[i] = (1.0 - self.beta) * self.a[i] + self.beta * obs
             self.observations[i] += 1
+        if round_ms is not None and round_ms >= 0:
+            self._observe_cost(depth, round_ms)
+
+    def _observe_cost(self, depth: int, round_ms: float) -> None:
+        prev = self.cost_ema.get(depth)
+        self.cost_ema[depth] = (
+            round_ms if prev is None
+            else (1.0 - _DEPTH_COST_EMA_BETA) * prev + _DEPTH_COST_EMA_BETA * round_ms
+        )
+        self.cost_observations[depth] = self.cost_observations.get(depth, 0) + 1
 
     def expected_tokens(self, m: int) -> float:
         """E(m) = 1 + sum(i<m) prod(j<=i) a[j] の閉じた式。"""
@@ -316,13 +377,29 @@ class DepthController:
             total += prod
         return total
 
+    def _cost_for(self, m: int, pos: int) -> float:
+        """depth=m の 1 ラウンド費用 (ms) の見積もり。
+
+        実測 (``cost_ema[m]``) があればそれをそのまま使う。実測が 1 つも
+        無ければ (cold start) 線形モデル T1 + m*dT を使う。実測はあるが
+        ``m`` そのものは未観測なら、観測済みで最も近い深さの EMA から
+        ``dT * (m - 最も近い深さ)`` だけ補外する (符号込み -- m が近い深さ
+        より浅ければ引く)。
+        """
+        t1, dt = _depth_cost_params(pos)
+        if not self.cost_ema:
+            return t1 + m * dt
+        if m in self.cost_ema:
+            return self.cost_ema[m]
+        nearest = min(self.cost_ema, key=lambda k: abs(k - m))
+        return self.cost_ema[nearest] + dt * (m - nearest)
+
     def choose(self, pos: int) -> int:
         """E(m)/T(m) を最大にする m (1..cap) を返す。"""
         cap = min(_depth_cap_default(pos), self.max_depth)
-        t1, dt = _depth_cost_params(pos)
         best_m, best_score = 1, -1.0
         for m in range(1, cap + 1):
-            cost = t1 + m * dt
+            cost = self._cost_for(m, pos)
             score = self.expected_tokens(m) / cost if cost > 0 else 0.0
             if score > best_score:
                 best_score, best_m = score, m
@@ -1198,6 +1275,12 @@ class FlashSpecEngine:
         # generated token", so dropping it here shifts everything by one
         out, accepted, rounds = [int(cur.item())], 0, 0
         while len(out) < max_tokens:
+            # depth-adapt の費用 EMA 用: draft 構築から verify の同期までを
+            # 実測する (既存の MLXTURBO_PHASE_TIMERS のような専用の強制 eval
+            # は挟まない -- 下の mx.eval(lg) が元々あった同期点なので、
+            # ここで測っても新たな同期は増えない)。既定 off では
+            # perf_counter() を 1 回余計に呼ぶだけで、mx.eval の追加は無い。
+            _round_t0 = time.perf_counter() if self._depth_adapt else None
             drafts = self._draft_chain(
                 cur, hyper_prev, mtp_cache,
                 self._effective_depth(ids.shape[1] + len(out)),
@@ -1212,7 +1295,8 @@ class FlashSpecEngine:
             toks, hypers, hit = self._verify(cap, lg, drafts, 0.0)
             accepted += hit
             if self._depth_adapt:
-                self._depth_controller.observe(hit, len(drafts))
+                round_ms = (time.perf_counter() - _round_t0) * 1000.0
+                self._depth_controller.observe(hit, len(drafts), round_ms)
             keep = len(toks)
             rollback(model, caches, cap, pre, keep=keep, total=total,
                      ids_kept=pair[:, :keep])
@@ -1646,6 +1730,16 @@ class FlashSpecEngine:
         # 1=通常の楽観パイプライン, 2=組むが毎回捨てる (切り分け用), 0=無効
         pipeline = int(os.environ.get("MLXTURBO_PIPELINE", "0") or 0)
         while len(out) < max_tokens:
+            # depth-adapt の費用 EMA 用 (generate() と同じ理由 -- 既存の
+            # 同期点で測るだけで、新たな mx.eval は増やさない)。
+            #
+            # 制約: MLXTURBO_PIPELINE 有効時、`pending` 経由のラウンドは
+            # このラウンドの GPU 仕事が実は**前のラウンドの余り時間**で
+            # 既に終わっている (楽観先組み)。その場合ここで測る経過時間は
+            # 実際の depth 依存コストを過小評価する。pipeline は既定 off
+            # かつ depth-adapt との組み合わせは今回のゲート対象外なので、
+            # 単純な「ループ先頭から hit 確定まで」のまま許容している。
+            _round_t0 = time.perf_counter() if self._depth_adapt else None
             if timers:
                 ts = time.perf_counter()
             if pending is not None:
@@ -1714,8 +1808,12 @@ class FlashSpecEngine:
             if self._depth_adapt:
                 # このラウンドで実際に引いた深さ (drafts はここでは
                 # pending/next_drafts のどちらから来ても、このラウンドで
-                # 検証フォワードにかけた本数そのもの)。
-                self._depth_controller.observe(hit, len(drafts))
+                # 検証フォワードにかけた本数そのもの)。round_ms は
+                # _round_t0 (ループ先頭、上のコメント参照) から今までの
+                # 経過時間 -- ここまでに mx.eval(lg, ...) 済みなので GPU の
+                # 仕事は終わっている。
+                round_ms = (time.perf_counter() - _round_t0) * 1000.0
+                self._depth_controller.observe(hit, len(drafts), round_ms)
 
             vals = [int(t.item()) for t in toks]
             cut = next((k for k, v in enumerate(vals) if v in eos), None)

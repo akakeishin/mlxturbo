@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from mlxturbo.spec_flash import (
     DepthController,
+    _depth_beta_default,
     _depth_cap_default,
     _depth_cost_params,
 )
@@ -111,3 +112,62 @@ def test_depth_cost_env_override(monkeypatch):
     monkeypatch.setenv("MLXTURBO_DEPTH_COST", "10,2")
     assert _depth_cost_params(0) == (10.0, 2.0)
     assert _depth_cost_params(4000) == (10.0, 2.0)
+
+
+def test_depth_beta_env_override(monkeypatch):
+    monkeypatch.delenv("MLXTURBO_DEPTH_BETA", raising=False)
+    assert _depth_beta_default() == 0.1  # 既定 (2026-09-03 に 0.15 から下げた)
+    monkeypatch.setenv("MLXTURBO_DEPTH_BETA", "0.3")
+    assert _depth_beta_default() == 0.3
+    assert DepthController().beta == 0.3
+    # 明示引数は env より優先する
+    assert DepthController(beta=0.05).beta == 0.05
+    # 0 以下は無視して既定に落ちる
+    monkeypatch.setenv("MLXTURBO_DEPTH_BETA", "0")
+    assert _depth_beta_default() == 0.1
+
+
+def test_cost_ema_shifts_choice_away_from_linear_model():
+    """線形モデル (cold start) は受理率が低いと depth を 1 に抑えるが、
+    実測のラウンド費用 EMA が「深くしてもさほど高くつかない」と示せば
+    選択が変わる。
+
+    2026-09-03 の短文脈 A/B (bench/results/depth-adapt-short.json) の再現:
+    線形モデルの dT=7 は実測 (+4.5ms 前後) より深さを重く罰っていて、
+    depth 1 に張り付いて既定の静的 depth 2 に ms/tok で負けていた。
+    """
+    # beta=0 で位置別 a[] を凍結し、費用 EMA だけの効果を見る
+    ctl = DepthController(beta=0.0)
+    ctl.a[0] = ctl.a[1] = ctl.a[2] = 0.5
+
+    # cold start (cost_ema が空): 線形モデル T1=25, dT=7 のままだと depth 1
+    assert ctl.choose(0) == 1
+
+    # 実測: depth 2 は depth 1 よりわずかしか高くつかない (線形モデルが
+    # 想定する dT=7 よりずっと軽い、実測 ~3ms 相当)
+    ctl.observe(n_accepted=1, depth=1, round_ms=30.0)
+    ctl.observe(n_accepted=2, depth=2, round_ms=33.0)
+    assert ctl.choose(0) == 2
+
+    # a[] は beta=0 のままなので凍結されているはず (費用 EMA だけの効果と
+    # 切り分けるための前提)
+    assert ctl.a[0] == ctl.a[1] == ctl.a[2] == 0.5
+
+
+def test_observe_without_round_ms_leaves_cost_ema_untouched():
+    """round_ms を渡さない呼び出し (既存の意味) は費用 EMA に触らない。"""
+    ctl = DepthController()
+    ctl.observe(n_accepted=1, depth=1)
+    assert ctl.cost_ema == {}
+
+
+def test_cost_ema_extrapolates_from_nearest_observed_depth():
+    ctl = DepthController(beta=0.0)
+    ctl.observe(n_accepted=2, depth=2, round_ms=40.0)  # depth=2 だけ観測
+    t1, dt = _depth_cost_params(0)
+    # depth=1 (未観測): 最も近い観測 (depth=2) から dT*(1-2) だけ補外
+    assert ctl._cost_for(1, 0) == 40.0 - dt
+    # depth=3 (未観測): dT*(3-2) だけ加算
+    assert ctl._cost_for(3, 0) == 40.0 + dt
+    # depth=2 (観測済み): EMA そのもの
+    assert ctl._cost_for(2, 0) == 40.0
