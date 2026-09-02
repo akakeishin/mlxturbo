@@ -660,3 +660,11 @@ prime 0.25 s、checkpoint。
 ms/tok A -1.5%、ms/round -0.3%、tok/round +1.2% (1.669 対 1.649)。短文脈で害なし、17k で
 小さく効くので **既定 on (MLXTURBO_MTP_CACHE_APPEND=1) のまま**。レビューの「生成長に比例して
 受理率が落ちる」は 512 トークン窓では 1% 程度の効果に留まる。
+
+## wide (gate/up の N 連結) の再 A/B、D-2 修正後、17k prefill (2026-09-02 19:20)
+
+回文順 A B B A × 3 本。prefill_s A 78.6 対 B 48.3 (**+62.6%**)、decode ms/tok +43.2%、
+tok/round 同じ。3 本とも A が 25 s 以上遅く、熱 (B が 41〜60 s とばらつく) を差し引いても
+逆転の余地はない。**レーン 2 (行数・N の連結でタイル水増しを減らす) は棄却で確定。**
+D-2 の並び替えバグは直したが、連結そのものが gather_qmm の効率を落とす。
+MoE 超過 1.07 s の帰属は `tools/moe_routing_skew.py` (chain32 で実行待ち) に絞る。
