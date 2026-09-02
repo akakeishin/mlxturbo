@@ -41,16 +41,16 @@ def bench(fn, reps: int, warm: int = 2) -> float:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--S", type=int, default=2048)
+    ap.add_argument("--S", default="2048", help="カンマ区切り。8 以下は decode 幅 (vector カーネル)")
     ap.add_argument("--kvs", default="2048,8192,16896")
     ap.add_argument("--heads", type=int, default=24)
     ap.add_argument("--kv-heads", type=int, default=2)
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--out", default="bench/results/sdpa-headdim-micro.json")
     a = ap.parse_args()
-    S, Hq, Hk = a.S, a.heads, a.kv_heads
+    Hq, Hk = a.heads, a.kv_heads
     res = []
-    for kv in (int(x) for x in a.kvs.split(",")):
+    for S, kv in ((int(s_), int(kv_)) for s_ in a.S.split(",") for kv_ in a.kvs.split(",")):
         mask = qsa_like_mask(S, kv); mx.eval(mask)
         cases = {}
         # 現行: head_dim 256、bool 配列マスク (fallback 経路)
@@ -67,6 +67,8 @@ def main() -> None:
         mx.eval(q2, k2, v2)
         cases["d128x2_mask"] = lambda: mx.fast.scaled_dot_product_attention(q2, k2, v2, scale=128 ** -0.5, mask=mask)
         cases["d128x2_causal"] = lambda: mx.fast.scaled_dot_product_attention(q2, k2, v2, scale=128 ** -0.5, mask="causal")
+        if S <= 8:
+            cases["d256_nomask"] = lambda: mx.fast.scaled_dot_product_attention(q, k, v, scale=256 ** -0.5)
         # 交互に測る (ABCD を reps 回)
         names = list(cases)
         samples = {n: [] for n in names}
@@ -79,9 +81,10 @@ def main() -> None:
         row = {"S": S, "kv": kv, **{n: statistics.median(v) for n, v in samples.items()}}
         row["fallback_over_fused_mask"] = row["d256_mask"] / row["d128x2_mask"]
         res.append(row)
-        print(f"S={S} kv={kv:6d}  d256 mask {row['d256_mask']:7.1f} ms  causal {row['d256_causal']:7.1f} ms | "
-              f"d128x2 (融合) mask {row['d128x2_mask']:7.1f} ms  causal {row['d128x2_causal']:7.1f} ms | "
-              f"fallback/融合 = {row['fallback_over_fused_mask']:.2f}x", flush=True)
+        print(f"S={S:4d} kv={kv:6d}  d256 mask {row['d256_mask']:7.2f} ms  causal {row['d256_causal']:7.2f} ms | "
+              f"d128x2 (融合) mask {row['d128x2_mask']:7.2f} ms  causal {row['d128x2_causal']:7.2f} ms | "
+              f"fallback/融合 = {row['fallback_over_fused_mask']:.2f}x"
+              + (f" | d256 マスク無し {row['d256_nomask']:7.2f} ms" if "d256_nomask" in row else ""), flush=True)
         del q, k, v, q2, k2, v2, mask
     os.makedirs(os.path.dirname(a.out), exist_ok=True)
     json.dump({"note": __doc__, "rows": res}, open(a.out, "w"), ensure_ascii=False, indent=1)

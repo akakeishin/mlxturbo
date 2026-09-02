@@ -789,3 +789,41 @@ kv > 8192 で有効) を自前で持ち、この経路を避けている。
 整合的。**ゲートは変えない (合成で dense sdpa の 2 倍、kv=16.9k S=2048)。手を T=1 + 12 GQA head
 で K/V タイル共有 + uint4 の段階 load に変えて再挑戦する。**見込み: 17k prefill で約 2 s (5%)、
 50k で約 25 s (15%)。indexer 側の 80 ms/層は別途 `tools/qsa_prefill_split.py` で内訳を出す。
+
+## decode 幅の attention: S ≥ 3 は vector カーネルから外れる (2026-09-02 22:10、`tools/sdpa_headdim_micro.py --S`、`tools/sdpa_split_micro.py`、GPU 空き)
+
+MLX 0.32.2 `scaled_dot_product_attention.cpp:703`: S ≤ 8 の vector カーネルは
+`query_sequence_length * gqa_factor > 32` で不適格。Flash-Next は gqa 12 なので **S ≥ 3 は素の経路
+(スコア実体化、bool マスクのスキップ無し、全 kv 読み)**。S ≤ 2 だけがキーをスキップできる。
+
+1 層あたり ms (Hq 24、Hk 2、head_dim 256、bool マスクは QSA 風に 2048 キー可視):
+
+| S | kv 4096 | kv 17000 | kv 25000 | kv 50000 | 備考 |
+|---|---|---|---|---|---|
+| 1 | 0.33 | 0.54 | 0.43 | 0.43 | vector、スキップ効く (kv に依らない) |
+| 2 | 0.24 | 0.34 | 0.39 | 0.59 | vector、スキップ効く |
+| 3 | 0.97〜1.52 | 2.58〜3.38 | — | 7.08 | 素の経路、kv に比例 |
+| 4 | 0.84 | 2.72 | 3.85 | 7.46 | 同上 |
+| 8 | 0.88 | 2.85 | — | 7.91 | 同上 |
+| 16 | 1.00 | 2.98 | — | 8.37 | 同上 |
+
+幅 2 の呼び出しに分けて `concatenate` した場合 (同じ層、ms):
+
+| S | kv 4096: 一括 → 分割 | kv 17000 | kv 50000 |
+|---|---|---|---|
+| 3 | 1.52 → 0.72 | 3.38 → 0.60 | 7.09 → 0.82 |
+| 4 | 0.83 → 0.40 | 2.70 → 0.58 | 7.43 → 1.01 |
+| 6 | 0.81 → 0.47 | 2.70 → 0.76 | 7.43 → 1.33 |
+| 8 | 0.87 → 0.58 | 2.85 → 0.93 | 7.90 → 1.72 |
+
+最大絶対誤差 1e-3 (bf16 の丸め、カーネルが違うため)。
+
+読み方:
+- 短文脈の本番 (depth 2 → verify 幅 S=3) は毎ラウンド 12 層 × 0.8〜0.9 ms ≈ **10 ms** を attention の
+  素の経路に払っている可能性がある。4k の decode ラウンドは約 43 ms なので 2 割。
+- 17k 以上で depth 1 (S=2) が勝っていた理由の一部はこれ (S=3 は 12 層で +27 ms/ラウンド)。
+  分割すれば depth 2 が長文脈でも成立し得る (tok/round 2.0 対 1.67)。
+- 50k の decode 落ち込み (+8.5 ms/tok) のうち attention は S=2 で 12 × (0.59-0.24) = 4 ms/ラウンド
+  程度。残りは indexer 等 (`tools/qsa_prefill_split.py --S 1,2,4` で内訳待ち)。
+- 実装 (`MLXTURBO_SDPA_SPLIT`、幅 32//gqa=2 で分けて呼ぶ) は Sonnet に出した。判定は in-model A/B
+  (`decode_ab --knob sdpa-split --only short`、17k の depth 1/2 再測)、KLD +0.0005 以内。
