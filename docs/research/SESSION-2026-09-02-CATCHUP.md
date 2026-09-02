@@ -967,3 +967,22 @@ decode +6 ms の説明にはならない (1 層しか発火していなかった
 
 残る問い: 素の HC 97 回が forward 24 ms のうち何 ms か (連鎖の 140 us × 97 = 13.6 ms が上限)。
 HC を捨てるスタブ (上限の見積もり) と `MLXTURBO_HC=compiled` (mx.compile 版) を同じ ABBA で測る。
+
+## HC の実装 4 通り、S=1/2 forward、ctx 0 (2026-09-03 00:45、scratchpad/hc_modes_inmodel.py、ABCD-DCBA×10)
+
+| 実装 | S=1 ms | S=2 ms |
+|---|---|---|
+| 素の op (本番の 96 層の状態) | 23.90 | 29.19 |
+| mx.compile 版 (`MLXTURBO_HC=compiled`) | 23.50 | 29.08 |
+| 融合カーネル 97 層 (`MLXTURBO_HC_INJECT_BF16=1`) | 31.98 | 36.67 |
+| HC を捨てるスタブ (費用の上限) | **19.23** | 22.84 |
+
+- **HC の真の費用は S=1 forward で最大 4.7 ms (24 ms の 2 割)。**decode +6 ms 差の 3 分の 2 に相当。
+  mx.compile 版は 0.4 ms しか縮めない (op 数の問題ではなく、qmv 2 本 + 小物の実行そのもの)。
+- 今の融合カーネルは 1 回 80 us 級で、素の op 列より 8 ms 遅い。読むデータは 1 回 1.2 MB
+  (帯域の床 3 us)、起動の床 3 us × 2 カーネル。**1 回 15〜20 us まで書き直せば forward -3 ms**
+  (`hc_pre` の 10240→320 と `hc_post` の 320→10240 の qmv を threadgroup で分担し、uint4 load)。
+  ゲート: 連鎖 (`tools/kernel_chain_cost.py`) で ≤ 20 us/回、in-model (hc_modes_inmodel) で
+  素より -2 ms 以上、合成検査で最大誤差 1.5e-2 以内。反転条件: 連鎖で 30 us を切れなければ畳む。
+- スタブとの差 4.7 ms は「HC を無くした場合」なので上限。相手 (hc_read ×3 の融合) は 18 ms なので、
+  この 3〜4 ms を取れば decode 短文脈はほぼ並ぶ。
