@@ -2364,6 +2364,39 @@ def test_streaming_generation_errors_keep_protocol_error_shape(client, protocol)
         assert error["error"] == {"type": "server_error", "message": "runner exploded"}
 
 
+# ---------- 独立レビュー 2026-09-02 C-12: 500 で str(exc) を素で返さない ----------
+
+
+def test_nonstream_500_hides_details_from_client_but_logs_them(client, capsys):
+    """独立レビュー C-12: 非ストリームの 500 応答が str(exc) を素で返すと、
+    内部パスや設定などの実装詳細が任意のクライアントに漏れる (上の
+    test_streaming_generation_errors_keep_protocol_error_shape が確認して
+    いるストリーム側の error イベントは対象外 -- あちらは生成の途中経過を
+    運ぶ既存の契約で、この修正が変えたのは except Exception: return
+    _X_error(str(exc), status=500, ...) だった非ストリーム経路だけ)。
+    クライアントには固定文言、実際の例外はサーバー側のログにだけ出す。"""
+
+    secret = "/Users/ht/secret/model-weights.safetensors not found"
+
+    class RaisingRunner(FakeRunner):
+        def generate(self, *args, **kwargs):
+            raise RuntimeError(secret)
+
+    _install_state(RaisingRunner([]), tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 500, resp.text
+    message = resp.json()["error"]["message"]
+    assert secret not in message
+    assert message == "internal server error"
+
+    out = capsys.readouterr().out
+    assert secret in out  # サーバー側のログには残る
+
+
 # ---------- ストリーミング: 最初のイベントが生成開始より前に出る ----------
 
 
@@ -3534,6 +3567,49 @@ def test_responses_stream_first_event_precedes_generation(client):
         assert runner.calls
 
     asyncio.run(run())
+
+
+# ---------- 独立レビュー 2026-09-02 C-5: _responses_stream に cancelled 分岐が無い ----------
+
+
+class _SelfCancellingRunner(FakeRunner):
+    """on_tokens を 1 回呼んだ直後に server._GenerationCancelled を投げる。
+    _start_generation の worker() が本物の cancel_event 経由の打ち切り
+    (項目 18: stop 文字列一致) で到達するのと同じ終端 ("cancelled", None)
+    を、Responses API には無い stop_sequences を経由せずに直接再現する
+    ための fake。"""
+
+    def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, **extra):
+        self.calls.append({"prompt_ids": list(prompt_ids), **extra})
+        on_tokens([self.tokens_to_emit[0]])
+        raise server._GenerationCancelled()
+
+
+def test_responses_stream_cancelled_completes_instead_of_failing(client):
+    """独立レビュー C-5: 他 3 経路 (_openai_stream/_anthropic_stream/
+    _completions_stream) には cancelled 専用の分岐があるが、
+    _responses_stream だけ else: error に落ちて response.failed
+    (message "None") になっていた。バッチ側の on_done("cancelled", None)
+    契約 (batch.py/batch_spec.py) は 4 経路共通のはずなので、他 3 経路と
+    同じく正常終了 (response.completed) で終わるべき。"""
+
+    tok = FakeTokenizer(vocab={10: "a"})
+    runner = _SelfCancellingRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/responses",
+        json={"model": "test-model", "input": "hi", "stream": True},
+    )
+    assert resp.status_code == 200, resp.text
+    pairs = _responses_sse_pairs(resp.text)
+    event_types = [e for e, _ in pairs]
+    assert "response.failed" not in event_types
+    assert "error" not in event_types
+    completed = [d for e, d in pairs if e == "response.completed"]
+    assert completed, event_types
+    assert completed[0]["response"]["status"] == "completed"
+    assert completed[0]["response"]["usage"]["output_tokens"] == 1
 
 
 # ---------- 10. バグ修正: Anthropic system の並び順 (実クライアント: Claude Code) ----------
@@ -5654,6 +5730,59 @@ def test_stream_options_must_be_object_before_queue_reservation(
     assert not runner.calls
 
 
+# ---------- 独立レビュー 2026-09-02 C-10: stream/store が bool 型か検査されていない ----------
+
+
+@pytest.mark.parametrize(
+    "path,body",
+    [
+        ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+        (
+            "/v1/messages",
+            {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 16},
+        ),
+        ("/v1/completions", {"prompt": "hi"}),
+        ("/v1/responses", {"input": "hi"}),
+    ],
+)
+def test_stream_field_non_bool_is_400(client, path, body):
+    """独立レビュー C-10: {"stream": "false"} は Python の truthy 判定では
+    True になり、修正前はストリーミングが黙って有効化されていた
+    (bool("false") is True)。JSON の真偽値以外は 400 で拒否する。"""
+
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(path, json={**body, "stream": "false"})
+    assert resp.status_code == 400, resp.text
+    assert "'stream'" in resp.json()["error"]["message"]
+    assert not runner.calls
+
+
+def test_store_field_non_bool_is_400(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post("/v1/responses", json={"input": "hi", "store": "false"})
+    assert resp.status_code == 400, resp.text
+    assert "'store'" in resp.json()["error"]["message"]
+    assert not runner.calls
+
+
+def test_stream_field_actual_bool_false_still_runs_non_streaming(client):
+    runner = FakeRunner(tokens_to_emit=[10, 999])
+    _install_state(
+        runner, tokenizer=FakeTokenizer(vocab={10: "x"}, eos_token_ids=(999,))
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "stream": False},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["choices"]
+
+
 @pytest.mark.parametrize("protocol", ["chat", "anthropic", "responses"])
 def test_close_after_stream_preamble_releases_queue_slot(protocol):
     runner = FakeRunner(tokens_to_emit=[10])
@@ -5707,6 +5836,54 @@ def test_close_after_lock_handoff_keepalive_releases_acquired_lock_and_queue():
             server._acquire_lock_with_keepalive.__defaults__ = defaults
 
     asyncio.run(run())
+    assert state.queue_depth == 0
+    assert not state.lock.locked()
+    assert not runner.calls
+
+
+# ---------- 独立レビュー 2026-09-02 C-8: aclose 時の錠解放を即時にする ----------
+
+
+def test_lock_release_on_aclose_is_immediate_not_deferred_to_loop_shutdown():
+    """独立レビュー C-8: 上のテスト
+    (test_close_after_lock_handoff_keepalive_releases_acquired_lock_and_queue)
+    は錠の状態を asyncio.run() が戻った後で判定しているため、
+    asyncio.run() 自体が終了時に呼ぶ loop.shutdown_asyncgens() が未回収の
+    async generator を片付けてしまい、「aclose() で即座に解放される」ことと
+    「いずれ (loop shutdown 時に) 解放される」ことを区別できていなかった。
+    ここでは run() コルーチンの中、await stream.aclose() の直後 —
+    asyncio.run() が戻るよりずっと前 — で判定することで、
+    contextlib.aclosing による即時解放を直接証明する。"""
+
+    runner = FakeRunner(tokens_to_emit=[10])
+    state = _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}), max_queue=1)
+
+    released_immediately = []
+
+    async def run():
+        await state.lock.acquire()
+        assert server._try_reserve_queue_slot()
+        inner = server._openai_stream(
+            [1, 2, 3], 8, 0.0, "chat-id", 0, "test-model", [], False, None
+        )
+        stream = server._queue_owned_stream(inner)
+        await stream.__anext__()  # role preamble
+
+        defaults = server._acquire_lock_with_keepalive.__defaults__
+        server._acquire_lock_with_keepalive.__defaults__ = (0.01,)
+        try:
+            assert await stream.__anext__() == server._SSE_KEEPALIVE_LINE
+            state.lock.release()
+            await asyncio.sleep(0.03)  # let the pending acquire task win
+            await stream.aclose()
+            # まだ run() コルーチンの内側 -- asyncio.run() の
+            # shutdown_asyncgens には一切触れていない時点での判定。
+            released_immediately.append(not state.lock.locked())
+        finally:
+            server._acquire_lock_with_keepalive.__defaults__ = defaults
+
+    asyncio.run(run())
+    assert released_immediately == [True]
     assert state.queue_depth == 0
     assert not state.lock.locked()
     assert not runner.calls
@@ -6770,6 +6947,91 @@ def test_positive_int_accepts_valid_session_capacity():
     assert server._positive_int("8") == 8
 
 
+# ---------- 独立レビュー 2026-09-02 C-9: 容量系フラグの 0/負値検証 ----------
+#
+# main() 自体は実モデルロードを伴うので直接は叩かないのが通例だが、
+# argparse の type= バリデーションは ap.parse_args() の中、モデルロードより
+# 前に走って SystemExit(2) するので、無効な値を渡す形なら main() を通しても
+# 実ロードには到達しない。--model はダミー文字列で足りる。
+
+
+@pytest.mark.parametrize(
+    "flag,bad_value",
+    [
+        ("--max-queue", "0"),
+        ("--max-tokens", "0"),
+        ("--max-context-tokens", "-1"),
+    ],
+)
+def test_capacity_flags_reject_non_positive_values(monkeypatch, capsys, flag, bad_value):
+    """独立レビュー C-9: --max-queue 0 で待ち行列が恒久 503、--max-tokens 0
+    で全リクエストの max_tokens 上限が 0、--max-context-tokens -1 で全
+    プロンプトが 400 になる、という起動時に気づけない構成を、
+    _positive_int と同じ検証で起動時にはじく。"""
+
+    monkeypatch.setattr(
+        "sys.argv", ["mlxturbo-serve", "--model", "dummy-model", flag, bad_value]
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        server.main()
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert flag in err
+    assert "at least 1" in err
+
+
+def test_capacity_flags_accept_positive_values_past_argparse(monkeypatch):
+    """有効な値では _positive_int 自体は通る (main() がその先で実モデル
+    ロードに進んでしまわないよう、model ロードの直前で打ち切る)。"""
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "mlxturbo-serve",
+            "--model",
+            "dummy-model",
+            "--max-queue",
+            "4",
+            "--max-tokens",
+            "2048",
+            "--max-context-tokens",
+            "8192",
+        ],
+    )
+
+    class _StopBeforeLoad(Exception):
+        pass
+
+    def _raise(*_a, **_k):
+        raise _StopBeforeLoad()
+
+    monkeypatch.setattr(server, "mlx_lm_load", _raise)
+    with pytest.raises(_StopBeforeLoad):
+        server.main()
+
+
+# ---------- 独立レビュー 2026-09-02 C-12: --api-key の argv 露出と MLXTURBO_API_KEY ----------
+
+
+@pytest.mark.parametrize(
+    "argv_keys,env_value,expected",
+    [
+        (["a", "b"], None, ["a", "b"]),  # argv のみ (既存呼び出しは不変)
+        ([], "x, y ,z", ["x", "y", "z"]),  # env のみ、カンマ区切り + 前後空白除去
+        (["a", "x"], "x,y", ["a", "x", "y"]),  # 重複除去、argv を先に並べる
+        (["a"], "", ["a"]),  # 空の env 値は無視
+        ([], None, []),  # どちらも無指定
+    ],
+)
+def test_resolve_api_keys_combines_argv_and_env(argv_keys, env_value, expected):
+    """独立レビュー C-12: --api-key はプロセスの引数一覧 (ps 等) から
+    同一マシンの他ユーザーに見えるため、環境変数 MLXTURBO_API_KEY
+    (カンマ区切りで複数可) も受け付ける。--api-key は既存呼び出しのため
+    そのまま残す (env はあくまで追加)。"""
+
+    assert server._resolve_api_keys(argv_keys, env_value) == expected
+
+
 # ---------- Kimi K3 レビュー 項目 14: /v1/embeddings は 501 で明示 ----------
 
 
@@ -6952,6 +7214,139 @@ def test_response_format_omitted_is_allowed(client):
         json={"messages": [{"role": "user", "content": "hi"}]},
     )
     assert resp.status_code == 200, resp.text
+
+
+# ---------- 独立レビュー 2026-09-02 C-2: n / legacy completions params を黙殺しない ----------
+
+
+@pytest.mark.parametrize("value", [2, 0, 1.5])
+def test_chat_completions_n_other_than_one_is_400(client, value):
+    """独立レビュー C-2: {"n": 3} のような複数選択肢の要求が、400 も警告も
+    無く choices 1 件で黙って返っていた。response_format と同じ方針で
+    明示的に拒否する。"""
+
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "n": value},
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+    assert "'n'" in resp.json()["error"]["message"]
+
+
+def test_chat_completions_n_equal_one_is_allowed(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}], "n": 1},
+    )
+    assert resp.status_code == 200, resp.text
+    assert runner.calls
+
+
+@pytest.mark.parametrize(
+    "field,value", [("best_of", 2), ("echo", True), ("suffix", "tail")]
+)
+def test_completions_legacy_unsupported_params_non_default_is_400(client, field, value):
+    """独立レビュー C-2: レガシー /v1/completions の best_of/echo/suffix は
+    どれも未実装なのに、非既定値を渡しても黙って無視されていた。"""
+
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post("/v1/completions", json={"prompt": "hi", field: value})
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+    assert f"'{field}'" in resp.json()["error"]["message"]
+
+
+def test_completions_legacy_unsupported_params_default_values_are_allowed(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "x"}))
+
+    resp = client.post(
+        "/v1/completions",
+        json={"prompt": "hi", "n": 1, "best_of": 1, "echo": False, "suffix": None},
+    )
+    assert resp.status_code == 200, resp.text
+    assert runner.calls
+
+
+# ---------- 独立レビュー 2026-09-02 C-3: 事前トークン化プロンプト/logit_bias の語彙範囲 ----------
+
+
+def test_completions_pretokenized_prompt_out_of_vocab_is_400(client):
+    """独立レビュー C-3: 事前トークン化プロンプト ([-1] や範囲外の巨大な id)
+    に語彙範囲チェックが無く、MLX の gather が黙って値を返していた。"""
+
+    tok = FakeTokenizer(vocab={10: "hi"})
+    tok.vocab_size = 5
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post("/v1/completions", json={"prompt": [1, 2, 999999]})
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+    assert "prompt" in resp.json()["error"]["message"]
+
+
+def test_completions_pretokenized_prompt_negative_id_is_400(client):
+    tok = FakeTokenizer(vocab={10: "hi"})
+    tok.vocab_size = 5
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post("/v1/completions", json={"prompt": [1, -1]})
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+
+
+def test_completions_pretokenized_prompt_in_vocab_is_allowed(client):
+    tok = FakeTokenizer(vocab={10: "hi"})
+    tok.vocab_size = 5
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post("/v1/completions", json={"prompt": [1, 2, 3]})
+    assert resp.status_code == 200, resp.text
+    assert runner.calls
+
+
+def test_logit_bias_out_of_vocab_key_is_400(client):
+    tok = FakeTokenizer(vocab={10: "hi"})
+    tok.vocab_size = 5
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "logit_bias": {"999999": -100},
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert not runner.calls
+    assert "logit_bias" in resp.json()["error"]["message"]
+
+
+def test_vocab_range_check_skipped_when_vocab_size_unknown(client):
+    """FakeTokenizer/FakeRunner が vocab_size をどこにも持たない (実運用では
+    まず起きない) ケースでは、既知でない上限で誤検出しない後方互換の既定
+    (検査そのものをスキップ) を確認する。"""
+
+    tok = FakeTokenizer(vocab={10: "hi"})  # vocab_size 属性なし
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post("/v1/completions", json={"prompt": [999999999]})
+    assert resp.status_code == 200, resp.text
+    assert runner.calls
 
 
 # ---------- Kimi K3 レビュー 項目 18: stop 文字列のトークン単位 early-stop ----------
@@ -7194,13 +7589,89 @@ def test_anthropic_usage_maps_prefill_reused_to_cache_read_input_tokens(client):
     assert usage["input_tokens"] + usage["cache_read_input_tokens"] >= 0
 
 
+# ---------- 独立レビュー 2026-09-02 C-1: Anthropic usage の二重計上 ----------
+
+
+def test_anthropic_usage_prompt_tokens_not_double_counted(client):
+    """独立レビュー C-1: 修正前は prefill_new が input_tokens と
+    cache_creation_input_tokens の両方に入り、3 フィールドの合計が
+    プロンプト長を超えていた。本家の意味 (3 つが互いに素で合計 =
+    プロンプト長) に合わせる。"""
+
+    runner = FakeRunner(tokens_to_emit=[10, 999], prefill_reused=1)
+    tok = FakeTokenizer(vocab={10: "hi"}, eos_token_ids=(999,), prompt_ids=[1, 2, 3, 4, 5])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    usage = resp.json()["usage"]
+    prompt_tokens = 5
+    assert usage["cache_read_input_tokens"] == 1
+    assert usage["cache_creation_input_tokens"] == prompt_tokens - 1
+    assert usage["input_tokens"] == 0
+    assert (
+        usage["input_tokens"]
+        + usage["cache_read_input_tokens"]
+        + usage["cache_creation_input_tokens"]
+        == prompt_tokens
+    )
+
+
+def test_anthropic_stream_message_delta_corrects_double_counted_usage(client):
+    """独立レビュー C-1: message_start は生成前の素朴な推測
+    (input_tokens=len(prompt_ids)、キャッシュ内訳なし) のまま流すが、
+    message_delta で二重計上のない確定値に訂正されること。"""
+
+    runner = FakeRunner(tokens_to_emit=[10, 999], prefill_reused=1)
+    tok = FakeTokenizer(vocab={10: "hi"}, eos_token_ids=(999,), prompt_ids=[1, 2, 3, 4, 5])
+    _install_state(runner, tokenizer=tok)
+
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "test-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    events = _sse_events(resp.text)
+    prompt_tokens = 5
+
+    start_usage = next(e["message"]["usage"] for e in events if e.get("type") == "message_start")
+    assert start_usage["input_tokens"] == prompt_tokens
+
+    delta_usage = next(e["usage"] for e in events if e.get("type") == "message_delta")
+    assert delta_usage["cache_read_input_tokens"] == 1
+    assert delta_usage["cache_creation_input_tokens"] == prompt_tokens - 1
+    assert delta_usage["input_tokens"] == 0
+
+
 def test_anthropic_usage_always_includes_cache_fields_even_when_zero(client):
     """再利用が無い (cold) ターンでも、フィールド自体は常に出す —
     「対応しているが今回は 0 件」と「対応していない」を区別しない
-    (_usage_dict/_anthropic_usage 共通の方針)。"""
+    (_usage_dict/_anthropic_usage 共通の方針)。
+
+    独立レビュー C-1 の修正前は、prefill_new が input_tokens と
+    cache_creation_input_tokens の両方に入る二重計上バグがあり、cold ターン
+    では両者がともに prompt_tokens に一致していた (このテストは元々それを
+    ``cache_creation_input_tokens == input_tokens`` として固定していた)。
+    正しい形は三分割が互いに素でプロンプト長に一致することで、新規処理分は
+    全部セッションに書くこの実装では cold ターンの input_tokens は 0 になる
+    (= 二重計上の逆で、cache_creation_input_tokens だけがプロンプト長を
+    持つ)。"""
 
     runner = FakeRunner(tokens_to_emit=[10])
-    _install_state(runner, tokenizer=FakeTokenizer(vocab={10: "hi"}))
+    tok = FakeTokenizer(vocab={10: "hi"}, prompt_ids=[1, 2, 3, 4])
+    _install_state(runner, tokenizer=tok)
 
     resp = client.post(
         "/v1/messages",
@@ -7213,7 +7684,8 @@ def test_anthropic_usage_always_includes_cache_fields_even_when_zero(client):
     assert resp.status_code == 200, resp.text
     usage = resp.json()["usage"]
     assert usage["cache_read_input_tokens"] == 0
-    assert usage["cache_creation_input_tokens"] == usage["input_tokens"]
+    assert usage["input_tokens"] == 0
+    assert usage["cache_creation_input_tokens"] == 4
 
 
 def test_anthropic_cache_control_on_system_block_is_accepted_and_ignored(client):

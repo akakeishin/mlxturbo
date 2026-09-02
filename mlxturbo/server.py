@@ -88,6 +88,7 @@ docstring for details.
 import argparse
 import asyncio
 import concurrent.futures
+import contextlib
 import functools
 import hashlib
 import hmac
@@ -99,6 +100,7 @@ import secrets
 import subprocess
 import threading
 import time
+import traceback
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -1892,6 +1894,65 @@ def _parse_optional_int(
     return raw, None
 
 
+def _parse_bool_field(body: dict, field: str, default: bool = False) -> tuple[bool, str | None]:
+    """Strict boolean parse for a JSON request field (independent review
+    C-10). The call sites this replaces used ``bool(body.get(field,
+    default))``, which applies Python's truthiness to whatever JSON value was
+    sent — so ``{"stream": "false"}`` (a string, and a plausible mistake for a
+    client used to shell-style config) evaluated to True, silently turning on
+    streaming when the client asked for the opposite. Only an actual JSON
+    true/false, or the field being absent, is accepted; anything else is a
+    400."""
+
+    raw = body.get(field, default)
+    if not isinstance(raw, bool):
+        return default, f"'{field}' must be a boolean"
+    return raw, None
+
+
+def _resolve_vocab_size() -> int | None:
+    """Best-effort vocabulary size, for bounds-checking token ids a client
+    supplies directly (independent review C-3: a pre-tokenized ``prompt`` or a
+    ``logit_bias`` key that names an id outside the vocabulary is not rejected
+    today, and MLX's gather does not raise on an out-of-range index — it
+    silently returns garbage instead). Prefers the tokenizer's own
+    ``vocab_size`` (the same source runner.py already uses to cross-check a
+    draft tokenizer against the main one), and falls back to the loaded
+    model's config when the tokenizer does not expose it. ``None`` means
+    "unknown" — callers must skip the bounds check rather than reject
+    everything, since a model/tokenizer combination without either field is
+    not itself an error.
+    """
+
+    tokenizer = getattr(STATE, "tokenizer", None)
+    vocab_size = getattr(tokenizer, "vocab_size", None)
+    if isinstance(vocab_size, int) and vocab_size > 0:
+        return vocab_size
+    model = getattr(getattr(STATE, "runner", None), "model", None)
+    args = getattr(model, "args", None)
+    vocab_size = getattr(args, "vocab_size", None)
+    if isinstance(vocab_size, int) and vocab_size > 0:
+        return vocab_size
+    return None
+
+
+def _check_token_ids_in_vocab(ids, field: str) -> str | None:
+    """Returns a 400 message if any id in ``ids`` falls outside
+    ``[0, vocab_size)``, or None if all are in range or the vocab size is not
+    known (see ``_resolve_vocab_size``)."""
+
+    vocab_size = _resolve_vocab_size()
+    if vocab_size is None:
+        return None
+    for tok in ids:
+        if not (0 <= tok < vocab_size):
+            return (
+                f"'{field}' contains token id {tok}, which is out of range for "
+                f"this model's vocabulary (0 <= id < {vocab_size})"
+            )
+    return None
+
+
 def _parse_logit_bias(body: dict) -> tuple[dict[int, float] | None, str | None]:
     raw = body.get("logit_bias")
     if raw is None:
@@ -1902,6 +1963,9 @@ def _parse_logit_bias(body: dict) -> tuple[dict[int, float] | None, str | None]:
         parsed = {int(k): float(v) for k, v in raw.items()}
     except (TypeError, ValueError):
         return None, "'logit_bias' must be an object mapping token id (string) to a numeric bias"
+    vocab_err = _check_token_ids_in_vocab(parsed.keys(), "logit_bias")
+    if vocab_err is not None:
+        return None, vocab_err
     return parsed, None
 
 
@@ -2246,6 +2310,62 @@ def _check_response_format(body: dict) -> str | None:
     )
 
 
+def _check_unsupported_generation_params(body: dict) -> str | None:
+    """Rejects OpenAI request params this server accepts the shape of but
+    silently ignores the effect of, rather than returning fewer or different
+    results than the client asked for with no error (independent review C-2):
+
+    - ``n``: number of choices to generate. This server always produces
+      exactly one completion per request; a client asking for ``n > 1``
+      previously got exactly 1 choice back with no indication anything was
+      short.
+    - The legacy ``/v1/completions`` knobs ``best_of``/``echo``/``suffix``:
+      none of them are implemented (``best_of`` would need running and
+      ranking multiple candidates; ``echo`` would need re-emitting the prompt
+      as completion text; ``suffix`` would need fill-in-the-middle
+      constraining the completion's tail), and a non-default value for any of
+      them was previously accepted and silently treated as a no-op.
+
+    Follows the same "explicitly refuse what is not supported" policy as
+    ``_check_response_format``. Shared by both ``chat_completions`` and the
+    legacy ``completions`` endpoint since a client could in principle send any
+    of these fields to either.
+    """
+
+    n = body.get("n")
+    if n is not None:
+        if isinstance(n, bool) or not isinstance(n, int):
+            return "'n' must be an integer"
+        if n != 1:
+            return (
+                "'n' > 1 is not supported: this server always generates exactly one "
+                "completion per request. Omit 'n' (or pass 1) and issue separate "
+                "requests for multiple completions."
+            )
+
+    best_of = body.get("best_of")
+    if best_of is not None and best_of != 1:
+        return (
+            "'best_of' is not supported: this server does not run or rank multiple "
+            "candidate completions. Omit 'best_of' (or pass 1)."
+        )
+
+    echo = body.get("echo")
+    if echo not in (None, False):
+        return (
+            "'echo' is not supported: this server does not re-emit the prompt as part "
+            "of the completion. Omit 'echo' (or pass false)."
+        )
+
+    if body.get("suffix") is not None:
+        return (
+            "'suffix' is not supported: this server has no fill-in-the-middle "
+            "implementation. Omit 'suffix'."
+        )
+
+    return None
+
+
 def _downgrade_headers(downgrade_reason: str | None) -> dict[str, str] | None:
     """An HTTP header that makes a per-request downgrade (item 7) observable in
     streaming responses too. Each SSE chunk follows the standard OpenAI/
@@ -2269,6 +2389,23 @@ def _attach_downgrade_reason(body: dict, downgrade_reason: str | None) -> None:
 
     if downgrade_reason is not None:
         body["downgrade_reason"] = downgrade_reason
+
+
+def _log_internal_error(exc: Exception) -> str:
+    """Logs the real exception server-side and returns a fixed, detail-free
+    message for the client (independent review C-12). A raw ``str(exc)`` in a
+    500 response can leak internal paths, model config, or other
+    implementation details to any caller of the server, not just the operator
+    watching its stdout — this is for the unexpected-failure paths (a bug in
+    generation, not something the client's request shape caused), which
+    already logs nothing else about the failure, so the full traceback goes
+    to stdout with the rest of this file's ``[mlxturbo-serve]``-prefixed
+    operational logging.
+    """
+
+    print(f"[mlxturbo-serve] internal error: {exc!r}")
+    traceback.print_exc()
+    return "internal server error"
 
 
 def _openai_error(
@@ -2411,38 +2548,54 @@ def _usage_dict(prompt_tokens: int, completion_tokens: int, cached_tokens: int) 
     return usage
 
 
-def _anthropic_usage(prompt_tokens: int, completion_tokens: int, res: dict) -> dict:
-    """Anthropic-format usage. Maps the measured prefill reuse
-    (``res["prefill_reused"]``/``res["prefill_new"]``, the same numbers as
-    cli.py's display line and ``_log_gen_stats``) onto Anthropic's cache-related
-    fields (Kimi K3 review item 16). The ``cache_control`` that Claude Code and
-    others send is itself not read — it is an instruction about "how far to
-    cache", but this server merely decides the amount of reuse mechanically per
-    request from the session's LCP and has no notion of block-level cache
-    boundaries, so it accepts and ignores it.
+def _anthropic_usage_fields(prompt_tokens: int, prefill_reused: int, prefill_new: int) -> dict:
+    """Splits ``prompt_tokens`` into Anthropic's three mutually-exclusive
+    prompt-usage fields (Kimi K3 review item 16 / independent review C-1),
+    from the measured prefill reuse (``prefill_reused``/``prefill_new``, the
+    same numbers as cli.py's display line and ``_log_gen_stats``). The
+    ``cache_control`` that Claude Code and others send is itself not read —
+    it is an instruction about "how far to cache", but this server merely
+    decides the amount of reuse mechanically per request from the session's
+    LCP and has no notion of block-level cache boundaries, so it accepts and
+    ignores it.
 
-    Aligned with the meaning in Anthropic's real API: ``input_tokens`` is the
-    number of tokens "actually processed" excluding what was read from the
-    cache (= prefill_new), and ``cache_read_input_tokens`` is the reused part
-    (= prefill_reused). ``cache_creation_input_tokens`` takes the newly
-    processed part written into the session (= prefill_new) verbatim — this
-    server's session stacks up KV every turn, so in principle everything newly
-    processed becomes a candidate for reuse on subsequent turns (there is no
-    ephemeral 5m/1h breakdown, only a flat total). Even for a runner whose
-    ``res`` carries no prefill information (normally there is none, but
-    defensively the default is 0), the fields themselves are always emitted —
-    the same policy as ``_usage_dict``: the shape of the response does not
-    distinguish 0 from "not supported".
+    Aligned with the meaning in Anthropic's real API, where the three fields
+    are pairwise disjoint and sum to the prompt length:
+    ``cache_read_input_tokens`` is the reused part (= prefill_reused);
+    ``cache_creation_input_tokens`` is the newly processed part written into
+    the session (= prefill_new) verbatim — this server's session stacks up KV
+    every turn, so in principle everything newly processed becomes a
+    candidate for reuse on subsequent turns (there is no ephemeral 5m/1h
+    breakdown, only a flat total); ``input_tokens`` is whatever is neither —
+    normally 0, since this server writes every newly processed token into the
+    session, but kept as a non-negative remainder rather than assumed zero so
+    a runner that reports partial prefill accounting doesn't silently lose
+    tokens off the total.
+    """
+
+    input_tokens = max(prompt_tokens - prefill_reused - prefill_new, 0)
+    return {
+        "input_tokens": input_tokens,
+        "cache_creation_input_tokens": prefill_new,
+        "cache_read_input_tokens": prefill_reused,
+    }
+
+
+def _anthropic_usage(prompt_tokens: int, completion_tokens: int, res: dict) -> dict:
+    """Anthropic-format usage for the non-streaming response. See
+    ``_anthropic_usage_fields`` for the prompt-token split; ``output_tokens``
+    is completion_tokens verbatim. Even for a runner whose ``res`` carries no
+    prefill information (normally there is none, but defensively the default
+    is 0), the fields themselves are always emitted — the same policy as
+    ``_usage_dict``: the shape of the response does not distinguish 0 from
+    "not supported".
     """
 
     prefill_reused = res.get("prefill_reused", 0)
     prefill_new = res.get("prefill_new", max(prompt_tokens - prefill_reused, 0))
-    return {
-        "input_tokens": prefill_new,
-        "output_tokens": completion_tokens,
-        "cache_creation_input_tokens": prefill_new,
-        "cache_read_input_tokens": prefill_reused,
-    }
+    usage = _anthropic_usage_fields(prompt_tokens, prefill_reused, prefill_new)
+    usage["output_tokens"] = completion_tokens
+    return usage
 
 
 def _log_gen_stats(res: dict) -> None:
@@ -3371,10 +3524,15 @@ async def chat_completions(request: Request):
     response_format_err = _check_response_format(body)
     if response_format_err is not None:
         return _openai_error(response_format_err)
+    unsupported_params_err = _check_unsupported_generation_params(body)
+    if unsupported_params_err is not None:
+        return _openai_error(unsupported_params_err)
     logprobs_requested, top_logprobs_n, lp_err = _parse_logprobs_openai_chat(body)
     if lp_err is not None:
         return _openai_error(lp_err)
-    stream = bool(body.get("stream", False))
+    stream, stream_err = _parse_bool_field(body, "stream")
+    if stream_err is not None:
+        return _openai_error(stream_err)
     if logprobs_requested and stream:
         # Item 17 (Kimi K3 review): logprobs is not implemented for streaming
         # (correlating per-chunk incremental logprobs token by token with
@@ -3489,7 +3647,7 @@ async def chat_completions(request: Request):
                     **sampling_params,
                 )
     except Exception as exc:
-        return _openai_error(str(exc), status=500, err_type="server_error")
+        return _openai_error(_log_internal_error(exc), status=500, err_type="server_error")
     finally:
         _release_queue_slot()
     _log_gen_stats(res)
@@ -3624,8 +3782,18 @@ async def _openai_stream(
                 **(sampling_params or {}),
             )
         else:
-            async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
-                yield keepalive
+            # Independent review C-8: wrapped in contextlib.aclosing so that if
+            # the outer SSE generator is itself closed while suspended at this
+            # `yield` (a client disconnect mid-keepalive), the inner generator
+            # is aclose()'d immediately as part of unwinding this `async with`
+            # — rather than only whenever the event loop's asyncgen finalizer
+            # eventually gets around to it, which is when a completed-but-not-
+            # transferred lock acquire would otherwise sit unreleased.
+            async with contextlib.aclosing(
+                _acquire_lock_with_keepalive(STATE.lock, owned)
+            ) as _lock_keepalives:
+                async for keepalive in _lock_keepalives:
+                    yield keepalive
 
             # A downgraded request (whose runner differs from STATE.runner =
             # STATE.downgrade_runner) does not touch the session pool — the types
@@ -3962,7 +4130,9 @@ async def anthropic_messages(request: Request):
     stops = _stop_sequences(body)
 
     model_id = STATE.model_name
-    stream = bool(body.get("stream", False))
+    stream, stream_err = _parse_bool_field(body, "stream")
+    if stream_err is not None:
+        return _anthropic_error(stream_err)
     msg_id = f"msg_{uuid.uuid4().hex}"
 
     if max_tokens == 0:
@@ -4035,7 +4205,7 @@ async def anthropic_messages(request: Request):
                     **sampling_params,
                 )
     except Exception as exc:
-        return _anthropic_error(str(exc), status=500, err_type="server_error")
+        return _anthropic_error(_log_internal_error(exc), status=500, err_type="server_error")
     finally:
         _release_queue_slot()
     _log_gen_stats(res)
@@ -4149,8 +4319,18 @@ async def _anthropic_stream(
                 **(sampling_params or {}),
             )
         else:
-            async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
-                yield keepalive
+            # Independent review C-8: wrapped in contextlib.aclosing so that if
+            # the outer SSE generator is itself closed while suspended at this
+            # `yield` (a client disconnect mid-keepalive), the inner generator
+            # is aclose()'d immediately as part of unwinding this `async with`
+            # — rather than only whenever the event loop's asyncgen finalizer
+            # eventually gets around to it, which is when a completed-but-not-
+            # transferred lock acquire would otherwise sit unreleased.
+            async with contextlib.aclosing(
+                _acquire_lock_with_keepalive(STATE.lock, owned)
+            ) as _lock_keepalives:
+                async for keepalive in _lock_keepalives:
+                    yield keepalive
 
             downgraded = runner is not None and runner is not STATE.runner
             session = None if downgraded else await _select_session_on_executor(prompt_ids)
@@ -4377,16 +4557,17 @@ async def _anthropic_stream(
                 {
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": matched_stop},
-                    # input_tokens stays the naive len(prompt_ids) that was
-                    # streamed out immediately in message_start (before
-                    # generation began), so it is not overwritten — here we add
-                    # only cache_read/cache_creation_input_tokens, the measured
-                    # cache figures (item 16) that are not known until after
-                    # generation.
+                    # message_start streamed out a naive guess (input_tokens=
+                    # len(prompt_ids), no cache split) before generation began,
+                    # since prefill reuse is not known until after generation.
+                    # Correct it here to the final, mutually-exclusive split
+                    # (item 16 / independent review C-1) — per Anthropic's
+                    # streaming usage semantics, message_delta.usage carries
+                    # output_tokens plus whatever input-side fields need
+                    # correcting.
                     "usage": {
                         "output_tokens": n_out,
-                        "cache_creation_input_tokens": prefill_new,
-                        "cache_read_input_tokens": prefill_reused,
+                        **_anthropic_usage_fields(len(prompt_ids), prefill_reused, prefill_new),
                     },
                 },
             )
@@ -4428,6 +4609,9 @@ def _prompt_to_ids(prompt) -> tuple[list[int] | None, str | None]:
         if not prompt:
             return None, "'prompt' must not be empty"
         if all(isinstance(t, int) and not isinstance(t, bool) for t in prompt):
+            vocab_err = _check_token_ids_in_vocab(prompt, "prompt")
+            if vocab_err is not None:
+                return None, vocab_err
             return list(prompt), None
         return None, "'prompt' array must contain only integers (pre-tokenized ids)"
     return None, "'prompt' must be a string or an array of token ids"
@@ -4464,10 +4648,15 @@ async def completions(request: Request):
     sampling_params, err = _parse_sampling_params(body)
     if err is not None:
         return _openai_error(err)
+    unsupported_params_err = _check_unsupported_generation_params(body)
+    if unsupported_params_err is not None:
+        return _openai_error(unsupported_params_err)
     logprobs_requested, top_logprobs_n, lp_err = _parse_logprobs_openai_legacy(body)
     if lp_err is not None:
         return _openai_error(lp_err)
-    stream = bool(body.get("stream", False))
+    stream, stream_err = _parse_bool_field(body, "stream")
+    if stream_err is not None:
+        return _openai_error(stream_err)
     if logprobs_requested and stream:
         # The same reason as chat_completions (see the item 17 docstring):
         # per-chunk logprobs support for streaming was deferred this time.
@@ -4548,7 +4737,7 @@ async def completions(request: Request):
                     **sampling_params,
                 )
     except Exception as exc:
-        return _openai_error(str(exc), status=500, err_type="server_error")
+        return _openai_error(_log_internal_error(exc), status=500, err_type="server_error")
     finally:
         _release_queue_slot()
     _log_gen_stats(res)
@@ -4622,8 +4811,18 @@ async def _completions_stream(
                 prompt_ids, max_tokens, temp, 0, **(sampling_params or {})
             )
         else:
-            async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
-                yield keepalive
+            # Independent review C-8: wrapped in contextlib.aclosing so that if
+            # the outer SSE generator is itself closed while suspended at this
+            # `yield` (a client disconnect mid-keepalive), the inner generator
+            # is aclose()'d immediately as part of unwinding this `async with`
+            # — rather than only whenever the event loop's asyncgen finalizer
+            # eventually gets around to it, which is when a completed-but-not-
+            # transferred lock acquire would otherwise sit unreleased.
+            async with contextlib.aclosing(
+                _acquire_lock_with_keepalive(STATE.lock, owned)
+            ) as _lock_keepalives:
+                async for keepalive in _lock_keepalives:
+                    yield keepalive
 
             downgraded = runner is not None and runner is not STATE.runner
             session = None if downgraded else await _select_session_on_executor(prompt_ids)
@@ -5281,7 +5480,9 @@ async def responses_endpoint(request: Request):
     prior_items, effective_instructions, prev_err = _resolve_previous_response(body)
     if prev_err is not None:
         return prev_err
-    store = bool(body.get("store", False))
+    store, store_err = _parse_bool_field(body, "store")
+    if store_err is not None:
+        return _openai_error(store_err)
 
     model_err = _check_model_openai(body)
     if model_err is not None:
@@ -5330,7 +5531,9 @@ async def responses_endpoint(request: Request):
         return _openai_error(unsupported_err)
 
     model_id = STATE.model_name
-    stream = bool(body.get("stream", False))
+    stream, stream_err = _parse_bool_field(body, "stream")
+    if stream_err is not None:
+        return _openai_error(stream_err)
     resp_id = f"resp_{uuid.uuid4().hex}"
     created = int(time.time())
 
@@ -5387,7 +5590,7 @@ async def responses_endpoint(request: Request):
                     **sampling_params,
                 )
     except Exception as exc:
-        return _openai_error(str(exc), status=500, err_type="server_error")
+        return _openai_error(_log_internal_error(exc), status=500, err_type="server_error")
     finally:
         _release_queue_slot()
     _log_gen_stats(res)
@@ -5484,7 +5687,7 @@ async def _responses_stream(
     try:
         if batch_route is not None:
             session = None
-            q, future, cancel_event, _raw_token_count = _start_batched_generation(
+            q, future, cancel_event, raw_token_count = _start_batched_generation(
                 batch_route,
                 prompt_ids,
                 max_tokens,
@@ -5495,12 +5698,22 @@ async def _responses_stream(
                 **(sampling_params or {}),
             )
         else:
-            async for keepalive in _acquire_lock_with_keepalive(STATE.lock, owned):
-                yield keepalive
+            # Independent review C-8: wrapped in contextlib.aclosing so that if
+            # the outer SSE generator is itself closed while suspended at this
+            # `yield` (a client disconnect mid-keepalive), the inner generator
+            # is aclose()'d immediately as part of unwinding this `async with`
+            # — rather than only whenever the event loop's asyncgen finalizer
+            # eventually gets around to it, which is when a completed-but-not-
+            # transferred lock acquire would otherwise sit unreleased.
+            async with contextlib.aclosing(
+                _acquire_lock_with_keepalive(STATE.lock, owned)
+            ) as _lock_keepalives:
+                async for keepalive in _lock_keepalives:
+                    yield keepalive
 
             downgraded = runner is not None and runner is not STATE.runner
             session = None if downgraded else await _select_session_on_executor(prompt_ids)
-            q, future, cancel_event, _raw_token_count = _start_generation(
+            q, future, cancel_event, raw_token_count = _start_generation(
                 prompt_ids,
                 max_tokens,
                 temp,
@@ -5528,6 +5741,8 @@ async def _responses_stream(
             budget_exceeded = False
             final_tokens: list[int] = []
             saw_tool_call = False
+            cancelled = False
+            n_out = 0
 
             def close_current():
                 nonlocal current_item, current_kind
@@ -5684,7 +5899,24 @@ async def _responses_stream(
                     budget_exceeded = True
                 elif kind == "done":
                     final_tokens = payload["tokens"]
+                    n_out = len(final_tokens)
                     _log_gen_stats(payload)
+                    break
+                elif kind == "cancelled":
+                    # Early cut-off caused by a stop string match (the same
+                    # reason and the same contract as the other 3 streaming
+                    # paths -- see the cancelled branch docstring in
+                    # _openai_stream). Independent review C-5: this path had
+                    # no dedicated handling for "cancelled" and fell into the
+                    # `else: error` branch below, which reported a bogus
+                    # "None" server_error and a response.failed event instead
+                    # of completing normally like the other 3 paths do.
+                    cancelled = True
+                    n_out = raw_token_count[0]
+                    print(
+                        f"[mlxturbo-serve] stop string matched — cancelled early after "
+                        f"{n_out} decoded tokens"
+                    )
                     break
                 else:  # error
                     response_error = {
@@ -5715,9 +5947,17 @@ async def _responses_stream(
             for closing in close_current():
                 yield closing
 
-            status, incomplete_reason = _responses_terminal_state(
-                final_tokens, budget_exceeded, saw_tool_call
-            )
+            if cancelled:
+                # Same as the other 3 paths: a stop-string cut-off is a normal
+                # stop, not something for _responses_terminal_state's EOS/
+                # budget logic to second-guess (there are no real
+                # final_tokens to inspect — the runner returns no res dict on
+                # this path, only the raw count).
+                status, incomplete_reason = "completed", None
+            else:
+                status, incomplete_reason = _responses_terminal_state(
+                    final_tokens, budget_exceeded, saw_tool_call
+                )
 
             final_response = {
                 "id": resp_id,
@@ -5728,8 +5968,8 @@ async def _responses_stream(
                 "output": output_items,
                 "usage": {
                     "input_tokens": len(prompt_ids),
-                    "output_tokens": len(final_tokens),
-                    "total_tokens": len(prompt_ids) + len(final_tokens),
+                    "output_tokens": n_out,
+                    "total_tokens": len(prompt_ids) + n_out,
                 },
             }
             if incomplete_reason is not None:
@@ -5971,6 +6211,23 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _resolve_api_keys(argv_keys: list[str], env_value: str | None) -> list[str]:
+    """Combines ``--api-key`` (argv, repeatable) and ``MLXTURBO_API_KEY``
+    (environment variable, comma-separated for multiple keys) into one
+    deduplicated list, argv keys first (independent review C-12: an
+    argv-supplied secret is visible to any other local user who can list
+    processes — ``ps -ef`` and the like — unlike an environment variable of
+    the launching shell, so the env var is offered as a less-exposed
+    alternative that keeps --api-key working unchanged for existing callers).
+    Split out of ``main()`` so it can be unit-tested without going through
+    argparse or model loading, the same reason ``_positive_int`` and
+    ``_enforce_required_runner`` are tested directly.
+    """
+
+    env_keys = [k.strip() for k in (env_value or "").split(",") if k.strip()]
+    return list(dict.fromkeys([*argv_keys, *env_keys]))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -5990,7 +6247,7 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument(
-        "--max-tokens", type=int, default=4096, help="1 リクエストあたりの max_tokens 上限"
+        "--max-tokens", type=_positive_int, default=4096, help="1 リクエストあたりの max_tokens 上限"
     )
     ap.add_argument(
         "--temp", type=float, default=0.7, help="リクエストで temperature 省略時の既定値"
@@ -6098,7 +6355,7 @@ def main() -> None:
     )
     ap.add_argument(
         "--max-context-tokens",
-        type=int,
+        type=_positive_int,
         default=None,
         help="1 リクエストのプロンプト長 (トークン数) の上限。超えたリクエストは"
         " 400 (invalid_request_error) で弾く。既定 (未指定) はモデルの config"
@@ -6129,11 +6386,14 @@ def main() -> None:
         " は Authorization: Bearer <key>、Anthropic 系 (/v1/messages) は"
         " x-api-key: <key> で送る (どちらのヘッダもどちらの経路でも受け付ける)。"
         " 既定 (未指定) では認証なし — ローカル専用の従来挙動のまま変えない。"
-        " /health と /api/hello は鍵の有無に関わらず常に認証なしで通す",
+        " /health と /api/hello は鍵の有無に関わらず常に認証なしで通す。"
+        " 引数だとプロセス引数一覧 (ps 等) から他ユーザーに見えるため、環境変数"
+        " MLXTURBO_API_KEY (カンマ区切りで複数可) でも指定できる (両方指定時は"
+        " 両方受け付ける)。--api-key 指定時は起動時に警告を出す",
     )
     ap.add_argument(
         "--max-queue",
-        type=int,
+        type=_positive_int,
         default=8,
         help="直列化ロックの待ち行列の上限 (既定 8)。生成系 4 経路 (chat/"
         "completions/messages/responses) でこれに達したリクエストは"
@@ -6224,6 +6484,14 @@ def main() -> None:
     args = ap.parse_args()
 
     global STATE
+
+    resolved_api_keys = _resolve_api_keys(args.api_key, os.environ.get("MLXTURBO_API_KEY"))
+    if args.api_key:
+        print(
+            "[mlxturbo-serve] 警告: --api-key はプロセスの引数一覧 (ps 等) から同一マシンの"
+            " 他ユーザーに見える。可能なら環境変数 MLXTURBO_API_KEY (カンマ区切りで複数可)"
+            " を使うこと"
+        )
 
     served_name = args.served_model_name or Path(args.model).name
 
@@ -6373,7 +6641,7 @@ def main() -> None:
         max_sessions=args.max_sessions,
         max_context_tokens=max_context_tokens,
         model_aliases=frozenset(args.model_alias),
-        api_keys=frozenset(args.api_key),
+        api_keys=frozenset(resolved_api_keys),
         max_queue=args.max_queue,
         version=_FASTMLX_VERSION,
         downgrade_runner=downgrade_runner,
@@ -6418,10 +6686,12 @@ def main() -> None:
         f"(session pool: {session_factory.__name__}, max {args.max_sessions} 会話)"
     )
     print(f"[mlxturbo-serve] 待ち行列の上限 (--max-queue): {args.max_queue}")
-    if args.api_key:
-        print(f"[mlxturbo-serve] API キー認証: 有効 ({len(args.api_key)} 件)")
+    if resolved_api_keys:
+        print(f"[mlxturbo-serve] API キー認証: 有効 ({len(resolved_api_keys)} 件)")
     else:
-        print("[mlxturbo-serve] API キー認証: 無効 (既定、--api-key 未指定)")
+        print(
+            "[mlxturbo-serve] API キー認証: 無効 (既定、--api-key / MLXTURBO_API_KEY 未指定)"
+        )
     if args.model_alias:
         print(f"[mlxturbo-serve] model alias (404 を回避): {', '.join(args.model_alias)}")
     if getattr(tokenizer, "has_thinking", False):
