@@ -41,6 +41,7 @@ from contextlib import contextmanager
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 # mlxturbo-serve wiring (added 2026-08-29): share the constant used to chunk
 # prefill at the same width as FallbackRunner/SpecEngine (see the
@@ -364,6 +365,42 @@ _STAGE_EVERY = int(os.environ.get("MLXTURBO_STAGE_EVERY", "2") or 0)
 
 # MLXTURBO_ROUND_TRACE=1: ラウンド内の CPU 側区間を ms で刻む (調査用)
 _ROUND_TRACE = os.environ.get("MLXTURBO_ROUND_TRACE") == "1"
+
+# MLXTURBO_PREFILL_TRACE=1: prefill のフェーズ別区間を ms で刻む (調査用)。
+# 既定 off で、off のときは生成コストゼロ (フラグ読み出しのみ)。
+_PREFILL_TRACE = os.environ.get("MLXTURBO_PREFILL_TRACE") == "1"
+
+
+class _PrefillTracer:
+    """_PREFILL_TRACE=1 のときだけ prefill の区間を ms で刻んで 1 行ずつ print する。
+
+    区間は「既にある eval の前後で perf_counter() を挟むだけ」で作る
+    (新規の mx.eval は増やさない -- 増やすと計測が経路を変えてしまう)。
+    `log` は区間の長さを内部 total に積み、`summary` で合計と壁時計の
+    差 (=計測できていない隙間) を出す。
+    """
+
+    def __init__(self):
+        self.t0 = time.perf_counter()
+        self.total = 0.0
+        self.end = None
+
+    def log(self, label, seg_t0):
+        now = time.perf_counter()
+        dur = (now - seg_t0) * 1e3
+        self.total += dur
+        print(f"[prefill] {label} t={(now - self.t0) * 1e3:.2f} "
+              f"dur={dur:.2f}", flush=True)
+        return now
+
+    def mark_end(self):
+        self.end = time.perf_counter()
+
+    def summary(self):
+        end = self.end if self.end is not None else time.perf_counter()
+        wall = (end - self.t0) * 1e3
+        print(f"[prefill] total dur_sum={self.total:.2f} wall={wall:.2f} "
+              f"gap={wall - self.total:.2f}", flush=True)
 
 
 def _staged_forward(model, ids, caches):
@@ -914,15 +951,25 @@ class FlashSpecEngine:
         embeds = self.model.model.embed_tokens(ids[:, 1:])
         hyper_ctx = hyper[:, :-1]
         i = 0
+        _pf_t0 = time.perf_counter() if _PREFILL_TRACE else None
+        _pf_ci = 0
         while i < n_pairs:
             j = min(i + PREFILL_STEP_SIZE, n_pairs)
             chunk = embeds[:, i:j]
+            if _PREFILL_TRACE:
+                _pf_t = time.perf_counter()
             out = self.mtp(
                 chunk, hyper_ctx[:, i:j], self.rope,
                 Q.create_attention_mask(chunk, None), cache, cache.indexer,
             )
             mx.eval(out)
             mx.clear_cache()
+            if _PREFILL_TRACE:
+                _pf_now = time.perf_counter()
+                print(f"[prefill] prime chunk ci={_pf_ci} i={i} j={j} "
+                      f"t={(_pf_now - _pf_t0) * 1e3:.2f} "
+                      f"dur={(_pf_now - _pf_t) * 1e3:.2f}", flush=True)
+                _pf_ci += 1
             i = j
         return cache
 
@@ -1105,6 +1152,7 @@ class FlashSpecEngine:
 
         n = ids.shape[1]
         use_resume = resume is not None and n == 0
+        _pf = _PrefillTracer() if (_PREFILL_TRACE and not use_resume) else None
         if use_resume:
             logits_tail, hyper_tail0, mtp_snap = resume
             # The primed draft cache is carried across too: without it a
@@ -1153,7 +1201,11 @@ class FlashSpecEngine:
                     group_chunks = [
                         ids[:, i + k * step : i + (k + 1) * step] for k in range(g)
                     ]
+                    if _pf:
+                        _t = time.perf_counter()
                     hys = _group_prefill_forward(model, group_chunks, caches)
+                    if _pf:
+                        _t = _pf.log(f"group build i={i} g={g}", _t)
                     hys = hys[-HYPER_KEEP_CHUNKS:]
                     states = [
                         st for c in caches
@@ -1173,19 +1225,31 @@ class FlashSpecEngine:
                         # 有効にする前に in-model で測ること
                         # (docs/research/IMPROVEMENT-QUEUE.md D5)。
                         mx.async_eval(*hys, *states)
+                        if _pf:
+                            # 非同期投入なので、ここでの dur は GPU 完了を
+                            # 待っていない (build+async の意)
+                            _t = _pf.log(f"group eval i={i} g={g} build+async", _t)
                     else:
                         mx.eval(*hys)
                         for st in states:
                             mx.eval(st)
+                        if _pf:
+                            _t = _pf.log(f"group eval i={i} g={g}", _t)
                         mx.clear_cache()
+                        if _pf:
+                            _t = _pf.log(f"clear_cache i={i} g={g}", _t)
                     hyper_chunks.extend(hys)
                     del hyper_chunks[:-HYPER_KEEP_CHUNKS]
                     i += g * step
                     if checkpoints is not None:
+                        if _pf:
+                            _t = time.perf_counter()
                         checkpoints.append(
                             (base_pos + i, snapshot_untrimmable_caches(caches))
                         )
                         del checkpoints[:-CHECKPOINT_RETENTION]
+                        if _pf:
+                            _pf.log(f"checkpoint i={i} g={g}", _t)
                     continue
                 if remaining > step:
                     j = i + min(big, remaining - step)
@@ -1212,6 +1276,8 @@ class FlashSpecEngine:
                             h0 = model.model(head, cache=caches)
                         return h0, cap0.hyper
 
+                    if _pf:
+                        _t = time.perf_counter()
                     chunk, head_result = split_and_checkpoint_tail(
                         chunk,
                         checkpoints,
@@ -1221,6 +1287,8 @@ class FlashSpecEngine:
                         snapshot_untrimmable_caches,
                         _forward_head,
                     )
+                    if _pf:
+                        _t = _pf.log(f"tail split i={i} j={j}", _t)
                     tail_split = bool(head_result)
                     # light=True: this chunk uses only cap.hyper[:, -1:]
                     # (referenced right below). Full capture (cap.gdn/cap.ple)
@@ -1233,9 +1301,13 @@ class FlashSpecEngine:
                     with capture(model, light=True) as cap:
                         logits = model(chunk, cache=caches)
                         mx.eval(logits)
+                    if _pf:
+                        _t = _pf.log(f"tail forward i={i} j={j}", _t)
                     if tail_split:
                         cap.hyper = mx.concatenate([head_result[1], cap.hyper], axis=1)
                 else:
+                    if _pf:
+                        _t = time.perf_counter()
                     # light=True (added for MTP priming): only the cheap
                     # GatedResidual hook runs, so this branch's computation and
                     # cache updates are unchanged -- we additionally record
@@ -1247,13 +1319,21 @@ class FlashSpecEngine:
                         state = getattr(c, "state", None)
                         if state is not None:
                             mx.eval(state)
+                    if _pf:
+                        _t = _pf.log(f"tail forward i={i} j={j}", _t)
                     mx.clear_cache()
+                    if _pf:
+                        _t = _pf.log(f"clear_cache i={i} j={j}", _t)
                 hyper_chunks.append(cap.hyper)
                 del hyper_chunks[:-HYPER_KEEP_CHUNKS]
                 i = j
                 if checkpoints is not None:
+                    if _pf:
+                        _t = time.perf_counter()
                     checkpoints.append((base_pos + i, snapshot_untrimmable_caches(caches)))
                     del checkpoints[:-CHECKPOINT_RETENTION]
+                    if _pf:
+                        _pf.log(f"checkpoint i={i}", _t)
             # mx.contiguous, not a bare slice: a slice keeps its parent
             # buffer alive, and these two outlive the call (they are published
             # as the session's tail for a later diff-0 resume). The last
@@ -1295,6 +1375,9 @@ class FlashSpecEngine:
         out = [first]
         if logprob_rows is not None:
             logprob_rows.extend(_logsoftmax_rows(logits_tail, 1))
+        if _pf:
+            _pf.log("first token", _pf.end)
+            _pf.summary()
         yield [first]
         accepted, rounds = 0, 0
         if first in eos:
