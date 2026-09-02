@@ -4661,6 +4661,107 @@ def test_flash_spec_draft_reuses_primed_cache_across_rounds():
     assert offsets == list(range(offsets[0], offsets[0] + len(offsets)))
 
 
+def test_flash_spec_prime_accepted_gap_advances_offset_by_confirmed_tokens():
+    """独立レビュー A-1 の修正の中核: `_draft_chain` は毎ラウンド、戻る前に
+    キャッシュを cur 1 列まで trim して戻す (上のテストの ``+1 ずつ`` がまさに
+    それ)。つまり受理された中間トークン (draft が当たった分) は、
+    ``_prime_accepted_gap`` を呼ばない限り MTP キャッシュに一度も書かれない
+    -- これが MTP の offset (RoPE 位置) を毎ラウンド hit ぶん遅らせていた
+    欠陥 (レビュー A-1)。
+
+    draft が実際に当たるかはこのテスト (乱数の小型モデル) では制御できない
+    ので、当たったことにして (``hit = len(drafts)``) 経路を強制的に通す --
+    ここで確かめたいのは「積んだ分だけ offset が伸びるか」という
+    キャッシュの帳簿合わせであって、当たり判定の正しさ自体は
+    ``bench/test_server.py`` の他のテストと ``_verify`` 自身の受理率計測
+    (GPU 側の A/B) が担う。"""
+
+    import mlxturbo.spec_flash as SF
+
+    mx.random.seed(4)
+    model, mtp = _build_tiny_qwen4_exp()
+    depth = 3
+    engine = SF.FlashSpecEngine(model, mtp, depth=depth)
+
+    caches = model.make_cache()
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    with SF.capture(model) as cap:
+        logits = model(ids, cache=caches)
+        mx.eval(logits)
+    hyper_prev = cap.hyper[:, -1:]
+    mtp_cache = engine._prime_draft_cache(ids, cap.hyper)
+    cur = mx.argmax(logits[:, -1], axis=-1).reshape(1, 1)
+
+    prime_offset = mtp_cache.offset
+    assert prime_offset == ids.shape[1] - 1
+
+    def run_round(cur, hyper_prev):
+        drafts = engine._draft_chain(cur, hyper_prev, mtp_cache, depth)
+        # _draft_chain 自身の不変条件: 戻った時点でキャッシュには cur の
+        # 1 列しか残っていない (投機的な列は積まない)。
+        offset_after_draft = mtp_cache.offset
+
+        pair = mx.concatenate([cur] + drafts, axis=1)
+        with SF.capture(model) as cap_r:
+            lg = model(pair, cache=caches)
+            mx.eval(lg)
+        # 当たったことにする (トランクの検証 logits 自体は本物 -- 出す値の
+        # 正しさとは無関係、ここで見たいのは帳簿合わせだけ)。
+        hit = len(drafts)
+        nxt_all = mx.argmax(lg, axis=-1)
+        toks = [nxt_all[:, j:j + 1] for j in range(hit + 1)]
+        hypers = [cap_r.hyper[:, j:j + 1] for j in range(hit + 1)]
+
+        engine._prime_accepted_gap(toks, hypers, mtp_cache)
+        mx.eval(mtp_cache.keys, mtp_cache.values)
+
+        # 確定したのは toks 全 hit+1 個。最後の 1 個 (次ラウンドの cur) は
+        # 次ラウンドの _draft_chain 自身が積むので、ここで進むのはそれを
+        # 除いた分だけ。
+        assert mtp_cache.offset == offset_after_draft + (len(toks) - 1)
+        return toks[-1], hypers[-1]
+
+    cur, hyper_prev = run_round(cur, hyper_prev)
+    offset_r1 = mtp_cache.offset
+    # 2 ラウンド目: 連鎖しても同じ帳簿合わせが保たれること。
+    cur, hyper_prev = run_round(cur, hyper_prev)
+    assert mtp_cache.offset > offset_r1
+
+
+def test_flash_spec_mtp_cache_append_knob_does_not_change_greedy_output():
+    """独立レビュー A-1 の修正は受理率にしか効かないはず -- 貪欲な出力
+    トークン列は採用ロジックがトランクの検証 logits だけを見て決まる
+    (``_verify`` の実装参照、draft/MTP キャッシュの中身は判定に使わない)
+    ので、``_MTP_CACHE_APPEND`` の on/off で変わらない。
+    tools/decode_ab.py の knob `mtp-append` が `control_identical=False` で
+    ``tok/round`` だけを判定に使う前提の不変条件を、CPU 上の合成モデルで
+    確認する (同じ ids で A/B を回してトークン列が一致すること)。"""
+
+    import mlxturbo.spec_flash as SF
+
+    mx.random.seed(5)
+    model, mtp = _build_tiny_qwen4_exp()
+    ids = mx.array([[1, 2, 3, 4, 5, 6, 7]])
+
+    def run(append_on):
+        SF._MTP_CACHE_APPEND = append_on
+        engine = SF.FlashSpecEngine(model, mtp, depth=2)
+        out = []
+        gen = engine.generate_stream(ids, max_tokens=12, temp=0.0, eos_ids=set())
+        for chunk in gen:
+            out.extend(chunk)
+        return out
+
+    try:
+        out_on = run(True)
+        out_off = run(False)
+    finally:
+        SF._MTP_CACHE_APPEND = True
+
+    assert len(out_on) == 12
+    assert out_on == out_off
+
+
 def test_flash_spec_checkpoint_reuse_matches_full_rebuild_with_tail_mismatch(monkeypatch):
     """この節の合否基準そのもの: thinking マーカー再オープンと同じ形の不一致
     (処理済み列の末尾わずかだけが新プロンプトと食い違う、チェックポイント

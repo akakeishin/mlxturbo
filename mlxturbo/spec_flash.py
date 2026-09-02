@@ -123,7 +123,7 @@ MTP_DEPTH = 2
 #
 # よって既定はモデルの indexer_budget にする (下の _depth_ctx_limit)。
 # 定数を持たない族では境界が無いので切り替えない。env で上書きできる。
-DEPTH_CONTEXT_LIMIT = int(os.environ.get("MLXTURBO_DEPTH_CTX_LIMIT", "0")) or None
+DEPTH_CONTEXT_LIMIT = int(os.environ.get("MLXTURBO_DEPTH_CTX_LIMIT", "0") or 0) or None
 _DEPTH_CTX_LIMIT_FALLBACK = 262144
 
 
@@ -383,6 +383,16 @@ _ROUND_TRACE = os.environ.get("MLXTURBO_ROUND_TRACE") == "1"
 # 既定 off で、off のときは生成コストゼロ (フラグ読み出しのみ)。
 _PREFILL_TRACE = os.environ.get("MLXTURBO_PREFILL_TRACE") == "1"
 
+# 独立レビュー A-1 の修正 (2026-09-02): 検証で確定した中間トークンを MTP
+# キャッシュへ積み直すか。既定 on ("1")。_draft_chain はチェーンを引くたび
+# cur 1 列まで cache を trim して戻すので、hit>=1 のラウンドでは受理済みの
+# 中間トークンが一度もキャッシュに書かれず、MTP の offset (RoPE 位置) が
+# 毎ラウンド hit ぶん遅れて受理率が生成長に比例して落ちていた
+# (FlashSpecEngine._prime_accepted_gap、generate_stream 参照)。
+# off ("0") で修正前の挙動に戻せる -- tools/decode_ab.py の knob
+# `mtp-append` の B 側 (旧挙動) との比較用。
+_MTP_CACHE_APPEND = os.environ.get("MLXTURBO_MTP_CACHE_APPEND", "1") != "0"
+
 
 class _PrefillTracer:
     """_PREFILL_TRACE=1 のときだけ prefill の区間を ms で刻んで 1 行ずつ print する。
@@ -468,7 +478,7 @@ _PREFILL_GROUP = int(os.environ.get("MLXTURBO_PREFILL_GROUP", "4") or 0)
 # 減りうる (代償は prefill の MoE バッチ効率)。既定 1 は従来の挙動そのもの。
 # 掃引するときは「17k TTFT の悪化 2% 以内」を反転条件にする
 # (docs/research/IMPROVEMENT-QUEUE.md B2)。
-_PREFILL_TAIL_CHUNKS = int(os.environ.get("MLXTURBO_PREFILL_TAIL_CHUNKS", "1"))
+_PREFILL_TAIL_CHUNKS = int(os.environ.get("MLXTURBO_PREFILL_TAIL_CHUNKS", "1") or 1)
 
 # group prefill のグループ境界を非同期投入にする (既定 off)。詳細は使用箇所の
 # コメント。取り分は小さく、メモリ側の危険は実在するので、測ってから決める。
@@ -583,7 +593,7 @@ def _prefetch_ngram_rows(model, ids: mx.array, caches) -> None:
     if ids.shape[1] == 0:
         return
     m = model.model
-    for pli in m.ple_layers:
+    for pli in getattr(m, "ple_layers", None) or []:
         ple_emb = m.layers[pli].ple.ple_embedding
         stream = ple_emb.ngram_embedding
         if not getattr(stream, "prefetch_enabled", False):
@@ -876,6 +886,39 @@ class FlashSpecEngine:
         trim_attn_cache(cache, keep)
         return drafts
 
+    def _prime_accepted_gap(self, toks: list, hypers: list, cache) -> None:
+        """検証で確定した中間トークンを MTP キャッシュへ追いつかせる (独立
+        レビュー A-1 の修正)。
+
+        ``_draft_chain`` は毎ラウンド、戻る前にキャッシュを ``cur`` の 1 列
+        まで trim する (自身の docstring どおり)。つまり ``toks[0 .. len-2]``
+        (末尾の 1 個 = 次ラウンドの ``cur`` は次の ``_draft_chain`` の 1 段目が
+        自分で積む) は、これを呼ばない限り一度もキャッシュに書かれない。
+
+        ``toks``/``hypers`` は ``_verify`` が返す対応済みの組で、
+        ``hypers[j]`` は「``toks[j]`` を出した直前のトランクの hyper」
+        (``_prime_draft_cache`` の規約 ``(embed(t_k), hyper_{k-1})`` と同じ
+        --- ここでは配列の添字 ``j`` 自体が ``k-1`` の役を兼ねる)。
+        ``_draft_chain`` 自身が使う投機的な hyper 連鎖 (MTP 自身の出力から
+        作った、外れているかもしれない値) ではなく、トランクの検証フォワード
+        が実際に出した hyper を使う点がここの要点 --- ドラフトが外れていても
+        確定後はここで正しい履歴に差し替わる。
+
+        呼び出し前の ``cache`` は常にクリーンな (投機的な列を含まない) 状態
+        である前提 (``_draft_chain`` の不変条件そのもの)。トークンの埋め込み
+        と ``mtp.layers[0]`` の呼び出しは ``_draft_chain`` の 1 段と全く同じ
+        形 --- 違いは hyper の出所と、logits/argmax を作らず捨てること
+        (キャッシュを進めるためだけの呼び出し) だけ。
+        """
+        Q = _arch()
+        for i in range(len(toks) - 1):
+            emb = self.model.model.embed_tokens(toks[i])
+            mask = Q.create_attention_mask(emb, None)
+            x = self.mtp.combine(emb, hypers[i])
+            self.mtp.layers[0](
+                x, self.rope, mask, None, cache, cache.indexer, None, None
+            )
+
     def _verify(self, cap, lg, drafts, temp, precomputed=None, sampler=None):
         """検証フォワードの結果から、採用するトークンと hyper を取り出す。
 
@@ -1139,8 +1182,8 @@ class FlashSpecEngine:
         handles it with ``.trim()`` and by following along the indexer keys.
 
         ``resume`` (mlxturbo-serve wiring, added 2026-08-30): a
-        ``(logits_last, hyper_prev)`` pair captured by a previous call at
-        *exactly* this same position (see the return value below), for when
+        ``(logits_last, hyper_prev, mtp_snap)`` triple captured by a previous
+        call at *exactly* this same position (see the return value below), for when
         ``ids`` has zero new tokens (a prompt that matches a session's cache
         down to the very last position -- a resend of the same prompt, a
         regenerate). The chunk loop above never executes for an empty
@@ -1155,9 +1198,9 @@ class FlashSpecEngine:
 
         Returns/yields the same as before, except the final ``(accepted,
         rounds)`` is now a 3-tuple ``(accepted, rounds, (logits_last,
-        hyper_prev))`` -- the pair at the prefill/decode boundary of *this*
-        call (untouched by the decode loop below, unlike the ``hyper_prev``
-        local variable that keeps advancing), passed straight through
+        hyper_prev, mtp_snap))`` -- the triple at the prefill/decode boundary
+        of *this* call (untouched by the decode loop below, unlike the
+        ``hyper_prev`` local variable that keeps advancing), passed straight through
         unchanged when ``resume`` was used. Callers thread it back in via
         ``resume`` on a session's next call (mlxturbo/runner.py's
         ``FlashSpecRunner``).
@@ -1498,7 +1541,11 @@ class FlashSpecEngine:
                                 lg2, snap2)
             if _ROUND_TRACE:
                 _rt = [("built", time.perf_counter())]
-            if temp <= 0 and drafts:
+            # _verify の分岐 (`temp > 0 or sampler is not None`) と揃える --
+            # sampler ありなら temp<=0 でも sampler 側に入り precomputed は
+            # 無視される (独立レビュー A-6)。揃えないと argmax/concat を
+            # 評価してから丸ごと捨てるだけの無駄になる。
+            if temp <= 0 and sampler is None and drafts:
                 nxt_all = mx.argmax(lg, axis=-1)
                 dv = mx.concatenate(drafts, axis=1)
                 mx.eval(lg, nxt_all, dv)
@@ -1534,6 +1581,14 @@ class FlashSpecEngine:
                     pending = next_pending
                 else:
                     _pipeline_restore(model, caches, mtp_cache, next_pending[6])
+            if _MTP_CACHE_APPEND and not (full_accept and pipeline == 1):
+                # 独立レビュー A-1: このラウンドで確定した中間トークンを MTP
+                # キャッシュへ積み直す。pipeline (既定 off) の先組みが採用され
+                # た (pending が立った) ときは、その先組み自身が古い hyper 連鎖
+                # で次ラウンドの cur をすでに積んでしまっているので、ここで
+                # 割り込むと順序が壊れる -- 触らない (既定 off 経路を壊さない
+                # ことだけが要件、そちらの受理率まで直すのはこの修正の範囲外)。
+                self._prime_accepted_gap(toks, hypers, mtp_cache)
             cur, hyper_prev = toks[-1], hypers[-1]
             # 次ラウンドの draft をここで組んで投げる (rollback / yield などの
             # CPU 後処理を draft の GPU 実行に隠す)。draft はトランクの

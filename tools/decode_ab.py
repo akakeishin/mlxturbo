@@ -133,6 +133,22 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              batch/batch_spec 経路には効かない。
              合格条件: **ms/token が短・長の両方で改善すること。**
              どちらかで悪化したら既定 off のまま据え置く。
+
+`mtp-append` 独立レビュー A-1 の修正 (MLXTURBO_MTP_CACHE_APPEND、既定 on、
+             `spec_flash._prime_accepted_gap`)。A = 検証で確定した中間
+             トークンを MTP キャッシュへ積む (既定) / B = 積まない
+             (修正前、`_draft_chain` が毎ラウンド cur 1 列まで trim して
+             戻すぶんが埋まらないまま)。B では MTP の offset (RoPE 位置)
+             が毎ラウンド hit ぶん遅れ、受理率が生成長に比例して落ちる。
+             出力トークン列は不変のはず (greedy はトランクの検証 logits
+             からしか出ない。合成モデルの CPU テストで確認: 同じ ids で
+             A/B を回してトークン列が一致すること)。ここでは
+             `control_identical=False` -- draft 自体は変わるので、途中の
+             `nxt_all`/`dv` 比較 (`_verify` の一致判定はドラフト側の値も
+             使う) はビット同一を要求しない。
+             合格条件: **tok/round (複数プロンプト x 512 の平均) が
+             改善すること。**上がらなければ既定 off に戻す。ms/token も
+             併せて見る。
 """
 
 from __future__ import annotations
@@ -796,6 +812,21 @@ def _knob_fold_tail(ctx):
     return apply
 
 
+def _knob_mtp_append(ctx):
+    """独立レビュー A-1 の修正。A = 検証で確定した中間トークンを MTP
+    キャッシュへ積む (既定) / B = 積まない (修正前の挙動)。
+
+    `spec_flash._MTP_CACHE_APPEND` を直接差し替える (env は import 時にしか
+    読まれないので、他の module-level knob と同じくここで属性を書き換える)。
+    """
+    import mlxturbo.spec_flash as SF
+
+    def apply(variant):
+        SF._MTP_CACHE_APPEND = variant == "A"
+
+    return apply
+
+
 def _knob_ngram_layout(ctx):
     """n-gram サイドカーのレイアウト。A = interleaved (`StreamNGram`、ディスク
     参照) / B = separate (`RamNGram`、RAM 常駐)。
@@ -1009,6 +1040,7 @@ KNOBS = {
     "prefill-attn": (_knob_prefill_attn, ["A", "B"], False, "B"),
     "wide": (_knob_wide, ["A", "B"], False, "B"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
+    "mtp-append": (_knob_mtp_append, ["A", "B"], False, "B"),
     # A = interleaved (本番既定) を基準に、B = separate (RAM 常駐) と比べる
     "ngram-layout": (_knob_ngram_layout, ["A", "B"], True, "A"),
     # A = 先読み有効 (既定) / B = 無効。判定は prefill_s
@@ -1264,6 +1296,11 @@ def main() -> int:
         # 一致 (対照が効く) なので prefill_s は動かない。ステップ数に比例する
         # decode の呼び出し回数のところで初めて差が出る。
         "ngram-layout",
+        # mtp-append (独立レビュー A-1) は generate_stream の decode ループ
+        # 内、_verify の後でしか _MTP_CACHE_APPEND を読まない
+        # (spec_flash._prime_accepted_gap の呼び出し口)。_prime_draft_cache
+        # (prefill 側の priming) は触らない。
+        "mtp-append",
     }
     if args.prefill_once and args.knob not in DECODE_ONLY_KNOBS:
         print(f"knob={args.knob} は prefill に影響しうるので --prefill-once は"
