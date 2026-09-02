@@ -755,6 +755,68 @@ def _knob_hc_compiled(ctx):
     return apply
 
 
+def _knob_hc_prefill_compile(ctx):
+    """A = hyper-connection の読み側のうち、GEMM 2 本 (`input_mix_weight_down`/
+    `up`、+ inject の `block_inject_weight`) を除いた elementwise 部分だけを
+    prefill 幅 (行数 >= `MLXTURBO_HC_COMPILE_MIN_ROWS`、既定 64) に限って
+    `mx.compile(shapeless=True)` に畳む
+    (`fused.enable_hyper_connection_prefill_compiled`、
+    `MLXTURBO_HC_PREFILL_COMPILE`、既定 off) / B = 素の実装 (`hc-compiled` の
+    B と同じ --- `disable_hyper_connection`/`disable_hyper_connection_kernel`
+    を両方呼んで `GatedResidual.__call__` を vendor 実装に戻した状態)。
+
+    `hc-compiled` (`enable_hyper_connection`、GEMM も含めて全体を 1 グラフに
+    する版) との違いは、GEMM 2 本を `mx.compile` の外に出したまま
+    `mx.quantized_matmul` を直接呼ぶこと (`_hc_prefill_compile_pre`/
+    `_hc_prefill_compile_post` の 2 グラフ + down/up の間の `silu(.../hc)` 1
+    op だけが素のまま挟まる)。decode/verify 幅 (行数 < しきい値) は常に
+    vendor 実装にそのまま落ちるので、`hc-kernel`/`hc-compiled` と違って
+    decode 幅では A/B とも同じコードパスを踏む。
+
+    既存の融合 Metal カーネル (`hc-kernel`、`enable_hyper_connection_kernel`)
+    とは同じ `GatedResidual.__call__` を取り合うため同時に使えない
+    (`enable_hyper_connection_prefill_compiled` 自身が `_ORIG_HC_KERNEL is
+    not None` で例外を出す)。A を貼る前に必ず
+    `disable_hyper_connection_kernel()` を呼ぶこと。
+
+    prefill にしか効かない (decode/verify 幅は行数ゲートで必ず素の実装へ
+    落ちる) ので **`--prefill-once` は使えない** (`DECODE_ONLY_KNOBS` には
+    入れない)。見るのは `prefill_s`。
+
+    合格条件: prefill_s が短・長の両方で改善すること。**出力はビット同一
+    ではない** (`control_identical=False`)。当初は `hc-compiled` と同じ理由
+    (GEMM の呼び出し順・量子化経路を変えていない) でビット同一のはずと
+    見込んでいたが、CPU 上の合成モデルで実測すると同一ではなかった
+    (`tools/vendor_fingerprint.py` の md5 が on/off で変わる、logits の
+    max|diff|=1.04e-7)。原因は `enable_hyper_connection_prefill_compiled`
+    の reshape 戦略 -- `mx.compile(shapeless=True)` は先頭の可変長軸を
+    Python の `.shape` 展開で reshape の target に焼き込むと壊れる (最初の
+    trace の行数が別の行数の呼び出しに使い回されて reshape が失敗する、
+    実測で確認)。回避のため先頭 (B, T) を 1 本の可変長行に潰してから
+    `hc_norm`/`RMSNorm` のグループ計算をしており、この潰し方が vendor の
+    `RMSNorm.__call__` (先頭を展開したまま `(B, T, hc, d)` で保持する) と
+    reshape の経路が違う。1.04e-7 は float32 の丸み込みの水準
+    (`tools/vendor_fingerprint.py` の `group_prefill_forward` が記録している
+    8e-7 と同じ桁) で、正しさの問題ではなく mx.compile の演算順の違いと
+    見て良い。短文脈で出力一致を要求せず、tok/round の悪化が無いことだけ
+    確認すること。
+    """
+    import os
+
+    from mlxturbo import fused
+
+    def apply(variant):
+        fused.disable_hyper_connection_prefill_compiled()
+        fused.disable_hyper_connection_kernel()
+        fused.disable_hyper_connection()
+        os.environ["MLXTURBO_HC_PREFILL_COMPILE"] = "1" if variant == "A" else "0"
+        if variant == "A":
+            fused.enable_hyper_connection_prefill_compiled()
+        # B は読み側の融合をすべて外した素の経路 (hc-compiled の B と同じ)
+
+    return apply
+
+
 def _knob_pipeline(ctx):
     """A = 楽観パイプライン (次ラウンドの draft を先に組む) / B = 無効 (既定)。
 
@@ -1516,6 +1578,7 @@ KNOBS = {
     "hc-prefill": (_knob_hc_prefill, ["A", "C", "B"], False, "C"),
     "hc-kernel": (_knob_hc_kernel, ["A", "B"], False, "B"),
     "hc-compiled": (_knob_hc_compiled, ["A", "B"], True, "B"),
+    "hc-prefill-compile": (_knob_hc_prefill_compile, ["A", "B"], False, "B"),
     "pipeline": (_knob_pipeline, ["A", "B"], False, "B"),
     "fast-qmm": (_knob_fast_qmm, ["A", "B"], False, "B"),
     "null": (_knob_null, ["A", "B"], True, "B"),

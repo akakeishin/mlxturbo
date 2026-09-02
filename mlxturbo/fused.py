@@ -43,11 +43,14 @@ from __future__ import annotations
 _ORIG_HC = None
 _ORIG_HC_KERNEL = None
 _ORIG_HC_COMBINE = None
+_ORIG_HC_PREFILL_COMPILE = None
 _ORIG_RNG = None
 _ORIG_MOE = None
 _COMPILED = {}
 _COMBINE_COMPILED = {}
 _COMBINE_PLAIN: dict = {}
+_HC_PREFILL_COMPILE_PRE: dict = {}
+_HC_PREFILL_COMPILE_POST: dict = {}
 
 
 def _build(hc: int, d: int, eps: float, use_combine: bool):
@@ -276,6 +279,232 @@ def disable_hyper_connection_kernel() -> None:
 
     Q.GatedResidual.__call__ = _ORIG_HC_KERNEL
     _ORIG_HC_KERNEL = None
+
+
+def _hc_prefill_compile_pack(lin):
+    """`input_mix_weight_down`/`up`/`block_inject_weight` から重みを取り出す。
+
+    `enable_hyper_connection` の内側にある `_pack` と同じ変換 (量子化なら
+    (weight, scales, biases, group_size, bits)、そうでなければ (weight,))。
+    `_pack_quantized` (非量子化を None で弾く、kernel 側専用の契約) とは別に
+    持つ -- こちらは `_build`/`enable_hyper_connection` と同じく非量子化
+    (bf16 の `nn.Linear`) もそのまま扱う。
+    """
+    if "scales" in lin:
+        return (lin.weight, lin.scales, lin.biases, lin.group_size, lin.bits)
+    return (lin.weight,)
+
+
+def _hc_prefill_compile_qmm(x, w):
+    """量子化線形。w は `_hc_prefill_compile_pack` の戻り値。"""
+    import mlx.core as mx
+
+    if len(w) == 1:
+        return x @ w[0].T
+    wt, sc, bi, gs, bits = w
+    return mx.quantized_matmul(
+        x, wt, scales=sc, biases=bi, transpose=True, group_size=gs, bits=bits
+    )
+
+
+def _hc_prefill_compile_pre(hc: int, d: int, eps: float):
+    """`RMSNorm(hyper)` + `(1+w)` 乗算 (down GEMM の直前まで) を 1 グラフに
+    畳む。``shapeless=True`` なので prefill チャンク幅 (2048 / 1779 / 端数)
+    が変わっても再コンパイルされない -- 変わるのは行数だけで、次元数
+    (`hyper` の rank) と dtype は固定なので shapeless の制約に収まる。
+
+    **`x.reshape(*x.shape[:-1], -1, d)` (Python 側で読んだ `.shape` を展開
+    して作る target shape) は使わない。**`shapeless=True` は「トレースした
+    グラフをそのまま別の形に使い回す」もので、Python の `.shape` 展開は
+    トレース時の具体的な整数をグラフへ焼き込む (最初の呼び出しが T=4 なら
+    reshape の目標形状に literal 4 が刻まれる)。次に T=3 (端数チャンク) で
+    呼ぶと「size 384 を shape (1,4,...) へ reshape できない」で落ちる (実装
+    中に実測で踏んだ -- 最小再現は 1 行の elementwise + reshape + reshape の
+    合成関数を T=4 で 1 回呼んでから T=3 で呼ぶだけで再現する)。安全な形は
+    「先頭の可変長をまとめて 1 つの `-1` に潰し、固定なのは `hc`/`d` だけ」
+    にすること -- `-1` はグラフ側で
+    毎回の実サイズから解決されるので、行数が変わっても壊れない
+    (`mlx_lm.models.qwen3_next._precise_swiglu` や `gated_delta.compute_g`
+    も reshape を伴わない/伴っても target が全部固定という形でこの罠を
+    踏んでいない)。
+    """
+    import mlx.core as mx
+
+    key = (hc, d, eps)
+    fn = _HC_PREFILL_COMPILE_PRE.get(key)
+    if fn is not None:
+        return fn
+
+    def pre(hyper, norm_w):
+        # 先頭 (B, T...) をまとめて 1 つの可変長行に潰す。hc/d は固定なので
+        # ここで焼き込んでも別の行数で使い回して安全 (上の docstring 参照)。
+        x = hyper.reshape(-1, hc, d)
+        x = mx.fast.rms_norm(x, None, eps)
+        x = x.reshape(-1, hc * d)
+        return x * (1.0 + norm_w)
+
+    fn = mx.compile(pre, shapeless=True)
+    _HC_PREFILL_COMPILE_PRE[key] = fn
+    return fn
+
+
+def _hc_prefill_compile_post(hc: int, d: int, use_combine: bool):
+    """up GEMM の直後 (`sigmoid` -> reshape -> `w * normed` -> `mean`) と、
+    combine のときは inject の `sigmoid` も同じグラフに畳む。inject は
+    `normed` にしか依存しない (up の結果とは無関係) ので、同じ
+    `mx.compile` 呼び出しの中に同居させても up 側の計算とは独立に評価される。
+
+    `_hc_prefill_compile_pre` と同じ理由で、reshape の target shape は
+    `-1` (可変長の行) と `hc`/`d` (固定) だけで組む -- `w.shape[:-1]` を
+    展開しない。入出力とも先頭の行軸は 1 本に潰れたまま
+    (呼び出し側の `patched` が `hyper.shape` を使って素の Python で
+    元の形に戻す -- そちらは毎回フレッシュに実行されるので焼き込みの心配が無い)。
+    """
+    import mlx.core as mx
+
+    key = (hc, d, use_combine)
+    fn = _HC_PREFILL_COMPILE_POST.get(key)
+    if fn is not None:
+        return fn
+
+    if use_combine:
+
+        def post(normed, up_raw, inject_raw):
+            w = mx.sigmoid(up_raw).reshape(-1, hc, d)
+            mixed = (w * normed.reshape(-1, hc, d)).mean(axis=-2)
+            inject = 2.0 * mx.sigmoid(inject_raw / hc)
+            return mixed, inject
+
+    else:
+
+        def post(normed, up_raw):
+            w = mx.sigmoid(up_raw).reshape(-1, hc, d)
+            return (w * normed.reshape(-1, hc, d)).mean(axis=-2)
+
+    fn = mx.compile(post, shapeless=True)
+    _HC_PREFILL_COMPILE_POST[key] = fn
+    return fn
+
+
+def enable_hyper_connection_prefill_compiled(model=None) -> None:
+    """`GatedResidual.__call__` の GEMM 2 本 (`input_mix_weight_down`/`up`、
+    combine のときは inject の `block_inject_weight` も合わせて 3 本) 以外の
+    elementwise 部分だけを、prefill 幅 (行数 >= `MLXTURBO_HC_COMPILE_MIN_ROWS`、
+    既定 64) のときに限って `mx.compile(shapeless=True)` に畳む。
+
+    2 つのグラフに分ける (`_hc_prefill_compile_pre` / `_hc_prefill_compile_post`)。
+    GEMM 自体は 4bit 量子化のままそのつど `mx.quantized_matmul` を直接呼ぶ
+    (`_hc_prefill_compile_qmm`) -- `enable_hyper_connection` (全体を 1 グラフに
+    する版) と違い、量子化 GEMM をコンパイル境界の外に出すことで down/up の
+    間の `silu(.../hc)` 1 op だけが素のまま挟まる (2 GEMM の間にどうしても
+    residency する 1 op で、まとめても短い chain 1 本にしかならない)。
+
+    prefill 1 チャンク (2048 tok) で HC が 97 回 x 380ms/チャンク (効率 60%)
+    かかっている内訳のうち、GEMM を除いた elementwise が 90-120ms/チャンクと
+    見積もられている (docs/research/KERNEL-BRIEF-DECODE-BW.md)。ここを
+    2 ディスパッチ (pre/post) に畳めれば -2〜3% が仮説 (在庫は in-model A/B
+    で検証、`tools/decode_ab.py --knob hc-prefill-compile`)。
+
+    行数 < 64 (decode/verify 幅) は enable した時点の `Q.GatedResidual.__call__`
+    (`_ORIG_HC_PREFILL_COMPILE` に控えてある) にそのまま落ちる -- decode 幅は
+    素のままにする。
+
+    **出力はビット同一ではない。**GEMM の呼び出し順・量子化経路自体は
+    素の実装から変えていないが、`_hc_prefill_compile_pre`/`_post` の内部で
+    先頭 (B, T...) を 1 本の可変長行に潰してから `hc_norm` のグループ計算を
+    しており (`shapeless=True` の reshape 焼き込み回避、両関数の docstring
+    参照)、これが vendor の `RMSNorm.__call__` が使う reshape 経路
+    (先頭を展開したまま保持) と違う。CPU 上の合成モデルで実測すると
+    (`tools/vendor_fingerprint.py`) md5 は on/off で変わり、logits の
+    max|diff|=1.04e-7 (float32 の丸みの水準、`group_prefill_forward` が
+    記録している 8e-7 と同じ桁)。正しさの問題ではないが、
+    `tools/decode_ab.py --knob hc-prefill-compile` の対照は
+    `control_identical=False` で扱うこと。
+
+    既存の融合 Metal カーネル (`enable_hyper_connection_kernel`) とは同時に
+    使わない。どちらも `Q.GatedResidual.__call__` を取り合うため、両方
+    有効化すると disable の順序次第でどちらの状態に戻るか不定になる
+    (`enable_hyper_connection`/`enable_hyper_connection_kernel` 同士も同じ
+    問題を抱えているが、`runner.py` の `hc_mode` if/elif/else が互いを
+    排他にしているので今まで表面化していない)。`_ORIG_HC_KERNEL is not None`
+    (= kernel 側が有効) ならここで例外を出す -- 呼び出し側が先に
+    `disable_hyper_connection_kernel()` を呼ぶこと。
+
+    既定 off。環境変数 `MLXTURBO_HC_PREFILL_COMPILE=1` が立っているときだけ
+    有効化する (`enable_moe_verify_gather`/`enable_gdn_prework_kernel` と同じ
+    ゲート方式 -- 呼ぶだけでは何も起きない)。`model` は他の `enable_*(model)`
+    とシグネチャを揃えてあるだけで今のところ未使用 -- パッキング
+    (`_hc_prefill_compile_pack`) は呼び出しごとに `self` から行うので、
+    事前に model の層を歩いて写しを作る必要が無い (`enable_gdn_prework_kernel`
+    の `A_log`/`dt_bias` の fp32 写しとは事情が違う)。
+    """
+    global _ORIG_HC_PREFILL_COMPILE
+    import os
+
+    import mlx_lm.models.qwen4_exp as Q
+
+    if os.environ.get("MLXTURBO_HC_PREFILL_COMPILE") != "1":
+        return
+    if _ORIG_HC_KERNEL is not None:
+        raise RuntimeError(
+            "enable_hyper_connection_prefill_compiled: "
+            "enable_hyper_connection_kernel と同時には使えない (同じ "
+            "GatedResidual.__call__ を取り合う)。先に "
+            "disable_hyper_connection_kernel() を呼ぶこと。"
+        )
+    if _ORIG_HC_PREFILL_COMPILE is not None:
+        return
+    _ORIG_HC_PREFILL_COMPILE = Q.GatedResidual.__call__
+    orig = _ORIG_HC_PREFILL_COMPILE
+
+    # 起動時に 1 回だけ読む (呼び出しごとの getenv を避ける)。
+    min_rows = int(os.environ.get("MLXTURBO_HC_COMPILE_MIN_ROWS", "64"))
+
+    import mlx.nn as nn
+
+    def patched(self, hyper):
+        m = 1
+        for s in hyper.shape[:-1]:
+            m *= s
+        if m < min_rows:
+            return orig(self, hyper)
+
+        use_combine = self.block_inject_weight is not None
+        lead = hyper.shape[:-1]  # 素の Python で毎回フレッシュに読む (焼き込み無し)
+        pre = _hc_prefill_compile_pre(self.hc, self.d, self.hc_norm.eps)
+        normed = pre(hyper, self.hc_norm.weight)  # (rows, hc*d) に潰れている
+
+        down_raw = _hc_prefill_compile_qmm(
+            normed, _hc_prefill_compile_pack(self.input_mix_weight_down)
+        )
+        w_mid = nn.silu(down_raw / self.hc)
+        up_raw = _hc_prefill_compile_qmm(
+            w_mid, _hc_prefill_compile_pack(self.input_mix_weight_up)
+        )
+
+        post = _hc_prefill_compile_post(self.hc, self.d, use_combine)
+        if not use_combine:
+            mixed = post(normed, up_raw)
+            return mixed.reshape(*lead, self.d)
+        inject_raw = _hc_prefill_compile_qmm(
+            normed, _hc_prefill_compile_pack(self.block_inject_weight)
+        )
+        mixed, inject = post(normed, up_raw, inject_raw)
+        mixed = mixed.reshape(*lead, self.d)
+        inject = inject.reshape(*lead, self.hc)
+        return mixed, hyper, inject
+
+    Q.GatedResidual.__call__ = patched
+
+
+def disable_hyper_connection_prefill_compiled() -> None:
+    global _ORIG_HC_PREFILL_COMPILE
+    if _ORIG_HC_PREFILL_COMPILE is None:
+        return
+    import mlx_lm.models.qwen4_exp as Q
+
+    Q.GatedResidual.__call__ = _ORIG_HC_PREFILL_COMPILE
+    _ORIG_HC_PREFILL_COMPILE = None
 
 
 def enable_rms_norm_gated() -> None:
@@ -1443,6 +1672,8 @@ __all__ = [
     "enable_hc_write_nofuse",
     "enable_hyper_connection",
     "enable_hyper_connection_kernel",
+    "enable_hyper_connection_prefill_compiled",
+    "disable_hyper_connection_prefill_compiled",
     "enable_moe_route",
     "enable_moe_route_nofuse",
     "enable_rms_norm_gated",

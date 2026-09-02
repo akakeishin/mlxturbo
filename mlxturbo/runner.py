@@ -1353,6 +1353,7 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
             fused.enable_hyper_connection_kernel()
             print(f"{log_prefix} hyper-connections 融合カーネル有効 (moe_route/rms_norm_gated は"
                   " 無効のまま)")
+        fused.enable_hyper_connection_prefill_compiled(model)
         # 書き戻し側 (DecoderLayer._combine) は読み側と別のゲート。
         # **2026-09-02 に既定 on にした。**in-model A/B (--knob hc-write、
         # 3 変種 A/C/B、下駄を取った後) で短 -0.7% / 長 -0.8%、tok/round は
