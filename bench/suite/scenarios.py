@@ -6,10 +6,17 @@
 履歴に積んでから次のターンを送る (`bench/self_snapshot.py` の
 「追記ターン: 実クライアントは履歴をまるごと送り直す」と同じ流儀)。
 
-長文脈の本文は必ず `tools/_bench_text.py` の実文プール (docs の Markdown +
-自前のソース) から、**互いに重ならない窓**を切って作る。プロセス内で
-`PoolCursor` を 1 つだけ共有し、シナリオをまたいでもオフセットを進める
-(`bench/self_snapshot.py` が文脈・繰り返しをまたいで守っているのと同じ規律)。
+長文脈の本文は `PROMPT_POOLS` (下記) の実文プールから、**互いに重ならない
+窓**を切って作る。`point` シナリオは種類の違うプールを軸に振る (投機デコード
+の受理率はテキストの性質で大きく動くので、1 つの池だけで測ると片方に有利な
+数字が固定される — `docs/research/BENCH-DESIGN-2026-09.md` (c) 節)。
+`agent`/`code-edit`/`rag` は従来通り `"default"` プール
+(`tools/_bench_text.py` の実文プール、docs Markdown + 自前ソース) を使う。
+
+`PoolCursor` はプール 1 つぶんの読み位置を持つ。`PoolRegistry` がプロセス内で
+プールごとに 1 つずつ (使うものだけ遅延生成して) 共有し、シナリオ・文脈・rep
+をまたいでもオフセットを進める (`bench/self_snapshot.py` が文脈ごとの offset
+で守っている規律をプール単位に一般化した形)。
 """
 
 from __future__ import annotations
@@ -28,8 +35,10 @@ for _p in (REPO_ROOT, REPO_ROOT / "bench", REPO_ROOT / "tools"):
 from vs_mlx_serve import QUESTIONS, SHORT  # noqa: E402
 
 __all__ = [
-    "MaterializeCtx", "PoolCursor", "TurnTemplate", "Scenario",
-    "build_scenario", "SCENARIO_NAMES", "DEFAULT_CTXS", "DEFAULT_CONCURRENCY",
+    "MaterializeCtx", "PoolCursor", "PoolRegistry", "PoolSpec",
+    "PROMPT_POOLS", "POOL_ORDER", "POOL_TOKEN_BUDGET", "TurnTemplate",
+    "Scenario", "build_scenario", "SCENARIO_NAMES", "DEFAULT_CTXS",
+    "DEFAULT_CONCURRENCY",
 ]
 
 SCENARIO_NAMES = ("point", "agent", "code-edit", "rag", "parallel")
@@ -62,17 +71,17 @@ CODE_EDIT_ROUNDS = [
 
 
 class PoolCursor:
-    """`tools/_bench_text.py` の実文プールから、重ならない窓を順に切り出す。
+    """実文プール 1 つぶんの読み位置。重ならない窓を順に切り出す。
 
-    プロセス内で 1 つだけ作り、全シナリオ・全 rep で使い回すこと。
-    足りなくなったら (窓を切り尽くしたら) `ValueError` — 繰り返しで
-    埋めてはいけない (受理率が嘘になる。CLAUDE.md 参照)。
+    プールごとに 1 つだけ作り (`PoolRegistry` 経由)、そのプールを使う
+    全シナリオ・全 rep で使い回すこと。足りなくなったら (窓を切り尽くしたら)
+    `ValueError` — 繰り返しで埋めてはいけない (受理率が嘘になる。CLAUDE.md
+    参照)。
     """
 
-    def __init__(self, tok) -> None:
-        from _bench_text import text_pool  # 遅延 import (トークナイザ依存)
+    def __init__(self, tok, text: str) -> None:
         self.tok = tok
-        self.ids: list[int] = tok.encode(text_pool())
+        self.ids: list[int] = tok.encode(text)
         self.offset = 0
 
     def take(self, n_tokens: int) -> str:
@@ -87,15 +96,251 @@ class PoolCursor:
         return chunk
 
 
+def _read_files(paths: list[Path], max_chars: int | None = None) -> str:
+    """複数ファイルを連結して読む。存在しないものは黙って飛ばす
+    (機体によって `~/dev/mlx-serve` や `.venv` の中身が違うため、
+    「無ければ次の情報源」という設計そのものが前提にしている)。
+    """
+    parts: list[str] = []
+    total = 0
+    for p in paths:
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            t = p.read_text(errors="ignore")
+        except OSError:
+            continue
+        parts.append(t)
+        total += len(t)
+        if max_chars is not None and total >= max_chars:
+            break
+    return "\n\n".join(parts)
+
+
+def _pool_default() -> str:
+    """`agent`/`code-edit`/`rag` が使う既定プール。`tools/_bench_text.py` の
+    実文プールをそのまま使う (この骨組みの前バージョンからの挙動を変えない)。
+    """
+    from _bench_text import text_pool  # 遅延 import (トークナイザ非依存だが軽くはない)
+    return text_pool()
+
+
+def _pool_ja_prose() -> str:
+    """(a) 日本語散文。`docs/**/*.md` — このリポジトリの研究ログ・設計文書
+    (ほぼ日本語)。"""
+    files = sorted(REPO_ROOT.glob("docs/**/*.md"))
+    return _read_files(files)
+
+
+def _pool_en_prose() -> str:
+    """(b) 英語散文。`README.en.md` を核に、mlx-serve のドキュメント一式
+    (`~/dev/mlx-serve/docs/**/*.md` — トップレベルの API/CLI 文書に加えて
+    `docs/gotchas/*.md` が本文の大半を占める、英語) を再帰的に足す。それでも
+    足りなさそうなら (目安 20 万文字未満)、`.venv` に入っているパッケージの
+    英語 README/RST/METADATA で埋める (ユーザー指定の優先順位)。
+    """
+    paths = [REPO_ROOT / "README.en.md"]
+    mlx_serve_docs = Path.home() / "dev" / "mlx-serve" / "docs"
+    if mlx_serve_docs.exists():
+        paths += sorted(mlx_serve_docs.rglob("*.md"))
+    text = _read_files(paths)
+    if len(text) < 200_000:
+        venv_lib = REPO_ROOT / ".venv" / "lib"
+        extra = (sorted(venv_lib.glob("**/README*"))
+                + sorted(venv_lib.glob("**/METADATA"))) if venv_lib.exists() else []
+        text += "\n\n" + _read_files(extra, max_chars=1_500_000)
+    return text
+
+
+def _pool_source_code() -> str:
+    """(c) ソースコード。python (mlxturbo/tools/bench の自前ソース) と、
+    あれば zig (`~/dev/mlx-serve/src/*.zig`) を混ぜる。zig が無い機体では
+    python だけになる (無いものを埋めない — その場合は窓が短くなるだけ)。
+    """
+    files = (sorted(REPO_ROOT.glob("mlxturbo/*.py"))
+             + sorted(REPO_ROOT.glob("mlxturbo/kernels/*.py"))
+             + sorted(REPO_ROOT.glob("tools/*.py"))
+             + sorted(REPO_ROOT.glob("bench/*.py")))
+    zig_dir = Path.home() / "dev" / "mlx-serve" / "src"
+    if zig_dir.exists():
+        files += sorted(zig_dir.glob("*.zig"))
+    return _read_files(files)
+
+
+def _pool_structured_data() -> str:
+    """(d) 構造化データ。`bench/results/*.json` (計測結果の生 JSON) +
+    `bench/results/logs/*.log` (サーバーログ)。JSON/ログはプローズと語の
+    分布が大きく違う (キー名の反復、数値の連続、タイムスタンプ) — n-gram/MTP
+    の効き方を試す別極として入れる。
+    """
+    results_dir = REPO_ROOT / "bench" / "results"
+    files = (sorted(results_dir.glob("*.json"))
+             + sorted((results_dir / "logs").glob("*.log")))
+    return _read_files(files, max_chars=2_000_000)
+
+
+_REPETITIVE_FILES = (
+    # 表行 (`^|`) + 箇条書き行の比率が高い順に選んだ、このリポジトリの
+    # 実在する文書 (`grep -c` で数えて選定。数値は BENCH-DESIGN-2026-09.md
+    # (c) 節に記録してある)。
+    "docs/README.md",
+    "docs/research/ROOFLINE-2026-08-26.md",
+    "docs/research/ENGINE-COMPARISON.md",
+    "docs/research/D2-RESULTS.md",
+    "docs/research/BAKE-RESULTS.md",
+    "docs/research/KERNEL-INTEL.md",
+    "docs/research/LANES-2026-09.md",
+    "docs/research/ARCH-BETS.md",
+    "docs/research/EXPANSION-BOTTLENECKS.md",
+    "docs/COMPATIBILITY.md",
+    "docs/MTP-FLASH.md",
+    "docs/research/ANE-PREFILL-BRIEF.md",
+    "docs/research/PLAN.md",
+    "docs/research/MLX-SERVE-PACK-FORMAT.md",
+    "docs/research/DECODE-ANATOMY-2026-08-31.md",
+    "docs/research/GATE-RESULTS-A2.md",
+    "docs/research/HYPOTHESES-A2.md",
+    "docs/research/SDPA-WIDTH-WALL.md",
+    "docs/research/PREFILL-CHUNKING-DETERMINISM.md",
+    "docs/research/KERNEL-BRIEF-HC.md",
+    "docs/research/KERNEL-BRIEF-MOE-GDN.md",
+    "docs/research/KERNEL-BRIEF.md",
+    "docs/research/ISA-QUEUE.md",
+    "docs/research/OFFLOAD-RESEARCH.md",
+)
+
+
+def _pool_repetitive() -> str:
+    """(f) 反復の多いテキスト。表・箇条書きが密な Markdown を選んだ
+    (`_REPETITIVE_FILES` — `docs/**/*.md` 全体のうち表行 (`^|`) と箇条書き行
+    の比率を数えて上位に来たもの)。n-gram が当たりやすい極端側を明示的に
+    用意する狙いで、繰り返し文字列を自分で作るのではなく、**実在する
+    表・箇条書き密度の高い文書**を選ぶことで「繰り返しで長さを作らない」
+    規律を保ったまま反復性の高い実文を確保する。
+    """
+    files = [REPO_ROOT / p for p in _REPETITIVE_FILES]
+    return _read_files(files)
+
+
+def _pool_conversation() -> str:
+    """(e) 会話履歴。**注意: 本物の保存済み会話ログではない** — このリポジトリ
+    には再利用できる形の会話ログが無い (`bench/opencode_e2e.py` は実サーバーと
+    やり取りする e2e ドライバで、静的なテキストとしては読めない)。代わりに、
+    ja-prose と source-code の実文プールから段落/関数単位の断片を切り出し、
+    `User:` / `Assistant:` の役割プレフィックスを挟んで積んだ、トランスクリプト
+    "形" の文字列を作る。文そのものは毎回違う実文から取るので、同じ短い
+    文字列を繰り返すわけではない — 作っているのは「役割プレフィックスと
+    細かい段落区切りが挟まる」という、単一の長い説明文とは違うトークン分布
+    であって、本物の会話内容ではないことを明記する。
+    """
+    ja = _pool_ja_prose()
+    code = _pool_source_code() or ja
+    ja_paras = [p for p in ja.split("\n\n") if len(p) > 40]
+    code_paras = [p for p in code.split("\n\n") if len(p) > 40]
+    n = min(len(ja_paras), len(code_paras))
+    turns = []
+    for i in range(n):
+        turns.append(f"User: {ja_paras[i][:400]}")
+        turns.append(f"Assistant: {code_paras[i][:400]}")
+    return "\n\n".join(turns)
+
+
+@dataclass
+class PoolSpec:
+    """実文プール 1 つの定義。`build()` はテキストを返すだけで、
+    トークナイザには触れない (遅延評価: dry-run では絶対に呼ばれない)。
+    """
+
+    key: str
+    category: str  # 設計書 (c) 節のラベル ("(a) 日本語散文" 等)
+    description: str
+    build: Callable[[], str]
+
+
+PROMPT_POOLS: dict[str, PoolSpec] = {
+    "default": PoolSpec("default", "(既定)",
+                        "tools/_bench_text.py の実文プール (docs + 自前ソース)。"
+                        " agent/code-edit/rag が使う", _pool_default),
+    "ja-prose": PoolSpec("ja-prose", "(a) 日本語散文",
+                         "docs/**/*.md (このリポジトリの研究ログ・設計文書)",
+                         _pool_ja_prose),
+    "en-prose": PoolSpec("en-prose", "(b) 英語散文",
+                         "README.en.md + ~/dev/mlx-serve/docs/*.md"
+                         " (無ければ .venv の英語 README/RST で補う)",
+                         _pool_en_prose),
+    "source-code": PoolSpec("source-code", "(c) ソースコード",
+                            "mlxturbo/tools/bench の python + "
+                            "~/dev/mlx-serve/src/*.zig (あれば)",
+                            _pool_source_code),
+    "structured-data": PoolSpec("structured-data", "(d) 構造化データ",
+                                "bench/results/*.json + bench/results/logs/*.log",
+                                _pool_structured_data),
+    "conversation": PoolSpec("conversation", "(e) 会話履歴 (構成物、注意書き参照)",
+                             "ja-prose / source-code の断片を role プレフィックス"
+                             " 付きで積んだトランスクリプト形。本物の会話ログではない",
+                             _pool_conversation),
+    "repetitive": PoolSpec("repetitive", "(f) 反復の多いテキスト",
+                           "表・箇条書きが密な Markdown (MTP-FLASH.md 等、"
+                           " scenarios.py の _pool_repetitive docstring参照)",
+                           _pool_repetitive),
+}
+# point で振る 6 種 (a)-(f)。"default" は agent/code-edit/rag 専用なので含めない。
+POOL_ORDER: tuple[str, ...] = (
+    "ja-prose", "en-prose", "source-code", "structured-data",
+    "conversation", "repetitive",
+)
+
+# 実測トークン数のスナップショット (2026-09-02、~/models/ddalcu-mlxlm の
+# トークナイザで `PoolSpec.build()` を実際にエンコードして測った値。
+# `run.py --dry-run` はこれを使ってプール残量が足りるかを見積もる —
+# dry-run 自体はトークナイザを読まないので、ここで固定値として持つ。
+# プールの情報源 (docs/**/*.md 等) が増減したら実測し直すこと (単に
+# `PROMPT_POOLS[key].build()` をトークナイズして `len()` を見ればよい)。
+POOL_TOKEN_BUDGET: dict[str, int] = {
+    "default": 1_070_797,
+    "ja-prose": 267_148,
+    "en-prose": 318_066,
+    "source-code": 4_108_940,
+    "structured-data": 2_094_687,
+    "conversation": 398_099,
+    "repetitive": 59_574,  # 6 種のうち最小 — 文脈点を選ぶときの律速
+}
+
+
+class PoolRegistry:
+    """必要になったプールだけを遅延構築して使い回すキャッシュ。
+
+    6 種類のプールを毎回全部読んでトークナイズすると (特に structured-data
+    や source-code は数百万文字あるので) 無駄が大きい。実際に `point` が
+    指定したプールだけを、初回アクセス時に `PoolCursor` へ変換する。
+    """
+
+    def __init__(self, tok) -> None:
+        self.tok = tok
+        self._cursors: dict[str, PoolCursor] = {}
+
+    def get(self, key: str) -> PoolCursor:
+        if key not in self._cursors:
+            spec = PROMPT_POOLS[key]
+            self._cursors[key] = PoolCursor(self.tok, spec.build())
+        return self._cursors[key]
+
+
 @dataclass
 class MaterializeCtx:
     """ターンの `content_fn` に渡す実行時コンテキスト。"""
 
     tok: object
-    pool: PoolCursor
+    pools: PoolRegistry
     rng: object  # random.Random
     # point シナリオ用: このシナリオ実行が対象とする文脈トークン数の目安
     target_ctx: int = 0
+
+    @property
+    def pool(self) -> PoolCursor:
+        """後方互換の別名。`"default"` プールを指す
+        (agent/code-edit/rag の既存コードがこれを使う)。"""
+        return self.pools.get("default")
 
 
 @dataclass
@@ -125,35 +370,43 @@ class Scenario:
 
 # ── point ──────────────────────────────────────────────────────────────
 
-def _point_cold(mctx: MaterializeCtx) -> str:
-    c = mctx.target_ctx
-    if c == 0:
-        return SHORT
-    win = max(c - 200, 16)
-    q = QUESTIONS[mctx.rng.randrange(len(QUESTIONS))]
-    return f"{mctx.pool.take(win)}\n\n---\n\n{q}"
+def _point_cold(pool_key: str) -> Callable[[MaterializeCtx], str]:
+    def _f(mctx: MaterializeCtx) -> str:
+        c = mctx.target_ctx
+        if c == 0:
+            return SHORT
+        win = max(c - 200, 16)
+        q = QUESTIONS[mctx.rng.randrange(len(QUESTIONS))]
+        return f"{mctx.pools.get(pool_key).take(win)}\n\n---\n\n{q}"
+    return _f
 
 
 def _point_warm(mctx: MaterializeCtx) -> str:
     return "続けて。"
 
 
-def build_point_scenario(ctx: int, tokens: int) -> Scenario:
+def build_point_scenario(ctx: int, tokens: int, pool: str = "default") -> Scenario:
     """一点突破: 単一ストリームで冷 TTFT・温 TTFT・decode を測る。
 
     `bench/self_snapshot.py` の測り方 (冷 1 ターン → 履歴を丸ごと送り直す
-    追記ターンで温 TTFT) をそのまま踏襲する。文脈ごとに `Scenario` を作る
-    (窓幅が `ctx` に依存するため)。
+    追記ターンで温 TTFT) をそのまま踏襲する。文脈・プールごとに `Scenario`
+    を作る (窓幅は `ctx`、窓の中身は `pool` に依存するため)。`pool` は
+    `PROMPT_POOLS` の鍵 (既定 `"default"` — 骨組みの前バージョンと同じ挙動。
+    入力の多様性を測るときは `POOL_ORDER` の 6 種を明示的に指定する)。
+    ctx=0 はどのプールでも `vs_mlx_serve.SHORT` の固定短文になる (プールを
+    引く必要が無いほど短いため) — プール間の差は文脈が付くところから出る。
     """
+    pool_label = "" if pool == "default" else f":{pool}"
     return Scenario(
-        name=f"point@{ctx}",
+        name=f"point@{ctx}{pool_label}",
         description=(
-            f"文脈 {ctx} トークンの単一ストリーム。冷 TTFT → 追記ターンで"
-            " 温 TTFT → decode。tool call なし。"),
+            f"文脈 {ctx} トークン、プール={pool} の単一ストリーム。冷 TTFT →"
+            " 追記ターンで温 TTFT → decode。tool call なし。"),
         tool_calls=False,
-        prompt_source="tools/_bench_text.py の実文プール (ctx=0 は固定短文)",
+        prompt_source=f"PROMPT_POOLS[{pool!r}] ({PROMPT_POOLS[pool].description})"
+        if pool in PROMPT_POOLS else f"未知のプール: {pool}",
         turns=[
-            TurnTemplate("cold", _point_cold, tokens,
+            TurnTemplate("cold", _point_cold(pool), tokens,
                          note="このターンの TTFT が「冷 TTFT」"),
             TurnTemplate("warm", _point_warm, 8,
                          note="履歴を丸ごと送り直す追記ターン。TTFT が「温 TTFT」"),
@@ -333,11 +586,12 @@ def build_parallel_scenario(concurrency: tuple[int, ...] = DEFAULT_CONCURRENCY) 
 def build_scenario(name: str, **kwargs) -> Scenario:
     """シナリオ名からファクトリを呼ぶディスパッチャ。
 
-    `point` は `ctx` (必須) と `tokens` (既定 512)、`rag` は `mode`
-    (既定 "fresh")、`parallel` は `concurrency` を受け取る。
+    `point` は `ctx` (必須)・`tokens` (既定 512)・`pool` (既定 "default")、
+    `rag` は `mode` (既定 "fresh")、`parallel` は `concurrency` を受け取る。
     """
     if name == "point":
-        return build_point_scenario(kwargs["ctx"], kwargs.get("tokens", 512))
+        return build_point_scenario(kwargs["ctx"], kwargs.get("tokens", 512),
+                                    kwargs.get("pool", "default"))
     if name == "agent":
         return build_agent_scenario(kwargs.get("tokens", 128))
     if name == "code-edit":

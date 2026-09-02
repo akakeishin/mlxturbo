@@ -57,7 +57,7 @@
 | decode tok/s | `(n-1) / decode_s`。`n`=受信チャンク数、`decode_s`=最初のチャンク後の経過秒 | `n<=1` または `decode_s<=0` は 0.0 (NaN にしない。集計で自然に無視されるようにする一方、レポートでは NaN として除外する場所もあるので用途で使い分ける) |
 | prefill tok/s | プロンプトのトークン数 / 冷 TTFT | 「冷」でないと接頭辞再利用ぶんだけ過大評価になる。`usage.cached_tokens` で確認すること (下記) |
 | tok/round | 投機のラウンドあたり受理トークン数。両エンジンともログに出る (mlx-serve: `avg_per_round` / `[spec-stats]`、mlxturbo: `res["tokens"]` の長さ / ラウンド数) | 受理率そのものではなく「1 回のフォワードで何トークン進んだか」。壁時計の差の内訳を見るときに使う (積算しない。CLAUDE.md「無効化の積み上げで部品時間を見積もらない」と同じ理由で、ラウンド費用は単独では読めても足し算しない) |
-| p50/p95 | 同一条件の反復 (既定 3 回以上) から取る中央値と 95 パーセンタイル | 反復 1-2 回では出さない。「3 回以上」の反復が無い指標には出さない |
+| min/p50/p95/max/CV | 同一条件の反復から取る最小・中央値・95 パーセンタイル・最大・変動係数 (標本標準偏差/平均) | 数字自体は反復 1-2 回でも出すが、**3 回未満は「分布なし」と明記する** (`report.py` の `has_distribution`) — percentile を語るには足りないという注記であって、数字を隠すことではない |
 | KLD | `bench/quant_eval.py` の近似 KLD (参照 top-K + 裾質量補正) | 受け入れ幅は現行比 +0.0005 (CLAUDE.md)。エンジン間比較では「両者とも同じ量子化方式か」を必ず明記する |
 | top-1 一致 | `bench/quant_eval.py` の `top1_agree_mean` | KLD と並記。KLD が小さくても top-1 が動くケースの検出用 |
 
@@ -80,17 +80,73 @@ OpenAI 標準 `usage.prompt_tokens_details.cached_tokens` を実装している
 毎ターン「前のやり取り + 新しい発言」を丸ごと送るのと同じ流儀。
 `bench/self_snapshot.py` の追記ターンを一般化した形)。
 
+### 入力の多様性: `point` が振る 6 種のプール
+
+`tools/_bench_text.py` の実文プール 1 つだけで文脈窓を切っていると、
+パターンが少なくばらつきが見えない。投機デコード (MTP/n-gram) の受理率は
+テキストの性質で大きく動くので、1 つの池だけで測ると片方のエンジンに
+有利な数字が固定される恐れがある。そこで `point` は文脈窓の中身を 6 種類の
+実文プールに分け、同じ文脈点でプールを替えて測れるようにした
+(`bench/suite/scenarios.py` の `PROMPT_POOLS`)。繰り返し文字列で長さを
+作らない規律 (CLAUDE.md) はどのプールでも守っていて、すべて実在する
+ファイルの連結から窓を切り出す。実測トークン数は `~/models/ddalcu-mlxlm`
+のトークナイザで実際にエンコードして測った値 (`scenarios.py` の
+`POOL_TOKEN_BUDGET`、2026-09-02 時点):
+
+| プール | 分類 | 出所 | 実測トークン数 |
+|---|---|---|---|
+| `ja-prose` | (a) 日本語散文 | `docs/**/*.md` (このリポジトリの研究ログ・設計文書) | 267,148 |
+| `en-prose` | (b) 英語散文 | `README.en.md` + `~/dev/mlx-serve/docs/**/*.md` (英語。無ければ `.venv` の英語 README/RST/METADATA で補う) | 318,066 |
+| `source-code` | (c) ソースコード | python (mlxturbo/tools/bench の自前ソース) + zig (`~/dev/mlx-serve/src/*.zig`、あれば) | 4,108,940 |
+| `structured-data` | (d) 構造化データ | `bench/results/*.json` (計測結果の生 JSON) + `bench/results/logs/*.log` | 2,094,687 |
+| `conversation` | (e) 会話履歴 (構成物) | ja-prose と source-code の断片を `User:`/`Assistant:` プレフィックスで積んだトランスクリプト形。**本物の保存済み会話ログではない** (下記注記) | 398,099 |
+| `repetitive` | (f) 反復の多いテキスト | 表・箇条書きが密な Markdown 24 本 (`docs/README.md`、`docs/MTP-FLASH.md` 等。選定基準は `scenarios.py` の `_REPETITIVE_FILES` docstring) | 59,574 |
+
+`conversation` プールは注意が要る。このリポジトリには再利用できる形の
+保存済み会話ログが無い (`bench/opencode_e2e.py` は実サーバーとやり取りする
+e2e ドライバで、静的なテキストとしては読めない)。代わりに ja-prose と
+source-code の実文プールから段落・関数単位の断片を切り出し、役割
+プレフィックスを挟んで積んだ「トランスクリプト形」の文字列を作っている。
+文そのものは毎回違う実文から取るので同じ短い文字列を繰り返してはいないが、
+**内容として本物の対話ではない** — 作っているのは「役割プレフィックスと
+細かい段落区切りが挟まる」という、単一の長い説明文とは違うトークン分布
+であって、対話の意味的な整合性を測るものではないことを明記しておく。
+
+6 種のうち `repetitive` が最小 (59,574 トークン) で、これが `point` の
+文脈点をどこまで広げられるかの律速になる。`(h)` 節の tier 設計はこの
+実測値から逆算してある。`--dry-run` は毎回、その回の計画がどのプールを
+どれだけ消費するかを実測予算と突き合わせて表示する
+(`bench/suite/run.py` の `pool_demand_report`)。予算を超えるプールがあれば
+`OVER` と表示し、実行すると `PoolCursor.take()` が `ValueError` で止まる
+(窓を使い果たしたら繰り返しで埋めるのではなく、素直に止まる設計)。
+
+結果は**プールを混ぜた平均だけを出さない**。`report.py` は
+`(シナリオ, 文脈, プール, 出力長, thinking)` の組ごとに集計し、同じ条件で
+プールだけ変えたときのばらつきを別表に出す (`(i)` 節、`(g)` 節)。
+
 ### point (一点突破)
 
-プロンプトは `tools/_bench_text.py` の実文プール (docs の Markdown + 自前
-ソース、約 145 万トークン相当) から切り出す窓で作り、ctx=0 だけは固定短文
-(`vs_mlx_serve.SHORT`) を使う。文脈は既定で 6 点
+プロンプトは上記 6 種のプール (既定では `"default"` — `tools/_bench_text.py`
+の実文プールそのもの、後方互換のための既定値) から切り出す窓で作り、ctx=0
+だけは固定短文 (`vs_mlx_serve.SHORT`) を使う。文脈は既定で 6 点
 (`0, 4000, 17000, 25000, 32000, 50000`、`docs/NEXT-SESSION-PROMPT.md` の
 再現コマンドと同じ点) を振り、各点を冷ターン 1 回・追記の温ターン 1 回の
-計 2 ターンで測る。tool call は使わない。生成長は既定 512 トークンとした。
-CLAUDE.md が「tok/step の比較は複数プロンプト x 512 トークンの平均でだけ
-行う」と定めているのに合わせた値で、短い決め打ちが要る場面は `--tokens`
-で変えられる。
+計 2 ターンで測る。tool call は使わない。
+
+**出力長と thinking も軸になる。** 生成長は短 (128) と長 (1024) の 2 段を
+既定の行列に入れ (CLAUDE.md の「tok/step の比較は複数プロンプト x 512
+トークンの平均」を踏まえつつ、短文応答と長文応答で受理率の挙動が違う点を
+軸として明示的に測る)、thinking は off/on の 2 値を軸にする。on のときは
+`reasoning_content` も生成トークンとして数え (`stream_with_usage` が両サーバー
+で同じ扱いをする)、**両エンジンに同じ `reasoning_effort` を送る**
+(`docs/research/SESSION-2026-09-02-CATCHUP.md` の thinking 不一致の罠を
+踏まない)。on のときの生成長は思考込みで揃える — `max_tokens` の値自体は
+off/on で変えない (thinking がその予算の中で思考と本文を取り合う、という
+現実の制約をそのまま測る設計で、on 側にだけ予算を足して有利にしない)。
+
+池 x 出力長 x thinking を全部振ると行列が大きくなるので、既定の掃引は
+`--tier` (quick/standard/overnight) で選ぶ (`(h)` 節)。`--pools`/
+`--tokens-set`/`--thinking-set`/`--ctxs` で個別に上書きもできる。
 
 ### agent (エージェント型マルチターン)
 
@@ -143,33 +199,42 @@ per-request レイテンシの p50/p95 を測る設計にした。ただし `(a)
 
 **単位はブロック = 1 回のサーバー起動** (`(scenario, ctx, engine)` の組)。
 「両サーバーを同時にメモリへ載せない (68GB + 91GB は 128GB に収まらない)」
-制約から、そもそも 1 プロセスしか起動できない。ブロック内で `reps`
-(既定 3) 回反復する (`self_snapshot.py` の反復と同じ — 起動は 1 回、
-中で複数回測る)。
+制約から、そもそも 1 プロセスしか起動できない。ブロックの中には**セル**
+(プール x 出力長 x thinking の組。`point` 以外は 1 セルだけ) が 1 つ以上
+入っていて、各セルを `reps` 回ずつ反復する (`self_snapshot.py` の反復と
+同じ — 起動は 1 回、中で複数回測る。セルの直積は `(h)` 節の tier が決める)。
 
-1. **スケジュール構築**: シナリオ x 文脈の全点を列挙し、**列挙順そのものを
+1. **スケジュール構築**: `(シナリオ, 文脈)` の組を列挙し、**列挙順そのものを
    シャッフル**する。各点で「どちらのエンジンを先に起動するか」も毎回
-   コインを振る (`build_schedule` の `rng.shuffle(pair)`)。これが
-   「文脈ブロックごとに交互に起動する」の実装で、単純な A→B→B→A の
-   固定パターンよりバイアス除去が広い (`vs_mlx_serve.py` の既存 ABBA 手法を
-   包含しつつ、毎回どちらが先かをランダム化する)。
+   コインを振り、その点に属するセルの順序もシャッフルする
+   (`group_into_blocks` の `rng.shuffle`)。これが「文脈ブロックごとに
+   交互に起動する」の実装で、単純な A→B→B→A の固定パターンよりバイアス
+   除去が広い (`vs_mlx_serve.py` の既存 ABBA 手法を包含しつつ、毎回どちらが
+   先かをランダム化する)。
 2. **乱数種はログに残す** (`--seed`)。再現したい dry-run / 実行はこの種を
-   渡し直せば同じ順序になる。
-3. **ブロックごとに**:
+   渡し直せば同じ順序になる (`--resume` もこの種を `plan.json` から復元して
+   同じスケジュールを再構成する)。
+3. **プール残量を dry-run の時点で確認する**: `point` のセルが要求する
+   窓の合計トークン数を、`(c)` 節の実測プール予算と突き合わせる
+   (`pool_demand_report`)。超えているプールは `OVER` と表示し、実行すると
+   `PoolCursor.take()` が `ValueError` で止まることを事前に警告する。
+4. **ブロックごとに**:
    - 起動 (`Server` コンテキストマネージャ、`vs_mlx_serve.py` を再利用)
    - ウォームアップ 2 段 (短文 → 対象文脈と重ならない長文) — カーネルの
      初回コンパイルと専門家重み/n-gram 行のページインを、測定と別のプロンプト
      で先に済ませる (`self_snapshot.py` と同じ理由: 同じプロンプトで
      温めると次の「冷」が冷えなくなる)
-   - `reps` 回の反復測定。**rep=0 (フレッシュ起動直後) だけが真の「冷」**。
-     rep>=1 は起動済みプロセスの中で GPU が温まっていくので、絶対値としては
-     rep=0 より当てにならない。ただし同一起動セッション内で真に冷え直る
-     わけではないので、`docs/NEXT-SESSION-PROMPT.md`「守ること」1. の
-     「A/B は 2 本目以降で判定」とは意味が違う: あちらは同一プロセスを
-     長時間使い回す decode_ab.py の話で「1 本目が暴走する」、こちらは
-     ブロックごとに毎回フレッシュ起動するので **rep=0 が最も信頼できる**。
+   - ブロック内の全セル x `reps` 回の反復測定。**ブロックで最初に来た
+     セルの rep=0 (フレッシュ起動直後) だけが真の「冷」**。それ以外
+     (同じセルの rep>=1、2 番目以降のセル) は起動済みプロセスの中で GPU が
+     温まっていくので、絶対値としては当てにならない。ただし同一起動
+     セッション内で真に冷え直るわけではないので、
+     `docs/NEXT-SESSION-PROMPT.md`「守ること」1. の「A/B は 2 本目以降で
+     判定」とは意味が違う: あちらは同一プロセスを長時間使い回す
+     decode_ab.py の話で「1 本目が暴走する」、こちらはブロックごとに毎回
+     フレッシュ起動するので **ブロック最初のセルの rep=0 が最も信頼できる**。
      この違いを混同しないこと (レポートの `cold_ttft_fresh_s` と
-     `cold_ttft_all_median_s` を両方出すのはこの区別を可視化するため)。
+     `cold_ttft_stats` を両方出すのはこの区別を可視化するため)。
    - 停止 (`Server.__exit__`: SIGTERM → 60 秒待って SIGKILL)
    - 停止した後で `pgrep -fl` を対象パターンに対して走らせ、
      `sysctl vm.swapusage` を記録する (`check_residual_processes`)。
@@ -178,19 +243,34 @@ per-request レイテンシの p50/p95 を測る設計にした。ただし `(a)
      症状を疑う
    - **冷却** (既定 180 秒)。`docs/research/SESSION-2026-09-02-CATCHUP.md`
      の実測 (GPU を 50 分回すと 17k prefill が 37→57s) を踏まえた既定値。
-4. **ログ保存**: `--server-log` 相当でサーバーの stdout/stderr を
-   `bench/results/suite/<run-id>/logs/` に残す (`self_snapshot.py --server-log`
-   を踏襲)。キャッシュヒットの一次情報は `usage.cached_tokens` だが、
-   ログはそれを裏取りする二次情報として保存する。
-5. **thinking を揃える**: 既定 `--thinking off` (両エンジンに
-   `reasoning_effort: "none"` を送る)。mlx-serve は qwen4_exp で thinking
-   既定 off、mlxturbo はテンプレート既定で on — 揃えないと生成する文の種類が
-   違い、MTP の受理率も比較にならない (`SESSION-2026-09-02-CATCHUP.md`)。
-6. **窓を重ねない**: `PoolCursor` がプロセス内で 1 つの読み位置を共有し、
-   シナリオ・文脈・rep をまたいでも同じ実文プールの窓を再利用しない
+5. **ログを 1 ブロック終わるたびに追記する**: `raw.jsonl` (JSON Lines、
+   1 行 1 ブロック) に書き、`--server-log` 相当でサーバーの stdout/stderr も
+   `bench/results/suite/<run-id>/logs/` に残す (`self_snapshot.py
+   --server-log` を踏襲)。キャッシュヒットの一次情報は `usage.cached_tokens`
+   だが、ログはそれを裏取りする二次情報として保存する。
+6. **中断と再開**: `--tier overnight` のような長時間ジョブが電源断や
+   SIGTERM で止まっても、`--resume <out-dir>` で `plan.json` からシード/
+   tier/軸を復元し、`raw.jsonl` に記録済みのブロック index をスキップして
+   続きから走る。1 ブロックの失敗 (プール枯渇の `ValueError` 等) はジョブ
+   全体を落とさず、`failed: true` の行として記録して次のブロックへ進む
+   (`report.py` は失敗ブロックを集計から外し、別表で理由を残す)。
+7. **thinking を揃える**: `point` の thinking は tier/`--thinking-set` の
+   軸そのもの (off/on 両方測る)、それ以外のシナリオは既定 `--thinking off`
+   (両エンジンに `reasoning_effort: "none"` を送る)。mlx-serve は qwen4_exp
+   で thinking 既定 off、mlxturbo はテンプレート既定で on — 揃えないと
+   生成する文の種類が違い、MTP の受理率も比較にならない
+   (`SESSION-2026-09-02-CATCHUP.md`)。on のときも off と同じ `max_tokens`
+   を送る (`(c)` 節、on 側に予算を足して有利にしない)。
+8. **窓を重ねない**: `PoolRegistry`/`PoolCursor` がブロック内でプールごとに
+   1 つの読み位置を共有し、セル・rep をまたいでも同じ窓を再利用しない
    (`self_snapshot.py` が同じ規律を文脈ごとの offset で実装しているのを
-   プロセス全体に一般化した形)。
-7. **生成長を揃える**: シナリオごとに固定の `max_tokens` を使い、エンジン間
+   プール単位に一般化した形)。**エンジンをまたぐときは意図的に例外**:
+   mlxturbo と mlx-serve は同じ `(シナリオ, 文脈)` に属するセルを同じ順で
+   持つので、それぞれ独立にフレッシュな `PoolRegistry` (offset 0) から
+   引く — これは「同じ本文を両エンジンに送って比較する」ための意図した
+   一致であって、プール予算の消費としては 1 回分としてしか数えない
+   (`(c)` 節の実測予算チェックはこの前提で計算している)。
+9. **生成長を揃える**: シナリオごとに固定の `max_tokens` を使い、エンジン間
    で変えない (CLAUDE.md「生成長を揃えて比較する」)。
 
 ## (e) エンジンアダプタの契約
@@ -243,15 +323,21 @@ argv 組み立てと 1 対 1 対応)。**未実装 (スタブ)**: `OMlxAdapter`�
 
 ## (g) 公開物
 
-1. **生 JSON**: `bench/suite/run.py` が書く `bench/results/suite/<run-id>/raw.json`
-   (ブロックごとの全 rep・全ターンの生値。`usage.cached_tokens` を含む) と
-   `plan.json` (実行順・シード・見積もり)。`bench/results/` はリポジトリの
-   `.gitignore` 対象 — 配布はリリース物として別途まとめる
+1. **生ログ**: `bench/suite/run.py` が 1 ブロックずつ追記で書く
+   `bench/results/suite/<run-id>/raw.jsonl` (JSON Lines。ブロックごとの
+   全セル・全 rep・全ターンの生値。`usage.cached_tokens` を含む) と
+   `plan.json` (実行順・シード・tier・軸・見積もり)。JSONL にしたのは
+   `--resume` (中断再開、(d) 節) のため — 1 ブロック終わるたびに 1 行
+   追記されるので、途中で落ちても直前までの記録が残る。`bench/results/`
+   はリポジトリの `.gitignore` 対象 — 配布はリリース物として別途まとめる
    (`docs/BENCHMARKS.md` が既にやっている「元データは配布しない、
    コマンドで再現可能にする」方針を踏襲)。
-2. **集計表 (Markdown)**: `bench/suite/report.py` が `raw.json` → 表に変換
-   (`--in raw.json --out REPORT.md`)。冷 TTFT は `fresh (rep=0)` と
-   `全 rep 中央値` を両方出す (熱の影響を隠さない)。
+2. **集計表 (Markdown)**: `bench/suite/report.py` が `raw.jsonl` → 表に変換
+   (`--in raw.jsonl --out REPORT.md`)。`(シナリオ, 文脈, プール, 出力長,
+   thinking)` ごとにエンジン別の行を作り、冷 TTFT は `fresh` (ブロック最初の
+   セルの rep=0) と `min/p50/p95/max + 変動係数` を両方出す (熱の影響を
+   隠さない、反復 1-2 回は「分布なし」と明記する)。**池を混ぜた平均は
+   出さず**、池間のばらつきを別表にする ((c) 節)。
 3. **スクリプト自体**: `bench/suite/*.py`。読者が自分の機体で再現できることが
    目的 (`docs/BENCHMARKS.md` の「その数字、自分の機械でも出るのか」と同じ
    立場)。
@@ -271,20 +357,69 @@ argv 組み立てと 1 対 1 対応)。**未実装 (スタブ)**: `OMlxAdapter`�
 
 `bench/suite/run.py` の `estimate_block_seconds` が
 `SESSION-2026-09-02-CATCHUP.md` の実測値 (文脈 0/4000/17000/50000 の冷
-TTFT・decode tok/s・温 TTFT) を較正点にした線形補間で見積もる
-(25000/32000 は 17000-50000 間の補間)。**実測ではない、大まかな時間予算**。
+TTFT・decode tok/s・温 TTFT、thinking off・プール default) を較正点にした
+線形補間で見積もる (25000/32000 は 17000-50000 間の補間)。**thinking=on と
+プール差 (default 以外) の較正データは無い** — この表は thinking=off・
+プール=default の実測値をそのまま流用した近似で、それを `--dry-run` の
+出力にも明記する。**実測ではない、大まかな時間予算。**
 
-既定プリセット (Flash-Next、mlxturbo vs mlx-serve、point x 文脈 6 点、
-各 3 反復、冷却 180 秒) の `--dry-run` 実測 (このドキュメントの検証時、
-`--seed 42`):
+`--tier` は 3 段。tier=standard/overnight の文脈点は当てずっぽうではなく、
+`(c)` 節の実測プール予算 (最小のプール `repetitive`、59,574 トークン) から
+「池 x 出力長(2) x thinking(2) x reps の合計消費量が予算に収まる上限」を
+逆算して選んである — 計算は `bench/suite/run.py` の `pool_demand_report`
+と一致する。
+
+### quick (既定、約 2 時間)
+
+`point` x 文脈 6 点 (`0, 4000, 17000, 25000, 32000, 50000`) x プール 1 種
+(`default`) x 反復 3。骨組みの前バージョンから変えていない。`--dry-run
+--tier quick` (`--seed` はどれでも合計推定は変わらない — ブロックの集合が
+同じなら順序を変えても合計は不変):
 
 ```
 ブロック数: 12 (文脈 6 点 x エンジン 2)
 合計推定: 1h56m49s
 ```
 
-内訳の目安 (1 ブロック = 起動 180s + ウォームアップ 20s + 測定 (反復 3) +
-冷却 180s):
+### standard (`--tier standard`、数時間)
+
+`point` x 文脈 3 点 (`0, 4000, 8000`) x プール 6 種 (`POOL_ORDER`) x
+出力長 2 種 (`128, 1024`) x thinking 2 値 (`off, on`) x 反復 1 (**分布は
+出ない** — `report.py` が「分布なし」と明記する)。文脈点をここまで絞った
+理由: 6 種のうち最小の `repetitive` (59,574 トークン) を基準に、文脈
+(0,4000,8000) x セル 24 種 (プール 6 x 出力長 2 x thinking 2) x 反復 1 の
+消費量が 46,400 トークン (予算の 77.9%) に収まるよう選んだ。もう 1 点
+足すと超える。
+
+```
+ブロック数: 6 (文脈 3 点 x エンジン 2)
+合計推定: 1h24m41s
+```
+
+### overnight (`--tier overnight`、反復 3 回以上で p50/p95、一晩)
+
+standard と同じ「池 x 出力長 x thinking の全部」の組を反復 3 回以上で回し
+(p50/p95 が出せる)、かつ quick と同じ長文脈ラダー (プール `default` のみ、
+これは 1,070,797 トークンの予算があるので長文脈でも余裕がある) も反復 3
+回以上で回す。両者を `(シナリオ, 文脈)` の組で合流させる (`0` と `4000` は
+2 つの掃引軸のセルが 1 ブロックに同居する)。池の掃引側は反復 3 回になった
+ぶん、文脈点をさらに `(0, 4000)` の 2 点に絞ってある —
+`repetitive` の消費量は 45,600 トークン (予算の 76.5%) で、`(4000, 8000)`
+の 2 点はそのままでは反復 3 回に耐えない (`(0,4000,8000)` x 反復 3 だと
+139,200 トークン要求、予算の 2.3 倍で確実に `ValueError` になる)。
+
+```
+ブロック数: 12 (長文脈ラダー 6 点 + 池掃引 2 点、うち 0/4000 は合流)
+合計推定: 3h11m34s
+```
+
+3 時間強は「一晩」と呼ぶには短いが、**反復 3 回以上で全条件の分布が出る**
+という、このドキュメントの実データ制約下で正直に出せる最大の掃引がこれ。
+もっと長く回したければ `--reps` を上げるか (実データの予算が許す範囲で)
+`--scenarios` を足す — `--tier overnight --resume` は中断しても続きから
+やり直せるので、複数晩に分けて伸ばすこともできる。
+
+### 内訳の目安 (quick の各文脈点、1 ブロック = 起動 180s + ウォームアップ 20s + 測定 (反復 3) + 冷却 180s)
 
 | 文脈 | 1 ブロックの推定 (mlx-serve / mlxturbo) |
 |---|---|
@@ -295,14 +430,19 @@ TTFT・decode tok/s・温 TTFT) を較正点にした線形補間で見積もる
 | 32000 | 約 10m42s / 11m46s |
 | 50000 | 約 13m42s / 15m17s |
 
-固定費 (起動 180s + 冷却 180s = 360s) が 12 ブロックで 4320s (72 分) を占める
-— 文脈が短いほど固定費の割合が支配的になる。ブロック粒度を「文脈単位で
-毎回起動し直す」設計にした代償で、(d) 節にある「rep=0 だけが真の冷」という
-性質を得るためのトレードオフ。
+固定費 (起動 180s + 冷却 180s = 360s) が quick の 12 ブロックで 4320s
+(72 分) を占める — 文脈が短いほど固定費の割合が支配的になる。ブロック
+粒度を「文脈単位で毎回起動し直す」設計にした代償で、(d) 節にある
+「ブロック最初のセルの rep=0 だけが真の冷」という性質を得るための
+トレードオフ。standard/overnight は 1 ブロックに複数セルを詰めることで、
+この固定費をセル数で割って薄めている (standard は 1 ブロックあたり 24
+セルで、固定費の比率が quick よりずっと小さい)。
 
-シナリオを増やすと (`--scenarios point,agent,code-edit,rag`)、agent/code-edit/
-rag は較正点が無いため見積もりに含まれない (「較正データ無しのブロック」と
-して件数だけ表示される) — 較正のやり直しには実測が要る。
+`--scenarios` に `agent`/`code-edit`/`rag`/`parallel` を足すと、これらは
+tier の池/出力長/thinking 軸を使わない (`(c)` 節のスコープ通り、掃引は
+`point` だけ) ので 1 セルのブロックとして増える。較正点が無い (`agent`
+等の較正はまだ実測していない) ため、`ctx=4000` 相当を代用した近似で
+見積もりに加算される — `--dry-run` の合計に含まれるが精度は低い。
 
 ## (i) 判定が反転する条件 (測る前に宣言する)
 
@@ -330,6 +470,24 @@ rag は較正点が無いため見積もりに含まれない (「較正デー�
 - **並列シナリオを走らせる判断をするとき** → mlxturbo の並列デコードが
   実際に直り、`docs/research/KERNEL-BRIEF-DECODE-BW.md` のバッチ判定が
   再訪されて反転したときだけ、`enabled_by_default=True` に変える。
+- **同じ条件でプールだけ変えたときの spread (`(max-min)/中央値`) が 10%
+  を超える** → `report.py` の「池間のばらつき」表で印が付く。これは
+  「エンジンの優劣」ではなく「投機デコードの受理率がテキストの性質に
+  依存する」ことの直接証拠として扱う — 片方のプールだけを見出しに使わない。
+  10% を超えた指標は、6 プール全部の値を併記しないと結論を出さない
+  (単一プールの数字だけを headline にしない)。
+- **反復が 1-2 回の条件 (`standard` tier や `--reps` を絞った実行) を
+  percentile 付きで語ろうとしたとき** → `report.py` は `has_distribution`
+  を見て「分布なし」と明記する。min/p50/max の数字自体は出すが、
+  「p95 が◯◯だった」のような強い主張はしない。分布が要る結論は
+  `overnight` (反復 3 回以上) の結果を待つ。
+- **プール残量チェックで `OVER` と出た組み合わせを走らせたとき** →
+  実行中のどこかで `PoolCursor.take()` が `ValueError` を投げてそのセルが
+  失敗する。`run.py` はブロック単位で捕まえてジョブ全体は継続するので、
+  「一部のセルが失敗ブロックとして記録され、集計から外れる」のは想定内の
+  劣化であって異常終了ではない。ただし本番の判定に使う組み合わせは
+  `OVER` が出ない範囲に収めること (既定の `standard`/`overnight` は
+  収まるように選んである)。
 
 ## 付録: 骨組みのファイル一覧
 
@@ -338,28 +496,46 @@ bench/suite/
   engines.py    EngineAdapter 基底 + MlxturboAdapter/MlxServeAdapter (実装済み)
                 + OMlxAdapter/LlamaCppAdapter/MlxLmAdapter (スタブ)。
                 stream_with_usage() で usage.cached_tokens を拾う。
-  scenarios.py  Scenario / TurnTemplate / PoolCursor。
-                point / agent / code-edit / rag(fresh|shared) / parallel(定義のみ)。
-  run.py        スケジュール構築 (シャッフル・冷却)・所要時間見積もり・
-                --dry-run・実行ループ (起動→測定→残留確認→冷却)。
-  report.py     raw.json → Markdown。cached_tokens 警告、環境メタ情報、
-                llmprobe 互換列。
+  scenarios.py  Scenario / TurnTemplate / PoolCursor / PoolRegistry。
+                PROMPT_POOLS (6 種、POOL_TOKEN_BUDGET に実測トークン数)。
+                point(ctx, tokens, pool) / agent / code-edit / rag(fresh|shared)
+                / parallel(定義のみ)。
+  run.py        Cell/AxisConfig/TIERS (quick/standard/overnight)・
+                セル展開 (expand_cells)・ブロック構築 (group_into_blocks、
+                シャッフル・プール残量チェック)・所要時間見積もり・
+                --dry-run・実行ループ (起動→全セル測定→残留確認→冷却)・
+                --resume (中断再開)。
+  report.py     raw.jsonl → Markdown。min/p50/p95/max・変動係数、
+                「分布なし」明記、池間ばらつき表 (10% 印)、cached_tokens
+                警告、環境メタ情報、llmprobe 互換列。
 ```
 
 **再現 (dry-run、GPU 不使用)**:
 
 ```bash
 .venv/bin/python bench/suite/run.py --dry-run
-# 既定: Flash-Next, mlxturbo vs mlx-serve, point x 文脈 6 点, 各 3 反復,
-# ランダム順, 冷却 180 秒。コマンド列・ターン構成・所要時間見積もりを表示し、
-# bench/results/suite/<timestamp>/plan.json に書き出す (サーバー起動・HTTP・
-# モデル読み込みは一切行わない)。
+# tier=quick (既定): Flash-Next, mlxturbo vs mlx-serve, point x 文脈 6 点,
+# プール "default" 1 種, 各 3 反復, ランダム順, 冷却 180 秒。
+
+.venv/bin/python bench/suite/run.py --dry-run --tier standard
+.venv/bin/python bench/suite/run.py --dry-run --tier overnight
+# どちらもプール残量チェック・コマンド列・セル構成・所要時間見積もりを
+# 表示し、bench/results/suite/<timestamp>/plan.json に書き出す
+# (サーバー起動・HTTP・モデル読み込みは一切行わない)。
+
+.venv/bin/python bench/suite/run.py --dry-run --tier standard \
+    --pools repetitive,ja-prose --tokens-set 128 --thinking-set off --reps 2
+# --pools/--tokens-set/--thinking-set/--ctxs を指定すると tier の軸を
+# 独自の組に差し替える。
 ```
 
 **実行 (GPU 使用。本ドキュメントでは実行していない)**:
 
 ```bash
-tools/biglock.sh uv run python bench/suite/run.py
-uv run python bench/suite/report.py --in bench/results/suite/<run-id>/raw.json \
+tools/biglock.sh uv run python bench/suite/run.py --tier overnight
+# 途中で止まったら (電源、SIGTERM 等) 同じ out-dir で再開:
+tools/biglock.sh uv run python bench/suite/run.py --resume bench/results/suite/<run-id>
+
+uv run python bench/suite/report.py --in bench/results/suite/<run-id>/raw.jsonl \
     --out bench/results/suite/<run-id>/REPORT.md
 ```

@@ -1,16 +1,24 @@
-"""`run.py` が書き出した生 JSON を Markdown の表にする。
+"""`run.py` が書き出した生ログ (`raw.jsonl`) を Markdown の表にする。
 
-集計方針 (`docs/research/BENCH-DESIGN-2026-09.md` (b)(g) 節が仕様):
+集計方針 (`docs/research/BENCH-DESIGN-2026-09.md` (b)(c)(g) 節が仕様):
 
-- **冷 TTFT の見出し数字は各ブロックの rep=0 (フレッシュ起動直後) だけ**を使う。
-  rep>=1 は同じ起動セッション内で GPU が温まっていくため、絶対値としては
-  rep=0 より当てにならない (CLAUDE.md の熱の作法)。rep>=1 は分散の参考値として
-  別列に出す。
-- decode tok/s は `(n-1)/経過` を rep ごとに計算し、中央値を報告する
-  (これは同一ブロック内の反復なので rep=0 に限定する理由が無い)。
+- **冷 TTFT の見出し数字はブロック内で最初に来たセルの rep=0 (フレッシュ
+  起動直後) だけ**を使う。ブロック内の他のセル・rep>=1 は GPU が温まって
+  いくため、絶対値としては当てにならない (CLAUDE.md の熱の作法)。
+- 各条件 (シナリオ x 文脈 x プール x 出力長 x thinking x エンジン) について
+  **min / p50 / p95 / max と変動係数 (CV = 標本標準偏差 / 平均)** を出す。
+  **反復が 1-2 回の条件は「分布なし」と明記する** (3 点未満で percentile を
+  語るのは統計として無理がある — 数字は出すが「分布」とは呼ばない)。
+- decode tok/s は `(n-1)/経過` を rep ごとに計算し、その分布を報告する。
 - `usage.prompt_tokens_details.cached_tokens` が「冷」ターンで 0 でなければ、
   その rep は接頭辞キャッシュに当たっていた = 真の意味で冷えていない。
   headline から除外し、警告として明記する (無かったことにしない)。
+- **池間のばらつきを別表で出す** (`pool_variance_table`)。同じ
+  (シナリオ, 文脈, 出力長, thinking, エンジン) で池だけ変えたときの
+  decode tok/s と冷 TTFT の中央値の散らばりを見て、`(max-min)/中央値` が
+  10% を超えたら印を付ける。**池を混ぜた平均だけを出すことはしない**
+  (投機デコードの受理率はテキストの性質で大きく動くので、平均は片方の
+  プール分布に有利不利が出ても隠してしまう)。
 
 `from_llmprobe_json` は `~/dev/mlx-serve/tests/bench.sh` が使う
 `llmprobe --bench-only --save <path>.json` の出力を、この報告と同じ行の
@@ -63,12 +71,61 @@ def collect_environment_meta() -> dict:
 
 
 def load_raw(path: Path) -> list[dict]:
-    return json.loads(path.read_text())
+    """`raw.jsonl` (1 ブロック 1 行) を読む。`--resume` で中断・再開した
+    ジョブでも、最後の行が壊れていれば無視して読み進める (途中で
+    プロセスが落ちたときの半端な行に備える)。
+    """
+    records = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return records
 
 
-def _cold_headline(block_result: dict) -> dict:
-    """rep=0 (フレッシュ起動) の "cold" ラベルターンを取り出す。"""
-    for rep in block_result.get("reps", []):
+# ── 統計 ─────────────────────────────────────────────────────────────
+
+def _percentile(sorted_vals: list[float], p: float) -> float:
+    """線形補間の分位点 (0<=p<=1)。標本 1 点なら常にその値を返す。"""
+    n = len(sorted_vals)
+    if n == 0:
+        return float("nan")
+    if n == 1:
+        return sorted_vals[0]
+    idx = p * (n - 1)
+    lo = int(idx)
+    hi = min(lo + 1, n - 1)
+    frac = idx - lo
+    return sorted_vals[lo] + frac * (sorted_vals[hi] - sorted_vals[lo])
+
+
+def _stats(samples: list[float]) -> dict:
+    """min/p50/p95/max と変動係数 (CV)。**反復 3 回未満は `has_distribution`
+    を False にする** — 数字は出すが「分布」を語らないための印。
+    """
+    vals = sorted(v for v in samples if v == v)  # NaN 除去
+    n = len(vals)
+    if n == 0:
+        return dict(n=0, min=None, p50=None, p95=None, max=None, cv=None,
+                   has_distribution=False)
+    mean = statistics.mean(vals)
+    cv = (statistics.pstdev(vals) / mean) if (n >= 2 and mean) else None
+    return dict(n=n, min=vals[0], p50=_percentile(vals, 0.5),
+               p95=_percentile(vals, 0.95), max=vals[-1], cv=cv,
+               has_distribution=n >= 3)
+
+
+def _cold_headline(reps: list[dict]) -> dict:
+    """ブロック内で最初に来たセルの rep=0 (フレッシュ起動直後) の
+    "cold" ラベルターンを取り出す。ブロック内の他セルにはこれが無い
+    (`run_block` がブロックあたり 1 回しか `is_fresh_boot=True` を立てない)。
+    """
+    for rep in reps:
         if rep.get("is_fresh_boot"):
             for turn in rep.get("turns", []):
                 if turn["label"] == "cold":
@@ -83,46 +140,87 @@ def _decode_tps(turn: dict) -> float:
     return float("nan")
 
 
-def aggregate(raw: list[dict]) -> dict:
-    """`(scenario, ctx)` ごとに、エンジン別の集計行を作る。"""
-    out: dict[tuple[str, int | None], dict[str, dict]] = {}
+AggKey = tuple  # (scenario, ctx, pool, tokens, thinking)
+
+
+def aggregate(raw: list[dict]) -> dict[AggKey, dict[str, dict]]:
+    """`(シナリオ, 文脈, プール, 出力長, thinking)` ごとに、エンジン別の
+    集計行を作る。`run.py` が記録した失敗ブロック (`failed: true`、プール
+    枯渇の `ValueError` 等) は集計から外す (無かったことにはしないが、
+    数字としては混ぜない — `failures` に理由を残す)。
+    """
+    out: dict[AggKey, dict[str, dict]] = {}
+    failures: list[dict] = []
     for block_result in raw:
         b = block_result["block"]
-        key = (b["scenario_name"], b["ctx"])
-        row = out.setdefault(key, {})
-        cold = _cold_headline(block_result)
-        all_cold_ttft = [
-            t["ttft_s"] for rep in block_result["reps"]
-            for t in rep["turns"] if t["label"] == "cold"
-        ]
-        all_warm_ttft = [
-            t["ttft_s"] for rep in block_result["reps"]
-            for t in rep["turns"] if t["label"] == "warm"
-        ]
-        decode_samples = [
-            _decode_tps(t) for rep in block_result["reps"] for t in rep["turns"]
-        ]
-        decode_samples = [d for d in decode_samples if d == d]  # NaN 除去
-        cold_cache_hits = [
-            t.get("cached_tokens") for rep in block_result["reps"]
-            for t in rep["turns"] if t["label"] == "cold" and t.get("cached_tokens")
-        ]
-        row[b["engine_kind"]] = dict(
-            cold_ttft_fresh_s=cold.get("ttft_s"),
-            cold_ttft_all_median_s=(statistics.median(all_cold_ttft)
-                                    if all_cold_ttft else None),
-            warm_ttft_median_s=(statistics.median(all_warm_ttft)
-                                if all_warm_ttft else None),
-            decode_tps_median=(statistics.median(decode_samples)
-                               if decode_samples else None),
-            reps=len(block_result["reps"]),
-            cold_cache_hit_warning=(
-                f"「冷」ターンで cached_tokens>0 が {len(cold_cache_hits)} 件"
-                f" (値: {cold_cache_hits}) — 真に冷えていなかった可能性"
-                if cold_cache_hits else None),
-            residual_warnings=block_result.get("residual_warnings") or [],
-        )
+        if block_result.get("failed"):
+            failures.append(dict(scenario=b["scenario_name"], ctx=b["ctx"],
+                                 engine=b["engine_kind"],
+                                 error=block_result.get("error")))
+            continue
+        for cell in block_result.get("cells", []):
+            key = (b["scenario_name"], b["ctx"], cell["pool"], cell["tokens"],
+                  cell["thinking"])
+            row = out.setdefault(key, {})
+            reps = cell["reps"]
+            cold = _cold_headline(reps)
+            all_cold_ttft = [t["ttft_s"] for rep in reps for t in rep["turns"]
+                             if t["label"] == "cold"]
+            all_warm_ttft = [t["ttft_s"] for rep in reps for t in rep["turns"]
+                             if t["label"] == "warm"]
+            decode_samples = [_decode_tps(t) for rep in reps for t in rep["turns"]]
+            cold_cache_hits = [t.get("cached_tokens") for rep in reps
+                              for t in rep["turns"]
+                              if t["label"] == "cold" and t.get("cached_tokens")]
+            row[b["engine_kind"]] = dict(
+                cold_ttft_fresh_s=cold.get("ttft_s"),
+                cold_ttft_stats=_stats(all_cold_ttft),
+                warm_ttft_stats=_stats(all_warm_ttft),
+                decode_tps_stats=_stats(decode_samples),
+                reps=len(reps),
+                cold_cache_hit_warning=(
+                    f"「冷」ターンで cached_tokens>0 が {len(cold_cache_hits)} 件"
+                    f" (値: {cold_cache_hits}) — 真に冷えていなかった可能性"
+                    if cold_cache_hits else None),
+                residual_warnings=block_result.get("residual_warnings") or [],
+            )
+    out["__failures__"] = failures  # type: ignore[assignment]
     return out
+
+
+def pool_variance_table(agg: dict[AggKey, dict[str, dict]]) -> list[dict]:
+    """同じ (シナリオ, 文脈, 出力長, thinking, エンジン) で池だけ変えたときの
+    ばらつきを見る。**池を混ぜた平均は出さない** — ここは個々のプールの
+    中央値をそのまま並べ、`(max-min)/中央値` が 10% を超えたものに印を付ける。
+    """
+    groups: dict[tuple, dict[str, dict]] = {}
+    for key, engines in agg.items():
+        if key == "__failures__":
+            continue
+        scenario, ctx, pool, tokens, thinking = key
+        for engine, row in engines.items():
+            gkey = (scenario, ctx, tokens, thinking, engine)
+            groups.setdefault(gkey, {})[pool] = row
+    rows = []
+    for gkey, by_pool in groups.items():
+        if len(by_pool) < 2:
+            continue  # プールが 1 つしか無ければ「ばらつき」は語れない
+        for metric, getter in (
+            ("decode_tps_p50", lambda r: r["decode_tps_stats"]["p50"]),
+            ("cold_ttft_p50", lambda r: r["cold_ttft_stats"]["p50"]),
+        ):
+            vals = {p: getter(r) for p, r in by_pool.items() if getter(r) is not None}
+            if len(vals) < 2:
+                continue
+            lo, hi = min(vals.values()), max(vals.values())
+            med = statistics.median(vals.values())
+            spread = (hi - lo) / med if med else 0.0
+            rows.append(dict(
+                scenario=gkey[0], ctx=gkey[1], tokens=gkey[2], thinking=gkey[3],
+                engine=gkey[4], metric=metric, min=lo, max=hi, median=med,
+                spread_pct=spread * 100, flagged=spread > 0.10,
+                per_pool={p: round(v, 3) for p, v in vals.items()}))
+    return rows
 
 
 def from_llmprobe_json(path: Path, engine_label: str) -> dict:
@@ -147,30 +245,70 @@ def from_llmprobe_json(path: Path, engine_label: str) -> dict:
                note="llmprobe 由来: cold/warm TTFT の区別なし")
 
 
-def render_markdown(agg: dict, meta: dict | None = None,
+def render_markdown(agg: dict[AggKey, dict[str, dict]], meta: dict | None = None,
                     extra_rows: list[dict] | None = None) -> str:
     lines = ["# ベンチ結果", ""]
     if meta:
         lines.append("計測環境: " + ", ".join(f"{k}={v}" for k, v in meta.items()))
         lines.append("")
-    lines.append("見出し数字は各ブロックの rep=0 (フレッシュ起動直後) のみ。"
-                 "全 rep の中央値は別列 (熱で膨らんでいる可能性がある)。")
+    lines.append("見出し数字はブロック内で最初に来たセルの rep=0"
+                 " (フレッシュ起動直後) のみ。他のセル・rep は GPU が"
+                 " 温まった状態での分布として別列に出す。**反復 1-2 回の"
+                 " 条件は「分布なし」** (percentile を出すには足りない)。")
     lines.append("")
-    header = ("シナリオ", "文脈", "エンジン", "冷TTFT(fresh)",
-             "冷TTFT(全rep中央値)", "温TTFT(中央値)", "decode(中央値)", "reps")
+    header = ("シナリオ", "文脈", "プール", "出力長", "think", "エンジン",
+             "冷TTFT(fresh)", "冷TTFT p50/p95", "decode p50/p95", "CV(decode)",
+             "reps")
     lines.append("| " + " | ".join(header) + " |")
     lines.append("|" + "---|" * len(header))
-    for (scenario, ctx), engines in sorted(agg.items(), key=lambda kv: (kv[0][0], kv[0][1] or -1)):
+    for key, engines in sorted(
+        ((k, v) for k, v in agg.items() if k != "__failures__"),
+        key=lambda kv: (kv[0][0], kv[0][1] or -1, kv[0][2], kv[0][3], kv[0][4]),
+    ):
+        scenario, ctx, pool, tokens, thinking = key
         for eng, row in sorted(engines.items()):
+            cts = row["cold_ttft_stats"]
+            dts = row["decode_tps_stats"]
+            dist_note = "" if cts["has_distribution"] else " (分布なし)"
             lines.append("| " + " | ".join(str(v) for v in (
-                scenario, ctx if ctx is not None else "-", eng,
-                _fmt(row["cold_ttft_fresh_s"]), _fmt(row["cold_ttft_all_median_s"]),
-                _fmt(row["warm_ttft_median_s"]), _fmt(row["decode_tps_median"]),
-                row["reps"])) + " |")
+                scenario, ctx if ctx is not None else "-", pool, tokens, thinking,
+                eng, _fmt(row["cold_ttft_fresh_s"]),
+                f"{_fmt(cts['p50'])}/{_fmt(cts['p95'])}{dist_note}",
+                f"{_fmt(dts['p50'])}/{_fmt(dts['p95'])}",
+                _fmt(dts["cv"]), row["reps"])) + " |")
             if row.get("cold_cache_hit_warning"):
-                lines.append(f"|  |  |  | **警告**: {row['cold_cache_hit_warning']} |||||")
+                lines.append(f"| | | | | | | **警告**: {row['cold_cache_hit_warning']} ||||")
             for w in row.get("residual_warnings") or []:
-                lines.append(f"|  |  |  | **警告 (残留プロセス)**: {w} |||||")
+                lines.append(f"| | | | | | | **警告 (残留プロセス)**: {w} ||||")
+
+    failures = agg.get("__failures__") or []
+    if failures:
+        lines.append("")
+        lines.append("## 失敗したブロック (集計から除外)")
+        lines.append("")
+        lines.append("| シナリオ | 文脈 | エンジン | エラー |")
+        lines.append("|---|---|---|---|")
+        for f in failures:
+            lines.append(f"| {f['scenario']} | {f['ctx']} | {f['engine']} | {f['error']} |")
+
+    pv = pool_variance_table(agg)
+    if pv:
+        lines.append("")
+        lines.append("## 池間のばらつき (10% を超える差に印)")
+        lines.append("")
+        lines.append("池を混ぜた平均ではなく、各条件で池ごとの中央値をそのまま並べる。"
+                     " `spread%` = (max-min)/中央値。")
+        lines.append("")
+        lines.append("| シナリオ | 文脈 | 出力長 | think | エンジン | 指標 |"
+                     " min | 中央値 | max | spread% | 印 | 池ごとの値 |")
+        lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for r in sorted(pv, key=lambda r: -r["spread_pct"]):
+            mark = "**>10%**" if r["flagged"] else ""
+            lines.append("| " + " | ".join(str(v) for v in (
+                r["scenario"], r["ctx"], r["tokens"], r["thinking"], r["engine"],
+                r["metric"], _fmt(r["min"]), _fmt(r["median"]), _fmt(r["max"]),
+                f"{r['spread_pct']:.1f}", mark, r["per_pool"])) + " |")
+
     if extra_rows:
         lines.append("")
         lines.append("## 互換列 (llmprobe --bench-only など、他ツール由来)")
@@ -196,7 +334,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--in", dest="raw_path", required=True,
-                    help="run.py が書き出した raw.json")
+                    help="run.py が書き出した raw.jsonl")
     ap.add_argument("--out", required=True, help="書き出す Markdown のパス")
     ap.add_argument("--llmprobe", action="append", default=[],
                     metavar="ENGINE=PATH",
