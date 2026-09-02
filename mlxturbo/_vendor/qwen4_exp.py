@@ -737,10 +737,38 @@ class Attention(nn.Module):
             kv_frac = (U * cr / blocks.kv_len) if blocks.kv_len else 0.0
             stats.append((T, n_blocks, U, n_sel, union_ratio, kv_frac, true_u))
 
-        out = scaled_dot_product_attention(
-            q, k_sel, v_sel, cache=cache, scale=self.scale,
-            mask=keep_sel[:, None],
-        )
+        # QSA gather 経路 (段 3(b)) の sdpa 呼び出し。mask=keep_sel は常に bool
+        # 配列 (`_final_mask` の causal 文字列を経由しない) なので、`__call__`
+        # と同じ幅の壁 (S * gqa > 32 かつ S <= 8) にだけ判定を絞ればよい
+        # (docs/research/SDPA-WIDTH-WALL.md、`_sdpa_split_width` がゲート、
+        # 既定 on)。T は decode/verify 幅 (`_gather_forward` がタイル無しなら
+        # S そのもの) のときしか壁の対象幅に入らない -- prefill 幅の呼び出し
+        # (T > 8) はこの分岐を素通りする。
+        gqa = self.n_heads // self.n_kv_heads
+        mask = keep_sel[:, None]
+        if (
+            getattr(self, "_sdpa_split_width", True)
+            and 1 < T <= 8
+            and T * gqa > 32
+        ):
+            from mlxturbo.kernels import _fire
+
+            _fire.bump("sdpa_split")
+            step = max(1, 32 // gqa)
+            out = mx.concatenate(
+                [
+                    scaled_dot_product_attention(
+                        q[:, :, i : i + step], k_sel, v_sel, cache=cache,
+                        scale=self.scale, mask=mask[..., i : i + step, :],
+                    )
+                    for i in range(0, T, step)
+                ],
+                axis=2,
+            )
+        else:
+            out = scaled_dot_product_attention(
+                q, k_sel, v_sel, cache=cache, scale=self.scale, mask=mask,
+            )
         return out
 
     def _gather_forward(self, x, rope, cache, idx_cache, offset: int, positions):
@@ -930,9 +958,19 @@ class Attention(nn.Module):
         # (docs/research/SDPA-WIDTH-WALL.md)。マスク付きの注意は q の行どうしが
         # 独立なので、壁に収まる幅で切って繋いでも数値は同一。列を切れない
         # 文字列マスク ("causal") のときは触らない。
+        #
+        # MLXTURBO_SDPA_SPLIT (既定 on、`fused.enable_sdpa_split`/
+        # `disable_sdpa_split`、`Attention._sdpa_split_width` がゲート) が
+        # この分割全体の knob。`getattr(..., True)` なので、誰も
+        # enable/disable を呼んでいない (= 素の `mlx_lm.models.qwen4_exp` を
+        # 直接使っている) ときも既定の分割挙動は保たれる。
         gqa = self.n_heads // self.n_kv_heads
         split_mask = None
-        if S * gqa > 32 and S <= 8:
+        if (
+            getattr(self, "_sdpa_split_width", True)
+            and 1 < S <= 8
+            and S * gqa > 32
+        ):
             if isinstance(mask, mx.array):
                 split_mask = mask
             elif mask == "causal" and k.shape[2] >= 512:
@@ -946,6 +984,9 @@ class Attention(nn.Module):
                     <= (offset + mx.arange(S))[:, None]
                 )[None, None]
         if split_mask is not None:
+            from mlxturbo.kernels import _fire
+
+            _fire.bump("sdpa_split")
             step = max(1, 32 // gqa)
             out = mx.concatenate(
                 [

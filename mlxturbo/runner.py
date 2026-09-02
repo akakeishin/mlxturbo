@@ -1335,6 +1335,14 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         fused.enable_gdn_metal_kernel()
         if os.environ.get("MLXTURBO_GDN_METAL") != "0":
             print(f"{log_prefix} GDN blocked-seq Metal カーネル有効 (oMLX 移植、既定 on)")
+        # enable_sdpa_split 自身が MLXTURBO_SDPA_SPLIT=0 で無効化する
+        # ゲートを持っているので、ここでは呼ぶだけでよい (既定 on)。
+        # decode/verify 幅 (S<=8) の sdpa が vector カーネルの適格幅
+        # (S*gqa_factor<=32) を越えるとき、q/mask を S 軸で分割して呼ぶ
+        # (docs/research/SDPA-WIDTH-WALL.md)。prefill 幅 (S>8) は素通り。
+        fused.enable_sdpa_split()
+        if os.environ.get("MLXTURBO_SDPA_SPLIT") != "0":
+            print(f"{log_prefix} sdpa 幅分割有効 (S*gqa_factor>32 の decode/verify 幅、既定 on)")
         if os.environ.get("MLXTURBO_FAST_QMM") == "1":
             # 検証フォワード (M=3..8) の密 qmm を 8x8 MMA タイルに通す。
             # stock qmv は M にほぼ比例して重みを読み直すが、MMA タイルは

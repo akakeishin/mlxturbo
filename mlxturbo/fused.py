@@ -501,6 +501,46 @@ def disable_gdn_metal_kernel() -> None:
     Q.GatedDeltaNet._gdn_metal = False
 
 
+def enable_sdpa_split() -> None:
+    """decode/verify 幅の sdpa を、vector カーネルの適格幅 (S * gqa_factor <= 32)
+    に収まる幅で S 軸に分割して呼ぶ (docs/research/SDPA-WIDTH-WALL.md,
+    docs/research/KERNEL-BRIEF-DECODE-BW.md)。
+
+    `Attention.__call__` / `Attention._gather_tile_attn` 側に既にある
+    シーム (`getattr(self, "_sdpa_split_width", True)`) を立てるだけ。実際に
+    分割するかは毎呼び出し「1 < S <= 8 かつマスクが bool 配列 (または
+    causal 文字列で kv が十分長い) かつ S * gqa_factor > 32」で判定し、
+    外れれば元の単発 sdpa 呼び出しにそのまま落ちる。
+
+    Flash-Next は Hq=24 / Hk=2 (gqa_factor=12) なので、検証フォワード
+    (S=3 など) はこの壁を越えて全 KV を読む素の経路に落ちていた。合成
+    マイクロ (`bench/results/sdpa-headdim-micro-decode*.json`) では幅 2 に
+    割ると 1 層あたり 4k で 1.52->0.72ms、17k で 3.38->0.60ms、50k で
+    7.09->0.82ms (3〜9 倍)。
+
+    分割ロジック自体は 2026-08-31 の変更 (`ebbe4a78`/`7222fce4`) で
+    `getattr` ガード無しに既に本番で有効だった。この関数が足すのは
+    on/off の knob だけ -- **既定 on**、環境変数 `MLXTURBO_SDPA_SPLIT=0`
+    で無効化できる (`enable_gdn_metal_kernel` と同じ書き方)。採否確認は
+    `tools/decode_ab.py --knob sdpa-split`。発火の確認は
+    `mlxturbo.kernels._fire.snapshot()` の `sdpa_split`。
+    """
+    import os
+
+    import mlx_lm.models.qwen4_exp as Q
+
+    if os.environ.get("MLXTURBO_SDPA_SPLIT") == "0":
+        Q.Attention._sdpa_split_width = False
+        return
+    Q.Attention._sdpa_split_width = True
+
+
+def disable_sdpa_split() -> None:
+    import mlx_lm.models.qwen4_exp as Q
+
+    Q.Attention._sdpa_split_width = False
+
+
 def disable_hyper_connection() -> None:
     global _ORIG_HC
     if _ORIG_HC is None:
@@ -1188,4 +1228,6 @@ __all__ = [
     "enable_rms_norm_gated_nofuse",
     "enable_fast_rope",
     "disable_fast_rope",
+    "enable_sdpa_split",
+    "disable_sdpa_split",
 ]

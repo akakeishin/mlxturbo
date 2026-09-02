@@ -724,6 +724,42 @@ def _knob_bool_mask(ctx):
     return apply
 
 
+def _knob_sdpa_split(ctx):
+    """A = sdpa 幅分割 (既定) / B = 単発呼び出し (旧経路)。
+
+    Flash-Next は Hq=24/Hk=2 (gqa_factor=12)。MLX 0.32.2 の sdpa vector
+    カーネルは `query_sequence_length * gqa_factor > 32` だと適格から
+    外れ (`mlx/backend/metal/scaled_dot_product_attention.cpp:703`)、
+    全 KV を読んで全スコアを実体化する経路に落ちる。verify 幅 (S>=3) は
+    常にこれを越える。A は `Attention.__call__` / `_gather_tile_attn` の
+    sdpa 呼び出しを、q と mask を幅 `max(1, 32 // gqa_factor)`
+    (Flash-Next では 2) で S 軸に割って複数回呼び、concatenate で戻す
+    (`mlxturbo/_vendor/qwen4_exp.py`、`_sdpa_split_width` がゲート)。
+    合成マイクロでは 1 層あたり最大 9 倍 (4k/17k/50k で幅 2 の分割が
+    3〜9 倍速い、`bench/test_sdpa_split.py`)。
+
+    出力一致は要求しない -- 幅を割ったほうは vector カーネル、割らない
+    ほうは materialize 経路に落ちる、選ばれるカーネル自体が違うので
+    丸めが ulp オーダーでずれうる (`bench/test_sdpa_split.py` が bf16
+    丸め (1e-2 以内) に収まることを別途、モデル無しで確認する)。
+
+    発火の確認: `mlxturbo.kernels._fire.snapshot()` の `sdpa_split`。
+    """
+    import os
+
+    from mlxturbo import fused
+
+    def apply(variant):
+        if variant == "A":
+            os.environ.pop("MLXTURBO_SDPA_SPLIT", None)  # 既定 on のゲートを開けたまま
+            fused.enable_sdpa_split()
+        else:
+            os.environ["MLXTURBO_SDPA_SPLIT"] = "0"  # off 側のゲートを閉じる
+            fused.disable_sdpa_split()
+
+    return apply
+
+
 def _knob_gather_attn(ctx):
     """A = gather 経路 (段 3(b)) / B = 現行の加算マスク。
 
@@ -1053,6 +1089,7 @@ KNOBS = {
     "fold-tail": (_knob_fold_tail, ["A", "B"], True, "A"),
     "qsa": (_knob_qsa, ["A", "B"], False, "A"),
     "bool-mask": (_knob_bool_mask, ["A", "B"], False, "B"),
+    "sdpa-split": (_knob_sdpa_split, ["A", "B"], False, "B"),
     "gather-attn": (_knob_gather_attn, ["A", "B"], False, "B"),
     # -1 は gather 自体を切る (現行既定)。0 はタイルなしの gather
     "gather-tile": (_knob_gather_tile, ["-1", "0", "256"], False, "-1"),
@@ -1320,6 +1357,10 @@ def main() -> int:
         # (spec_flash._prime_accepted_gap の呼び出し口)。_prime_draft_cache
         # (prefill 側の priming) は触らない。
         "mtp-append",
+        # sdpa-split は `1 < S <= 8` のときしか分岐に入らない。prefill の
+        # チャンク幅 (既定 2048、`mlxturbo/spec.py` の PREFILL_STEP_SIZE)
+        # は常にこれを大きく越えるので、prefill 幅では発火しない。
+        "sdpa-split",
     }
     if args.prefill_once and args.knob not in DECODE_ONLY_KNOBS:
         print(f"knob={args.knob} は prefill に影響しうるので --prefill-once は"
