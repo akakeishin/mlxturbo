@@ -932,3 +932,22 @@ decode 幅 S=1 (部品ごとの eval 同期 0.2 ms が乗るので部品和は�
   伸びない。**decode の kv 罰 (+8.5 ms/tok) は attention 層以外にある** (indexer の増分キャッシュ、
   verify 幅 S=2 の経路、n-gram、MoE の重み読み)。S=2/4 の結果 (chain35) と合わせて帰属する。
 - S=1 では 17k 以上で gather 経路 (段 3(b)) が実際に走っている (union 2048 ≤ 0.2·kv)。
+
+## decode 幅 S=2 の attention 1 層 (2026-09-03 00:05、`tools/qsa_prefill_split.py --S 2`、部品和は同期の床で 1.5〜2.4 倍に膨らむので壁時計だけ読む)
+
+| kv | 経路 | 層の壁時計 ms (同期 1 回込み) | ×12 層 ms | 参考: S=1 の ×12 |
+|---|---|---|---|---|
+| 4096 | dense | 1.24 | 14.9 | 8.1 |
+| 17000 | dense | 1.69 | 20.3 | 9.1 |
+| 25000 | gather | 1.97 | 23.6 | 10.1 |
+| 50000 | gather | 0.96 | 11.5 | 10.1 |
+
+- S=1 → S=2 で attention 層が 12 層ぶん +7 ms。verify 幅 S=2 の forward が S=1 より +8 ms
+  (`verify_width_cost`: 25.2 → 33.1 ms) なのは **MoE の重み読みではなく attention 層の中**。
+  部品では sdpa (vector) 0.46、indexer 0.63、射影+gate+o_proj 0.89 ms (各 0.2〜0.3 ms の同期込み)。
+  indexer と射影が sdpa より大きい。射影は重み 50 MB 級で帯域の床 0.13 ms、indexer は小さい op の
+  列 (pooled の増分、スコア、argpartition)。**どちらも op 数か効率の問題**で、S=2 では sdpa は主役
+  でない。
+- 50k の壁時計が 25k より小さいのは gather 経路 (union 4096 が kv の 8%) が効いているためだが、
+  熱・同期のばらつき (±0.3 ms) の範囲でもある。S=4 (chain36) と合わせて読む。
+- 帰属を確定するには同期の床を外す測り方 (部品を N 回回して 1 回 eval) が要る。道具に追加中。
