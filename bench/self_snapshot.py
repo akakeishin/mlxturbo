@@ -56,14 +56,24 @@ def main() -> int:
 
     tok = AutoTokenizer.from_pretrained(os.path.expanduser(args.model))
     ctxs = [int(c) for c in args.ctxs.split(",")]
-    # **文脈ごとに別の問いを使う。**同じ本文を使い回すと 2 つ目以降の「冷」が
-    # 接頭辞キャッシュに当たる。
-    prompts: dict[int, str] = {}
+    # **文脈ごとに、かつ繰り返しごとに別のプロンプトを使う。**同じ本文を
+    # 2 回送ると 2 回目が接頭辞キャッシュに当たり、「冷 TTFT」が冷えた 1 回と
+    # キャッシュ当たり 1 回の平均になる。**2026-09-02 に実際にそれをやった**
+    # (17k で 31.7s のはずが 16.89s = (31.7+2)/2 と出た)。
+    # `long_prompts` は問いごとに違う窓を切るので、問いを変えれば本文も変わる。
+    prompts: dict[int, list[str]] = {}
     for i, c in enumerate(ctxs):
         if c == 0:
-            prompts[c] = SHORT
+            # 短文脈は本文が固定なので、末尾に通し番号を足して別物にする
+            prompts[c] = [f"{SHORT} (#{r})" for r in range(args.reps)]
         else:
-            prompts[c] = long_prompts(tok, c, [QUESTIONS[i % len(QUESTIONS)]])[0]
+            qs = [QUESTIONS[(i * args.reps + r) % len(QUESTIONS)]
+                  for r in range(args.reps)]
+            prompts[c] = [long_prompts(tok, c, [q])[0] for q in qs]
+            if len({p[:200] for p in prompts[c]}) < args.reps:
+                print(f"警告: 文脈 {c} で {args.reps} 本の別プロンプトを作れなかった"
+                      f" (問いが {len(QUESTIONS)} 本しかない)。--reps を下げること",
+                      flush=True)
 
     argv = [sys.executable, "-m", "mlxturbo.server",
             "--model", os.path.expanduser(args.model),
@@ -82,7 +92,7 @@ def main() -> int:
         for c in ctxs:
             colds, warms, decs, ntok = [], [], [], []
             for r in range(args.reps):
-                msgs = [{"role": "user", "content": prompts[c]}]
+                msgs = [{"role": "user", "content": prompts[c][r]}]
                 t_cold, dec, n, reply = stream_once(args.port, msgs, args.tokens, mid)
                 # 追記ターン: 実クライアントは履歴をまるごと送り直す
                 msgs2 = msgs + [{"role": "assistant", "content": reply},
@@ -97,7 +107,7 @@ def main() -> int:
                        decode_tps=statistics.median(decs),
                        n_tokens=statistics.median(ntok))
             rows.append(row)
-            pt = len(tok.encode(prompts[c]))
+            pt = len(tok.encode(prompts[c][0]))
             print(f"  文脈 {c:>6} ({pt:>6} tok)  冷 TTFT {row['cold_ttft']:7.2f}s  "
                   f"温 TTFT {row['warm_ttft']:6.2f}s  "
                   f"decode {row['decode_tps']:6.1f} tok/s  "
