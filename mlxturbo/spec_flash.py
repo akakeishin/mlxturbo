@@ -61,6 +61,7 @@ from .spec import CHECKPOINT_RETENTION, PREFILL_STEP_SIZE, snapshot_untrimmable_
 from .prefill_common import split_and_checkpoint_tail
 from . import arch as _archmod
 from .arch import qwen4_arch as _arch
+from .kernels import _fire
 
 
 # How many trailing prompt positions are fed to the MTP head before decoding
@@ -195,6 +196,137 @@ def _depth_ctx_limit(model) -> int:
     from .arch import indexer_budget
 
     return indexer_budget(model) or _DEPTH_CTX_LIMIT_FALLBACK
+
+
+# ---------- レーン10 (docs/research/LANES-2026-09.md): 受理率適応の depth ----
+#
+# 既定は上の choose_depth (文脈長だけを見る静的規則) のまま変えない。
+# ここは MLXTURBO_DEPTH_ADAPT=1 のときだけ通る別分岐で、位置別の受理率の
+# 実測 (EMA) からラウンドごとに depth を選び直す。
+#
+# 設計は相手 (mlx-serve、~/dev/mlx-serve/src/generate.zig:6215-6395、MIT) の
+# EV コントローラ (索引ごとの条件付き受理率 EMA と、幅ごとのラウンド費用表から
+# 期待トークン数 / 費用を最大化する) を参考にしたが、コードは写していない。
+
+MLXTURBO_DEPTH_ADAPT = os.environ.get("MLXTURBO_DEPTH_ADAPT") == "1"
+
+# DepthController が保持する位置別 EMA の本数。MLXTURBO_DEPTH_CAP がこれを
+# 超えて指定されても、ここで頭打ちにする (相手の上限が 6 なので余裕を見て 8)。
+_DEPTH_CONTROLLER_MAX = 8
+_DEPTH_EMA_BETA = 0.15
+_DEPTH_EMA_PRIOR = 0.85
+
+# choose() が探索する depth の上限 (cap) の既定の境界。choose_depth 側の
+# DEPTH_CONTEXT_LIMIT (既定 = モデルの indexer_budget) とは別の定数 --
+# こちらは相手の規則にならって文脈長 2048 に固定してある。in-model の
+# 実測はまだ無く、採否は decode_ab --knob depth-adapt の A/B で親が決める。
+_DEPTH_CAP_CTX_LIMIT = 2048
+
+
+def _depth_cap_default(pos: int) -> int:
+    """DepthController.choose がこの位置で探索する depth の上限 (m の範囲)。
+
+    env (MLXTURBO_DEPTH_CAP) が最優先。無ければ文脈長 2048 を境に
+    3 (以下) / 2 (超) にする。
+    """
+    env = os.environ.get("MLXTURBO_DEPTH_CAP")
+    if env:
+        try:
+            v = int(env)
+        except ValueError:
+            v = 0
+        if v >= 1:
+            return min(v, _DEPTH_CONTROLLER_MAX)
+    return 2 if pos > _DEPTH_CAP_CTX_LIMIT else 3
+
+
+def _depth_cost_params(pos: int) -> tuple[float, float]:
+    """DepthController.choose が使う 1 ラウンドの費用モデル T(m) = T1 + m*dT
+    の (T1, dT) (ms)。既定は verify_width_cost の実測
+    (docs/research/SESSION-2026-09-02-CATCHUP.md: 短文脈 S=1 25.2 / S=2 33.1
+    / S=3 39.8、17k は S=1 30.4 / S=2 39.3 -- 差分から T1≈25/dT≈7 と
+    T1≈30/dT≈9 を採った)。MLXTURBO_DEPTH_COST="T1,dT" で文脈長によらず
+    固定できる。
+    """
+    env = os.environ.get("MLXTURBO_DEPTH_COST")
+    if env:
+        try:
+            t1_s, dt_s = env.split(",")
+            return float(t1_s), float(dt_s)
+        except ValueError:
+            pass
+    return (30.0, 9.0) if pos > _DEPTH_CAP_CTX_LIMIT else (25.0, 7.0)
+
+
+class DepthController:
+    """受理率の指数移動平均から、このラウンドで引く draft の深さを選ぶ。
+
+    位置ごとの条件付き受理率 ``a[i]`` (i = 0..max_depth-1、「ドラフトの
+    チェーンが位置 i まで届いたとき、位置 i も的中する確率」) を EMA
+    (既定 beta=0.15、未観測の事前値 0.85) で保持する。``choose(pos)`` は
+    期待受理トークン数 E(m) を 1 ラウンドの費用 T(m) で割った値が最大の
+    m (= depth) を、``m in 1..cap`` の範囲で返す:
+
+        E(m) = 1 + sum(i = 0..m-1) prod(j = 0..i) a[j]
+        T(m) = T1 + m * dT
+
+    ``cap``/``T1``/``dT`` は文脈長 (``pos``) から ``_depth_cap_default`` /
+    ``_depth_cost_params`` が決める (env で上書き可)。
+
+    副作用を持たない (発火の記録は呼び出し側の責務 --
+    ``FlashSpecEngine._effective_depth`` を参照)。単体テストが直接構成できる
+    よう、依存はコンストラクタ引数だけに閉じてある。
+    """
+
+    def __init__(self, max_depth: int = _DEPTH_CONTROLLER_MAX,
+                 beta: float = _DEPTH_EMA_BETA,
+                 prior: float = _DEPTH_EMA_PRIOR):
+        self.max_depth = max_depth
+        self.beta = beta
+        self.a = [prior] * max_depth
+        # 検査用: 各位置が何回観測されたか (単体テストと分布確認に使う)。
+        self.observations = [0] * max_depth
+
+    def observe(self, n_accepted: int, depth: int) -> None:
+        """検証ラウンドの結果で ``a`` を更新する。
+
+        ``depth`` はそのラウンドで実際に引いたドラフト数、``n_accepted`` は
+        そのうち採用された数 (0..depth)。位置 ``i < n_accepted`` は的中 (1)、
+        ``i == n_accepted`` (depth 未満なら) は不的中 (0)、それより先の位置は
+        「ドラフトのチェーンがそこで既に切れていて検証されていない」ので
+        未観測のまま触らない。
+        """
+        limit = min(depth, self.max_depth)
+        for i in range(limit):
+            if i < n_accepted:
+                obs = 1.0
+            elif i == n_accepted:
+                obs = 0.0
+            else:
+                break
+            self.a[i] = (1.0 - self.beta) * self.a[i] + self.beta * obs
+            self.observations[i] += 1
+
+    def expected_tokens(self, m: int) -> float:
+        """E(m) = 1 + sum(i<m) prod(j<=i) a[j] の閉じた式。"""
+        total = 1.0
+        prod = 1.0
+        for i in range(m):
+            prod *= self.a[i]
+            total += prod
+        return total
+
+    def choose(self, pos: int) -> int:
+        """E(m)/T(m) を最大にする m (1..cap) を返す。"""
+        cap = min(_depth_cap_default(pos), self.max_depth)
+        t1, dt = _depth_cost_params(pos)
+        best_m, best_score = 1, -1.0
+        for m in range(1, cap + 1):
+            cost = t1 + m * dt
+            score = self.expected_tokens(m) / cost if cost > 0 else 0.0
+            if score > best_score:
+                best_score, best_m = score, m
+        return best_m
 
 
 class Capture:
@@ -762,6 +894,14 @@ class FlashSpecEngine:
         self.rope = model.model.rope
         self.depth = max(1, int(depth))
         self.depth_ctx_limit = _depth_ctx_limit(model)
+        # レーン10: 受理率 EMA で depth を選ぶ適応 (既定 off、
+        # MLXTURBO_DEPTH_ADAPT=1 で有効)。controller はエンジンの生存期間中
+        # 持ち回り、複数ラウンド/複数リクエストにまたがって学習する
+        # (mlx-serve の EV コントローラと同じ想定 -- リクエストごとに
+        # 作り直さない)。_effective_depth / generate() / generate_stream()
+        # の verify 後で観測する。
+        self._depth_adapt = MLXTURBO_DEPTH_ADAPT
+        self._depth_controller = DepthController() if self._depth_adapt else None
         # draft-rerank (mlx-serve の設計の移植): trunk lm_head の 2bit 再量子化で
         # 全語彙を粗く読み、正確な top-32 だけを trunk のヘッドの行で再採点する。
         # 粗い top-32 に真の argmax が入っている限り draft は trunk と一致し、
@@ -849,7 +989,15 @@ class FlashSpecEngine:
     def _effective_depth(self, pos: int) -> int:
         """この位置で引くドラフト数。長い文脈では 1 に落とす
         (DEPTH_CONTEXT_LIMIT の注記を参照)。政策そのものは
-        `choose_depth` (純関数) に閉じてある。"""
+        `choose_depth` (純関数) に閉じてある。
+
+        `MLXTURBO_DEPTH_ADAPT=1` のときだけ、代わりに `self._depth_controller`
+        (受理率 EMA) が選ぶ。既定 (off) の経路は 1 ビットも変わらない。
+        """
+        if self._depth_adapt:
+            m = self._depth_controller.choose(pos)
+            _fire.bump(f"depth_adapt_{m}")
+            return m
         return choose_depth(pos, self.depth, self.depth_ctx_limit)
 
     def _draft_chain(self, cur, hyper_prev, cache, depth: int):
@@ -1063,6 +1211,8 @@ class FlashSpecEngine:
             rounds += 1
             toks, hypers, hit = self._verify(cap, lg, drafts, 0.0)
             accepted += hit
+            if self._depth_adapt:
+                self._depth_controller.observe(hit, len(drafts))
             keep = len(toks)
             rollback(model, caches, cap, pre, keep=keep, total=total,
                      ids_kept=pair[:, :keep])
@@ -1561,6 +1711,11 @@ class FlashSpecEngine:
             toks, hypers, hit = self._verify(cap, lg, drafts, temp, sampler=sampler,
                                              precomputed=(nxt_all, dv))
             accepted += hit
+            if self._depth_adapt:
+                # このラウンドで実際に引いた深さ (drafts はここでは
+                # pending/next_drafts のどちらから来ても、このラウンドで
+                # 検証フォワードにかけた本数そのもの)。
+                self._depth_controller.observe(hit, len(drafts))
 
             vals = [int(t.item()) for t in toks]
             cut = next((k for k, v in enumerate(vals) if v in eos), None)

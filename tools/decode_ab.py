@@ -383,6 +383,35 @@ def _knob_depth(ctx):
     return apply
 
 
+def _knob_depth_adapt(ctx):
+    """A = 受理率 EMA で depth を選ぶ適応 (`MLXTURBO_DEPTH_ADAPT=1`
+    相当) / B = 既定の静的規則 (`choose_depth`、文脈長だけで決める)。
+
+    レーン10 (docs/research/LANES-2026-09.md)。貪欲なので出力トークン列は
+    A/B で原則一致するはず -- verify は本体の argmax と一致したときだけ
+    受理するので、depth の選び方自体は採否の基準を変えない。ただし `depth`
+    knob と同じ理由で、verify 幅が変わると `mx.quantized_matmul` の幅依存の
+    丸めで argmax がまれに割れる (厳密一致は要求しない)。
+
+    ラウンドごとに選んだ depth の分布は `mlxturbo.kernels._fire`
+    (`depth_adapt_<m>`) に積まれ、結果 JSON の `fired` にそのまま出る
+    (harness 側の仕組みをそのまま使う。既存の knob と同じ)。
+
+    A に切り替えるたびに controller を作り直す (`DepthController` は
+    エンジンの生存期間中ずっと学習を持ち回る設計だが、A/B の回文順で前の
+    A 実行の学習が残ると 2 回目の A が不公平に有利になるので、ここでは
+    `_fire.reset()` と同じ「実行のたびに測り直す」に合わせてある)。
+    """
+    from mlxturbo.spec_flash import DepthController
+
+    def apply(variant):
+        eng = ctx["eng"]
+        eng._depth_adapt = variant == "A"
+        if eng._depth_adapt:
+            eng._depth_controller = DepthController()
+
+    return apply
+
 
 def _knob_rms_norm_gated(ctx):
     """A = 融合カーネル / C = 機構だけ (eligible まで評価して素へ) / B = 素 (既定)。
@@ -1144,6 +1173,7 @@ KNOBS = {
     "prefill-attn": (_knob_prefill_attn, ["A", "B"], False, "B"),
     "wide": (_knob_wide, ["A", "B"], False, "B"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
+    "depth-adapt": (_knob_depth_adapt, ["A", "B"], False, "B"),
     "mtp-append": (_knob_mtp_append, ["A", "B"], False, "B"),
     # A = interleaved (本番既定) を基準に、B = separate (RAM 常駐) と比べる
     "ngram-layout": (_knob_ngram_layout, ["A", "B"], True, "A"),
@@ -1389,6 +1419,11 @@ def main() -> int:
     DECODE_ONLY_KNOBS = {
         "hc-write", "moe-verify", "gdn-prework", "depth", "null",
         "rms-norm-gated", "moe-route",
+        # depth-adapt は _effective_depth 経由でしか呼ばれず、それ自体
+        # decode ループの中 (generate/generate_stream の while) でしか
+        # 呼ばれない (prefill の forward は素の model(...) 呼び出しで、
+        # draft/verify を挟まない)。"depth" knob と同じ理由。
+        "depth-adapt",
         # MLXTURBO_PIPELINE は generate_stream の decode ループの中でしか
         # 読まれない (spec_flash.py:1264)。prefill には触らない。
         "pipeline",
