@@ -274,3 +274,32 @@ MLX の matmul/relu/sum/argpartition、attention は **dense bool マスク + ML
 せいではなく、gather 経路 (段 3(b)) が相手の dense マスク経路より重い**か、indexer
 の作りの差。過去の A/B (`gather-attn-17k.json`) でも 17k では dense (B) が 5% 速く、
 gather が勝つのは 25k 以上。17k の forward を gather off でも測る。
+
+## 冷えた状態の 17k forward S=1 (2026-09-02 12:44-12:48、交互)
+
+| | mlx-serve | mlxturbo |
+|---|---|---|
+| KV 0 | 19.9 / 19.7 (eval 18.1 / 17.9) | plain eval 24.1、staged 23.2 |
+| KV 17k | 23.0 / 22.8 (eval 21.1 / 20.9) | plain eval 31.5 (nocap 31.1)、staged 30.6 |
+| 文脈の罰 | **+3.0 ms** | **+7.4 ms** |
+
+短文脈で +6 ms、17k で +10 ms。文脈の罰はうちが 2.5 倍。
+
+## prefill のタイル gather は「効かない設計」だった (2026-09-02、`tools/gather_union_stats.py`)
+
+17k、tile 0/256/64/32 の全部で union_ratio = 1.000。`Attention._gather_tile_attn` は
+`U = min(n_blocks, T * block_topk)` を和集合の大きさとして使う (真の和集合を数えない)。
+17k は n_blocks ≈ 4218、block_topk = 512 なので T >= 9 で U = n_blocks、**タイルに
+割っても全ブロックを集めて dense sdpa に渡している**。前セッションの
+「tile=256 で prefill_s が縮まない」「attention はほぼ詰み」は、この実装の帰結。
+真の和集合の大きさを測り直す (フックに true_u を足す)。小さければ、タイルごとに
+真の union だけ集める経路 (同期 1 回/タイル/層) で prefill attention を kv に依らず
+一定に近づけられる。
+
+## oMLX 移植の GDN blocked-seq Metal カーネル (2026-09-02 12:56、`tools/verify_gdn_metal.py`)
+
+逐次カーネルとの差: y の相対誤差 1-2e-5、state 1e-8 (加算順の差の範囲)。
+T=2048 (B=1、Hk=16、Hv=48、Dk=Dv=128、bf16) の壁時計、交互 20 回:
+逐次 min 4.98 / mean 6.04 ms、Metal 移植 min 3.14 / mean 3.81 ms (**x1.59**)。
+36 層 x 8 チャンクで 17k prefill あたり約 0.6 s (1.8%) の見込み。in-model A/B
+(`--knob gdn-metal`、prefill_s) で採否を決める。

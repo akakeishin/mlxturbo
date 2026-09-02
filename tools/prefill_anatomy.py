@@ -563,9 +563,10 @@ def main() -> int:
         print("  捕まえた: " + " ".join(f"{k}={len(v)}"
                                      for k, v in grabbed.items() if v), flush=True)
         if stats:
-            T, nb, U, n_sel, ur, kvf = stats[0]
+            T, nb, U, n_sel, ur, kvf, true_u = stats[0]
             print(f"  gather 経路が活性: T={T} n_blocks={nb} union={U} ({ur:.0%})"
-                  f" 集める列/kv={kvf:.0%}", flush=True)
+                  f" 集める列/kv={kvf:.0%} true_union={true_u} ({true_u / nb if nb else 0.0:.0%})",
+                  flush=True)
 
         def bench(key):
             if not grabbed[key]:

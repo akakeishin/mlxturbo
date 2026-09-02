@@ -60,11 +60,13 @@ def enable_gather_attn(
     を立てる。GDN 層 (`linear_attn`) には触らない。
 
     ``stats`` にリストを渡すと、gather が実際に活性化した呼び出しごとに
-    ``(T, n_blocks, U, n_sel, union_ratio, kv_frac)`` を追記する
+    ``(T, n_blocks, U, n_sel, union_ratio, kv_frac, true_u)`` を追記する
     (`_gather_stats` 属性、`_wide_qkv` と同じ注入の作法)。``T`` はそのタイルの
     クエリ行数 (タイル無効なら S そのもの)、``union_ratio = U / n_blocks``、
-    ``kv_frac = U * compress_ratio / kv_len``。既定 None のときは 1 行も
-    増えない (計測・検証専用、`tools/verify_gather_attn.py` が使う)。
+    ``kv_frac = U * compress_ratio / kv_len``、``true_u`` は和集合の真の大きさ
+    (``U`` は上限 ``min(n_blocks, T*block_topk)`` であって和集合の実測ではない)。
+    既定 None のときは 1 行も増えない (計測・検証専用、
+    `tools/verify_gather_attn.py` が使う)。
 
     ``tile`` は段 P1a のタイル幅 (`_gather_attn_tile` 属性、`_wide_qkv` と
     同じ注入の作法)。既定 0 は従来どおり S 全体を 1 回で処理する

@@ -683,9 +683,19 @@ class Attention(nn.Module):
             # tail は分母にだけ含み分子には含めない --- tail は端数ぶんの
             # 小さな定数なので比の主要項ではない)。段 P1a のタイル掃引と
             # 同じ量をタイル分割後にも取れるようにするための拡張。
+            #
+            # true_u = 真の和集合の大きさ (union を直接数えた値)。U は上限
+            # `min(n_blocks, T*block_topk)` であって和集合の実測ではないので、
+            # 17k のように T>=9 になる幅では U が毎回 n_blocks に張り付き、
+            # union_ratio が恒常的に 1.000 になる (タイル分割で prefill が
+            # 縮まなかった原因はこの上限の頭打ちであって、データの性質では
+            # ない)。`int()` は GPU→CPU 同期を伴うが、このフックは
+            # `stats is not None` のときだけ通る計測専用経路で、本番経路
+            # (stats=None) の速度には影響しない。
+            true_u = int(mx.sum(union))
             union_ratio = (U / n_blocks) if n_blocks else 0.0
             kv_frac = (U * cr / blocks.kv_len) if blocks.kv_len else 0.0
-            stats.append((T, n_blocks, U, n_sel, union_ratio, kv_frac))
+            stats.append((T, n_blocks, U, n_sel, union_ratio, kv_frac, true_u))
 
         out = scaled_dot_product_attention(
             q, k_sel, v_sel, cache=cache, scale=self.scale,

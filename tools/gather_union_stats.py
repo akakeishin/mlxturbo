@@ -64,16 +64,33 @@ def _aggregate(layer_lists: list[tuple[int, list]], cr: int) -> dict:
     """層 x サブタイル呼び出しの生レコードを、チャンク (kv_len 近似) で集計する。
 
     ``layer_lists`` は ``[(layer_idx, [(T, n_blocks, U, n_sel, union_ratio,
-    kv_frac), ...]), ...]``。チャンクの識別は ``n_blocks * cr``
+    kv_frac, true_u), ...]), ...]``。チャンクの識別は ``n_blocks * cr``
     (= kv_len の近似、tail を無視) をキーにする -- 同じチャンクを処理した
     呼び出しは層が違っても kv_len が一致するはず。
+
+    ``U`` は実装が集めるブロック数の上限 (``min(n_blocks, T*block_topk)``)
+    であって、和集合の実測ではない (17k のように T>=9 になる幅では毎回
+    n_blocks に張り付き、union_ratio が恒常的に 1.000 になる)。``true_u``
+    は `Attention._gather_tile_attn` (`mlxturbo/_vendor/qwen4_exp.py`) が
+    ``mx.sum(union)`` で直接数えた真の和集合の大きさ。``true_union_ratio``
+    と ``flop_ratio_vs_dense_true`` はこちらを使う。従来の U ベースの値
+    (``union_ratio`` / ``flop_ratio_vs_dense``) は「実装が実際に集めている
+    量 (詰め物込み)」として併記する。
     """
     rows = []
     for layer_idx, lst in layer_lists:
-        for (T, n_blocks, U, n_sel, union_ratio, kv_frac) in lst:
+        for (T, n_blocks, U, n_sel, union_ratio, kv_frac, true_u) in lst:
+            # tail (端数列。ブロック格子の外、全タイル共通で読み直す分) は
+            # レコードに直接残っていないが、n_sel = U*cr + tail の構造
+            # (`_gather_tile_attn` 参照) から逆算できる。
+            tail = n_sel - U * cr
+            true_union_ratio = (true_u / n_blocks) if n_blocks else 0.0
             rows.append(dict(layer=layer_idx, T=T, n_blocks=n_blocks, U=U,
                              n_sel=n_sel, union_ratio=union_ratio,
-                             kv_frac=kv_frac, kv_len=n_blocks * cr))
+                             kv_frac=kv_frac, kv_len=n_blocks * cr,
+                             true_u=true_u, tail=tail,
+                             true_union_ratio=true_union_ratio,
+                             true_n_sel=true_u * cr + tail))
 
     by_chunk: dict[int, list[dict]] = defaultdict(list)
     for r in rows:
@@ -84,6 +101,7 @@ def _aggregate(layer_lists: list[tuple[int, list]], cr: int) -> dict:
         rs = by_chunk[kv_len]
         ur = [r["union_ratio"] for r in rs]
         kf = [r["kv_frac"] for r in rs]
+        tur = [r["true_union_ratio"] for r in rs]
         by_chunk_out.append(dict(
             kv_len_approx=kv_len,
             n_records=len(rs),
@@ -91,26 +109,40 @@ def _aggregate(layer_lists: list[tuple[int, list]], cr: int) -> dict:
             union_ratio_max=max(ur),
             kv_frac_mean=sum(kf) / len(kf),
             kv_frac_max=max(kf),
+            true_union_ratio_mean=sum(tur) / len(tur),
+            true_union_ratio_max=max(tur),
         ))
 
     if rows:
         ur_all = [r["union_ratio"] for r in rows]
         kf_all = [r["kv_frac"] for r in rows]
+        tur_all = [r["true_union_ratio"] for r in rows]
         overall = dict(
             union_ratio_mean=sum(ur_all) / len(ur_all),
             kv_frac_mean=sum(kf_all) / len(kf_all),
+            true_union_ratio_mean=sum(tur_all) / len(tur_all),
         )
         # dense (T 行 x kv_len 列を毎回総なめ) に対する、gather が実際に読む
         # 列数の比。1.0 未満なら理屈のうえで計算量が縮んでいるはず
+        # (U ベース。実装が実際に集めている量 -- U が上限に張り付いていれば
+        # 1.0 に近いまま動かない)。
         num = sum(r["T"] * r["n_sel"] for r in rows)
         den = sum(r["T"] * r["kv_len"] for r in rows)
         flop_ratio = num / den if den else 0.0
+
+        # 同じ比を真の和集合 (true_u) で計算し直したもの。U の頭打ちを
+        # 取り除いた「タイル分割が理屈のうえでどこまで縮むか」の値。
+        num_true = sum(r["T"] * r["true_n_sel"] for r in rows)
+        flop_ratio_true = num_true / den if den else 0.0
     else:
-        overall = dict(union_ratio_mean=0.0, kv_frac_mean=0.0)
+        overall = dict(union_ratio_mean=0.0, kv_frac_mean=0.0,
+                        true_union_ratio_mean=0.0)
         flop_ratio = 0.0
+        flop_ratio_true = 0.0
 
     return dict(n_records=len(rows), by_chunk=by_chunk_out, overall=overall,
-                flop_ratio_vs_dense=flop_ratio)
+                flop_ratio_vs_dense=flop_ratio,
+                flop_ratio_vs_dense_true=flop_ratio_true)
 
 
 def main() -> int:
@@ -201,8 +233,10 @@ def main() -> int:
             model=model_path, ngram=args.ngram, ctx=n_ctx,
             compress_ratio=cr, tiles=tiles,
             note="prefill_s は熱ドリフトの影響を受ける参考値。案の優劣は"
-                 " union_ratio / kv_frac / flop_ratio_vs_dense で見ること"
-                 " (CLAUDE.md の計測の作法)。",
+                 " true_union_ratio / kv_frac / flop_ratio_vs_dense_true で"
+                 " 見ること (union_ratio / flop_ratio_vs_dense は U の上限"
+                 " 張り付きで 1.000 に固定されがちな、実装が実際に集めている"
+                 " 量の参考値) (CLAUDE.md の計測の作法)。",
         ),
         "tiles": {},
     }
@@ -229,12 +263,16 @@ def main() -> int:
         print(f"tile={tile:4d}  prefill {prefill_s:6.2f}s  "
               f"records={agg['n_records']:5d}  "
               f"union_ratio(mean) {agg['overall']['union_ratio_mean']:.3f}  "
+              f"true_union_ratio(mean) {agg['overall']['true_union_ratio_mean']:.3f}  "
               f"kv_frac(mean) {agg['overall']['kv_frac_mean']:.3f}  "
-              f"flop_ratio_vs_dense {agg['flop_ratio_vs_dense']:.3f}")
+              f"flop_ratio_vs_dense {agg['flop_ratio_vs_dense']:.3f}  "
+              f"flop_ratio_vs_dense_true {agg['flop_ratio_vs_dense_true']:.3f}")
         for c in agg["by_chunk"]:
             print(f"    kv~{c['kv_len_approx']:6d}  n={c['n_records']:4d}  "
                   f"union_ratio mean={c['union_ratio_mean']:.3f} "
                   f"max={c['union_ratio_max']:.3f}  "
+                  f"true_union_ratio mean={c['true_union_ratio_mean']:.3f} "
+                  f"max={c['true_union_ratio_max']:.3f}  "
                   f"kv_frac mean={c['kv_frac_mean']:.3f} "
                   f"max={c['kv_frac_max']:.3f}")
 

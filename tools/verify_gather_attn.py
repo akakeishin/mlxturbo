@@ -154,13 +154,14 @@ def check(budget: int, tile: int) -> tuple[bool, float, list]:
         print(
             "\n  gather が実際に活性化した呼び出し (タイルごとに 1 行。"
             "T=タイルのクエリ行数、n_blocks、union U、gather 列数 n_sel、"
-            "union_ratio=U/n_blocks、kv_frac=U*compress_ratio/kv_len):"
+            "union_ratio=U/n_blocks、kv_frac=U*compress_ratio/kv_len、"
+            "true_u=和集合の真の大きさ):"
         )
-        for T, n_blocks, U, n_sel, union_ratio, kv_frac in stats:
+        for T, n_blocks, U, n_sel, union_ratio, kv_frac, true_u in stats:
             print(
                 f"    T={T:2d}  n_blocks={n_blocks:3d}  U={U:3d}  "
                 f"n_sel={n_sel:3d}  union_ratio={union_ratio:.2f}  "
-                f"kv_frac={kv_frac:.2f}"
+                f"kv_frac={kv_frac:.2f}  true_u={true_u:3d}"
             )
     else:
         print("\n  警告: gather が一度も活性化しなかった (budget/chunk の組み方を見直すこと)")
