@@ -1442,3 +1442,11 @@ MLX の capture はモデルの全バッファ (91 GB) を含めて記録する�
   +1 (S=3 → 4) で MoE の重み読みと attention が +5 ms/round (+13%) 増えるので **ms/tok は同着〜負け**。長文脈
   (depth 1、S=2 → 3) も同様。**仮説 5 (木) は畳む。**取り分が出るのは verify 幅の 1 行追加費用が 2 ms を切った場合
   (MoE の重み読みが支配的な今の構造では無理)。
+
+## rerank on/off、17k (2026-09-03 09:50、`bench/results/draft-rerank-17k.json`)
+
+ms/round A (rerank on) **-4.6%**、tok/round -0.5%。hit@1 0.59〜0.60、hit@2 0.75〜0.76 (rounds 263〜266) →
+差 16〜17 ポイント (短文脈と同じ)。判定は短文脈と同じ: rerank は維持、木は畳む。
+
+仮説 A/B の残り: temp>0 の厳密棄却サンプリング (上限測定には decode_ab に temp の knob が要る、未)、HC の
+split-K カーネル (走行中)、長文脈の品質ゲート (課題の正答率)。
