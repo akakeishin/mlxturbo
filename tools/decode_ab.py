@@ -192,6 +192,25 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              上限 = hit@2 - hit@1) の裏取り用で、rerank の on/off どちらでも
              測れる (top-2 の取り方が rerank の有無で変わるだけ、
              `spec_flash.FlashSpecEngine._draft_argmax` 参照)。
+
+`temp`       レーン11 仮説6 の裏取り: 現行の temp>0 投機 (`spec_flash._verify`
+             の `temp > 0 or sampler is not None` 分岐 --- verify の logits
+             からサンプルし、greedy な draft と一致したら採用) は分布としては
+             正しい (`verify_spec_sampling.py` が検証済み) が、真の棄却
+             サンプリング (受理確率 min(1, p/q)、棄却時は残差分布から再サンプル)
+             より受理率が低いはず、という仮説。variant の値をそのまま
+             `generate_stream(..., temp=...)` の温度として使う (`--temp`
+             フラグ自体は無視され、variant が勝つ)。既定の対照 (`--variants`
+             省略時) は 0.0 (greedy) 対 0.7。**サンプリングなので出力は
+             temp>0 側で毎回変わりうる --- `control_identical=False`。**
+             `--seed` で `mx.random.seed` を固定すれば同じ乱数列にはなるが、
+             それでも greedy 側と一致することは期待しない。合格条件は無い
+             (探索用の道具): **tok/round** (複数プロンプト x 512 の平均) を
+             `--knob null --temp 0.7` (ハーネス自身のばらつき、両側 temp 0.7)
+             と比べて、`temp` knob の 0.0→0.7 の落ち幅がそれより大きいかを見る。
+             prefill には触らない (`_sample` は verify 後の 1 トークン目/2
+             トークン目だけで、prefill のチャンクループはそれを通らない) ので
+             `DECODE_ONLY_KNOBS` に入れてある --- `--prefill-once` が使える。
 """
 
 from __future__ import annotations
@@ -595,6 +614,23 @@ def _knob_null(ctx):
 
     def apply(variant):
         return
+
+    return apply
+
+
+
+def _knob_temp(ctx):
+    """variant の値をそのまま温度として使う (`--knob temp --variants 0.0,0.7`)。
+
+    詳細はモジュール docstring の `temp` 節を参照。`--temp` フラグの値は
+    ここでは使わない (常に variant で上書きされる) --- `run_once`/`run_resumed`
+    は呼び出し側 (`main`) が `ctx["args"].temp` を読んで
+    `generate_stream(..., temp=...)` に渡す。
+    """
+    args = ctx["args"]
+
+    def apply(variant):
+        args.temp = float(variant)
 
     return apply
 
@@ -1340,6 +1376,7 @@ KNOBS = {
     "pipeline": (_knob_pipeline, ["A", "B"], False, "B"),
     "fast-qmm": (_knob_fast_qmm, ["A", "B"], False, "B"),
     "null": (_knob_null, ["A", "B"], True, "B"),
+    "temp": (_knob_temp, ["0.0", "0.7"], False, "0.0"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
     "indexer-lean": (_knob_indexer_lean, ["A", "B"], True, "B"),
@@ -1421,15 +1458,19 @@ def prefill_once(eng, ids, eos_ids):
     return caches, _snapshot(caches), resume, first
 
 
-def run_resumed(eng, caches, snap, resume, base_pos, n_tokens, eos_ids):
-    """控えた状態から decode だけを流す。返り値は run_once と同じ形。"""
+def run_resumed(eng, caches, snap, resume, base_pos, n_tokens, eos_ids, temp=0.0):
+    """控えた状態から decode だけを流す。返り値は run_once と同じ形。
+
+    ``temp`` は `spec_flash.generate_stream` にそのまま渡す (既定 0.0 = 現行の
+    greedy)。temp>0 だと draft は greedy のまま、verify の logits からだけ
+    温度付きサンプリングする (`spec_flash._verify` の分岐)。"""
     import mlx.core as mx
 
     _restore(caches, snap)
     empty = mx.zeros((1, 0), dtype=mx.int32)
     t0 = time.perf_counter()
     gen = eng.generate_stream(empty, n_tokens, caches=caches, eos_ids=eos_ids,
-                              resume=resume, base_pos=base_pos)
+                              resume=resume, base_pos=base_pos, temp=temp)
     out = []
     try:
         while True:
@@ -1439,14 +1480,16 @@ def run_resumed(eng, caches, snap, resume, base_pos, n_tokens, eos_ids):
     return out, 0.0, time.perf_counter() - t0, accepted, rounds
 
 
-def run_once(eng, ids, n_tokens, eos_ids):
-    """1 本流して (トークン列, prefill 秒, decode 秒, accepted, rounds) を返す。"""
+def run_once(eng, ids, n_tokens, eos_ids, temp=0.0):
+    """1 本流して (トークン列, prefill 秒, decode 秒, accepted, rounds) を返す。
+
+    ``temp`` は `run_resumed` と同じ意味 (既定 0.0 = greedy)。"""
     import mlx.core as mx
 
     caches = eng.model.make_cache()
     mx.clear_cache()
     t0 = time.perf_counter()
-    gen = eng.generate_stream(ids, n_tokens, caches=caches, eos_ids=eos_ids)
+    gen = eng.generate_stream(ids, n_tokens, caches=caches, eos_ids=eos_ids, temp=temp)
     out, t_prefill = [], None
     try:
         while True:
@@ -1492,6 +1535,20 @@ def main() -> int:
     ap.add_argument("--mtp-bits", type=int, default=4)
     ap.add_argument("--tokens", type=int, default=512)
     ap.add_argument("--ctx", type=int, default=17000)
+    ap.add_argument("--temp", type=float, default=0.0,
+                    help="サンプリング温度 (既定 0.0 = greedy)。"
+                         "generate_stream(..., temp=...) にそのまま渡り、"
+                         "draft は greedy のまま verify の logits だけ温度付きで"
+                         "サンプルする (spec_flash._verify)。"
+                         "temp>0 では毎ラウンドの採否が乱数で変わるので、"
+                         "control_identical=True の knob でも短文脈の出力一致"
+                         "対照は成立しない (対照 NG は測定破綻ではなく "
+                         "temp>0 の性質)。temp 自体を A/B の軸にしたいときは "
+                         "--knob temp --variants 0.0,0.7 を使う (このフラグは "
+                         "そちらでは無視され、variant の値が温度になる)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="mx.random.seed に渡す。temp>0 の乱数列を固定して "
+                         "run 間で比較・再現できるようにする (既定 0)")
     ap.add_argument("--out", default=None, help="結果 JSON の書き出し先")
     ap.add_argument("--only", choices=("both", "short", "long"), default="both",
                     help="長さの片方だけ回す (交差点探しで短文脈を省くため)")
@@ -1533,6 +1590,8 @@ def main() -> int:
 
     import mlx.core as mx
     from mlx_lm import load
+
+    mx.random.seed(args.seed)
 
     import mlxturbo  # noqa: F401
     from mlxturbo import mtp_flash, spec_flash
@@ -1614,7 +1673,7 @@ def main() -> int:
     for want in ("short", "long"):
         for kind, ids in cases:
             if kind == want:
-                run_once(eng, ids, 32, eos_ids)
+                run_once(eng, ids, 32, eos_ids, temp=args.temp)
                 break
 
     # **ホワイトリストにすること。**`--prefill-once` は共有 prefill を
@@ -1669,6 +1728,10 @@ def main() -> int:
         # 中だけ) だけ。prefill の priming (`_prime_draft_cache`) は
         # `_draft_argmax` を経由しない素の `self.mtp(...)` forward。
         "draft-rerank",
+        # temp は generate_stream の _sample (verify 後の 1/2 トークン目) に
+        # しか渡らない。prefill のチャンクループはトークンをサンプルせず、
+        # 与えられた ids をそのまま処理するだけ (_sample を通らない)。
+        "temp",
     }
     if args.prefill_once and args.knob not in DECODE_ONLY_KNOBS:
         print(f"knob={args.knob} は prefill に影響しうるので --prefill-once は"
@@ -1699,9 +1762,10 @@ def main() -> int:
         # 下駄を履かせていた。**
         set_variant(baseline)
         if shared is None:
-            run_once(eng, ids, 32, eos_ids)
+            run_once(eng, ids, 32, eos_ids, temp=args.temp)
         else:
-            run_resumed(eng, *shared, base_pos=n, n_tokens=32, eos_ids=eos_ids)
+            run_resumed(eng, *shared, base_pos=n, n_tokens=32, eos_ids=eos_ids,
+                        temp=args.temp)
         for v in order:
             set_variant(v)
             # カーネルの発火回数を条件ごとに数え直す。適格判定は条件を外すと
@@ -1711,11 +1775,12 @@ def main() -> int:
             if ngram_stream is not None:
                 ngram_stream.reset_stats()
             if shared is None:
-                out, tp, td, acc, rounds = run_once(eng, ids, args.tokens, eos_ids)
+                out, tp, td, acc, rounds = run_once(
+                    eng, ids, args.tokens, eos_ids, temp=args.temp)
             else:
                 out, tp, td, acc, rounds = run_resumed(
                     eng, *shared, base_pos=n, n_tokens=args.tokens,
-                    eos_ids=eos_ids)
+                    eos_ids=eos_ids, temp=args.temp)
             ms = td / max(len(out), 1) * 1000
             tpr = len(out) / max(rounds, 1)
             # ms/token は ms/round と tok/round の比なので、**費用と受理が
