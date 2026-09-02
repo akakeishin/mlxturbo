@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import mmap
 import os
 import struct
 import threading
@@ -48,6 +49,10 @@ import numpy as np
 from .kernels import _fire
 
 _SHARD_RE = "ngram_embedding.shard_"
+
+# backend=mmap の prefetch (`StreamNGram._madvise_prefetch`) が madvise を
+# 打つ単位。行のバイト範囲をこの境界に丸めてから隣接/重複区間をまとめる。
+_MADVISE_CHUNK_BYTES = 16 * 1024
 
 
 # --------------------------------------------------------- building the sidecar
@@ -213,7 +218,14 @@ class StreamNGram:
     (12 on this machine) looked like the safe choice, so that is the default.
 
     The mmap path is kept so it can be reverted to if this regresses. Switch with
-    `FASTMLX_NGRAM_BACKEND=mmap` or `backend="mmap"`.
+    `FASTMLX_NGRAM_BACKEND=mmap` or `backend="mmap"`. It opens its own
+    `mmap.mmap` (not `np.memmap`, whose underlying mmap object numpy keeps
+    private) so it can call `madvise(MADV_WILLNEED)` from `prefetch()`
+    (`_madvise_prefetch`) and hand the page-in to the kernel ahead of time.
+    `__call__` (`_gather_mmap`) sorts the requested row ids before gathering
+    and unsorts the result afterward, for a little extra page locality when
+    rows land in the same page; the output order matches the caller's order
+    either way, bit-for-bit.
 
     `_gather_pread` の中身自体も `os.preadv` (macOS 11+) が使えるなら使う
     (既定 on)。`os.preadv(fd, buffers, offset)` は offset を 1 個しか取らない
@@ -242,13 +254,20 @@ class StreamNGram:
     自動的に旧経路。
 
     prefetch: prefill プロンプトの行 id は最初から全部わかっているので、
-    `prefetch()` に渡すと専用のバックグラウンドスレッドが行キャッシュ
-    (`_NGramCacheGen`) を埋めておく。`__call__` はキャッシュに乗っている行を
-    そのまま返し、乗っていない行だけ pread する。呼び出しは即時に返り、キャッシュ
-    への書き込みは `_cache_lock` で守られているので `__call__` と並走しても壊れない
-    (同じ行を二重に読んでも結果は同じなので、そこは守らない)。
-    `MLXTURBO_NGRAM_PREFETCH=1` で有効化できる (既定 off。backend=mmap では
-    常に無効)。
+    `prefetch()` に渡すと先読みが始まる。呼び出しは即時に返る。
+    `MLXTURBO_NGRAM_PREFETCH=1` で有効化できる (既定 off)。backend ごとに
+    中身が違う:
+
+    - backend=pread: 専用のバックグラウンドスレッドが行キャッシュ
+      (`_NGramCacheGen`) を埋めておく。`__call__` はキャッシュに乗っている
+      行をそのまま返し、乗っていない行だけ pread する。キャッシュへの
+      書き込みは `_cache_lock` で守られているので `__call__` と並走しても
+      壊れない (同じ行を二重に読んでも結果は同じなので、そこは守らない)。
+    - backend=mmap: `_madvise_prefetch` が対象行のページに
+      `MADV_WILLNEED` を打つだけ (`_gather_mmap` にキャッシュは無い --
+      ページキャッシュそのものが既にキャッシュなので二重に持たない)。
+      madvise はアドバイスを渡すだけの軽い syscall なので専用スレッドを
+      立てず、呼び出しスレッドで同期的に打ってすぐ返る。
 
     呼び出し側 (`mlxturbo/spec_flash.py` の `_prefetch_ngram_span`) は
     プロンプト全体を一度にではなく、**次の 1 eval 境界ぶんだけ**、直前境界の
@@ -287,7 +306,6 @@ class StreamNGram:
         self.wb = m.get("weight_bytes", self.npack * 4)
         self.sb = m.get("scale_bytes", self.ngrp * 2)
         rows_bin = self.dir / "rows.bin"
-        self.mm = np.memmap(rows_bin, dtype=np.uint8, mode="r", shape=(self.rows, self.rec))
 
         self.backend = backend or os.environ.get("FASTMLX_NGRAM_BACKEND", "pread")
         if self.backend not in ("mmap", "pread"):
@@ -322,10 +340,25 @@ class StreamNGram:
             )
             self._cache_lock = threading.Lock()
             self._cache_gen: "_NGramCacheGen | None" = None
+        else:
+            # backend=mmap: 生の mmap.mmap を自前で開く (np.memmap でも動くが、
+            # 内部で保持している mmap オブジェクトは numpy 非公開の `_mmap`
+            # 属性経由でしか触れず、madvise を打つのに使えない)。1 本の
+            # flat byte view を作ってから (rows, rec) へ reshape する --
+            # ファイル上は行が連続レコードとして並んでいるので、この reshape
+            # はコピーを起こさない view のまま
+            self._mmap_fd = os.open(str(rows_bin), os.O_RDONLY)
+            self._mmap_obj = mmap.mmap(self._mmap_fd, 0, access=mmap.ACCESS_READ)
+            self._mmap_view = np.frombuffer(self._mmap_obj, dtype=np.uint8).reshape(
+                self.rows, self.rec
+            )
+            # bound method を保持しておく (テストがここだけ差し替えて呼び出し
+            # 回数/引数を記録できるように)。madvise が無い環境
+            # (madvise(2) 自体が無い OS) では mmap オブジェクトにこの属性が
+            # 生えないので None のままにし、prefetch は黙って何もしない
+            self._madvise_fn = getattr(self._mmap_obj, "madvise", None)
 
-        self.prefetch_enabled = self.backend == "pread" and (
-            os.environ.get("MLXTURBO_NGRAM_PREFETCH", "0") == "1"
-        )
+        self.prefetch_enabled = os.environ.get("MLXTURBO_NGRAM_PREFETCH", "0") == "1"
         self.reset_stats()
 
         # `install()` は今のこのインスタンスへの参照を呼び手に返さない (現状
@@ -362,6 +395,25 @@ class StreamNGram:
         if pool is not None:
             try:
                 pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+        # `_mmap_view` は `_mmap_obj` の buffer export (np.frombuffer) を
+        # 抱えている。export が残ったまま mmap.close() を呼ぶと CPython は
+        # BufferError を出すので、参照を先に手放してから閉じる (握っている
+        # のがこのインスタンスだけならこれで export が消える。外部が
+        # `_mmap_view` を掴んだままなら close は例外を出すが、下の except で
+        # 飲む -- 後始末なので失敗しても致命的ではない)
+        self._mmap_view = None
+        mm_obj = getattr(self, "_mmap_obj", None)
+        if mm_obj is not None:
+            try:
+                mm_obj.close()
+            except Exception:
+                pass
+        fd = getattr(self, "_mmap_fd", None)
+        if fd is not None:
+            try:
+                os.close(fd)
             except Exception:
                 pass
 
@@ -546,16 +598,108 @@ class StreamNGram:
         _fire.bump("ngram_misses", n_miss)
         return out
 
+    def _gather_mmap(self, flat: np.ndarray) -> np.ndarray:
+        """backend=mmap: `self._mmap_view` ((rows, rec) の 1 本の view) から
+        numpy の fancy index 1 回で `flat` の行を集める。
+
+        `flat` をソートしてから読み、読み終わったあとで呼び出し順に並べ戻す。
+        ページキャッシュが温まっている行ほど近い行 id 同士がまとまって
+        メモリ上でも近くなる (1 ページに約 40 行入る) ので、ソート順で
+        触るほうが局所性が上がる -- 効果自体は行 id がハッシュでほぼ一様に
+        散っているため小さいが、無償なので付けておく。並べ戻すのは
+        呼び出し順を変えると出力の行の対応がずれ、`self._mmap_view[flat]`
+        直叩き (ソートしない場合) や `_gather_pread` (pread 経路) と
+        ビット一致しなくなるため。
+        """
+        n = flat.shape[0]
+        if n == 0:
+            return np.empty((0, self.rec), dtype=np.uint8)
+        order = np.argsort(flat, kind="stable")
+        sorted_rows = flat[order]
+        out_sorted = self._mmap_view[sorted_rows]
+        out = np.empty_like(out_sorted)
+        out[order] = out_sorted
+        return out
+
+    def _madvise_prefetch(self, ids64: np.ndarray) -> None:
+        """`ids64` の行が乗っているページに `MADV_WILLNEED` を打ち、
+        カーネルにバックグラウンドで先読みさせる。madvise はアドバイスを
+        渡すだけの軽い syscall で、呼び出しはすぐ返る (実際の読み込みは
+        カーネル側で非同期に進む) ので、pread backend の
+        `_prefetch_worker` と違って専用スレッドを立てる必要が無い。
+
+        行ごとに 1 回 madvise を打つと 1 チャンク (32,768 行) で 32,768 回の
+        syscall になるので、行のバイト範囲を `_MADVISE_CHUNK_BYTES` (16KB)
+        境界に丸めてから隣接/重複する範囲をまとめる。n-gram の行 id はハッシュで
+        ほぼ一様に散っているので実際にまとまる本数は少なく (16KB に約 163
+        行分の余地があっても、32,768 行 / 320M 行という疎さでは同じ 16KB に
+        2 つ以上乗る確率は低い、実測でも 32,768 行が約 32,000 区間にしか
+        減らない)、正しさには影響しない (mmap の madvise は重複した範囲に
+        何度打っても副作用が無い)。
+
+        **実測 (`tools/ngram_pread_bench.py --mmap`、実サイドカー、
+        2026-09-03): この「まとめても減らない」せいで、1 チャンク 32,768 行
+        ぶんの madvise 発行そのものに 160-370ms かかる (syscall 1 回あたり
+        5-9us x 約 32,000 回)。madvise 自体は軽い syscall で背景スレッドは
+        要らない、という前提はここで崩れる -- 1 回あたりは軽くても、束ねて
+        1 チャンクぶん打つと合計は無視できない。呼び出しはこの `prefetch()`
+        から同期的に行われる (専用スレッドは立てない設計のまま) ので、この
+        時間はそのまま呼び出し元のスレッドの壁時計に乗る。`_prefetch_ngram_span`
+        は直前境界の `mx.eval` 投入直前に呼ぶ設計なので、この 160-370ms は
+        次境界の `mx.eval` 投入をその分だけ遅らせる (GPU 実行 3.4-3.8s に対し
+        4-11%)。冷条件での読み出し自体は劇的に速くなる (同ベンチで 冷 mmap
+        単体 2.2-2.7s -> mmap+madvise 冷 19-35ms) ので、madvise 発行の遅延を
+        差し引いても正味は大幅な改善に見えるが、**この発行コストを飲み込んで
+        なお勝つかは in-model A/B で確認すること** (このモジュールの CPU
+        micro だけでは、次境界の GPU 実行と実際にどれだけ重なるかまでは
+        分からない)。
+        """
+        if self._madvise_fn is None or not hasattr(mmap, "MADV_WILLNEED"):
+            return
+        n = ids64.shape[0]
+        if n == 0:
+            return
+        rec = self.rec
+        chunk = _MADVISE_CHUNK_BYTES
+        uniq = np.unique(ids64)  # 昇順。starts は rec>0 なのでこの順のまま単調非減少
+        byte_lo = uniq * rec
+        byte_hi = byte_lo + rec
+        starts = (byte_lo // chunk) * chunk
+        ends = np.minimum(-(-byte_hi // chunk) * chunk, self.rows * rec)
+
+        # 隣接/重複区間の併合 (starts は単調非減少なので 1 パスで済む):
+        # 「それまでの区間の右端」の累積最大値より新しい区間の左端が大きい
+        # 位置だけが新しい区間の開始
+        running_max_end = np.maximum.accumulate(ends)
+        prev_end = np.concatenate(([np.int64(-1)], running_max_end[:-1]))
+        new_seg = starts > prev_end
+        seg_start_idx = np.nonzero(new_seg)[0]
+        seg_starts = starts[seg_start_idx]
+        seg_ends = np.maximum.reduceat(ends, seg_start_idx)
+
+        for s, e in zip(seg_starts.tolist(), seg_ends.tolist()):
+            self._madvise_fn(mmap.MADV_WILLNEED, s, e - s)
+
     def prefetch(self, flat_ids: np.ndarray) -> None:
-        """`flat_ids` のうち未キャッシュの行をバックグラウンドスレッドで
-        取り込む。呼び出しは即時に返る。backend=mmap または
-        `prefetch_enabled=False` のときは何もしない。"""
+        """未キャッシュ (mmap backend では未先読み) の行を先読みする。
+        呼び出しは即時に返る。`prefetch_enabled=False` のときは何もしない。
+
+        backend=pread: バックグラウンドスレッドが `_gather_pread` して
+        行キャッシュ (`_NGramCacheGen`) に積む (従来どおり)。
+        backend=mmap: スレッドを立てず、その場で `_madvise_prefetch` を
+        呼ぶだけ (madvise 自体が軽いので同期呼び出しで十分)。
+        """
         if not self.prefetch_enabled:
             return
         ids64 = np.asarray(flat_ids, dtype=np.int64).reshape(-1)
         if ids64.size == 0:
             return
         self.stats["prefetch_rows"] += ids64.size
+        if self.backend == "mmap":
+            self._madvise_prefetch(ids64)
+            self.stats["prefetch_done"] += 1
+            self._prefetch_thread = None
+            return
         t = threading.Thread(target=self._prefetch_worker, args=(ids64,), daemon=True)
         self._prefetch_thread = t
         t.start()
@@ -591,11 +735,7 @@ class StreamNGram:
         if self.backend == "pread":
             rec = self._gather_cached(flat)
         else:
-            # numpy's fancy index collects everything at once on the C side. A
-            # per-row Python loop would show up during generation, so always
-            # settle this with a single gather. Since one row is one contiguous
-            # record, this also touches only one page per row
-            rec = self.mm[flat]
+            rec = self._gather_mmap(flat)
         t2 = time.perf_counter()
         sync_ms = (t1 - t0) * 1000.0
         fetch_ms = (t2 - t1) * 1000.0

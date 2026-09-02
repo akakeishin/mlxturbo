@@ -10,6 +10,7 @@ interleaved) を tmp_path に焼き、StreamNGram.__call__ の出力を
 from __future__ import annotations
 
 import json
+import mmap as mmap_module
 import os
 import sys
 import threading
@@ -215,9 +216,12 @@ def test_prefetch_disabled_is_noop(tmp_path):
     # prefetch が無効なら行キャッシュ (既定 4M 行 = 419MB) は一度も確保しない
     # (B-7)。以前は空の生成物 (n==0) を無条件に確保していた。
     assert new._cache_gen is None
-    # backend=mmap のときも常に off (StreamNGram.__init__ の契約)
+    # backend=mmap も同じ環境変数 (MLXTURBO_NGRAM_PREFETCH) で決まる。この
+    # テストでは未設定なので既定 off のまま (mmap 固有の無効化は無い --
+    # 有効化した場合の挙動は test_mmap_prefetch_* 系で確認する)
     mmap_stream = StreamNGram(sidecar, backend="mmap")
     assert mmap_stream.prefetch_enabled is False
+    mmap_stream.close()
 
     gid = mx.array(ids.reshape(1, -1))
     _assert_bit_identical(new(gid), ref(gid))
@@ -443,6 +447,181 @@ def test_prefetch_ngram_span_matches_real_forward(tmp_path):
     assert stream.stats["hits"] == expected_flat.size
     assert stream.stats["misses"] == 0
     mx.eval(got)
+
+
+# --------------------------------------------------------- backend=mmap
+
+
+def test_mmap_backend_matches_reference(tmp_path):
+    """backend=mmap の __call__ (_gather_mmap 経由) が、行ごと pread の参照
+    実装とビット一致することを確認する。decode 1 ラウンド相当 (48 行) と
+    prefill 1 チャンク相当 (数千行) の両方。"""
+    sidecar, _ = _build_synthetic_sidecar(tmp_path)
+    ref = _RefStreamNGram(sidecar)
+    new = StreamNGram(sidecar, backend="mmap")
+    rng = np.random.default_rng(20)
+    try:
+        for shape in ((1, 3, 16), (1, 2000)):
+            ids = rng.integers(0, ROWS, size=int(np.prod(shape))).astype(np.int64)
+            gid = mx.array(ids.reshape(shape))
+            _assert_bit_identical(new(gid), ref(gid))
+    finally:
+        new.close()
+
+
+def test_gather_mmap_matches_naive_indexing(tmp_path):
+    """`_gather_mmap` (ソートしてから読んで元順に戻す) が、`_mmap_view` への
+    直接のファンシーインデックス (ソートしない、旧 mmap 経路と同じ) と完全に
+    同じ結果を返すことを確認する。重複行・0 行・1 行・行数が偶数/奇数の境界も
+    含める。"""
+    sidecar, rec = _build_synthetic_sidecar(tmp_path, rows=3000)
+    stream = StreamNGram(sidecar, backend="mmap")
+    rng = np.random.default_rng(21)
+    try:
+        for n in (0, 1, 2, 5, 63, 64, 65, 500, 2999):
+            ids = rng.integers(0, 3000, size=n).astype(np.int64)
+            # 重複を混ぜる (同じ行を複数回引く状況)
+            if n >= 4:
+                ids[1] = ids[0]
+                ids[-1] = ids[0]
+            got = stream._gather_mmap(ids)
+            want = stream._mmap_view[ids]
+            assert got.shape == (n, rec)
+            assert got.tobytes() == want.tobytes(), n
+    finally:
+        stream.close()
+
+
+def test_mmap_prefetch_disabled_by_default(tmp_path):
+    """backend=mmap も既定 (env var 未設定) では prefetch_enabled=False で
+    prefetch() は何もしない (madvise を一度も呼ばない)。"""
+    sidecar, _ = _build_synthetic_sidecar(tmp_path)
+    stream = StreamNGram(sidecar, backend="mmap")
+    try:
+        assert stream.prefetch_enabled is False
+        calls = []
+        stream._madvise_fn = lambda *a, **k: calls.append((a, k))
+        rng = np.random.default_rng(22)
+        ids = rng.integers(0, ROWS, size=500).astype(np.int64)
+        stream.prefetch(ids)
+        assert calls == []
+        assert stream.stats["prefetch_rows"] == 0
+        assert stream.stats["prefetch_done"] == 0
+    finally:
+        stream._madvise_fn = getattr(stream._mmap_obj, "madvise", None)
+        stream.close()
+
+
+def test_mmap_prefetch_enabled_via_env_calls_madvise_synchronously(tmp_path, monkeypatch):
+    """`MLXTURBO_NGRAM_PREFETCH=1` で backend=mmap も prefetch_enabled=True に
+    なり、`prefetch()` が (pread と違って) 専用スレッドを立てずにその場で
+    madvise を打って即座に戻ることを確認する。呼び出し後 `_prefetch_thread`
+    は None のまま (join すべきスレッドが無い) で、統計 (prefetch_rows /
+    prefetch_done) はどちらも即座に確定する。"""
+    monkeypatch.setenv("MLXTURBO_NGRAM_PREFETCH", "1")
+    sidecar, _ = _build_synthetic_sidecar(tmp_path)
+    stream = StreamNGram(sidecar, backend="mmap")
+    try:
+        assert stream.prefetch_enabled is True
+        calls = []
+        stream._madvise_fn = lambda option, start, length: calls.append((option, start, length))
+        rng = np.random.default_rng(23)
+        ids = rng.integers(0, ROWS, size=500).astype(np.int64)
+        stream.prefetch(ids)
+        assert calls, "madvise が一度も呼ばれなかった"
+        assert all(c[0] == mmap_module.MADV_WILLNEED for c in calls)
+        assert stream.stats["prefetch_rows"] == 500
+        assert stream.stats["prefetch_done"] == 1
+        assert stream._prefetch_thread is None  # 背景スレッドを立てない
+    finally:
+        stream._madvise_fn = getattr(stream._mmap_obj, "madvise", None)
+        stream.close()
+
+
+def test_mmap_prefetch_does_not_change_call_output(tmp_path, monkeypatch):
+    """madvise はあくまでアドバイスで、prefetch を挟んでも __call__ の
+    出力 (行の中身) は変わらない -- pread 経路の参照実装とビット一致し続ける
+    ことを確認する。"""
+    monkeypatch.setenv("MLXTURBO_NGRAM_PREFETCH", "1")
+    sidecar, _ = _build_synthetic_sidecar(tmp_path)
+    ref = _RefStreamNGram(sidecar)
+    stream = StreamNGram(sidecar, backend="mmap")
+    try:
+        assert stream.prefetch_enabled is True
+        rng = np.random.default_rng(24)
+        ids = rng.integers(0, ROWS, size=3000).astype(np.int64)
+        stream.prefetch(ids)  # 同期的に madvise を打つだけ。ここで完了している
+        gid = mx.array(ids.reshape(1, -1))
+        _assert_bit_identical(stream(gid), ref(gid))
+    finally:
+        stream.close()
+
+
+def test_madvise_prefetch_merges_adjacent_ranges(tmp_path):
+    """`_madvise_prefetch` が 16KB 境界に丸めたうえで隣接/重複する範囲を
+    まとめることを確認する。既定サイドカー (dim=160, bits=4, group_size=32)
+    の record_bytes は 100 バイトで、16KB チャンクには約 163 行分の余地が
+    ある。
+
+    - 連番 200 行 (100 バイト x 200 = 20,000 バイト): 行同士が隙間無く
+      連続しているので、丸めた範囲を跨いでも必ず 1 回にまとまる。
+    - 16KB の何倍も離して 5 か所から引いた行: 互いの範囲が重ならないので
+      5 回に分かれたまま (まとめすぎない) ことを確認する。
+    """
+    sidecar, rec = _build_synthetic_sidecar(tmp_path, rows=5000)
+    assert rec == 100  # 以下の行間隔の前提
+    stream = StreamNGram(sidecar, backend="mmap")
+    try:
+        calls = []
+        stream._madvise_fn = lambda option, start, length: calls.append((start, length))
+
+        # 連番 200 行: 行の生バイト範囲に隙間が無いので必ず 1 回にまとまる
+        dense_ids = np.arange(0, 200, dtype=np.int64)
+        stream._madvise_prefetch(dense_ids)
+        assert len(calls) == 1, calls
+        s, length = calls[0]
+        assert s == 0
+        assert length >= rec * 200
+
+        # 1000 行おきに 5 か所 (1000*100=100,000 バイト間隔 >> 16KB) からは
+        # まとめすぎず 5 回に分かれる
+        calls.clear()
+        scattered_ids = np.array([0, 1000, 2000, 3000, 4999], dtype=np.int64)
+        stream._madvise_prefetch(scattered_ids)
+        assert len(calls) == 5, calls
+        # 呼び出し順に単調増加 (starts が単調非減少なので、境界もその順)
+        starts = [c[0] for c in calls]
+        assert starts == sorted(starts)
+        assert len(set(starts)) == 5  # 5 区間が実際に別々
+    finally:
+        stream._madvise_fn = getattr(stream._mmap_obj, "madvise", None)
+        stream.close()
+
+
+def test_madvise_prefetch_noop_when_madvise_unavailable(tmp_path):
+    """madvise が使えない環境を模して (`_madvise_fn=None`)、prefetch が
+    例外を出さずに何もしないことを確認する。"""
+    sidecar, _ = _build_synthetic_sidecar(tmp_path)
+    stream = StreamNGram(sidecar, backend="mmap")
+    try:
+        stream._madvise_fn = None
+        rng = np.random.default_rng(25)
+        ids = rng.integers(0, ROWS, size=200).astype(np.int64)
+        stream._madvise_prefetch(ids)  # 例外を出さずに戻ってくるはず
+    finally:
+        stream._madvise_fn = getattr(stream._mmap_obj, "madvise", None)
+        stream.close()
+
+
+def test_mmap_close_is_idempotent_and_releases_view(tmp_path):
+    """`close()` を複数回呼んでも例外を出さず、`_mmap_view` への参照が
+    無くなる (BufferError を避けるための取り決め) ことを確認する。"""
+    sidecar, _ = _build_synthetic_sidecar(tmp_path)
+    stream = StreamNGram(sidecar, backend="mmap")
+    assert stream._mmap_view is not None
+    stream.close()
+    assert stream._mmap_view is None
+    stream.close()  # 2 回目も例外を出さない
 
 
 if __name__ == "__main__":

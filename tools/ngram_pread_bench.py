@@ -19,6 +19,14 @@
 であって「syscall 数を減らせるか」ではない (`StreamNGram` クラス docstring
 に詳しい経緯がある)。
   uv run python tools/ngram_pread_bench.py --sidecar ~/models/ddalcu-ngram --preadv
+
+--mmap: `mlxturbo/ngram_stream.py` の `StreamNGram` を直に使い、4 経路
+(pread / preadv / mmap / mmap+madvise 先読み後) を 1 チャンク相当の行数
+(既定 32768 = 2048 トークン x 16) で温 (同じ行を 2 回目) / 冷 (別の行、
+mmap+madvise だけは madvise を打ってから `--prefetch-delay` 秒待って読む)
+で比べる。sysctl vm.swapusage を前後で出す (32GB のファイルを mmap しても
+常駐はページキャッシュ任せで RSS/swap を無条件には食わないはずなのを見るため)。
+  uv run python tools/ngram_pread_bench.py --sidecar ~/models/ddalcu-ngram --mmap
 """
 
 from __future__ import annotations
@@ -26,11 +34,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def bench_mmap(mm, rows: int, n: int, iters: int, rng: np.random.Generator) -> float:
@@ -134,6 +148,143 @@ def bench_pread_vs_preadv(
     return ts_pread, ts_preadv
 
 
+def _swapusage() -> str:
+    """`sysctl vm.swapusage` の出力をそのまま返す (macOS のみ)。mmap で
+    32GB のファイルを開いても常駐はページキャッシュ任せ (RSS を無条件に
+    食うわけではない) はずだが、それを確かめたいので `--mmap` の前後で
+    呼んで報告する。"""
+    try:
+        out = subprocess.run(
+            ["sysctl", "vm.swapusage"], capture_output=True, text=True, timeout=5
+        )
+        return out.stdout.strip() or out.stderr.strip()
+    except Exception as e:  # pragma: no cover - 環境依存の best-effort
+        return f"(sysctl 失敗: {e})"
+
+
+def bench_mmap_backend(
+    sidecar: Path, rows: int, rec: int, n: int, threads: int, prefetch_delay: float,
+) -> None:
+    """StreamNGram の 4 経路 (pread / preadv / mmap / mmap+madvise 先読み後)
+    を、1 チャンク相当 (既定 32768 行) で温/冷 それぞれ比べる。
+
+    実装をそのまま使う (再実装しない) ので、ここで出る数字は
+    `mlxturbo/ngram_stream.py` の `_gather_pread` / `_gather_mmap` /
+    `_madvise_prefetch` を直に呼んだもの。`StreamNGram.__call__` の
+    dequantize (mx 側) は含まない -- 比べたいのは行取得 (ディスク/mmap)
+    だけなので、そこを混ぜると差が見えにくくなる。
+
+    温: 同じ行集合を 1 回捨て読みしてから 2 回目を計測 (ページキャッシュに
+    乗った状態)。
+    冷: 毎回新しく引いた行集合を初回だけ計測 (ページキャッシュに乗っていない
+    見込みが高い状態。320M 行からランダムに引くので条件間の重複はほぼ無い)。
+    mmap+madvise: 新しい行集合に `prefetch()` (= `_madvise_prefetch`) を打ち、
+    `--prefetch-delay` 秒待ってから読む。madvise がカーネル側の非同期読み込みを
+    間に合わせられていれば、冷の素の mmap より速く、温に近い値が出るはず。
+    """
+    from mlxturbo.ngram_stream import StreamNGram
+
+    print(f"\n=== backend 比較 (mmap): 1 回で {n} 行, pread/preadv は {threads} スレッド ===")
+    print("計測前:", _swapusage())
+
+    os.environ["MLXTURBO_NGRAM_PREFETCH"] = "1"  # madvise 先読みを有効にする
+    pread_s = StreamNGram(sidecar, backend="pread", n_threads=threads)
+    mmap_s = StreamNGram(sidecar, backend="mmap")
+    assert mmap_s.prefetch_enabled, "MLXTURBO_NGRAM_PREFETCH=1 が効いていない"
+
+    rng = np.random.default_rng()  # 種固定なし (前回実行のページキャッシュの跡を踏まない)
+
+    def fresh_ids() -> np.ndarray:
+        return rng.integers(0, rows, size=n).astype(np.int64)
+
+    results: dict[str, dict[str, float]] = {}
+
+    # --- pread (preadv 無効) ---
+    pread_s._use_preadv = False
+    warm_ids = fresh_ids()
+    pread_s._gather_pread(warm_ids)  # 捨て読みで温める
+    t0 = time.perf_counter()
+    pread_s._gather_pread(warm_ids)
+    warm_ms = (time.perf_counter() - t0) * 1000.0
+    cold_ids = fresh_ids()
+    t0 = time.perf_counter()
+    pread_s._gather_pread(cold_ids)
+    cold_ms = (time.perf_counter() - t0) * 1000.0
+    results["pread"] = dict(warm=warm_ms, cold=cold_ms)
+
+    # --- preadv ---
+    pread_s._use_preadv = True
+    warm_ids = fresh_ids()
+    pread_s._gather_pread(warm_ids)
+    t0 = time.perf_counter()
+    pread_s._gather_pread(warm_ids)
+    warm_ms = (time.perf_counter() - t0) * 1000.0
+    cold_ids = fresh_ids()
+    t0 = time.perf_counter()
+    pread_s._gather_pread(cold_ids)
+    cold_ms = (time.perf_counter() - t0) * 1000.0
+    results["preadv"] = dict(warm=warm_ms, cold=cold_ms)
+
+    # --- mmap + madvise 先読み ---
+    # 「先読み無し mmap」より先に測る。先読み無し mmap の冷条件は 32768 行
+    # ぶんの page fault が直列に走る一番重い区間で、直後の計測に I/O queue の
+    # 混雑を持ち越しうる (実際、先に置いたときは madvise submit が 350ms 台に
+    # 膨らみ、素の pread cold より遅く出た。単体の madvise loop だけを測ると
+    # 100ms 前後だったので、これは madvise 自体の費用ではなく直前の重い
+    # 区間からの持ち越しだった)。順序をここで固定し、素の mmap 冷は最後に回す。
+    #
+    # 温: 先読み対象と同じ行を先読み直後に読む (ほぼ即座なので madvise の
+    # 効果を切り分けるにはあまり意味が無いが、「先読み分は無条件に速い」の
+    # 対照として置く)
+    warm_ids = fresh_ids()
+    t0 = time.perf_counter()
+    mmap_s.prefetch(warm_ids)
+    submit_warm_ms = (time.perf_counter() - t0) * 1000.0
+    t0 = time.perf_counter()
+    mmap_s._gather_mmap(warm_ids)
+    warm_ms = (time.perf_counter() - t0) * 1000.0
+    # 冷: 新しい行集合に madvise を打ってから prefetch_delay 秒待って読む --
+    # 待っている間にカーネルがどこまで先読みを終えているかがそのまま出る
+    cold_ids = fresh_ids()
+    t0 = time.perf_counter()
+    mmap_s.prefetch(cold_ids)
+    submit_cold_ms = (time.perf_counter() - t0) * 1000.0
+    time.sleep(prefetch_delay)
+    t0 = time.perf_counter()
+    mmap_s._gather_mmap(cold_ids)
+    cold_ms = (time.perf_counter() - t0) * 1000.0
+    results["mmap+madvise"] = dict(
+        warm=warm_ms, cold=cold_ms, submit_warm=submit_warm_ms, submit_cold=submit_cold_ms
+    )
+
+    # --- mmap (先読み無し) --- 最後に置く (上のコメント参照)
+    warm_ids = fresh_ids()
+    mmap_s._gather_mmap(warm_ids)
+    t0 = time.perf_counter()
+    mmap_s._gather_mmap(warm_ids)
+    warm_ms = (time.perf_counter() - t0) * 1000.0
+    cold_ids = fresh_ids()
+    t0 = time.perf_counter()
+    mmap_s._gather_mmap(cold_ids)
+    cold_ms = (time.perf_counter() - t0) * 1000.0
+    results["mmap"] = dict(warm=warm_ms, cold=cold_ms)
+
+    print(f"\n{'経路':<16s} {'温 (ms)':>10s} {'冷 (ms)':>10s}   備考")
+    for name in ("pread", "preadv", "mmap", "mmap+madvise"):
+        r = results[name]
+        note = ""
+        if name == "mmap+madvise":
+            note = (
+                f"madvise submit: 温 {r['submit_warm']:.2f}ms / "
+                f"冷 {r['submit_cold']:.2f}ms (待ち {prefetch_delay:.1f}s 込みでない)"
+            )
+        print(f"{name:<16s} {r['warm']:>10.2f} {r['cold']:>10.2f}   {note}")
+
+    pread_s.close()
+    mmap_s.close()
+    print("\n計測後:", _swapusage())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sidecar", required=True)
@@ -155,12 +306,39 @@ def main():
         help="--preadv 時、行数・スレッド数の組ごとに何回 interleave するか"
              "(片側 iters 回、pread/preadv 合わせて 2x iters 回の読み出し)",
     )
+    ap.add_argument(
+        "--mmap", action="store_true",
+        help="StreamNGram の 4 経路 (pread / preadv / mmap / mmap+madvise 先読み後) "
+             "を 1 チャンク相当の行数で温/冷 比べる (mlxturbo/ngram_stream.py の"
+             "実装をそのまま使う)。--mmap-rows / --mmap-threads / --prefetch-delay"
+             "で調整できる",
+    )
+    ap.add_argument(
+        "--mmap-rows", type=int, default=32768,
+        help="--mmap 時に 1 回で読む行数。既定 32768 = 1 チャンク 2048 トークン x "
+             "16 (ngram_heads) 分",
+    )
+    ap.add_argument(
+        "--mmap-threads", type=int, default=12,
+        help="--mmap 時の pread/preadv 側のスレッド数",
+    )
+    ap.add_argument(
+        "--prefetch-delay", type=float, default=3.0,
+        help="--mmap 時、mmap+madvise の冷条件で madvise を打ってから読むまで"
+             "待つ秒数 (先読みが間に合っているかを見る)",
+    )
     args = ap.parse_args()
 
     sidecar = Path(args.sidecar).expanduser()
     manifest = json.loads((sidecar / "manifest.json").read_text())
     rows, rec = manifest["rows"], manifest["record_bytes"]
     print(f"{sidecar}  rows={rows:,}  record_bytes={rec}")
+
+    if args.mmap:
+        bench_mmap_backend(
+            sidecar, rows, rec, args.mmap_rows, args.mmap_threads, args.prefetch_delay
+        )
+        return
 
     mm = np.memmap(sidecar / "rows.bin", dtype=np.uint8, mode="r", shape=(rows, rec))
     fd = os.open(str(sidecar / "rows.bin"), os.O_RDONLY)
