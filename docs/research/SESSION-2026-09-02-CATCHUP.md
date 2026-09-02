@@ -520,3 +520,41 @@ B (dense+bool) 34.9 / 35.2 / 36.1 → **差なし**。17k の verify 幅 2 は�
 ので当然で、gather が効くのは S=1 のラウンドだけ。既定は変えない。
 
 ## 多日レーンを切った → `docs/research/LANES-2026-09.md`
+
+## GDN 前処理融合の A/B (fp32 写しで発火、2026-09-02 16:52-17:00、短文脈 3 本 x 512)
+
+発火 8316 回。ms/round **-1.1%**、tok/round -0.3%、ms/tok -0.5%。**取り分なし (却下、既定 off)。**
+36 層 x 約 20 op を 1 発にしても 0.4 ms しか縮まない = 小さい op は MLX/Metal 側で既に重なっていて、
+decode の +6 ms は dispatch 数ではない。部品別の突き合わせ (`decode_prof`) で場所を決める。
+
+## vllm-mlx の調査 (scout 実読、`~/dev/vllm-mlx`、Apache-2.0)
+
+- mlx_lm の `BatchGenerator` をモンキーパッチ。**固定の相方待ち窓は無い**: 毎 tick 待機要求を
+  空きがある限り `insert()` して走行中バッチに合流 (mid-run join)、仕事が無いときだけ待つ。
+- chunked prefill: prefill を budget ずつに割り、chunk 間に decode を 1 ステップ挟む。
+- MTP はバッチ全体に毎ステップ (B=1..N、最小バッチ無し)。
+- "paged KV" の実体はプレフィックスキャッシュのブロック格納 (paged attention ではない)。
+  GDN 系は mlx_lm の ArraysCache のバッチ対応に委ねる。qwen4_exp 未対応。
+- 性能主張: 5 並列で 3.4 倍 (Qwen3-0.6B)。
+- **レーン 5 への持ち込み**: 待ち窓を捨てて途中参加に寄せる、prefill を chunk して decode と
+  混ぜる、の 2 点。
+
+## 相手の `[decode-prof]` は取れなかった (2026-09-02 17:03)
+
+`MLX_SERVE_DECODE_PROFILE=1 --no-mtp --no-pld --log-level debug` で 200 トークン x 2 を流しても
+`[decode-prof]` 行が出ない (decode は 23.8 tok/s まで落ちるので profile 自体は効いている)。
+qwen4_exp の forward 経路では report が出ない可能性がある。相手側の部品別は諦め、うちの
+`tools/decode_prof.py` と `module_costs.py` で内訳を持ち、相手は合計 (fwd-ubench) だけで比べる。
+
+## うちの部品別 decode プロファイル (2026-09-02 17:10、`tools/decode_prof.py`、S=1、強制 eval)
+
+serial/tok 79.9 ms (embed 0.2 / attn 31.0 / mlp 38.5 / combine 8.2 / lmhead 2.0、
+moe: router 11.3 / experts 15.4 / shared ≈1) に対し、通常 forward は 22.9 ms。**強制 eval の
+上乗せが +57 ms (境界 ≈290 回 x 0.2 ms)** で、部品の値は同期費用に埋もれる。相手の
+`[decode-prof]` も取れなかったので、**この切り方での突き合わせは成立しない**。
+decode 短文脈の +6 ms は「部品別 (単体ループ) では MoE 8.6 / GDN 6.4 / HC 3.7 / attn 1.5 /
+lm_head 2.0 (計 22.1) に対し全体 27.9」という module_costs の形のまま未帰属。
+残る仮説: (a) MLX のビルド差 (相手は mlx-src を自前ビルド、buffer-pool cap 8GB)、
+(b) 層間の依存で露出するカーネルのレイテンシ差 (同じ op でも入力の contiguity が違う)、
+(c) HC 融合カーネル自身の遅さ (3.7 ms / 97 回 = 38 us)。次は (c) を単体で相手の
+hc_read 3 カーネルと比べる (レーン 1 の次の一手)。

@@ -1,4 +1,4 @@
-# 次のセッション用プロンプト (Fable 親、実装は Sonnet)
+# 次のセッション用プロンプト (2026-09-02 夕方版。Fable 親、実装は Sonnet)
 
 以下をそのまま新セッションの最初の入力にする。
 
@@ -7,111 +7,67 @@
 ## 依頼
 
 mlxturbo (`/Users/ht/dev/fastmlx`) が対戦相手 mlx-serve (`~/dev/mlx-serve`) に
-**速度で負けている**。その差を埋めて追い越すところまで、自律的に進めてほしい。
+**冷 prefill と短〜中文脈の decode で負けている**。多日レーン (`docs/research/LANES-2026-09.md`)
+のゲートを上から回し、差を埋める。ANE は M5 前提で本格化する方針、dflash-mlx / vllm-mlx は
+調査済み (同ファイル)。並列デコード (continuous batching) も対象。
 
-**やり方の指定はしない。**相手のソースを読むのも、うちを解剖するのも、
-相手が採っていない手を考えるのも、全部あなたの裁量。**ただし下の「守ること」は
-破らないこと。**
+**読む順**: `docs/research/LANES-2026-09.md` → `docs/research/SESSION-2026-09-02-CATCHUP.md`
+(本日の実測の全記録) → `CLAUDE.md` の計測の作法。
 
-## いまの現在地 (2026-09-02 実測、条件をそろえた単独測定)
+## 現在地 (2026-09-02、条件を揃えた単独測定。フルテストの最新値は
+`bench/results/self-snapshot-*-0902f*.json` と CATCHUP 末尾の表)
 
-`bench/self_snapshot.py` で両者を同じ手順で 1 つずつ測った値。
-mlx-serve は最新 (`8058076`、YaRN 1M) をビルド済み。
+前セッションの「prefill 2 倍差」はハーネスの産物だった (接頭辞キャッシュ、thinking 不一致)。
+揃えた実差: 冷 prefill 1.3-1.5 倍負け、decode 短文脈 12% / 17k 27% 負け (bool マスクで
+17k は -12.8% 改善済み)、温 TTFT 2 倍勝ち、50k は decode も勝ち。
 
-| 文脈 | 冷 TTFT serve / turbo | 温 TTFT serve / turbo | decode serve / turbo | prefill tok/s serve / turbo |
-|---|---|---|---|---|
-| 0 | 0.17 / **0.69** | 0.72 / **1.16** | 55.0 / **45.3** | 109 / **28** |
-| 4k | 2.99 / **7.30** | 0.85 / **1.21** | 54.1 / **42.5** | 1275 / **523** |
-| **17k** | **10.91 / 21.48** | 0.88 / **1.35** | 49.1 / **37.6** | 1541 / **783** |
-| **50k** | **36.77 / 68.51** | 1.55 / **1.96** | 45.0 / **35.7** | 1355 / **727** |
+## 今日入れた既定の変更 (全部 A/B と KLD 済み)
 
-**prefill が約半分、decode が約 4 分の 3。**品質は逆に**うちが 3 倍良い**
-(KLD 0.00445 対 0.01308、top-1 98.12%)。
+- QSA マスクを bool のまま sdpa へ (17k decode ms/tok -12.8%、出力不変)
+- oMLX 移植の GDN blocked-seq Metal (prefill -1.3〜-4.5%、KLD +0.00014)、`MLXTURBO_GDN_METAL=0` で戻る
+- n-gram 行取得のバッチ pread (ビット一致)
+- 端数チャンクのグループ化 (差なし、害なし)
 
-再現コマンド:
+却下 (既定 off のまま): n-gram 先読み、fast rope、GDN 前処理融合、RMSNormGated 融合、
+MoE router 融合、union gather (真の union が 6 割)。理由と数字は CATCHUP。
 
-    tools/biglock.sh .venv/bin/python bench/self_snapshot.py \
-      --model ~/models/ddalcu-mlxlm --ngram ~/models/ddalcu-ngram \
-      --ctxs 0,4000,17000,50000 --tokens 256 --reps 2
+## 守ること (CLAUDE.md に加えて、今日踏んだ罠)
 
-    tools/biglock.sh .venv/bin/python bench/self_snapshot.py \
-      --serve-bin ~/dev/mlx-serve/zig-out/bin/mlx-serve \
-      --serve-model ~/models/ddalcu-flashnext-serve-4bit \
-      --model ~/models/ddalcu-mlxlm --ctxs 0,4000,17000,50000 --tokens 256 --reps 2
+1. **熱**: GPU を 50 分回すと 17k prefill が 37 → 57 s。絶対値は冷えた最初の 1 本だけ。
+   A/B は回文順でも 1 本目が暴走するので、**2 本目以降で判定**する。
+2. **残留プロセス**: 計測ツールが終了時に固まって Metal のメモリを握る (直したが、
+   連鎖では各ジョブ後に `pkill -f "decode_ab.py --knob"` と `sysctl vm.swapusage` を確認)。
+3. **発火**: 融合の A/B は `発火` の表示を見てから読む (GDN 前処理は bf16 の A_log で
+   落ちていた)。
+4. **相手のログを読む**: `--log-level debug` の `[prefill-trace]` と `[spec-stats]`、
+   `[hot-cache] reused` で cache hit と thinking を確認する。
+5. **xctrace は MLX の GPU 区間を拾わない**。カーネル比較には使えない。
+6. **`~/models/ddalcu-ngram-sep` (RAM 常駐) は 17k で 41% 遅い**。長文脈は interleaved で。
 
-## 前のセッションが確かめたこと (再調査は不要。ただし疑ってよい)
-
-**`docs/research/KERNEL-PROGRAM.md` の冒頭「読む順」から入ること。**1650 行あるが、
-最初の 40 行と「このプログラムの答え」を読めば全体が分かる。
-
-要点だけ:
-
-- **prefill 35s の内訳と実質の伸びしろ**: MoE 1.4-1.7s / GDN 射影 0.6s (効率 88%) /
-  GDN スキャン 約 1s / attention 2.1s / HC 0s (取る手が無い)。**合計 5s 前後**
-- **decode に未帰属は無い。**段階投入 (`STAGE_EVERY=2`) が既に 18% 取っている
-- **相手は別の下限で走っている。**`gated_delta_blocked_seq` (seq>=64 の prefill 幅
-  専用、ブロック化スキャン) は逐次の FLOP を仮定したうちの下限を割れる。
-  相手の 536ms/チャンクに対しうちの計算上の下限が 762ms
-- **カーネルを 5 本書いて採用 1 本** (HC 書き戻しの -0.8%)。融合で dispatch を
-  減らす手はこの系でほとんど効かない
-- **「負けたから off」の knob 6 件を測り直して、判定の変更ゼロ**
-- **バッチは配線済みで、噛めば効く** (1880 トークン x 2 本・512 生成で
-  25.05 対 31.74s = **-21%**)。**ただし 2 つの条件がある**:
-  (a) n-gram サイドカーが `interleaved` でないと `rows_fit` が落ちて全要求が
-  単独に倒れる (`separate` は RAM 32GB 常駐)、(b) HTTP 経路の相方待ちが
-  取り分を食う (既定 15ms では会えず、1000ms では待ちが得を相殺)。
-  **「割に合わない」と一度書いたが誤りだった** (`docs/BACKLOG.md` の訂正節)
-
-**5s の積み上げでは 2 倍差は埋まらない。**別の下限に移るか、うちが見落として
-いる何かがある。**そこを見つけるのがこのセッションの仕事。**
-
-## 守ること (破ると数字が嘘になる。全部この 2 日で実際に踏んだ)
-
-`/Users/ht/dev/fastmlx/CLAUDE.md` の「計測の作法」を必ず読むこと。加えて:
-
-1. **率は時間ではない。**転嫁率 0.30 なら 60% の無駄は 18% の時間。
-   「効率が低い = 伸びしろがある」ではない (2026-09-02 に 3 例)
-2. **効率の分母が何を仮定しているか確かめる。**機械の天井で割ると
-   アルゴリズムの選択ミスが効率の数字に出ない
-3. **単体の測定は「その op の中での改善率」であって「ラウンドへの寄与」ではない**
-   (`gather_qmm` 96% / HC 52% / GDN スキャン 20% / `fast_qmm` の qkv -22%、
-   いずれもラウンドでは 1% 以下)
-4. **発火を確かめてから数字を読む。**`mlxturbo/kernels/_fire.py` の発火カウンタと
-   `/health` の `spec_batch`。**「効果ゼロ」の 3 件が「動いていなかった」だった**
-5. **数値を変えるカーネルは `ms/round` ではなく `tok/round` で判定する。**
-   投機デコードでは受理率が品質の指標そのもの
-6. **道具自体を対照で検査する。**`--knob null` (何もしない) と、機構だけの
-   対照 C の型がある。**A/B が長文脈で A 側に +5.6% の下駄を履かせていた**
-7. **同じものを 2 回測ると 2 回目は違う条件で走る** (接頭辞キャッシュ)。
-   温めは測定と別のプロンプト、繰り返しごとに別の窓
-8. **`tools/biglock.sh` を入れ子にしない** (自分のロックを 127 分待った)
-9. **`--prefill-once` は `DECODE_ONLY_KNOBS` の knob だけ**
-
-## 分業
-
-- **実装は Sonnet のサブエージェント**に出す。親 (Fable) は方針と計測の判定と
-  commit を持つ
-- 横断検索・ファイル特定は `scout`
-- 判断に分岐があるときだけ `opus-advisor` (親が Fable なので Opus 側を呼ぶ)
-
-## 使える道具 (この 2 日で整備した)
+## 使える道具 (今日足したもの)
 
 | | |
 |---|---|
-| `bench/self_snapshot.py` | 両エンジンを同じ手順で単独測定 |
-| `tools/decode_ab.py` | knob 式 A/B。回文順、グループごとの温め捨て、発火表示 |
-| `tools/prefill_anatomy.py` | prefill を部品に割る。MoE は中身まで |
-| `tools/decode_anatomy.py` | decode を部品に割る |
-| `tools/gpu_fingerprint.py` | GPU 分岐の一次検査。**発火 0 は不合格** |
-| `tools/vendor_fingerprint.py` | CPU の一次検査。**GPU 分岐は保証しない** |
-| `tools/calibrate.py` | 原始量 6 つを測って閾値を式から出す |
-| `tools/probe_tile_padding.py` | タイル水増しの因果 |
-| `tools/probe_moe_pressure.py` | メモリ圧の仮説検証 |
-| `tools/biglock.sh` | GPU の直列化とメモリ待ち |
-| `bench/quant_eval.py` | KLD。**品質を売って速度を買わない** |
+| `bench/self_snapshot.py` | 窓を重ねない・thinking を揃える・ログを残す版 (`--thinking`, `--server-log`) |
+| `tools/verify_width_cost.py` | 幅 S の verify forward 費用 (相手の fwd-ubench と同じ量) |
+| `tools/forward_split.py` | build (CPU) / eval (GPU) 分離 + op 数 |
+| `tools/decode_prof.py` | 部品別 (強制 eval、サイジング不可) |
+| `tools/gather_union_stats.py` | QSA タイル union の真の大きさ |
+| `tools/verify_gdn_metal.py` | GDN Metal の一致と単体速度 |
+| `bench/quant_eval.py compare --fusions` | 融合 knob 込みの KLD |
+| `tools/decode_ab.py --knob {bool-mask,gdn-metal,gdn-prework,fast-rope,fold-tail,ngram-*,gather-attn,wide}` | |
 
-## 期待する成果
+## 相手の測り方 (再現コマンド)
 
-**mlx-serve を超える。**超えられないなら、**なぜ超えられないかを実測で示す。**
+    MLX_SERVE_DECODE_FWD_UBENCH=30 MLX_SERVE_DECODE_FWD_UBENCH_S=1 MLX_SERVE_DECODE_FWD_UBENCH_KV=0 \
+      ~/dev/mlx-serve/zig-out/bin/mlx-serve --serve --model ~/models/ddalcu-flashnext-serve-4bit \
+      --host 127.0.0.1 --port 8161 --mtp --log-level info   # [fwd-ubench] 行を読んで落とす
 
-どちらでも、**判断が反転する条件を先に宣言してから測ること。**
+    tools/biglock.sh .venv/bin/python bench/self_snapshot.py --serve-bin ~/dev/mlx-serve/zig-out/bin/mlx-serve \
+      --serve-model ~/models/ddalcu-flashnext-serve-4bit --model ~/models/ddalcu-mlxlm \
+      --ctxs 0,4000,17000,25000,32000,50000 --tokens 256 --reps 2 --server-log bench/results/logs/serve.log
+
+## 分業
+
+実装は Sonnet のサブエージェント、親 (Fable) は方針・計測の判定・commit。判断に分岐があるときだけ
+`opus-advisor`。横断検索は `scout`。
