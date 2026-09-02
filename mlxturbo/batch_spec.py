@@ -733,11 +733,16 @@ def _ragged_indexer_call(self, x, rope, cache, offset, positions, orig):
     ブロック格子は論理列の上では**全行そろう** (どの行も論理 0 から cr 刻み)
     ので、pooled の rope 角は本家と同じ 1 本で済む。
 
-    行ごとに違うのは「何ブロックまでが実在するか」(``kv_len // cr``) だけで、
-    そこから先の端数列は本家と同じく因果窓で見せる。行の論理 kv 長が
-    ``token_budget`` 以下なら、可視ブロックの数が ``block_topk`` 以下に
-    なるので top-k は全部を選び、結果は素の causal と同じになる --- 単独
-    実行のその行が疎化されない (``__call__`` が None を返す) のと一致する。
+    行ごとに違うのは「何ブロックまでが実在するか」(``kv_len // cr``、
+    ``row_blocks``) だけで、そこから先の端数列は本家と同じく因果窓で見せる。
+    行の論理 kv 長が ``token_budget`` 以下の行は ``row_blocks`` を 0 に潰す
+    --- ブロック選択には一切乗せず、行全体を「格子の外」として因果窓
+    フォールバックに落とす。ブロック選択に乗せたまま「候補が block_topk
+    以下だから top-k が全部拾う」という理屈は成り立たない -- クエリ自身が
+    属するブロックは ``block_end <= q_col`` を満たさない限り (端の列で
+    ない限り) 候補にすら入らないので、budget 以下の短い行でも自分の直近
+    列が見えなくなっていた。単独実行のその行が疎化されない (``__call__``
+    が None を返す) のと一致させるには、行ごと causal に落とすしかない。
 
     ``dead slot も右パディングも無いラウンド``では物理列と論理列が全行
     一致するので、**本家をそのまま呼ぶ** (pooled の増分キャッシュもそのまま
@@ -803,7 +808,17 @@ def _ragged_indexer_call(self, x, rope, cache, offset, positions, orig):
     # だけブロック数も少ないことを表す (実在しないブロックの pooled は
     # 詰め物から作られた値なので、候補に入れてはいけない)。
     block_end = block_starts + cr - 1
-    row_blocks = m.kv_lens // cr  # (B,)
+    # budget 以下の行は単独実行なら疎化されない (`__call__` が None を返す)。
+    # ここでは複数行をまとめて処理するので、そういう行だけ実在ブロック数を
+    # 0 に潰す (B-1)。`in_block` (下) が全列 False になり、素の causal
+    # フォールバックが行全体に効く。潰さないと、クエリ自身が属するブロックは
+    # `block_end <= q_col` を満たせず候補にも入らないので、budget 以下でも
+    # 直近の列が消える。
+    row_blocks = mx.where(
+        m.kv_lens <= self.token_budget,
+        mx.zeros_like(m.kv_lens),
+        m.kv_lens // cr,
+    )  # (B,)
     visible = (block_end[None, None, :] <= q_col[:, :, None]) & (
         mx.arange(n_blocks)[None, None, :] < row_blocks[:, None, None]
     )

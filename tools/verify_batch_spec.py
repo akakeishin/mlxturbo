@@ -66,6 +66,11 @@ tools/verify_batch_cache.py が単体で確認済みの float32 丸め幅 (1.5e-
 - ``check_qsa_row_invariance``: 同じ機構を B=1 で回したものと、B=3 で
   同時に回したものが一致すること (行数だけが違う比較)。走行中の join と
   compaction を挟んだ場合も見る。
+- ``check_qsa_mixed_budget`` (B-1、追記 2026-09-02): budget を跨ぐ長い行と
+  跨がない短い行を同居させ、短い行の出力が単独実行と一致すること。プロンプト
+  長を固定して最初のラウンドから確実に踏ませる (受理/棄却の巡り合わせに
+  頼る ``check_qsa_row_invariance`` では、短い行が長い行に巻き込まれる瞬間を
+  安定して踏めない)。
 
 ## 既知の未対応
 
@@ -737,6 +742,55 @@ def check_qsa_row_invariance(model) -> bool:
     return ok
 
 
+def check_qsa_mixed_budget(model) -> bool:
+    """B-1: budget を跨ぐ長い行と跨がない短い行が同居するとき、短い行の出力が
+    単独実行と一致すること (17k 級の長い行 + 短いリクエストの同居を、合成
+    モデルの縮尺で再現したケース)。
+
+    ``_ragged_indexer_call`` はどれか 1 行でも論理 kv 長が ``token_budget`` を
+    超えたら**全行**をブロック選択経路に落とす (帳簿の ``qsa_max_len`` は
+    行ごとの最大)。修正前は budget 以下の短い行もそこに巻き込まれ、クエリ
+    自身が属するブロックが ``block_end <= q_col`` を満たせず候補にすら
+    入らないので、直近の列が不可視になっていた (B-1)。
+
+    長い行のプロンプト長を budget 超えに、短い行を budget 以下に固定して
+    join するので、**最初の検証ラウンドから確実にこの経路を踏む**
+    (`check_qsa_row_invariance` のような自然な受理/棄却の巡り合わせに頼らない)。
+    """
+    from mlxturbo.batch_spec import BatchSpecGenerator, SpecPrefillLane
+
+    eng = _engine(model)
+    budget = model.args.text.indexer_budget
+    long_prompt = [3 + i % 200 for i in range(budget + 8)]  # kv 長 > budget
+    short_prompt = [3, 11, 27, 5, 9, 41, 8, 17]  # kv 長 8 <= budget
+    n = 6
+
+    def prefilled(p):
+        lane = SpecPrefillLane(eng, p)
+        while not lane.finished:
+            lane.advance(min(8, lane.remaining))
+        return lane.result()
+
+    print(f"\n--- QSA 活性 (budget={budget}): budget を跨ぐ行との同居 (B-1) ---")
+    ref_gen = BatchSpecGenerator.from_prefilled(eng, [prefilled(short_prompt)])
+    while len(ref_gen.out[0]) < n:
+        ref_gen.step()
+    ref = ref_gen.out[0][:n]
+
+    mixed = BatchSpecGenerator.from_prefilled(
+        eng, [prefilled(long_prompt), prefilled(short_prompt)]
+    )
+    while min(len(o) for o in mixed.out) < n:
+        mixed.step()
+    got = mixed.out[1][:n]
+
+    ok = got == ref
+    print(f"  {'OK' if ok else 'NG'} 短い行 (単独 vs 長い行との同居): {n} トークン")
+    if not ok:
+        print(f"     alone={ref}\n     mixed={got}")
+    return ok
+
+
 def check_rounds(model, label: str) -> bool:
     """検証ラウンドを B 行同時に回した結果が、1 行ずつ回した結果と一致するか
     (最終 logits と全キャッシュ配列)。判定基準の (a)/(b) そのもの。"""
@@ -824,6 +878,13 @@ def main():
     print("\n\n########## QSA 活性 (indexer_budget=8) ##########")
     ok &= check_rounds(qsa, "QSA 活性")
     ok &= check_qsa_row_invariance(qsa)
+
+    # B-1: 短い行が budget を跨ぐ長い行と同居するケース。budget=8 だと
+    # cr=4 の短い行を「跨がない」まま数ラウンド維持する余地が狭いので、
+    # 別途 budget=32 で確保する (17k 級の長い行 + 短いリクエストの縮尺)。
+    qsa32 = build(budget=32)
+    print("\n\n########## QSA 活性 (indexer_budget=32) ##########")
+    ok &= check_qsa_mixed_budget(qsa32)
 
     print("\n=== 全ケース一致 ===" if ok else "\n=== 不一致あり ===")
     return 0 if ok else 1

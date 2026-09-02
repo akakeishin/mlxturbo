@@ -613,22 +613,22 @@ def disable_batch_cache() -> None:
 #      0.00378) for every configuration this module will ever actually
 #      admit into a shared batch.
 #
-# `classify()` below is *intended* to keep guarantee 3 honest, but as written
-# it does not fully do so (B-3): it looks only at one request's own
-# `prompt_len + max_tokens` against `indexer_budget`, while what actually
-# determines whether QSA can activate for a shared batch is the batch's
-# *physical* column count (`BatchKVCache._idx` = the longest co-resident
-# prompt plus elapsed decode steps). Two requests can each individually
-# classify "pool" (own prompt_len + max_tokens <= budget) and still, once
-# co-resident, push max(prompt_len) + max(max_tokens) across the batch past
-# budget — e.g. A = 2040+8 and B = 8+2040 against a 2048 budget: each is
-# "pool" alone, but sharing a batch gives a physical column count of
-# 2040 + 2040 = 4080 > 2048, so QSA can activate for that pair even though
-# neither request was classified "solo". The correct condition would be on
-# the co-resident set (max(prompt_len) + max(max_tokens) across whatever
-# ends up sharing the batch), not on each request in isolation; `classify()`
-# does not implement that (this comment records the gap, not a fix — the
-# runtime behavior of `classify()` is unchanged).
+# `classify()` below only ever sees one request at a time: `prompt_len +
+# max_tokens` against `indexer_budget`. What actually determines whether QSA
+# can activate for a shared batch is the batch's *physical* column count
+# (`BatchKVCache._idx` = the longest co-resident prompt plus elapsed decode
+# steps) — two requests can each individually classify "pool" (own
+# prompt_len + max_tokens <= budget) and still, once co-resident, push
+# max(prompt_len) + max(max_tokens) across the batch past budget — e.g.
+# A = 2040+8 and B = 8+2040 against a 2048 budget: each is "pool" alone, but
+# sharing a batch gives a physical column count of 2040 + 2040 = 4080 > 2048
+# (B-3). `classify()` stays the per-request heuristic it always was — it
+# cannot see who else will be resident. The actual guarantee (max(prompt_len)
+# + max(max_tokens) across the co-resident set never exceeds budget) is
+# enforced where that set is actually known: `_drive()`'s pool admission loop
+# (`_pool_admission_fits`) refuses to add a "pool" admission whenever doing so
+# would push the combined figure over budget, leaving it in `pending_pool`
+# until enough of the live pool has drained.
 #
 # QSA's block grid is cut by absolute column position, so an unequal-length,
 # left-padded batch can select a different set of blocks than solo
@@ -644,9 +644,8 @@ def disable_batch_cache() -> None:
 # joins" across a continuously-refilling batch is a correctness-sensitive
 # bookkeeping problem this pass chose not to take on; the cost is one
 # forgone speed opportunity (equal-length long prompts always run one at a
-# time here), not a correctness gap. That said, this "cost, not a gap" framing
-# assumes classify()'s solo/pool split is otherwise sound, which the
-# co-resident-budget gap above means it currently is not.
+# time here), not a correctness gap — classify()'s solo/pool split is sound
+# again now that the co-resident-budget gap above is closed at admission time.
 
 import queue as _queue
 import threading
@@ -670,16 +669,37 @@ def classify(model, prompt_len: int, max_tokens: int) -> str:
     batch with anything else (see the module docstring above). "pool": QSA
     cannot activate from this request's own length alone.
 
-    This is a per-request check, not a per-batch one (B-3, see the module
-    docstring above): two "pool" requests can still push a shared batch's
-    physical column count (longest co-resident prompt + elapsed steps) past
-    `indexer_budget` once they are actually co-resident, so "pool" does not
-    provably rule out QSA activating for the batch they end up in."""
+    Per-request only (B-3, see the module docstring above): two "pool"
+    requests can still push a shared batch's physical column count (longest
+    co-resident prompt + elapsed steps) past `indexer_budget` once they are
+    actually co-resident. `classify()` cannot see who else will be resident,
+    so it does not by itself rule that out — `BatchCoordinator._drive()`'s
+    pool admission loop (`_pool_admission_fits`) enforces the actual
+    guarantee where the co-resident set is known."""
 
     budget = _indexer_budget(model)
     if budget is None:
         return "pool"
     return "solo" if (prompt_len + max_tokens) > budget else "pool"
+
+
+def _pool_admission_fits(
+    candidate: "Admission", resident: list, budget: int | None
+) -> bool:
+    """B-3: whether adding ``candidate`` to the already-live ``resident``
+    pool admissions keeps the co-resident set's guarantee intact —
+    max(prompt_len) + max(max_tokens), taken across ``resident + [candidate]``,
+    must stay within ``budget`` (``None`` means the architecture has no QSA,
+    so anything fits). ``classify()`` already proved this for ``candidate``
+    alone; this is the check it cannot make on its own (no visibility into
+    who else is resident)."""
+
+    if budget is None or not resident:
+        return True
+    rows = resident + [candidate]
+    longest_prompt = max(len(a.prompt_ids) for a in rows)
+    longest_tokens = max(a.max_tokens for a in rows)
+    return longest_prompt + longest_tokens <= budget
 
 
 @dataclass
@@ -856,8 +876,22 @@ class BatchCoordinator:
                     (pending_solo if adm.tier == "solo" else pending_pool).append(adm)
 
                 if mode in (None, "pool"):
-                    while pending_pool and len(live) < self.max_batch:
-                        admit(pending_pool.pop(0), "pool")
+                    # B-3: 各候補は「今すでに live な pool 行 + 自分」の
+                    # max(prompt_len) + max(max_tokens) が budget に収まる
+                    # ときだけ入れる (classify() は自分の値しか見ないので、
+                    # 同居する相手を知らない)。収まらない候補は先頭で止めて
+                    # pending_pool に残す -- pool が空くまで待たせれば、次に
+                    # 試すときは resident が減って通る可能性が出る。
+                    budget = _indexer_budget(self.model)
+                    resident = list(live.values())
+                    while (
+                        pending_pool
+                        and len(live) < self.max_batch
+                        and _pool_admission_fits(pending_pool[0], resident, budget)
+                    ):
+                        adm = pending_pool.pop(0)
+                        admit(adm, "pool")
+                        resident.append(adm)
                 if mode is None and not live and pending_solo:
                     admit(pending_solo.pop(0), "solo")
 
