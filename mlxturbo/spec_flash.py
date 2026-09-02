@@ -506,6 +506,45 @@ def _group_prefill_forward(model, chunks, caches):
     return hs
 
 
+def _prefetch_ngram_rows(model, ids: mx.array, caches) -> None:
+    """この呼び出しで prefill する `ids` 全体ぶんの n-gram 行を先読みする。
+
+    prefill では `ids` (プロンプト全体、またはセッション継続時はその新規
+    分) の行 id が最初から全部わかっているので、GPU がチャンク 0 を計算
+    している間に CPU 側でディスクから先読みしておけば、後続チャンクの
+    `StreamNGram.__call__` が待たずに返る。`ngram_ids` の計算自体は 1 回
+    (GPU) で済ませ、以降は `StreamNGram.prefetch` がバックグラウンドスレッド
+    で pread する (呼び出しは即時に返る)。
+
+    `ngram_embedding` が `StreamNGram` でない (RamNGram / 未 install) か
+    `prefetch_enabled=False` のときは何もしない (`getattr` で判定)。
+
+    先頭の文脈 (`prev_ctx`) の扱いは `Qwen4ExpModel._prelude` /
+    `_group_prefill_forward` と揃えてある: セッション継続ならキャッシュ
+    (`pc[3]`) の文脈から、そうでなければ eos x(ngram_size-1) から始める。
+    ここがズレても正しさは壊れない (miss してその場で pread するだけ) が、
+    先読みの分だけ効かなくなる。
+    """
+    if ids.shape[1] == 0:
+        return
+    m = model.model
+    for pli in m.ple_layers:
+        ple_emb = m.layers[pli].ple.ple_embedding
+        stream = ple_emb.ngram_embedding
+        if not getattr(stream, "prefetch_enabled", False):
+            continue
+        pc = caches[pli] if caches is not None else None
+        prev = pc[3] if pc is not None else None
+        if prev is None:
+            prev = mx.full(
+                (ids.shape[0], ple_emb.context_len), ple_emb.eos_token_id, ids.dtype
+            )
+        history = mx.concatenate([prev, ids], axis=1)
+        gid = ple_emb.ngram_ids(history)[:, -ids.shape[1] :]
+        mx.eval(gid)
+        stream.prefetch(np.array(gid.reshape(-1), copy=False).astype(np.int64))
+
+
 def _pipeline_snapshot(model, caches, mtp_cache):
     """楽観先組み (次ラウンドのグラフを結果を知らずに組む) 用の浅い退避。
 
@@ -1094,6 +1133,11 @@ class FlashSpecEngine:
             # capture(light=True) records only GatedResidual's hyper, so this
             # does not reintroduce the OOM that `light` exists to avoid.
             hyper_chunks = []
+            if _pf:
+                _t = time.perf_counter()
+            _prefetch_ngram_rows(model, ids, caches)
+            if _pf:
+                _t = _pf.log("prefetch", _t)
             while i < n:
                 remaining = n - i
                 # 前方の等長 2048 チャンクだけレイヤー主導でグループ処理する
@@ -1222,13 +1266,22 @@ class FlashSpecEngine:
                 # Keep the successfully prefetched cache, but do not expose the
                 # first sampled ``cur``.  This mirrors SpecEngine.generate(0) and
                 # lets FlashSpecRunner publish exactly the prompt as processed.
+                if _pf:
+                    _pf.mark_end()
+                    _pf.summary()
                 return 0, 0, (logits_tail, hyper_tail0, None)
             hyper_tail = (
                 hyper_chunks[0] if len(hyper_chunks) == 1
                 else mx.concatenate(hyper_chunks, axis=1)
             )
+            if _pf:
+                _t = time.perf_counter()
             mtp_cache = self._prime_draft_cache(ids[:, -hyper_tail.shape[1]:], hyper_tail)
+            if _pf:
+                _t = _pf.log("prime", _t)
             mtp_snap = snapshot_mtp_cache(mtp_cache)
+            if _pf:
+                _pf.mark_end()
 
         if max_tokens == 0:
             # Only reachable via ``use_resume`` -- the normal path already

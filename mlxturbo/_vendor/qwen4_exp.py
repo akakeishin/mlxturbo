@@ -1294,9 +1294,16 @@ class NGramEmbedding(nn.Module):
         ok = (in_segment >= shift) & (src[None] >= 0)
         return mx.where(ok, gathered, self.eos_token_id)
 
-    def __call__(self, ids: mx.array, prev_context: mx.array) -> mx.array:
-        n_new = ids.shape[1]
-        history = mx.concatenate([prev_context, ids], axis=1).astype(mx.int64)
+    def ngram_ids(self, ids_with_ctx: mx.array) -> mx.array:
+        """``ids_with_ctx`` (直前文脈 + 新規 ids を結合した ID 列) の全位置ぶんの
+        行 id (B, T, ngram_heads) を返す。
+
+        `__call__` から計算部分だけを切り出したもの (値はビット一致)。
+        prefill では文脈込みのプロンプト全体を丸ごと渡せば全位置ぶんの gid が
+        1 回で求まるので、`mlxturbo/spec_flash.py` の n-gram 先読み
+        (`StreamNGram.prefetch`) もこれを呼ぶ。
+        """
+        history = ids_with_ctx.astype(mx.int64)
         shifted = [self._shift_right(history, s) for s in range(self.ngram_size)]
 
         blocks = []
@@ -1311,7 +1318,12 @@ class NGramEmbedding(nn.Module):
             )
             blocks.append(self.ngram_heads_offsets[lo:hi].reshape(1, 1, -1) + gid)
 
-        gid = mx.concatenate(blocks, axis=-1)[:, -n_new:]
+        return mx.concatenate(blocks, axis=-1)
+
+    def __call__(self, ids: mx.array, prev_context: mx.array) -> mx.array:
+        n_new = ids.shape[1]
+        history = mx.concatenate([prev_context, ids], axis=1)
+        gid = self.ngram_ids(history)[:, -n_new:]
         return self.ngram_embedding(gid).reshape(*gid.shape[:2], -1)
 
 

@@ -37,10 +37,14 @@ from __future__ import annotations
 import json
 import os
 import struct
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+
+from .kernels import _fire
 
 _SHARD_RE = "ngram_embedding.shard_"
 
@@ -167,6 +171,24 @@ def build_sidecar(
 # ------------------------------------------------------------ runtime lookups
 
 
+class _NGramCacheGen:
+    """行キャッシュ 1 世代ぶんの入れ物 (辞書 + スロット配列)。
+
+    満杯になったら世代ごと差し替える (このオブジェクトを作り直して
+    `StreamNGram._cache_gen` に付け替える)。既存の世代を in-place で
+    使い回さないのは、読み手が世代への参照を 1 回だけ取ってから読む限り、
+    書き手が別スレッドで新しい行を足したり世代を丸ごと差し替えたりしても
+    読み手の見ているスロットの中身が後から書き換わることが無いようにする
+    ため (満杯 -> 全消し のときに起こりうる)。"""
+
+    __slots__ = ("idx", "buf", "n")
+
+    def __init__(self, cap: int, rec: int):
+        self.idx: dict[int, int] = {}
+        self.buf = np.empty((cap, rec), dtype=np.uint8)
+        self.n = 0
+
+
 class StreamNGram:
     """Fetch only the needed rows from the sidecar. Same calling convention as
     `_ShardedEmbedding`.
@@ -191,6 +213,16 @@ class StreamNGram:
 
     The mmap path is kept so it can be reverted to if this regresses. Switch with
     `FASTMLX_NGRAM_BACKEND=mmap` or `backend="mmap"`.
+
+    prefetch: prefill プロンプトの行 id は最初から全部わかっているので、
+    `prefetch()` にまとめて渡すと専用のバックグラウンドスレッドが行キャッシュ
+    (`_NGramCacheGen`) を埋めておく。`__call__` はキャッシュに乗っている行を
+    そのまま返し、乗っていない行だけ pread する。呼び出しは即時に返り、キャッシュ
+    への書き込みは `_cache_lock` で守られているので `__call__` と並走しても壊れない
+    (同じ行を二重に読んでも結果は同じなので、そこは守らない)。
+    `MLXTURBO_NGRAM_PREFETCH=1` で有効化できる (既定 off。17k の in-model A/B
+    (`tools/decode_ab.py --knob ngram-prefetch`) で先読みの取り分が 0% だった
+    ため。backend=mmap では常に無効)。
     """
 
     def __init__(
@@ -198,6 +230,7 @@ class StreamNGram:
         sidecar: Path,
         backend: str | None = None,
         n_threads: int | None = None,
+        cache_rows: int | None = None,
     ):
         self.dir = Path(sidecar)
         m = json.loads((self.dir / "manifest.json").read_text())
@@ -215,6 +248,10 @@ class StreamNGram:
         self.backend = backend or os.environ.get("FASTMLX_NGRAM_BACKEND", "pread")
         if self.backend not in ("mmap", "pread"):
             raise ValueError(f"backend は mmap/pread のどちらか ({self.backend})")
+        # `_gather_pread` の「64 行未満は行ごと submit / それ以上はスライス
+        # 分割」の閾値。tools/decode_ab.py の ngram-batch knob が
+        # `10**9` に上げて常に行ごと経路 (旧経路) を踏ませる A/B に使う
+        self.batch_min_rows = 64
         if self.backend == "pread":
             self.n_threads = n_threads or int(
                 os.environ.get("FASTMLX_NGRAM_THREADS", "12")
@@ -225,39 +262,207 @@ class StreamNGram:
             self._pool = ThreadPoolExecutor(max_workers=self.n_threads)
             self._fd = os.open(str(rows_bin), os.O_RDONLY)
 
+            # 行キャッシュ (prefetch 用)。既定 4M 行 = 400MB (50k プロンプト =
+            # 80万行が入る)。満杯になったら世代ごと全消し (単純さ優先)
+            self._cache_cap = cache_rows or int(
+                os.environ.get("FASTMLX_NGRAM_CACHE_ROWS", str(1 << 22))
+            )
+            self._cache_lock = threading.Lock()
+            self._cache_gen = _NGramCacheGen(self._cache_cap, self.rec)
+
+        self.prefetch_enabled = self.backend == "pread" and (
+            os.environ.get("MLXTURBO_NGRAM_PREFETCH", "0") == "1"
+        )
+        self.reset_stats()
+
+    def reset_stats(self) -> None:
+        """発火カウンタを初期化しなおす。A/B の条件ごとの頭で呼ぶ。"""
+        self.stats: dict[str, float] = dict(
+            calls=0, rows=0, hits=0, misses=0, prefetch_rows=0,
+            prefetch_done=0, sync_ms=0.0, fetch_ms=0.0,
+        )
+
+    def stats_line(self) -> str:
+        """`self.stats` を 1 行にまとめる (ログ用)。"""
+        s = self.stats
+        total = s["hits"] + s["misses"]
+        hit_rate = s["hits"] / total * 100 if total else 0.0
+        return (
+            f"ngram calls={s['calls']} rows={s['rows']} hits={s['hits']} "
+            f"misses={s['misses']} hit_rate={hit_rate:.1f}% "
+            f"prefetch_rows={s['prefetch_rows']} prefetch_done={s['prefetch_done']} "
+            f"sync_ms={s['sync_ms']:.2f} fetch_ms={s['fetch_ms']:.2f}"
+        )
+
     def _gather_pread(self, flat: np.ndarray) -> np.ndarray:
         """Take an array of row ids and fill in the corresponding records with
-        parallel preads."""
+        parallel preads.
+
+        `self.batch_min_rows` (既定 64) 未満は従来どおり行ごとに future を 1 つ
+        submit する (decode の 48 行はこちらの並列度が効く)。それ以上は `flat`
+        を `n_threads` 個の連続スライスに割り、各 future が自分のスライスを
+        ループで pread する -- 行ごとの submit/result にかかる Python 側費用
+        (実測 7.6us/行、prefill 1 チャンク 32768 行で約 250ms) を消すため。
+        結果は従来と完全に同じ `buf` (bit 一致)。`tools/decode_ab.py` の
+        ngram-batch knob は `batch_min_rows` を `10**9` にして常にこの行ごと
+        経路 (旧経路) を踏ませ、バッチ化そのものの取り分を切り分ける。
+        """
 
         n = flat.shape[0]
-        buf = np.empty((n, self.rec), dtype=np.uint8)
         rec_bytes = self.rec
+        buf = np.empty((n, rec_bytes), dtype=np.uint8)
+        fd = self._fd
 
-        def read_one(i: int, row_id: int) -> None:
-            # os.pread releases the GIL, so the disk I/O really does run in
-            # parallel here. The destination buf[i] is disjoint per row, so
-            # there is no contention
-            buf[i] = np.frombuffer(
-                os.pread(self._fd, rec_bytes, int(row_id) * rec_bytes), dtype=np.uint8
-            )
+        if n < self.batch_min_rows:
+            def read_one(i: int, row_id) -> None:
+                # os.pread releases the GIL, so the disk I/O really does run in
+                # parallel here. The destination buf[i] is disjoint per row, so
+                # there is no contention
+                buf[i] = np.frombuffer(
+                    os.pread(fd, rec_bytes, int(row_id) * rec_bytes), dtype=np.uint8
+                )
 
-        futures = [self._pool.submit(read_one, i, row_id) for i, row_id in enumerate(flat)]
+            futures = [
+                self._pool.submit(read_one, i, row_id) for i, row_id in enumerate(flat)
+            ]
+            for f in futures:
+                f.result()
+            return buf
+
+        def read_range(lo: int, hi: int) -> None:
+            for i in range(lo, hi):
+                row_id = int(flat[i])
+                buf[i] = np.frombuffer(
+                    os.pread(fd, rec_bytes, row_id * rec_bytes), dtype=np.uint8
+                )
+
+        n_th = min(self.n_threads, n)
+        step = -(-n // n_th)  # ceil div
+        futures = [
+            self._pool.submit(read_range, lo, min(lo + step, n))
+            for lo in range(0, n, step)
+        ]
         for f in futures:
             f.result()
         return buf
 
+    def _cache_put(self, rows: np.ndarray, data: np.ndarray) -> None:
+        """`rows`/`data` (`_gather_pread` の戻り値) をキャッシュへ書き込む。
+
+        スロットの割り当てとキャッシュ辞書への公開をロックの下で行う。
+        `buf[slot] = data` を辞書への登録より先に済ませてから登録するので、
+        ロック無しで読む `_gather_cached` は「辞書にあれば buf の中身も
+        揃っている」を常に見られる。満杯なら世代ごと差し替える (既存の
+        読み手がまだ古い世代を掴んでいても、その世代は書き換えない)。
+        """
+        with self._cache_lock:
+            gen = self._cache_gen
+            for i in range(rows.shape[0]):
+                row = int(rows[i])
+                if row in gen.idx:
+                    continue
+                if gen.n >= self._cache_cap:
+                    gen = _NGramCacheGen(self._cache_cap, self.rec)
+                    self._cache_gen = gen
+                gen.buf[gen.n] = data[i]
+                gen.idx[row] = gen.n
+                gen.n += 1
+
+    def _gather_cached(self, flat: np.ndarray) -> np.ndarray:
+        """`flat` をキャッシュ済み/未キャッシュに分け、未キャッシュ分だけ
+        `_gather_pread` する。ヒット分はキャッシュのスロット配列から集める。
+        戻り値は従来 (`_gather_pread(flat)` だけ) と完全に同じ `buf`。
+
+        キャッシュが空 (`gen.n == 0`) のときは全行が確実に miss なので、
+        1 行ずつ `idx.get` する意味が無い。素通しで `_gather_pread` に渡す
+        (無駄な dict 参照を消す)。
+        """
+        gen = self._cache_gen  # 1 回だけ読む: 以降はこの世代の idx/buf で通す
+        n = flat.shape[0]
+        if gen.n == 0:
+            out = self._gather_pread(flat)
+            self._cache_put(flat, out)
+            self.stats["misses"] += n
+            _fire.bump("ngram_misses", n)
+            return out
+        idx, buf = gen.idx, gen.buf
+        out = np.empty((n, self.rec), dtype=np.uint8)
+        miss_pos: list[int] = []
+        miss_rows: list[int] = []
+        for i in range(n):
+            row = int(flat[i])
+            slot = idx.get(row)
+            if slot is None:
+                miss_pos.append(i)
+                miss_rows.append(row)
+            else:
+                out[i] = buf[slot]
+        if miss_rows:
+            miss_arr = np.asarray(miss_rows, dtype=np.int64)
+            got = self._gather_pread(miss_arr)
+            for j, i in enumerate(miss_pos):
+                out[i] = got[j]
+            self._cache_put(miss_arr, got)
+        n_miss = len(miss_rows)
+        n_hit = n - n_miss
+        self.stats["hits"] += n_hit
+        self.stats["misses"] += n_miss
+        _fire.bump("ngram_hits", n_hit)
+        _fire.bump("ngram_misses", n_miss)
+        return out
+
+    def prefetch(self, flat_ids: np.ndarray) -> None:
+        """`flat_ids` のうち未キャッシュの行をバックグラウンドスレッドで
+        取り込む。呼び出しは即時に返る。backend=mmap または
+        `prefetch_enabled=False` のときは何もしない。"""
+        if not self.prefetch_enabled:
+            return
+        ids64 = np.asarray(flat_ids, dtype=np.int64).reshape(-1)
+        if ids64.size == 0:
+            return
+        self.stats["prefetch_rows"] += ids64.size
+        t = threading.Thread(target=self._prefetch_worker, args=(ids64,), daemon=True)
+        self._prefetch_thread = t
+        t.start()
+
+    def _prefetch_worker(self, ids64: np.ndarray) -> None:
+        gen = self._cache_gen
+        idx = gen.idx
+        uniq = np.unique(ids64)
+        # 事前に重複/既キャッシュ分を削る (無くても正しさは変わらないが、
+        # 同じ行を何度も pread しないほうが速い)
+        missing = [int(r) for r in uniq.tolist() if int(r) not in idx]
+        if not missing:
+            self.stats["prefetch_done"] += 1
+            return
+        miss_arr = np.asarray(missing, dtype=np.int64)
+        got = self._gather_pread(miss_arr)
+        self._cache_put(miss_arr, got)
+        self.stats["prefetch_done"] += 1
+
     def __call__(self, gid):
         import mlx.core as mx
 
+        t0 = time.perf_counter()
+        # ここの np.array(gid.reshape(-1)) が GPU->CPU 同期そのもの
         flat = np.array(gid.reshape(-1), copy=False).astype(np.int64)
+        t1 = time.perf_counter()
         if self.backend == "pread":
-            rec = self._gather_pread(flat)
+            rec = self._gather_cached(flat)
         else:
             # numpy's fancy index collects everything at once on the C side. A
             # per-row Python loop would show up during generation, so always
             # settle this with a single gather. Since one row is one contiguous
             # record, this also touches only one page per row
             rec = self.mm[flat]
+        t2 = time.perf_counter()
+        sync_ms = (t1 - t0) * 1000.0
+        fetch_ms = (t2 - t1) * 1000.0
+        self.stats["calls"] += 1
+        self.stats["rows"] += flat.shape[0]
+        self.stats["sync_ms"] += sync_ms
+        self.stats["fetch_ms"] += fetch_ms
+        _fire.bump("ngram_sync_ms", sync_ms)
         n = rec.shape[0]
         w = mx.array(rec[:, : self.wb].copy().view(np.uint32).reshape(n, self.npack))
         s = mx.array(

@@ -843,6 +843,10 @@ def _knob_ngram_prefetch(ctx):
     (`control_identical=True`)。判定は **prefill_s** (prefill-group knob と
     同じ扱い)。`--prefill-once` とは併用できない (prefill 自体を先読みごと
     畳んでしまうと A/B の差が消える) ので `DECODE_ONLY_KNOBS` には入れない。
+
+    `StreamNGram.prefetch_enabled` の既定は off (`MLXTURBO_NGRAM_PREFETCH=1`
+    で明示的に有効化しない限り on にならない)。17k の in-model A/B で先読みの
+    取り分が 0% だったため (2026-09-02)。
     """
     model = ctx["eng"].model
     if not ctx["args"].ngram:
@@ -865,6 +869,47 @@ def _knob_ngram_prefetch(ctx):
     def apply(variant):
         for s in streams:
             s.prefetch_enabled = variant == "A"
+
+    return apply
+
+
+def _knob_ngram_batch(ctx):
+    """`StreamNGram._gather_pread` のバッチ化 pread 自体の取り分。
+    A = 既定 (`batch_min_rows=64`、64 行以上はスライス分割 + 並列 pread) /
+    B = `batch_min_rows=10**9` (常に行ごとに future を 1 つ submit する
+    旧経路)。
+
+    17k の ngram-prefetch A/B で差が 0% だった (B もバッチ化 pread を含む
+    ため)。prefetch の発火有無とバッチ化自体の取り分が分かれていなかった
+    ので、こちらでバッチ化だけを切り出す。prefetch は両側とも `--ngram`
+    install 時点の既定 (on) のまま触らない。
+
+    行の中身は変えないので出力は一致するはず (`control_identical=True`)。
+    判定は prefill_s (n-gram lookup は prefill のチャンクで大量の行数を
+    まとめて叩くので、バッチ化の差はここに出るはず。decode の 48 行は
+    どちらの分岐でも同じ「行ごと submit」経路を通るので差が出ない)。
+    """
+    model = ctx["eng"].model
+    if not ctx["args"].ngram:
+        raise ValueError("ngram-batch には --ngram (StreamNGram の install) が要る")
+    streams = []
+    for layer in model.model.layers:
+        ple = getattr(layer, "ple", None)
+        if ple is None:
+            continue
+        stream = ple.ple_embedding.ngram_embedding
+        if not hasattr(stream, "batch_min_rows"):
+            raise ValueError(
+                "ngram_embedding が StreamNGram ではない (--ngram の manifest が"
+                " layout=separate だと RamNGram になり batch_min_rows を持たない)"
+            )
+        streams.append(stream)
+    if not streams:
+        raise ValueError("PLE 層が見つからない")
+
+    def apply(variant):
+        for s in streams:
+            s.batch_min_rows = 64 if variant == "A" else 10**9
 
     return apply
 
@@ -901,6 +946,8 @@ KNOBS = {
     "ngram-layout": (_knob_ngram_layout, ["A", "B"], True, "A"),
     # A = 先読み有効 (既定) / B = 無効。判定は prefill_s
     "ngram-prefetch": (_knob_ngram_prefetch, ["A", "B"], True, "A"),
+    # A = batch_min_rows=64 (既定) / B = 10**9 (常に行ごと旧経路)。判定は prefill_s
+    "ngram-batch": (_knob_ngram_batch, ["A", "B"], True, "A"),
 }
 
 
@@ -998,6 +1045,23 @@ def run_once(eng, ids, n_tokens, eos_ids):
     return out, t_prefill, t_dec, accepted, rounds
 
 
+# ngram-prefetch / ngram-batch のときだけ StreamNGram.stats を run ごとに
+# 拾う。install() は PLE 層全部に同じ 1 インスタンスを配るので、最初の 1 個
+# を掴めば足りる
+NGRAM_STATS_KNOBS = {"ngram-prefetch", "ngram-batch"}
+
+
+def _ngram_stream_instance(model):
+    for layer in model.model.layers:
+        ple = getattr(layer, "ple", None)
+        if ple is None:
+            continue
+        emb = ple.ple_embedding.ngram_embedding
+        if hasattr(emb, "reset_stats"):
+            return emb
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--knob", required=True, choices=sorted(KNOBS))
@@ -1084,6 +1148,13 @@ def main() -> int:
     set_variant = setup({"eng": eng, "args": args})
     order = variants + variants[::-1]
 
+    # ngram-prefetch / ngram-batch: 発火が実際にあるか (キャッシュ hit 率、
+    # バッチ pread の分岐) を数字で見る。StreamNGram.stats を run ごとに
+    # reset_stats() してから拾う
+    ngram_stream = (
+        _ngram_stream_instance(eng.model) if args.knob in NGRAM_STATS_KNOBS else None
+    )
+
     print(f"knob={args.knob}  判定基準はモジュール docstring のとおり"
           " (測る前に宣言済み)。")
     print(f"生成長 {args.tokens} トークンで全条件そろえる。"
@@ -1165,6 +1236,8 @@ def main() -> int:
             # 黙って False を返すので、「効果ゼロ」が遅いのか届いていないのかを
             # 区別する手が要る (2026-09-01 に GDN 前処理で実際に空振りした)。
             _fire.reset()
+            if ngram_stream is not None:
+                ngram_stream.reset_stats()
             if shared is None:
                 out, tp, td, acc, rounds = run_once(eng, ids, args.tokens, eos_ids)
             else:
@@ -1185,9 +1258,13 @@ def main() -> int:
             rows[-1]["fired"] = fired
             fired_s = ("  発火 " + " ".join(f"{k}={n}" for k, n in
                                             sorted(fired.items()))) if fired else ""
+            ngram_s = ""
+            if ngram_stream is not None:
+                rows[-1]["ngram"] = dict(ngram_stream.stats)
+                ngram_s = "  " + ngram_stream.stats_line()
             print(f"  {v}: prefill {tp:6.2f}s  decode {td:6.2f}s  "
                   f"{ms:6.2f} ms/tok  tok/round {tpr:.3f}  "
-                  f"({acc}/{rounds}){fired_s}", flush=True)
+                  f"({acc}/{rounds}){fired_s}{ngram_s}", flush=True)
     set_variant(baseline)
 
     # ---- まとめ -------------------------------------------------------
@@ -1217,6 +1294,32 @@ def main() -> int:
                 worst = min((means[v] - base) / base * 100 for v in variants)
                 if worst < -5:
                     print("    ** tok/round が 5% 超落ちた条件がある **")
+
+    # ngram-prefetch / ngram-batch: StreamNGram.stats の合計 (発火の確認)。
+    # hit/miss は「先読みが実際に効いているか」、sync_ms/fetch_ms は
+    # 「バッチ化自体の取り分」を切り分けるためのもの
+    if ngram_stream is not None:
+        for kind in ("short", "long"):
+            sub = [r for r in rows if r["kind"] == kind and "ngram" in r]
+            if not sub:
+                continue
+            for metric in ("hits", "misses", "sync_ms", "fetch_ms"):
+                totals = {}
+                for v in variants:
+                    vals = [r["ngram"][metric] for r in sub if r["variant"] == v]
+                    totals[v] = sum(vals)
+                base = totals[baseline]
+                if base == 0:
+                    cells = "  ".join(f"{v}={totals[v]:10.2f}" for v in variants)
+                    print(f"  {kind:5s} ngram_{metric:9s} {cells}"
+                          f"   [基準 {baseline} が 0 なので比は無し]")
+                    continue
+                cells = "  ".join(
+                    f"{v}={totals[v]:10.2f}"
+                    f"({(totals[v] - base) / base * 100:+5.1f}%)"
+                    for v in variants
+                )
+                print(f"  {kind:5s} ngram_{metric:9s} {cells}   [基準 {baseline}]")
 
     if control_identical:
         # 対照: 短文脈は A と B で出力が完全一致するはず
