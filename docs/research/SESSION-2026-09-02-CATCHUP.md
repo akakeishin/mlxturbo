@@ -1631,3 +1631,20 @@ tok/step の揺れ (17k の温ターンが 1.40) が ±5% 動かすので、-6�
 - チャンク外: prime (512 で 150 ms 減)、checkpoint、n-gram 文脈。小さい。
 決め: フルベンチをもう一度回す前に、PLE の mmap 化と qkv wide (prefill 幅) の 2 つを入れて小さいベンチで確かめる。
 decode 側は HC 4.7 ms / indexer 2.7 ms に手が無く、-7% は当面残る。
+
+## MoE の gather_qmm を本番と同じソート済み経路で測る (モデル無し、2026-09-03 18:10、scratchpad/moe_gather_micro.py、E=512 top-10 2560→640、行 20480 = 2048 tok × 10)
+
+| 経路 | ms | TFLOPS |
+|---|---|---|
+| gather_qmm、専門家順ソート済み (**本番**) | **9.01** | 7.45 |
+| gather_qmm、未ソート | 45.9 | 1.46 |
+| dense 4-bit qmm、同 FLOP | **5.98** | 11.2 |
+| dense bf16 matmul、同 FLOP | 5.44 | 12.3 |
+| gather_mm bf16 (専門家 bf16 常駐) | 14.7 | 4.6 |
+
+- in-model の gate/up/down (各 440 ms / 48 層 = 9.2 ms) はこの micro と一致。**MoE の行列積は dense の 1.5 倍**の時間で、
+  差はそのまま「専門家ごとの区間タイル (M/E=40、bm=32、水増し 1.41)」。
+- **G=8 が効かなかった理由は、層主導のグループ処理がチャンクごとに MoE を呼んでいて、行数を太らせていなかった**
+  疑い (確認中)。G 個のチャンクの hidden を連結して MoE を 1 回で呼べば、M/E=160 (G=4) で水増し 1.22 → MoE -13%、
+  G=8 で 1.10 → -22%。prefill 全体で **-6〜-9%**。これは Python だけの変更で、数値は不変 (行の順序が変わるだけ)。
+- bf16 の専門家常駐 (gather_mm) は遅く、量子化の形を変えても dense qmm の 11.2 TFLOPS が上限。
