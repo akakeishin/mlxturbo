@@ -89,12 +89,13 @@ GPU は `tools/biglock.sh` で 1 本ずつ直列。親の連鎖スクリプト�
    - 待ち: D3 (文脈 n-gram の draft) のオフライン集計。生成トークン列が保存されていなかったので `--save-out` を足してから 17k / 50k を 1 本ずつ。
    - 待ち: D4 (command buffer の粒度、env のみ) を chain83 で A B B A。
    - 未: サーバー経由の 1 リクエストで `[round]` trace を取り、decode_ab の 43 ms との差を見る (detokenize / SSE の GPU 遊び)。
-2. モデル無しの proof-of-life: P1 の 2 stream micro (`tools/two_stream_micro.py`)、D5 の gather_qmm のスケール micro
-   (`tools/gather_qmm_scale_micro.py`)。Sonnet が書いている。出来たら biglock で流す。
-3. 通った案だけ Sonnet に実装させて ABBA: D1 (draft の 1 段目を verify のグラフに同梱) → D2 → D3 → P1。
-   D6 (indexer 228 us/層の内訳) は計測から。
-4. P3: MoE の grouped GEMM を自前で書く (設計は fable が調査中: mlx の `affine_gather_qmm_rhs` の律速をソースで確定してから)。
-   最初の proof-of-life は単一専門家の bf16 × 4-bit GEMM で dense qmm の 0.9 倍以内に入るか。KLD ゲート +0.0005。
+2. 済 (08:28): モデル無しの proof-of-life。P1 (2 stream) は直列化 0.965 で畳む、D5 (専門家共有) は重複行が既に安いので畳む、
+   D4 (command buffer 粒度) は ±1% で畳む。既製 gather_qmm に 16 行揃えのダミー行を足すと r=40 -11% / r=160 -3.6% (P3 の variant C)。
+3. 天井スタブ (chain86、`--knob stub-*`) で上限を取ってから、通った案だけ Sonnet に実装させて ABBA: D1 → D2 → D3。
+   D6 は stub-indexer-topk の天井が 1 ms/round 未満なら D7 (top-k select カーネル) ごと畳む。
+4. P3: MoE の grouped GEMM。第 1 段 (dense クローン、ビット一致 1.000 倍) と第 2 段 (segmented BM=32、r=160 で 1.098 対 1.167) は済。
+   第 3 段 (fused.py のフック + knob `moe-grouped-gemm` の A=segmented / B=既製 / C=pad16+既製、4k/8k/17k) を Opus が実施中。
+   判定線: 17k -2% 未満かつ 4k -4% 未満なら BM=16 経路 (専門家ごとに BM を選ぶ) を足してから再 A/B。KLD はビット一致なので出力一致で代替。
    **NAX 対応機 (M5 系) でも使う** (ユーザー方針 08:30): カーネルは NAX 専用 intrinsic を使わず、`MLXTURBO_MOE_GEMM=auto|on|off` で
    NAX 機では auto=off (MLX の NAX カーネルとの A/B を NAX 機で取り直すまで)。この機の数字は全部「非 NAX」の数字。
 5. 小さいベンチ (mlxturbo だけ、冷却 10 分) → 報告 → フルベンチ (mlx-serve は origin/main と同じで再ビルド不要) → 27B / 35B-A3B。
