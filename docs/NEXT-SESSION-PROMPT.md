@@ -105,8 +105,12 @@ GPU の待ち行列 (2026-09-03 03:20 時点の状態):
 - **フルベンチをもう一度回す前に入れる 2 手** (ユーザー方針: 分析して修正してから): (1) PLE の n-gram 行取得を
   mmap + madvise(WILLNEED) に (syscall 律速の 137〜257 ms/チャンク = 4〜7%)、(2) attention の qkv 連結を prefill 幅だけ
   (`MLXTURBO_WIDE_SCOPE=attn`、-2% 見込み)。どちらも実装中。入ったら小さいベンチで確かめ、それからフルベンチ。
+- 19:30 の追加判定: attention qkv 連結 (+0.3%、畳む)、MoE は本番の G=4 連結で既に dense 比 1.19 (残り 16% はカーネル、
+  優先度下げ)、GDN は 83% が天井 (前処理は 1.5% の小物)、4k の最終チャンクは 1 トークンあたりグループと同じ費用
+  (畳んでも -3% 止まり)。PLE の mmap backend はコミット済み (冷 257 → 19〜35 ms/チャンク) で、madvise 発行の
+  背景化を実装中。HC の elementwise を prefill 幅で mx.compile (実装中)。decode の advisor (未試行の手の洗い出し) 走行中。
 - 手なしと判定した残差: MoE の gather_qmm (相手と同じ op)、HC (prefill 幅も decode も融合が効かない)、decode の
-  indexer (op 整理は ±0.3%)。
+  indexer (op 整理は ±0.3%)、量子化の形、専門家レイアウト、層をまたいだ射影。
 - その後: 長文脈の品質ゲートを 17k / 50k で走らせて gather カーネルの採用を裏付ける → temp 0.7 の tok/round →
   mlx-serve 最新版でフルベンチ → 27B / 35B-A3B。
 - その後: 小さいベンチ (mlxturbo だけ、冷、新しい冷却条件の基準) → 仮説 A/B (draft の hit@2、rerank off、
