@@ -52,7 +52,8 @@ from bench.eval_prompts import PROMPTS, STRESS_KINDS  # noqa: E402
 CALIB_PROMPTS: dict[str, str] = {k: v.text for k, v in PROMPTS.items()}
 
 
-def _load(model_ref: str, ngram: str | None = None, rebit_spec: str | None = None):
+def _load(model_ref: str, ngram: str | None = None, rebit_spec: str | None = None,
+          fusions: bool = False):
     if ngram:
         # n-gram をディスクに置いた構成。vendored arch は import 時に旗を読む
         import os
@@ -69,11 +70,26 @@ def _load(model_ref: str, ngram: str | None = None, rebit_spec: str | None = Non
         from mlxturbo.ngram_stream import install
 
         install(model, ngram)
+    if fusions:
+        # 出荷経路 (build_runner) が起動時に通す融合・置き換えと同じものを
+        # 当てる。これを呼ばないと MLXTURBO_GDN_METAL 等の knob は
+        # 環境変数を立てても比較 (KLD) に一切効かない
+        from mlxturbo.runner import enable_default_fusions
+
+        enable_default_fusions(model, log_prefix="[quant_eval]")
+        print("fusions: 有効 (環境変数の knob が効く)")
     if rebit_spec:
         from mlxturbo import rebit
 
         rebit.apply(model, rebit_spec)
     return model, tok
+
+
+def _mlxturbo_env_snapshot() -> dict:
+    """再現用に、そのとき立っていた MLXTURBO_* 環境変数を集める。"""
+    import os
+
+    return {k: v for k, v in sorted(os.environ.items()) if k.startswith("MLXTURBO_")}
 
 
 def _prompt_ids(tokenizer, text: str) -> list[int]:
@@ -267,7 +283,8 @@ def cmd_sweep(args):
 
     import mlx.core as mx
 
-    model, tok = _load(args.model, getattr(args, "ngram", None))
+    model, tok = _load(args.model, getattr(args, "ngram", None),
+                       fusions=getattr(args, "fusions", False))
     cont = json.loads(Path(args.continuations).read_text())
     if args.prompts:
         keep = set(args.prompts.split(","))
@@ -308,6 +325,8 @@ def cmd_sweep(args):
         out.write_text(json.dumps({
             "kind": "rebit-sweep",
             "tag": args.tag,
+            "fusions": bool(getattr(args, "fusions", False)),
+            "mlxturbo_env": _mlxturbo_env_snapshot(),
             "model": args.model,
             "ref_dump": str(args.ref_dump),
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -352,7 +371,8 @@ def cmd_sweep(args):
 
 def cmd_compare(args):
     model, _ = _load(args.model, getattr(args, "ngram", None),
-                     getattr(args, "rebit", None))
+                     getattr(args, "rebit", None),
+                     fusions=getattr(args, "fusions", False))
     if getattr(args, "disable_ple", False):
         # n-gram/PLE を丸ごと切る。埋め込みがゼロなら PLE の出力もゼロになる
         # ので、層を外すのと等価。「n-gram が無いことの代償」を測るための経路
@@ -368,6 +388,8 @@ def cmd_compare(args):
     result = {
         "kind": "compare",
         "tag": args.tag,
+        "fusions": bool(getattr(args, "fusions", False)),
+        "mlxturbo_env": _mlxturbo_env_snapshot(),
         "model": args.model,
         "rebit": getattr(args, "rebit", None),
         "ref_dump": str(args.ref_dump),
@@ -483,6 +505,10 @@ def main():
                    help="n-gram/PLE を切って測る (無しの代償を見る)")
     p.add_argument("--rebit", help="読み込み後にビットを打ち直す "
                    "(例 gdn=4,hc=4)。焼かずにビット配分を試すため")
+    p.add_argument("--fusions", action="store_true",
+                   help="出荷経路と同じ融合 knob (runner.enable_default_fusions) "
+                        "を有効にする。MLXTURBO_GDN_METAL 等の環境変数がここで"
+                        "初めて効くようになる")
     p.set_defaults(fn=cmd_compare)
 
     p = sub.add_parser("sweep", help="1 回のロードでビット構成を積み上げて測る")
@@ -497,6 +523,10 @@ def main():
                    help="評価に使うプロンプトを絞る (カンマ区切り)。段あたりの "
                         "時間が縮むので、落とされる前に終わる")
     p.add_argument("--speed-tokens", type=int, default=40)
+    p.add_argument("--fusions", action="store_true",
+                   help="出荷経路と同じ融合 knob (runner.enable_default_fusions) "
+                        "を有効にする。MLXTURBO_GDN_METAL 等の環境変数がここで"
+                        "初めて効くようになる")
     p.set_defaults(fn=cmd_sweep)
 
     p = sub.add_parser("speed")
