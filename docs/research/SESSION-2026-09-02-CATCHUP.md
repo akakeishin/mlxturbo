@@ -1743,3 +1743,17 @@ mmap 17k の 1 巡目: pread 31.8 s → mmap 29.6 s (-6.9%)。
 
 8k の -6% と合わせて 4 対とも揃った。**既定を mmap + 背景 madvise に切り替えた** (`FASTMLX_NGRAM_BACKEND=mmap`、
 `MLXTURBO_NGRAM_PREFETCH` は mmap で on / pread で off)。decode 幅 (16 行取得) の確認は chain85 (短 3 本 × 512、A B B A)。
+
+### 2026-09-03 08:40 P3 第 2 段: 専門家セグメント対応 (`tools/moe_grouped_gemm_micro.py --stage segmented`)
+
+| 形 | ケース | stock/dense | seg/dense | seg/stock | ビット一致 |
+|---|---|---|---|---|---|
+| gate/up | skew r=40 | 1.458 | 1.398 | 0.959 | yes |
+| gate/up | skew r=160 | 1.167 | 1.098 | 0.941 | yes |
+| down | skew r=40 | 1.414 | 1.415 | 1.000 | yes |
+| down | skew r=160 | 1.145 | 1.101 | 0.961 | yes |
+
+判定線 (r=160 で 1.14 未満) は通過。時間はタイル枚数 Σ ceil(rows_e/32)·32 / M × 1.015 で 1% 以内に説明でき、
+端数タイルの費用 c ≈ 1.0 (frag の間引きは分岐で 1 割損)。3 本加重で r=160 -5.2% / r=40 -2.7%、in-model 換算 17k -1.9% / 4k -1.0%。
+第 3 段 (フック + in-model) で 1:1 の換算とテーブル構築費 (48 層 × 小 op 5 本) を先に確定し、届かなければ BM=16 の経路
+(逆算で BM=32 の 0.53 倍、専門家ごとに良い方を選ぶと r=40 1.214 / r=160 1.067 の見込み) を足す。
