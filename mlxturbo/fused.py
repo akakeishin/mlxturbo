@@ -205,6 +205,7 @@ def enable_hyper_connection_kernel() -> None:
     # 起動時に 1 回だけ読む (呼び出しごとの getenv を避ける)。既定 off なので
     # このフラグが False なら以下の prefill 分岐は一度も実行されない。
     prefill_on = os.environ.get("MLXTURBO_HC_PREFILL") == "1"
+    inject_bf16_on = os.environ.get("MLXTURBO_HC_INJECT_BF16") == "1"
 
     def patched(self, hyper):
         down = _pack_quantized(self.input_mix_weight_down)
@@ -240,6 +241,11 @@ def enable_hyper_connection_kernel() -> None:
         # 無いとカーネル全体が素の実装に落ちていた)
         inject = inject_q
         if combine and inject is None:
+            # 2026-09-03: 97 層で発火させると S=1 forward が 24 → 32 ms と遅くなった
+            # (CATCHUP「HC 融合を 97 層で発火させた小さい in-model」)。既定は
+            # 素の実装のまま。MLXTURBO_HC_INJECT_BF16=1 のときだけ bf16 inject を試す。
+            if not inject_bf16_on:
+                return orig(self, hyper)
             inject = _pack_inject_bf16(self.block_inject_weight)
             if inject is None:
                 return orig(self, hyper)
