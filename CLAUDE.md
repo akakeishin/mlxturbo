@@ -63,6 +63,8 @@
   (`MLXTURBO_PREFILL_ATTN_MIN_KV`) だけ発火する (50k prefill -21%、2026-09-03)。長文脈の KLD (自前の dense
   比) 0.040 は、既に受理している GDN Metal の同じ物差しでの 0.111 より小さい。長文脈の品質は
   bf16 参照が無いので、この物差しではなく課題の正答率で見ること (CATCHUP 2026-09-03 07:40)。
+  `MLXTURBO_MOE_COMBINE_FOLD` (既定 on、行数 ≥ 64 の prefill 幅だけ、`=0` で off) と `MLXTURBO_PRIME_WINDOW`
+  (既定 512) も 2026-09-03 に A/B と KLD で入れた本番の既定値。
 - 品質を売って速度を買わない。fake を実物より緩くしない。KLD の受け入れ幅は
   現行比 +0.0005 (bench/quant_eval.py compare)。
 
