@@ -849,3 +849,23 @@ MLX 0.32.2 `scaled_dot_product_attention.cpp:703`: S ≤ 8 の vector カーネ�
   bits/group_size の一致を要求) で大半の層が素の op に落ちている、(c) 数え方の漏れ、のどれかを
   先に決める。(a)(b) なら decode は素の HC (140 us × 96 = 13 ms 相当が重なりつつ走っている) を
   払っていることになり、6 ms の説明そのものになる。
+
+## HC 融合カーネルは 97 層中 1 層しか発火していない (2026-09-02 22:50、scratchpad/hc_fire_diag.py、実モデル S=1)
+
+`GatedResidual` は 97 個 (48 層 × 2 + mixer)。うち 96 個は `block_inject_weight` が**量子化されていない
+素の `Linear`** で、`fused._pack_quantized` が None を返し `patched` が素の実装 (`orig`) に落ちる。
+発火するのは inject の無い 1 個だけ (plain でも capture でも同じ)。適格判定 (D-4) は原因ではない。
+つまり **本番の decode は HC を 96 回、素の op で払っている。**連鎖計測では素 140 us 対 融合 44 us
+なので、差 96 us × 96 回 = 最大 9 ms (重なりで一部隠れる)。decode +6 ms の最有力候補。
+
+手: inject を bf16 のまま読むカーネル変種 (inject は小さく、復号不要)。量子化して押し込む手は
+KLD を触るので後回し。判定は小さい in-model (S=1 forward の ABBA、scratchpad/sdpa_split_inmodel.py
+と同型) → decode_ab の短文脈 3 本。
+
+## 相手の verify 幅の扱い (scout 実読、`~/dev/mlx-serve/src/transformer.zig:3342-3393`)
+
+`splitMaskedSdpa256` (env `MLX_SERVE_SDPA_SPLIT` 既定 on): qL 3〜8 のとき、クエリ行を
+`max(1, 32/gqa)` = 2 行ずつに切り、各グループを MLX の array-mask sdpa で個別に呼んで concat。
+K/V も head も分けない。qL=2 は素通し (vector に入る)。単体テストに「gqa 12 (24/2) の qL 4 は素の
+MLX では非融合フォールバック」と明記されている。うちの `MLXTURBO_SDPA_SPLIT` と同型。
+融合カーネル `msv_attn_p256` は qL ≥ 16 (prefill) 専用で、verify 幅には出てこない。
