@@ -203,21 +203,62 @@ def _bench_fixed(fn, n):
     return samples
 
 
-def _bench_chained_hc(step_fn, init_hyper, n):
-    """HC 用: 出力 (mixed, inject) を `_combine` で次の hyper に連鎖させながら
-    n 回、毎回 eval して us を記録する (固定入力の使い回しによるアーチファクトを避ける)。
+def _bench_fixed_ab(fn_a, fn_b, n_pairs):
+    """A/B 比較 (CLAUDE.md: 1 プロセス内で交互に測る): ABBA を n_pairs 回繰り返し、
+    fn_a/fn_b それぞれ同じ入力で毎回 eval して us を記録する。ブロック測定
+    (A を n 回 → B を n 回) だと熱・キャッシュ状態のドリフトが A/B 間で
+    ずれるので、呼び出し順序を交互にして打ち消す。戻り値は
+    (samples_a, samples_b) (各 2*n_pairs 個)。
     """
     import mlx.core as mx
 
-    hyper = init_hyper
-    samples = []
-    for _ in range(n):
+    samples_a: list[float] = []
+    samples_b: list[float] = []
+    for _ in range(n_pairs):
+        for fn, samples in (
+            (fn_a, samples_a),
+            (fn_b, samples_b),
+            (fn_b, samples_b),
+            (fn_a, samples_a),
+        ):
+            t0 = time.perf_counter()
+            mx.eval(fn())
+            samples.append((time.perf_counter() - t0) * 1e6)
+    return samples_a, samples_b
+
+
+def _bench_chained_hc_ab(step_fn_a, step_fn_b, init_hyper, n_pairs):
+    """HC 用 A/B 比較: 各側は出力 (mixed, inject) を `_combine` で自分の hyper
+    に連鎖させながら (固定入力の使い回しによるアーチファクトを避ける)、
+    呼び出し順序だけ ABBA (CLAUDE.md: 1 プロセス内で交互) にする。
+
+    `_combine` の結果は次周回の入力になるが、eval せずに返すと次周回の
+    `step_fn` 呼び出し + eval がこの `_combine` の遅延グラフも一緒に評価する
+    ことになり、前周回の後始末が次周回の計測窓に漏れる。ここでは
+    `_combine` 直後に eval して窓の外で確定させてから次周回へ渡す。
+    戻り値は (samples_a, samples_b) (各 2*n_pairs 個)。
+    """
+    import mlx.core as mx
+
+    def _step(step_fn, hyper, samples):
         t0 = time.perf_counter()
         mixed, inj = step_fn(hyper)
         mx.eval(mixed, inj)
         samples.append((time.perf_counter() - t0) * 1e6)
         hyper = _combine(hyper, mixed, inj)
-    return samples
+        mx.eval(hyper)  # 次入力の準備 (計測窓の外で確定させる)
+        return hyper
+
+    hyper_a = init_hyper
+    hyper_b = init_hyper
+    samples_a: list[float] = []
+    samples_b: list[float] = []
+    for _ in range(n_pairs):
+        hyper_a = _step(step_fn_a, hyper_a, samples_a)
+        hyper_b = _step(step_fn_b, hyper_b, samples_b)
+        hyper_b = _step(step_fn_b, hyper_b, samples_b)
+        hyper_a = _step(step_fn_a, hyper_a, samples_a)
+    return samples_a, samples_b
 
 
 def _summarize(samples, warmup):
@@ -278,8 +319,7 @@ def run_hc_kernel():
     def plain_step(hyper):
         return plain_gated_residual(hyper, norm_weight, RMS_EPS, HC, HIDDEN, down, up, inject)
 
-    fused_samples = _bench_chained_hc(fused_step, init_hyper, N_HC)
-    plain_samples = _bench_chained_hc(plain_step, init_hyper, N_HC)
+    fused_samples, plain_samples = _bench_chained_hc_ab(fused_step, plain_step, init_hyper, N_HC // 2)
     fused = _summarize(fused_samples, WARMUP)
     plain = _summarize(plain_samples, WARMUP)
     return {
@@ -320,8 +360,7 @@ def run_gdn_prework():
             N_K, N_V, DK, DV, KEY_DIM, VALUE_DIM,
         )
 
-    fused_samples = _bench_fixed(fused_step, N_GDN_PREWORK)
-    plain_samples = _bench_fixed(plain_step, N_GDN_PREWORK)
+    fused_samples, plain_samples = _bench_fixed_ab(fused_step, plain_step, N_GDN_PREWORK // 2)
     fused = _summarize(fused_samples, WARMUP)
     plain = _summarize(plain_samples, WARMUP)
     return {
@@ -356,8 +395,7 @@ def run_gdn_recurrent():
     def mlx_lm_step():
         return gated_delta_update(q, k, v, a, b, A_log, dt_bias, state, None, use_kernel=True)
 
-    with_states_samples = _bench_fixed(with_states_step, N_GDN_RECUR)
-    mlx_lm_samples = _bench_fixed(mlx_lm_step, N_GDN_RECUR)
+    with_states_samples, mlx_lm_samples = _bench_fixed_ab(with_states_step, mlx_lm_step, N_GDN_RECUR // 2)
     with_states = _summarize(with_states_samples, WARMUP)
     mlx_lm_summary = _summarize(mlx_lm_samples, WARMUP)
     return {
@@ -369,12 +407,19 @@ def run_gdn_recurrent():
     }
 
 
-def run_lm_head():
-    """5) lm_head の 8bit quantized_matmul (帯域の目安。融合との比較対象はない)。"""
+def run_lm_head(lm_head_bits=QBITS):
+    """5) lm_head の quantized_matmul (帯域の目安。融合との比較対象はない)。
+
+    ビット数は `--lm-head-bits` で選ぶ (既定 8: 本番モデル
+    `~/models/ddalcu-mlxlm` の config が lm_head 8bit/g64。
+    `convert_flash.RECIPES["v-fast6"]` は 6bit なので、そちらを見たいときは
+    `--lm-head-bits 6` を渡す)。帯域床とバイト数はここで渡すビット数から
+    計算する。
+    """
     import mlx.core as mx
 
     dtype = mx.bfloat16
-    wq, sc, bi, gs, bits = _quant_linear(VOCAB, HIDDEN, dtype)
+    wq, sc, bi, gs, bits = _quant_linear(VOCAB, HIDDEN, dtype, bits=lm_head_bits)
     x = mx.random.normal((1, HIDDEN)).astype(dtype)
     mx.eval(wq, sc, bi, x)
 
@@ -400,6 +445,11 @@ def run_lm_head():
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default="bench/results/micro-kernel-latency.json")
+    ap.add_argument(
+        "--lm-head-bits", type=int, default=QBITS,
+        help="lm_head の量子化ビット数 (既定 8。v-fast6 レシピを見たいときは 6)。"
+             " HC の down/up/inject は対象外 (常に 8bit のまま)。",
+    )
     args = ap.parse_args()
 
     result = {
@@ -411,6 +461,7 @@ def main():
                 "key_dim": KEY_DIM, "value_dim": VALUE_DIM, "conv_dim": CONV_DIM,
                 "conv_kernel": CONV_KERNEL, "vocab": VOCAB,
                 "qbits": QBITS, "qgroup": QGROUP,
+                "lm_head_bits": args.lm_head_bits,
             },
             "warmup_discarded": WARMUP,
         },
@@ -418,7 +469,7 @@ def main():
         "hc_kernel": run_hc_kernel(),
         "gdn_prework": run_gdn_prework(),
         "gdn_recurrent": run_gdn_recurrent(),
-        "lm_head": run_lm_head(),
+        "lm_head": run_lm_head(args.lm_head_bits),
     }
 
     out_path = Path(args.out)

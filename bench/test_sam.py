@@ -98,6 +98,22 @@ def test_draft_reads_a_genuine_continuation():
     assert sam.draft(max_len=100, min_len=5) is None  # match_len (4) < min_len
 
 
+def test_draft_reads_most_recent_when_ngram_repeats_twice():
+    # D-12 (docs/research/REVIEW-2026-09-02-INDEPENDENT.md): draft() must
+    # follow the docstring's "most recent earlier occurrence", not the
+    # first one. "1,2,3" occurs three times, with a different continuation
+    # after each of the first two; once the third occurrence completes the
+    # tail, the automaton must read the continuation from the *second*
+    # (more recent) occurrence, not the first.
+    seq = [1, 2, 3, 4, 4, 1, 2, 3, 5, 5, 1, 2, 3]
+    sam = SuffixAutomaton()
+    sam.extend_all(seq)
+    match_len, end = sam.longest_match()
+    assert match_len == 3
+    assert end == 7  # the second occurrence (indices 5-7), not the first (0-2)
+    assert sam.draft(max_len=2) == [5, 5]
+
+
 def test_draft_none_when_nothing_repeats():
     sam = SuffixAutomaton()
     sam.extend_all([1, 2, 3, 4, 5])
@@ -164,6 +180,7 @@ def main():
         test_immediate_and_overlapping_repeats,
         test_random_small_vocab_sequences,
         test_draft_reads_a_genuine_continuation,
+        test_draft_reads_most_recent_when_ngram_repeats_twice,
         test_draft_none_when_nothing_repeats,
         test_extend_o1_amortized_state_growth_is_linear,
         test_peek_match_equals_real_extend_without_mutation,

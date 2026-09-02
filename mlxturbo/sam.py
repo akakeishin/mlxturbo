@@ -31,10 +31,18 @@ class _State:
         self.length = length
         self.link = link
         self.trans: dict[int, int] = {}
-        # One valid earlier ending index (0-based, into the automaton's own
-        # `_seq`) for this state's substrings.  Any single member of the
-        # (possibly large) endpos set works: a draft only needs *an* earlier
-        # occurrence to read a continuation from, not all of them.
+        # An ending index (0-based, into the automaton's own `_seq`) for this
+        # state's substrings, from the (possibly large) endpos set.
+        # `_advance_match` refreshes this to the most recent occurrence each
+        # time the match exactly fills this state's own length (the state's
+        # canonical representative, not merely a shorter member of its
+        # class) -- that's the only case where "matching statistics" has
+        # actually verified this state's own substring, so it's the only
+        # case safe to overwrite. When a transition instead lands mid-state
+        # (matched length short of the state's length), this field is left
+        # alone and keeps whatever earlier-but-still-genuine occurrence it
+        # already had, rather than risk recording a position that was only
+        # ever verified for a shorter suffix.
         self.endpos: int | None = None
 
 
@@ -79,9 +87,13 @@ class SuffixAutomaton:
     def _advance_match(self, token: int) -> None:
         states = self._states
         state, length = self._match_state, self._match_len
+        if length and length == states[state].length:
+            states[state].endpos = len(self._seq) - 1
         while state != 0 and token not in states[state].trans:
             state = states[state].link
             length = states[state].length
+            if length:
+                states[state].endpos = len(self._seq) - 1
         nxt = states[state].trans.get(token)
         if nxt is not None:
             state, length = nxt, length + 1
@@ -134,6 +146,10 @@ class SuffixAutomaton:
         """Continuation following the most recent earlier occurrence of the
         current longest repeated suffix, capped at ``max_len`` tokens, or
         None if there is no repeat of at least ``min_len`` tokens.
+
+        "Most recent" holds whenever the match exactly fills its automaton
+        state (the common case); see ``_State.endpos`` for why a mid-state
+        match instead reads an older, but still genuine, earlier occurrence.
         """
 
         if max_len <= 0:
