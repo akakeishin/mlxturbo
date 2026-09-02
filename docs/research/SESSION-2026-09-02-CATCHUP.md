@@ -1097,3 +1097,10 @@ decode kv 罰の正体で、相手 (Zig の refcount 共有) は払っていな�
 
 **番外: MoE decode を take + quantized_matmul に** (相手の形): M=1 で gather_qmm 240 us 対 take+qmm 437 us、
 M=2 で 323 対 697、M=3 で 292 対 538。**gather_qmm の方が速い。棄却。**
+
+## n-gram 同期の前倒し (`MLXTURBO_PLE_HOIST`) の前提訂正 (2026-09-03 09:00)
+
+相談役の仮説 3 は「PLE 層が約 5 層あり、forward が 5〜6 区間に分断される」が前提だったが、Flash-Next の
+`ple_layer_ids` は `[2]` で **PLE 層は 1 つ**。同期は元々 1 forward に 1 回。knob は実装した (同期を層 2 の
+途中から層ループの前に寄せる) が、見込みは小さい (`ngram-prefetch` の 0% の前例に近い)。A/B は短文脈 3 本と
+17k × 64 だけ取り、-1% 未満なら畳む。
