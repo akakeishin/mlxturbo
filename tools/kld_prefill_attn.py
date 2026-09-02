@@ -101,6 +101,10 @@ def _kld_stats(logits_p, logits_q, topk: int) -> dict:
     ``sum(p_k * (logp_k - logq_k))`` を位置ごとに計算する
     (``bench/quant_eval.py`` の ``evaluate()`` の ``kld_pos`` と同一式)。
     """
+    import mlx.core as mx
+    # (B, tail, vocab) でも (tail, vocab) でも受ける: 末尾の vocab 軸だけ残して平らにする
+    logits_p = mx.array(logits_p).reshape(-1, mx.array(logits_p).shape[-1])
+    logits_q = mx.array(logits_q).reshape(-1, mx.array(logits_q).shape[-1])
 
     import mlx.core as mx
     import numpy as np
