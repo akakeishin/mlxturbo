@@ -70,51 +70,36 @@ MoE router 融合、union gather (真の union が 6 割)、wide 連結。理由
 - レーン 5: 非投機の継続バッチングを毎 tick の途中参加に (コミット済み)。ゲート計測 `bench/parallel_join_gate.py` は未実走。
 - ユーザー方針: Qwen3.8 Flash だけ見る。overnight tier は指示があるまで走らせない。多日レーン → フルテストの順。
 
-## いまの段取り (2026-09-03 05:00 時点。何をやっているか見失ったらここを読む)
+## いまの段取り (2026-09-03 08:00 時点。何をやっているか見失ったらここを読む)
 
 GPU は `tools/biglock.sh` で 1 本ずつ直列。親の連鎖スクリプトは scratchpad
-(`/private/tmp/claude-501/-Users-ht-dev-fastmlx/65b31683-391c-444c-b255-622b126131f9/scratchpad/run_chain45.sh`)
-にあり、旗ファイル (`bench/results/logs/*.ready` / `hc.done`) で順番を付けている。連鎖が消えていたら
-下の順番を手で流せばよい (コマンドは各行に書いた)。
+(`/private/tmp/claude-501/-Users-ht-dev-fastmlx/65b31683-391c-444c-b255-622b126131f9/scratchpad/run_chainNN.sh`、
+いま 80 番台) にあり、前の連鎖の終了を `pgrep -f run_chainNN.sh` で待って順番を付けている。
 
-GPU の待ち行列 (2026-09-03 03:20 時点の状態):
-- 済: HC 検証 (畳む)、仮説マイクロ (KV slice は素の forward では in-place、take+qmm 棄却)、depth margin 版
-  (17k -4%、既定 on)、T=1 gather 17k/50k (50k -21.3%) **ただし長文脈 KLD が 0.04 / 0.017 で幅外 → 原因調査中、
-  既定 off のまま**、lm_head 4-bit 本焼き (KLD +0.0047、速度比較用に限定)、hc-compiled (取り分なし)、G=8 (-1.2%、
-  畳む)、PLE hoist (差なし、畳む)、prefill 8k の内訳 (MoE 43% / GDN 27% / PLE 4.4%)、TTFT 内訳 (固定 300 ms 発見)。
-- 済 (05:30): n-gram 先読み (8k -0.9%、畳む)、固定 300 ms = リクエストごとの detokenizer 構築 → 修正済み
-  (温 TTFT 0.45 → 0.15 s、完全ヒット 0.003 s)、投機ラウンドの KV コピーは無し (棄却)、decode の kv 罰は
-  +3 ms/round で attention 層 (indexer + gather マスク) に帰属、レーン 8 は閉じた。
-- 済 (08:00): gather カーネルは **既定 on** (KLD 0.04 は top-k 反転のカスケードで、受理済みの GDN Metal の同じ物差し
-  0.111 より小さい)。indexer-lean は畳んだ (+0.3%)。小さいベンチ (冷却強化後、既知を片付けた基準) は
-  `bench/results/self-snapshot-turbo-small-0903b.json` (gather 前) と `...-0903c.json` (gather 後、走行中)。
-- 済 (10:00): 仮説 A/B の判定 — rerank は受理率を削らず速い (維持)、draft の木は hit@2−hit@1 = 17 pt だが
-  verify 幅 +1 の費用に食われて畳む、group_size 128 は forward -3% で焼き直しに見合わず畳む、
-  `mx.metal.start_capture` は 68 GB で使えない、indexer-lean は ±0.3% で畳む。
-- 済 (10:50): HC の split-K も否定 (レーン 1 の HC カーネルは閉じた)、temp 0.7 の受理は greedy の 0.91 倍で
-  厳密棄却サンプリングは畳んだ。仮説 A/B は一通り終わり。
-- 走行中 (03:56〜): **フルベンチ** (chain70、`bench/results/self-snapshot-full-0903.json`、両エンジン、0/4k/17k/25k/32k/50k、
-  反復 1、冷却 10 分後)。mlx-serve は origin/main と同じで再ビルド不要と確認済み。
-- 済 (14:35): フルベンチ (CATCHUP 12:20 の表: 冷 prefill 1.13〜1.21x 負け、decode ±8%、温 TTFT 4〜17 倍速)、
-  長文脈の品質ゲート (17k / 50k とも kernel は dense と同じ正答率 → gather カーネル既定 on 確定)。
-- 小物の判定 (16:10): prime 窓 512 を既定に (4k TTFT -2.2%)。MoE 重み付き和の畳み込みは prefill -2.2〜-2.5% /
-  decode +0.6〜1.4% → **行数 ≥ 64 だけ既定 on** (KLD 0.01289、幅内。閾値の実装中)。PLE の冷 pread は 257 ms/チャンク
-  (7%) で、先読みを本当に重ねる実装中 (`MLXTURBO_NGRAM_PREFETCH` の作り直し)。
-- 小物をかき集めた小さいベンチ (17:30、`self-snapshot-turbo-small-0903d.json`): 冷 prefill 4k 6.60 / 17k 31.3 / 50k 89.9 s
-  (相手 12:00 の 5.70 / 27.8 / 82.1 → 1.16x / 1.13x / 1.09x)、decode 51.9 / 46.1 / 42.7 (相手比 -7〜-10%、揺れ込み)。
-- **フルベンチをもう一度回す前に入れる 2 手** (ユーザー方針: 分析して修正してから): (1) PLE の n-gram 行取得を
-  mmap + madvise(WILLNEED) に (syscall 律速の 137〜257 ms/チャンク = 4〜7%)、(2) attention の qkv 連結を prefill 幅だけ
-  (`MLXTURBO_WIDE_SCOPE=attn`、-2% 見込み)。どちらも実装中。入ったら小さいベンチで確かめ、それからフルベンチ。
-- 19:30 の追加判定: attention qkv 連結 (+0.3%、畳む)、MoE は本番の G=4 連結で既に dense 比 1.19 (残り 16% はカーネル、
-  優先度下げ)、GDN は 83% が天井 (前処理は 1.5% の小物)、4k の最終チャンクは 1 トークンあたりグループと同じ費用
-  (畳んでも -3% 止まり)。PLE の mmap backend はコミット済み (冷 257 → 19〜35 ms/チャンク) で、madvise 発行の
-  背景化を実装中。HC の elementwise を prefill 幅で mx.compile (実装中)。decode の advisor (未試行の手の洗い出し) 走行中。
-- 手なしと判定した残差: MoE の gather_qmm (相手と同じ op)、HC (prefill 幅も decode も融合が効かない)、decode の
-  indexer (op 整理は ±0.3%)、量子化の形、専門家レイアウト、層をまたいだ射影。
-- その後: 長文脈の品質ゲートを 17k / 50k で走らせて gather カーネルの採用を裏付ける → temp 0.7 の tok/round →
-  mlx-serve 最新版でフルベンチ → 27B / 35B-A3B。
-- その後: 小さいベンチ (mlxturbo だけ、冷、新しい冷却条件の基準) → 仮説 A/B (draft の hit@2、rerank off、
-  厳密棄却サンプリング、indexer の op 整理、group_size 128) → mlx-serve 最新版でフルベンチ → 27B / 35B-A3B。
+案出し Studio (Scout 5 本 + decode advisor) の凍結ポートフォリオと落とした的は `docs/research/IDEAS-2026-09-03.md`。
+ユーザーの Commit (07:50): 選抜は親に任せる。**カーネル (P3) はフルベンチの前に書く。**
+
+順番:
+1. 測定だけ (今日)。
+   - 済: 段階投入の切り分け (完全直列 +16.2% → 構築 6 ms 級、decode は GPU 律速。層単位 compile は先頭に入れない)。
+   - 済: HC の elementwise を prefill 幅で compile (-0.1%、畳む。knob は既定 off で残す)。
+   - 済: PLE の mmap + 背景 madvise (8k prefill -6%、別プロセス 2 巡)。17k の確認 (chain82) が通ったら
+     `FASTMLX_NGRAM_BACKEND` の既定を mmap、`MLXTURBO_NGRAM_PREFETCH` の既定を on にし、CLAUDE.md の knob 段落に足す。
+   - 待ち: D2 の trace (depth を受理履歴 / draft マージンで決める案の判定。Sonnet が仕掛けを実装中、親が biglock で 1 回流す)。
+   - 待ち: D3 (文脈 n-gram の draft) のオフライン集計。生成トークン列が保存されていなかったので `--save-out` を足してから 17k / 50k を 1 本ずつ。
+   - 待ち: D4 (command buffer の粒度、env のみ) を chain83 で A B B A。
+   - 未: サーバー経由の 1 リクエストで `[round]` trace を取り、decode_ab の 43 ms との差を見る (detokenize / SSE の GPU 遊び)。
+2. モデル無しの proof-of-life: P1 の 2 stream micro (`tools/two_stream_micro.py`)、D5 の gather_qmm のスケール micro
+   (`tools/gather_qmm_scale_micro.py`)。Sonnet が書いている。出来たら biglock で流す。
+3. 通った案だけ Sonnet に実装させて ABBA: D1 (draft の 1 段目を verify のグラフに同梱) → D2 → D3 → P1。
+   D6 (indexer 228 us/層の内訳) は計測から。
+4. P3: MoE の grouped GEMM を自前で書く (設計は fable が調査中: mlx の `affine_gather_qmm_rhs` の律速をソースで確定してから)。
+   最初の proof-of-life は単一専門家の bf16 × 4-bit GEMM で dense qmm の 0.9 倍以内に入るか。KLD ゲート +0.0005。
+5. 小さいベンチ (mlxturbo だけ、冷却 10 分) → 報告 → フルベンチ (mlx-serve は origin/main と同じで再ビルド不要) → 27B / 35B-A3B。
+
+これまでの判定 (全部 CATCHUP に数字あり): 既定に入れたものは CLAUDE.md の knob 段落、畳んだものは IDEAS の「落とした的」と
+LANES-2026-09.md。小物をかき集めた小さいベンチ (`self-snapshot-turbo-small-0903d.json`): 冷 prefill 4k 6.60 / 17k 31.3 /
+50k 89.9 s (相手 5.70 / 27.8 / 82.1 → 1.16x / 1.13x / 1.09x)、decode 51.9 / 46.1 / 42.7 (相手比 -7〜-10%)。
 
 判定と数字は必ず `docs/research/SESSION-2026-09-02-CATCHUP.md` の末尾に節を足して書く。既定を変えたら
 CLAUDE.md の knob の段落も直す。フルテスト (対 mlx-serve) と overnight tier はユーザーの指示があるまで走らせない。

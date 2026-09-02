@@ -1710,3 +1710,16 @@ advisor の「最終チャンクは 1 トークンあたり 2.1 倍」は 4k で
 粒度の掃引 (agent): 16 KB が最良。行 id がハッシュで散っているので 64 KB 以上は発行が 10〜20 倍遅く、冷 fetch は改善しない。
 
 案出し Studio の凍結ポートフォリオは `docs/research/IDEAS-2026-09-03.md`。
+
+### 2026-09-03 07:30 段階投入の切り分け (D0、advisor の P0)
+
+`--knob stage-every --variants 0,2 --only short --tokens 512`: 完全直列 (0) は ms/round 43.5 (+16.2%)、既定 2 は 37.5。
+判定基準 (測る前に宣言): 悪化 15% 未満なら構築は 5 ms 級で CPU 仮説は死ぬ、35% 以上なら 20 ms 級。
+結果は境界のすぐ上で、構築 ≈ 6 ms/round。段階投入がそれを隠しているので、decode は GPU 律速として読む。
+層単位の mx.compile レーンは先頭には入れない (取れても構築 6 ms の一部)。融合カーネルの敗北記録の読み替えも不要。
+
+### 2026-09-03 07:36 HC の elementwise を prefill 幅で mx.compile (P2、`--knob hc-prefill-compile`、8k)
+
+prefill_s A 14.013 / B 14.026 (-0.1%)、tok/round 同一。発火は確認済み (env と enable を knob が両方立てる、行数ゲート 64 に対し 2048 行)。
+HC の elementwise は compile しても動かない。GEMM 床 234 ms + traffic 床 105 ms = 340 ms に対し実測 380〜423 ms なので、
+残りは 1 割強しか無く、その 1 割も op 起動でなく traffic だった。畳む。knob は既定 off のまま残す。
