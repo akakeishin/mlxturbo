@@ -95,9 +95,10 @@ GPU の待ち行列 (2026-09-03 03:20 時点の状態):
   厳密棄却サンプリングは畳んだ。仮説 A/B は一通り終わり。
 - 走行中 (03:56〜): **フルベンチ** (chain70、`bench/results/self-snapshot-full-0903.json`、両エンジン、0/4k/17k/25k/32k/50k、
   反復 1、冷却 10 分後)。mlx-serve は origin/main と同じで再ビルド不要と確認済み。
-- その後 (chain71): 長文脈の品質ゲート `tools/longctx_quality.py` を 17k (n=8) と 50k (n=6) で。1 回目は thinking on の
-  ままで課題不成立だった (直して 2k の健全性 recall 3/3、quote 2/3)。dense と kernel の正答率と一致率で gather
-  カーネルの採用を裏付ける (kernel が dense より有意に低ければ既定 off に戻す)。
+- 済 (14:35): フルベンチ (CATCHUP 12:20 の表: 冷 prefill 1.13〜1.21x 負け、decode ±8%、温 TTFT 4〜17 倍速)、
+  長文脈の品質ゲート (17k / 50k とも kernel は dense と同じ正答率 → gather カーネル既定 on 確定)。
+- 走行中: 小物の A/B — prime 窓 2048 対 512 (4k)、MoE 重み付き和の畳み込み (`MLXTURBO_MOE_COMBINE_FOLD`、8k / 短文脈 / 17k)、
+  PLE の 167 ms/チャンクの内訳 (`tools/ple_split.py`)。ユーザー方針: 小物をちびちび集める (prefill も decode も)。
 - その後: 長文脈の品質ゲートを 17k / 50k で走らせて gather カーネルの採用を裏付ける → temp 0.7 の tok/round →
   mlx-serve 最新版でフルベンチ → 27B / 35B-A3B。
 - その後: 小さいベンチ (mlxturbo だけ、冷、新しい冷却条件の基準) → 仮説 A/B (draft の hit@2、rerank off、
