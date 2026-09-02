@@ -1569,3 +1569,18 @@ GPU 時間 3.4 s に対して 250 ms)。`MLXTURBO_NGRAM_PREFETCH=1` が -0.9% �
 prefill_s **-2.2%** (14.11 → 13.81 s)、decode ms/round +1.3% (fold の経路は decode 幅でも SwitchGLU を迂回するため、
 S=1〜3 では (rows, 640) の乗算と個別の gather の分だけ損)。短文脈と 17k の結果を見て、**prefill 幅 (S ≥ 64) だけ
 fold にする**形で採用するかを決める。
+
+## 小物 3 の続き: MoE 重み付き和の畳み込み、短文脈と 17k (2026-09-03 15:55)
+
+| 条件 | prefill_s | ms/round | tok/round |
+|---|---|---|---|
+| 8k | -2.2% | +1.3% | ±0 |
+| 短文脈 (decode 512) | — | +1.4% | -4.0% (数値が動いて draft が変わる分) |
+| 17k | **-2.5%** | +0.6% | ±0 |
+
+prefill 幅では勝ち、decode 幅では負け。**行数 ≥ 64 (prefill) だけ fold にして既定 on** にする (実装中)。
+KLD は `quant_eval compare --fusions` (prompt 約 600 トークンで fold が発火する) で確認してから。
+
+PLE の補足 (`tools/ple_split.py` の再計測): 冷の pread は **257 ms/チャンク (89%)**、`prefill_anatomy` の 167 ms は
+ページキャッシュが温まった値だった。本番 (新しい本文) では冷の 257 ms が掛かる = 1 チャンク 3.4〜3.8 s の 7%。
+先読みを本当に重ねれば prefill -7% の見込み (実装中)。
