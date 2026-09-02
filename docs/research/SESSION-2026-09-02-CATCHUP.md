@@ -755,3 +755,37 @@ decode ms/tok A -0.3%、prefill -3.0% (熱の範囲)、tok/round 同じ。結果
 データ量に対して遅い」はこれと整合する。`tools/kernel_chain_cost.py` (作成中) で HC / GDN step /
 prework / rms_norm_gated の 1 回の費用を連鎖で測り、forward 内の呼び出し回数を掛けて
 未帰属 6 ms への寄与を出す。
+
+## prefill attention の経路と head_dim 256 の費用 (2026-09-02 21:30、`tools/sdpa_headdim_micro.py`、GPU 空き)
+
+事実 (MLX 0.32.2 のソース、相手の写しは無改造なので pip と同一):
+`ScaledDotProductAttention::use_fallback` は S>8 で head_dim 192/256 なら常に true (NAX 機で
+causal かつ配列マスク無しのときだけ融合)。**Flash-Next (head_dim 256) の prefill attention は
+融合 (steel) ではなく、スコア [H, S, kv] を実体化する素の経路。**相手 (mlx-serve) は head_dim 256
+の flash 型カーネル (`msv_attn_p256`) と QSA 用の block-gather カーネル (`msv_attn_qsa256`、
+kv > 8192 で有効) を自前で持ち、この経路を避けている。
+
+費用 (S=2048、Hq=24、Hk=2、bf16、ABAB × 5 の中央値、ms/層):
+
+| kv | d256 bool マスク (現行) | d256 causal | d128×2 head 融合 マスク | 同 causal | 現行 / 融合 |
+|---|---|---|---|---|---|
+| 2048 | 10.5 | 10.5 | 9.4 | 4.9 | 1.12 |
+| 8192 | 40.7 | 40.8 | 36.4 | 31.5 | 1.12 |
+| 16896 | 83.8 | 84.0 | 74.9 | 69.3 | 1.12 |
+
+読み方:
+- **素の経路の損は 12% しかない。**head_dim 256 では matmul が支配的で、スコアの実体化は小さい。
+  MLX が 256 を素の経路に回す判断は正しい。dense のまま融合しても取り分は 1 割。
+- 融合 (d128×2) の kv=16.9k は 850 GFLOP を 75 ms = 11 TFLOPS で、GPU の計算上限に張り付いている。
+  **kv に比例して伸びる attention は、計算量を減らす (選択ブロックだけ計算する) 以外に縮まない。**
+- in-model の末尾チャンク attention は 12 層で 1954 ms = 163 ms/層。マイクロの sdpa 84 ms との差
+  約 80 ms/層は indexer (pooled key、スコア、argpartition)、マスク構築、`mask & sparse` の分。
+  **indexer 側が sdpa と同じ大きさ**で、こちらは疎化カーネル無しで縮められる可能性がある。
+
+レーン 3 の判定の訂正: T=4/8 の union で畳んだのは早計だった。相手が使っているのは T=1 (クエリ
+ごとの直接添字 gather) で、union の問題は無く、kv=16.9k で読むのは 2048 キー × K/V × 2 kv head
+= 8 GB/層/チャンク (400 GB/s で 20 ms)、計算は dense causal の 24%。前回の T=1 カーネルが dense と
+同速だったのは読み出し量ではなくカーネルの効率 (素朴な load で 85 GB/s 相当) と考えるのが
+整合的。**ゲートは変えない (合成で dense sdpa の 2 倍、kv=16.9k S=2048)。手を T=1 + 12 GQA head
+で K/V タイル共有 + uint4 の段階 load に変えて再挑戦する。**見込み: 17k prefill で約 2 s (5%)、
+50k で約 25 s (15%)。indexer 側の 80 ms/層は別途 `tools/qsa_prefill_split.py` で内訳を出す。
