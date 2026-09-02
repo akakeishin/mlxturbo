@@ -1560,6 +1560,372 @@ def _knob_moe_combine(ctx):
     return apply
 
 
+# ------------------------------------------------------------------------
+# 天井スタブ (ceiling stub) knob 5 種。「その部品を 0 費用にしたら壁時計は
+# どれだけ減るか」を in-model で測るための道具。出力の正しさは問わない --
+# ms/round / prefill_s だけを見る。触るのは decode_ab.py の中だけ
+# (`_vendor/qwen4_exp.py` と `spec_flash.py` は編集しない。差し替えは
+# monkeypatch で knob の apply/呼び出し口から行う)。
+# ------------------------------------------------------------------------
+
+
+def _knob_stub_draft(ctx):
+    """天井スタブ (D1)。A = MTP のドラフト生成を丸ごとスキップし、直前
+    トークン (`cur`) の繰り返しを固定 draft として `depth` 個返す /
+    B = 素 (既定)。
+
+    `FlashSpecEngine._draft_chain` を丸ごと差し替え、`self.mtp.layers[0]`
+    の forward を一切呼ばない (embed / combine / hyper_connection_mixer も
+    呼ばない --- CPU 構築も GPU 実行も 0)。返す `drafts` は「長さ depth の
+    mx.array (1,1) のリスト」という呼び手側の形だけ保つ (`generate_stream`
+    の `mx.concatenate([cur] + drafts, axis=1)` / `mx.async_eval(drafts)`
+    (2236〜2247 行、`next_drafts` 経由の 2349〜2358 行) はそのまま通る)。
+
+    `_prime_accepted_gap` も no-op にする。素の `_draft_chain` はキャッシュを
+    `keep=cache.size()+1` まで trim して cur 自身の 1 枠だけ残す規約になって
+    いて、`_prime_accepted_gap` はその残り (`toks[0..len-2]`) を埋める役目
+    --- この knob はその 1 枠すら書かない (MTP を一切呼ばないため) ので、
+    `_prime_accepted_gap` を生かしたままだと毎ラウンド cur の分だけ書き損ね
+    が積もり、MTP キャッシュの offset がラウンドを追うごとにずれ続ける
+    (`oracle-draft` の docstring 参照 --- あちらは逆に「cur の 1 枠だけは
+    本物の forward で書く」ことでこの積み残りを避けている)。ここでは MTP
+    キャッシュの整合性そのものに用が無いので、両方まとめて無効化するのが
+    安全。verify 幅 (depth) は呼び手からそのまま受け取って個数だけ揃える
+    --- **変えない**。
+
+    出力の正しさは問わない (draft はほぼ毎回外れる想定で、trunk の verify
+    が「+1 ボーナストークン」だけを確定させる形に近づく)。目的は「draft の
+    CPU 構築 + GPU 実行を 0 費用にしたら壁時計がどれだけ減るか」の天井
+    (D1)。**判定は ms/round だけ**(tok_per_round/受理率は意味を持たないので
+    無視すること)。
+    """
+    from mlxturbo.spec_flash import FlashSpecEngine
+
+    orig_chain = FlashSpecEngine._draft_chain
+    orig_prime = FlashSpecEngine._prime_accepted_gap
+
+    def stub_chain(self, cur, hyper_prev, cache, depth, trace_top2=False):
+        return [cur for _ in range(depth)]
+
+    def stub_prime(self, toks, hypers, cache):
+        return None
+
+    def apply(variant):
+        if variant == "A":
+            FlashSpecEngine._draft_chain = stub_chain
+            FlashSpecEngine._prime_accepted_gap = stub_prime
+        else:
+            FlashSpecEngine._draft_chain = orig_chain
+            FlashSpecEngine._prime_accepted_gap = orig_prime
+
+    return apply
+
+
+def _knob_stub_indexer_topk(ctx):
+    """天井スタブ (D6)。A = decode/verify 幅 (S<=4) の QSA top-k 選択
+    (`QSAIndexer._pooled_and_top` の `mx.argpartition` 呼び出し 1 箇所、
+    `_vendor/qwen4_exp.py:474`) を「先頭 k ブロックの固定 slice」に
+    置き換える / B = 素 (既定)。**prefill 幅 (S>=64) は触らない**
+    (`_pooled_and_top` に入った時点で S を見て素の経路へ丸ごと逃がす)。
+
+    `_pooled_and_top` (370〜481 行) は pooled key の作成からブロック選択
+    まで 1 関数にまとまっていて、argpartition の 1 行だけを外から差し替える
+    フックが無い。関数を丸ごと写すと `_vendor` 側の変更に追従できなくなる
+    ので、代わりに **呼び出しの瞬間だけ** `mx.argpartition` をこの関数専用の
+    固定 slice にすり替え、`_pooled_and_top` 本体 (`orig`) を呼んだ直後に
+    元へ戻す。MLX はグラフを Python 側で同期的に組むだけ (GPU 実行は非同期
+    でも、この 1 メソッド呼び出しの間に他の Python コードが割り込むことは
+    無い) なので、この間だけの差し替えは `_pooled_and_top` 以外の
+    argpartition 呼び出し (MoE routing、draft-rerank の top-2 選定など) には
+    一切触れない。
+
+    固定 slice は `mx.arange(n_blocks, dtype=mx.uint32)` を
+    `mx.argpartition` と同じ形・同じ dtype (uint32) にブロードキャストした
+    もの --- スライス `[..., :k]` を取ると常に「ブロック 0..k-1」になる
+    (`visible` によるマスク処理・softmax 相当の重み付けなど後続の演算は
+    素のまま通す)。出力の正しさ (選ばれるブロックが実際に近いかどうか) は
+    問わない。目的は「top-k 選択そのものの費用が 0 だったら壁時計がどれだけ
+    減るか」の天井 (D6)。**判定は ms/round だけ**(短文脈 decode で見る --
+    `--only short` で十分。長文脈でも発火はするが目的は decode 幅の費用な
+    ので `--only short` を推奨)。
+    """
+    import mlx.core as mx
+    import mlx_lm.models.qwen4_exp as Q
+
+    orig = Q.QSAIndexer._pooled_and_top
+
+    def _fixed_argpartition(a, kth, axis=-1):
+        n = a.shape[axis]
+        idx = mx.arange(n, dtype=mx.uint32)
+        shape = [1] * a.ndim
+        shape[axis] = n
+        return mx.broadcast_to(idx.reshape(shape), a.shape)
+
+    def stub(self, x, rope, cache, offset, positions=None):
+        B, S, _ = x.shape
+        if S > 4:
+            return orig(self, x, rope, cache, offset, positions)
+        real_argpartition = mx.argpartition
+        mx.argpartition = _fixed_argpartition
+        try:
+            return orig(self, x, rope, cache, offset, positions)
+        finally:
+            mx.argpartition = real_argpartition
+
+    def apply(variant):
+        Q.QSAIndexer._pooled_and_top = stub if variant == "A" else orig
+
+    return apply
+
+
+def _knob_stub_gdn_scan(ctx):
+    """天井スタブ (P1)。A = prefill 幅 (T>=64) の GDN 再帰スキャンを、v を
+    そのまま返す no-op (state も同じ形のまま素通し) に差し替える /
+    B = 素 (既定)。
+
+    prefill 幅で実際に発火する経路は、既定 (`MLXTURBO_GDN_METAL=1`) では
+    `GatedDeltaNet.__call__` (`_vendor/qwen4_exp.py:1292〜1298`) の
+    `_gdn_metal` 分岐 -- `gdn_blocked_metal.gated_delta_update_blocked_metal`
+    が呼ぶ `gated_delta_blocked_seq` (同ファイル 271 行、実際の Metal
+    カーネル dispatch)。`gbm.eligible()` (Dk==128 / Dv%32==0 / T>=64 など)
+    で外れた場合の素の経路は `mlx_lm.models.gated_delta.gated_delta_update`
+    (`_vendor/qwen4_exp.py:1311〜1323`、`from .gated_delta import
+    gated_delta_update` でモジュール名前空間に束ねてある)。**この 2 つを
+    両方 no-op にする**ことで、どちらの経路が発火していても scan の費用を
+    消せる (`gdn-blocked` は既定 off で対象外のまま --- 発火していないことは
+    `mlxturbo.kernels._fire.snapshot()` に `gdn_blocked` が出ないことで確認
+    できる)。
+
+    no-op は「g/beta の計算と `_fire.bump` は素のまま (費用として残る --
+    再帰そのものではないので)、実際の再帰スキャンだけを飛ばして v を
+    そのまま出力・state を素通し (無ければ fp32 ゼロ) で返す」。
+    出力の正しさは問わない (v をそのまま出すだけで decode 後段は破綻した
+    値のまま流れる)。目的は「scan を丸ごと 0 費用にしたら prefill_s が
+    どれだけ縮むか」の天井 (P1)。**判定は prefill_s だけ**(生成トークン
+    自体は捨てる -- `--only long --ctx 8000 --tokens 8` 程度で十分)。
+    """
+    import mlx.core as mx
+    import mlx_lm.models.qwen4_exp as Q
+    from mlxturbo.kernels import gdn_blocked_metal as gbm
+
+    orig_seq = gbm.gated_delta_blocked_seq
+    orig_ref = Q.gated_delta_update
+
+    def stub_seq(q, k, v, g, beta, state=None, block_t=None):
+        B, T, Hk, Dk = q.shape
+        Hv, Dv = v.shape[2:]
+        if state is None:
+            state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        return v, state
+
+    def stub_ref(q, k, v, a, b, A_log, dt_bias, state=None, mask=None,
+                 use_kernel=True):
+        B, T, Hk, Dk = q.shape
+        Hv, Dv = v.shape[-2:]
+        if state is None:
+            state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        return v, state
+
+    def apply(variant):
+        if variant == "A":
+            gbm.gated_delta_blocked_seq = stub_seq
+            Q.gated_delta_update = stub_ref
+        else:
+            gbm.gated_delta_blocked_seq = orig_seq
+            Q.gated_delta_update = orig_ref
+
+    return apply
+
+
+def _knob_stub_moe_single_expert(ctx):
+    """天井スタブ (P3/P4)。A = `SparseMoeBlock.__call__`
+    (`_vendor/qwen4_exp.py:1422` 付近) の routing 結果 `idx` を全行
+    「専門家 0..top_k-1 の固定」に差し替える (top_k はそのまま、全行同じ
+    top_k 個の専門家) / B = 素 (既定)。gather_qmm はソート済み経路のまま
+    触らない。
+
+    `stub-indexer-topk` と同じ「呼び出しの瞬間だけ `mx.argpartition` を
+    固定 slice にすり替える」手口 (`idx = mx.argpartition(-lr_or_logits,
+    top_k-1, axis=-1)[..., :top_k]` が r513/素の両分岐にあるが、どちらも
+    `[..., :top_k]` を取る前の argpartition だけを差し替えれば済む)。
+    全行が同じ `[0..top_k-1]` を選ぶので、後続の softmax 重み
+    (`take_along_axis(logits, idx)`) は実在する値のまま計算され、
+    `_moe_combine_fold`/`switch_mlp` のソート済み経路 (`mx.argsort(idx_flat)`)
+    に渡ると **行またぎのセグメントが専門家境界をまたがない最良ケース**
+    になる (全トークンが同じ専門家集合を引くため)。
+
+    幅によるゲートは無い (decode/verify 幅の MoE 呼び出しにも同じ差し替えが
+    掛かる) --- 測定対象が prefill_s だけなので実害は無い。目的は
+    「gather_qmm がセグメント straddle 無しの最大効率で走ったときの
+    prefill_s」の天井 (P3/P4)。**判定は prefill_s だけ**
+    (`--only long --ctx 8000 --tokens 8` 程度で十分、出力の正しさは問わない
+    --- 全トークンが専門家 0..top_k-1 だけで処理されるので中身は破綻する)。
+    """
+    import mlx.core as mx
+    import mlx_lm.models.qwen4_exp as Q
+
+    orig_call = Q.SparseMoeBlock.__call__
+
+    def _fixed_argpartition(a, kth, axis=-1):
+        n = a.shape[axis]
+        idx = mx.arange(n, dtype=mx.uint32)
+        shape = [1] * a.ndim
+        shape[axis] = n
+        return mx.broadcast_to(idx.reshape(shape), a.shape)
+
+    def stub_call(self, x):
+        real_argpartition = mx.argpartition
+        mx.argpartition = _fixed_argpartition
+        try:
+            return orig_call(self, x)
+        finally:
+            mx.argpartition = real_argpartition
+
+    def apply(variant):
+        Q.SparseMoeBlock.__call__ = stub_call if variant == "A" else orig_call
+
+    return apply
+
+
+def _knob_oracle_draft(ctx):
+    """D3 の損益 (仮説裏取り、天井スタブではない)。`--oracle-out <json>`
+    (decode_ab の `--save-out` 出力、`rows[].out`/`rows[].prompt_ids`) を
+    読み、各ラウンドで「現在位置の真の次 N-1 トークン」を draft にして
+    verify 幅 S=N で流す (受理はほぼ 100% になるはず)。variant がその S
+    そのもの --- `"6"` は真の次 5 トークンを draft (depth=5)、`"2"` は
+    真の次 1 トークンだけを draft (depth=1、既定の depth=2 相当の対照より
+    さらに絞った下限)。目的は **S=6 の ms/round が S=2 の何倍か**
+    (2.4 倍を超えたら畳む、というのが仮説の判定線)。
+
+    `--oracle-out` の JSON は **`--only long` で作った (かつこの knob の
+    run 自身も `--only long` でなければならない)** --- `rows` の中で
+    `kind=="long"` の行を `prompt_ids` の初出順に 0,1,2,... と番号付けし、
+    それが decode_ab 自身の `case_idx` (`cases` を `--only long` で作った
+    ときの並び) と一致する前提で対応付けている。`--only both` で作った
+    JSON でも `kind=="long"` の行だけを拾うので使えるが、**この knob の run
+    自身は必ず `--only long`**(`_knob_oracle_draft` の setup で検査し、
+    違えば例外)。
+
+    `_draft_chain` を差し替える (呼び手は変えない)。現在の生成位置は
+    エンジン側の状態を直接読むのではなく、この knob 自身が
+    `eng.depth_trace_prompt_id` (`f"{kind}:{case_idx}"`、main() が
+    ラウンドとは無関係に毎回立てている識別子) で「どの oracle 系列を
+    追っているか」を特定し、**oracle の受理が 100% だった場合に engine が
+    たどるはずの受理済みトークン数**を `apply()` 呼び出し (= 1 回の
+    generate_stream 開始) のたびに 0 から数え直して求める --- 1 ラウンド
+    ごとに `depth+1` (draft 全部命中 + trunk 自身のボーナス 1 トークン)
+    ずつ進む想定。受理が 100% から外れた場合はこのカウンタが実際の位置から
+    ずれていくので、その回以降は「真の続き」ではなくなる (出力の正しさは
+    問わない --- ms/round の計測が目的で、tok/round は参考程度)。
+
+    cur 自身の MTP キャッシュへの書き込みだけは本物の forward で行う
+    (embed -> combine -> `mtp.layers[0]` を 1 段だけ、素の `_draft_chain`
+    の step 0 と全く同じ形。予測結果は使わず捨てる)。**これは
+    `stub-draft` と違って `_prime_accepted_gap` を無効化しないため**
+    --- `_prime_accepted_gap` は検証で確定した中間トークンを毎ラウンド
+    MTP キャッシュへ書き戻す本物の処理で、S が広いほど書き戻す本数が
+    増える (これ自体が S=6 vs S=2 の実コスト差の一部なので、消してはいけ
+    ない)。それが要求する「呼び出し前の cache は常にクリーン」という
+    不変条件を満たすには、cur 自身の 1 枠だけは `_draft_chain` が書く
+    という規約を保つ必要がある -- なので step 0 だけは本物を通す
+    (2 段目以降 --- 素の経路なら投機的に組んでトリムで捨てられるだけの
+    段 --- はスキップして oracle の値をそのまま使う。捨てられる計算を
+    そもそもしないだけなので、cache の整合性に影響しない)。
+
+    `eng.depth_ctx_limit` を `1<<30` に上げ、`eng._depth_adapt` を False に
+    する (`_knob_depth`/`_knob_depth_adapt` と同じ理由 --- 17k は
+    `MLXTURBO_DEPTH_ADAPT` の既定 on が効く範囲なので、それを無効化しないと
+    指定した S が長文脈の途中で上書きされる)。
+
+    `DECODE_ONLY_KNOBS` に入れてある (`_draft_chain` は decode ループの中
+    でしか呼ばれない) ので **`--prefill-once` が使える** --- 17k の prefill
+    を 4 回 (variants=["6","2"] の回文) 払わずに済む。
+    """
+    import json
+    from pathlib import Path
+
+    import mlx.core as mx
+    from mlxturbo import spec_flash
+    from mlxturbo.spec_flash import FlashSpecEngine, trim_attn_cache
+
+    args = ctx["args"]
+    eng = ctx["eng"]
+    if args.only != "long":
+        raise ValueError(
+            "oracle-draft: --only long でだけ使うこと (case_idx の対応付けが "
+            "--oracle-out の JSON と decode_ab 自身の long 系列内の出現順で "
+            "決まるため -- --only both だと global な case_idx がずれる)"
+        )
+    if not args.oracle_out:
+        raise ValueError("oracle-draft: --oracle-out <json> が必須")
+
+    saved = json.loads(Path(args.oracle_out).expanduser().read_text())
+    seen: dict[tuple, int] = {}
+    by_idx: dict[int, list] = {}
+    for row in saved:
+        if row.get("kind") != "long":
+            continue
+        if "out" not in row or "prompt_ids" not in row:
+            raise ValueError(
+                f"oracle-draft: {args.oracle_out} に out/prompt_ids が無い"
+                " (元の run で --save-out を付け忘れていないか確認すること)"
+            )
+        key = tuple(row["prompt_ids"])
+        idx = seen.setdefault(key, len(seen))
+        by_idx.setdefault(idx, row["out"])
+    if not by_idx:
+        raise ValueError(f"oracle-draft: {args.oracle_out} に kind=long の行が無い")
+
+    state = {"fresh": True, "seq": None, "pos": 0}
+
+    def _resolve():
+        pid = getattr(eng, "depth_trace_prompt_id", "") or ""
+        head, sep, tail = pid.rpartition(":")
+        case_idx = int(tail) if sep and head == "long" and tail.isdigit() else None
+        state["seq"] = by_idx.get(case_idx)
+        state["pos"] = 0
+        state["fresh"] = False
+
+    def stub_chain(self, cur, hyper_prev, cache, depth, trace_top2=False):
+        if state["fresh"]:
+            _resolve()
+        # cur 自身の MTP キャッシュ書き込みだけは本物 (素の _draft_chain の
+        # step 0 と同じ形)。予測結果は使わず捨てる -- docstring 参照。
+        Q = spec_flash._arch()
+        keep = cache.size() + 1
+        emb = self.model.model.embed_tokens(cur)
+        mask = Q.create_attention_mask(emb, None)
+        x = self.mtp.combine(emb, hyper_prev)
+        self.mtp.layers[0](x, self.rope, mask, None, cache, cache.indexer, None, None)
+        trim_attn_cache(cache, keep)
+
+        seq = state["seq"]
+        pos = state["pos"]
+        if seq is None:
+            # oracle 系列が引けない (warmup、または case 不一致)。安全な
+            # フォールバックとして stub-draft と同じ「cur の繰り返し」
+            drafts = [cur for _ in range(depth)]
+        else:
+            last = len(seq) - 1
+            drafts = []
+            for i in range(1, depth + 1):
+                j = pos + i if pos + i <= last else last
+                drafts.append(mx.array([[seq[j]]], dtype=cur.dtype))
+        state["pos"] = pos + depth + 1
+        return drafts
+
+    FlashSpecEngine._draft_chain = stub_chain
+
+    def apply(variant):
+        depth = int(variant) - 1
+        eng.depth = depth
+        eng.depth_ctx_limit = 1 << 30
+        eng._depth_adapt = False
+        state["fresh"] = True
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
@@ -1611,6 +1977,14 @@ KNOBS = {
     "ngram-batch": (_knob_ngram_batch, ["A", "B"], True, "A"),
     "prime-window": (_knob_prime_window, ["2048", "512"], False, "2048"),
     "moe-combine": (_knob_moe_combine, ["A", "B"], False, "B"),
+    # 天井スタブ 5 種 (docs 参照は各 knob 関数の docstring)。出力の正しさは
+    # 問わないので control_identical は全部 False
+    "stub-draft": (_knob_stub_draft, ["A", "B"], False, "B"),
+    "stub-indexer-topk": (_knob_stub_indexer_topk, ["A", "B"], False, "B"),
+    "stub-gdn-scan": (_knob_stub_gdn_scan, ["A", "B"], False, "B"),
+    "stub-moe-single-expert": (
+        _knob_stub_moe_single_expert, ["A", "B"], False, "B"),
+    "oracle-draft": (_knob_oracle_draft, ["6", "2"], False, "2"),
 }
 
 
@@ -1809,6 +2183,12 @@ def main() -> int:
                          "ときだけ) を追加で持たせる。既定 off のときの "
                          "結果 JSON は今までと完全に同一 (行を追加するだけで "
                          "既存キーは変えない)。")
+    ap.add_argument("--oracle-out", default=None,
+                    help="`--knob oracle-draft` 専用。decode_ab の "
+                         "`--save-out` 出力 (JSON、`rows[].out`/"
+                         "`rows[].prompt_ids` を使う) へのパス。真の続き "
+                         "トークン列を draft として流す (`_knob_oracle_draft` "
+                         "の docstring 参照)。他の knob では無視される。")
     args = ap.parse_args()
 
     if args.ngram:
@@ -1970,6 +2350,18 @@ def main() -> int:
         # しか渡らない。prefill のチャンクループはトークンをサンプルせず、
         # 与えられた ids をそのまま処理するだけ (_sample を通らない)。
         "temp",
+        # stub-draft (`_draft_chain`/`_prime_accepted_gap`) は decode ループ
+        # の中でしか呼ばれない。prefill のチャンクループは MTP に一切触れ
+        # ない (素の model(...) 呼び出しのみ)。
+        "stub-draft",
+        # stub-indexer-topk は `_pooled_and_top` に入った時点で S<=4 を見て
+        # 分岐する (S>=64 の prefill 幅は orig にそのまま逃がす、knob 自身の
+        # docstring 参照)。prefill 幅は 1 op も変わらない。
+        "stub-indexer-topk",
+        # oracle-draft (`_draft_chain` の差し替え) も decode ループの中でしか
+        # 呼ばれない。17k の prefill を variants=["6","2"] の回文 4 回払わず
+        # 済むよう、ここに入れておく (knob 自身の docstring 参照)。
+        "oracle-draft",
     }
     if args.prefill_once and args.knob not in DECODE_ONLY_KNOBS:
         print(f"knob={args.knob} は prefill に影響しうるので --prefill-once は"
