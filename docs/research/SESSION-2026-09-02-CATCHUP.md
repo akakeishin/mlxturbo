@@ -1126,3 +1126,10 @@ decode ms/tok も -2.3% (decode 幅の経路ずれは修正前の走行だが、
 出ない)。**採用条件 (-10%) を大きく超えた。**長文脈の KLD (`tools/kld_prefill_attn.py`、17k / 25k) が
 0.001 未満 (不変) か 0.01 未満 (小) なら `MLXTURBO_PREFILL_ATTN` を既定 on にする (kv ≥ 12288 だけ効く)。
 見込みの 100k: dense は kv に比例して伸びるので、-30% 級。
+
+## lm_head 4-bit 本焼き (真 bf16 から g64) の KLD (2026-09-03 00:11、`bench/results/quant-eval/compare-head4-baked-0903.json`)
+
+kld_mean **0.01794** / agree 0.962 (現行 8-bit + GDN Metal: 0.01326 / 0.966)。**+0.0047** で、rebit (二重量子化)
+の +0.0054 とほぼ同じ。「焼けば +0.0015」の見込みは外れ。受け入れ幅 (+0.0005) の 9 倍。
+**本番は lm_head 8-bit のまま。**`~/models/ddalcu-mlxlm-head4` は「相手の一律 4-bit と条件を揃えた速度比較用」
+としてだけ使う (公開ベンチでは注記付き)。
