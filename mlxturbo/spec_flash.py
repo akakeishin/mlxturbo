@@ -767,6 +767,15 @@ _PREFILL_TRACE = os.environ.get("MLXTURBO_PREFILL_TRACE") == "1"
 # `mtp-append` の B 側 (旧挙動) との比較用。
 _MTP_CACHE_APPEND = os.environ.get("MLXTURBO_MTP_CACHE_APPEND", "1") != "0"
 
+# MLXTURBO_DRAFT_TRACE=1: 木化ドラフト (レーン11 仮説7) の上限を測る --
+# _draft_chain の 1 段目で draft の top-1/top-2 候補を読み、_verify が
+# 確定させた真の次トークンと突き合わせて hit@1/hit@2 をラウンドごとに
+# 数える (mlxturbo.kernels._fire に積む。tools/decode_ab.py の `fired` に
+# そのまま出る)。読むだけで _draft_chain/_verify/_rerank の決定 (実際に
+# どのトークンを drafts に積むか、どこで受理を打ち切るか) は一切変えない
+# --- off のときは既存のフラグ読み出しのみで生成コストゼロ。
+_DRAFT_TRACE = os.environ.get("MLXTURBO_DRAFT_TRACE") == "1"
+
 
 class _PrefillTracer:
     """_PREFILL_TRACE=1 のときだけ prefill の区間を ms で刻んで 1 行ずつ print する。
@@ -1150,6 +1159,11 @@ class FlashSpecEngine:
         # -- 静的規則が depth 2 を返す短文脈側は静的規則のまま)。
         # _depth_adapt が off でも計算しておいて害はない (未使用のまま)。
         self._depth_adapt_min_pos = _depth_adapt_min_pos_default(self.depth_ctx_limit)
+        # MLXTURBO_DRAFT_TRACE=1 のときだけ使う受け渡しスロット。
+        # _draft_chain の 1 段目が (top1, top2) を置き、直後の _verify が
+        # 読んで消費する (1 ラウンドに 1 回だけ、常に対で消費されるので
+        # 世代をまたいで残らない --- _trace_draft_hit の docstring 参照)。
+        self._trace_top2: list | None = None
         # draft-rerank (mlx-serve の設計の移植): trunk lm_head の 2bit 再量子化で
         # 全語彙を粗く読み、正確な top-32 だけを trunk のヘッドの行で再採点する。
         # 粗い top-32 に真の argmax が入っている限り draft は trunk と一致し、
@@ -1191,19 +1205,42 @@ class FlashSpecEngine:
         del w
         mx.clear_cache()
 
-    def _draft_argmax(self, out) -> mx.array:
+    def _draft_argmax(self, out, want_top2: bool = False):
         """draft 用の次トークン。(1, 1) を返す。
 
         rerank あり: 2bit 粗ヘッドで全語彙 -> top-32 -> trunk の該当行を
         逆量子化して再採点 -> argmax。無し: trunk ヘッドで argmax。
+
+        ``want_top2`` (既定 False、MLXTURBO_DRAFT_TRACE 専用): True なら
+        ``(tok, top2)`` を返す。``tok`` は上と全く同じ計算 (argmax) で、
+        ``want_top2`` の有無で値は変わらない --- 木化ドラフトの上限
+        (hit@2 - hit@1) を測るための読み出し専用の追加で、どのトークンが
+        実際に drafts に積まれるかという決定には触れない。``top2`` は
+        既に計算済みの logits/scores から 2 位を追加で読むだけ (matmul も
+        dequantize もこの目的のためには増えない)。rerank なしなら
+        argpartition で全語彙から 2 つ、rerank ありなら再採点済みの
+        top-32 (``scores``) から argpartition で 2 つ。``top2`` は
+        (vocab id, vocab id) の Python int 対。rerank ありでバッチ行
+        (``row.shape[0] > 1``) のときは top2 側の再計算をしない
+        (``_draft_argmax_rows`` は加算順を変えないため触らない対象) ので
+        ``(tok, None)`` を返す --- 呼び手はここで trace を諦めること。
         """
         if self._rerank is None:
-            return mx.argmax(self._head(out)[:, -1], axis=-1).reshape(-1, 1)
+            logits = self._head(out)[:, -1]
+            tok = mx.argmax(logits, axis=-1).reshape(-1, 1)
+            if not want_top2:
+                return tok
+            part = mx.argpartition(-logits, 1, axis=-1)[..., :2]
+            vals = mx.take_along_axis(logits, part, axis=-1)
+            order = mx.argsort(-vals, axis=-1)
+            top2 = mx.take_along_axis(part, order, axis=-1)
+            return tok, top2
         lm = self.model.lm_head  # _rerank があるなら lm_head も必ずある
         row = out[:, -1]
         cw, cs, cb = self._rerank
         if row.shape[0] > 1:
-            return self._draft_argmax_rows(row, lm, cw, cs, cb)
+            tok = self._draft_argmax_rows(row, lm, cw, cs, cb)
+            return (tok, None) if want_top2 else tok
         coarse = mx.quantized_matmul(
             row, cw, scales=cs, biases=cb, transpose=True,
             group_size=64, bits=self.RERANK_BITS)
@@ -1213,7 +1250,14 @@ class FlashSpecEngine:
             group_size=lm.group_size, bits=lm.bits)
         scores = (row.astype(rows.dtype) @ rows.T)
         best = mx.argmax(scores, axis=-1, keepdims=True)
-        return mx.take_along_axis(top, best, axis=-1)
+        tok = mx.take_along_axis(top, best, axis=-1)
+        if not want_top2:
+            return tok
+        part = mx.argpartition(-scores, 1, axis=-1)[..., :2]
+        vals = mx.take_along_axis(scores, part, axis=-1)
+        order = mx.argsort(-vals, axis=-1)
+        top2 = mx.take_along_axis(top, mx.take_along_axis(part, order, axis=-1), axis=-1)
+        return tok, top2
 
     def _draft_argmax_rows(self, row, lm, cw, cs, cb) -> mx.array:
         """`_draft_argmax` の rerank 経路の B 行版 (バッチ x 投機で使う)。
@@ -1254,7 +1298,7 @@ class FlashSpecEngine:
             return m
         return choose_depth(pos, self.depth, self.depth_ctx_limit)
 
-    def _draft_chain(self, cur, hyper_prev, cache, depth: int):
+    def _draft_chain(self, cur, hyper_prev, cache, depth: int, trace_top2: bool = False):
         """``self.depth`` トークンをまとめて引く。
 
         ヘッドは (embed(t), hyper) を受けて、mixer で潰す前に **hyper 形状の
@@ -1264,11 +1308,21 @@ class FlashSpecEngine:
         確定した (トークン, hyper) の対は 1 段目だけなので、戻る前にキャッシュを
         その 1 件まで縮める。**このキャッシュに投機的なものを入れない**という
         不変条件が、ラウンドを跨いで持ち回れる根拠になっている。
+
+        ``trace_top2`` (既定 False): 呼び手が「この呼び出しで作る draft が、
+        次に来る `_verify` 呼び出しでそのまま検証される」と保証できるときだけ
+        True を渡すこと (``generate_stream`` のパイプライン先組み
+        (``next_pending`` 側の 2 本目) はこの保証が無いので False のまま)。
+        True かつ ``MLXTURBO_DRAFT_TRACE=1`` のときだけ、1 段目の
+        ``_draft_argmax`` に ``want_top2=True`` を渡して top-2 候補を
+        ``self._trace_top2`` に置く (どのトークンを drafts に積むかという
+        決定そのものは変わらない --- ``_draft_argmax`` の docstring 参照)。
         """
         Q = _arch()
         keep = cache.size() + 1  # 物理列数 (trim_attn_cache の注記参照)
         drafts = []
         tok, hyper = cur, hyper_prev
+        want_top2 = trace_top2 and _DRAFT_TRACE
         for step in range(depth):
             emb = self.model.model.embed_tokens(tok)
             mask = Q.create_attention_mask(emb, None)
@@ -1277,7 +1331,13 @@ class FlashSpecEngine:
                 x, self.rope, mask, None, cache, cache.indexer, None, None
             )
             out = self.mtp.hyper_connection_mixer(x)
-            tok = self._draft_argmax(out)
+            if want_top2 and step == 0:
+                tok, top2 = self._draft_argmax(out, want_top2=True)
+                if top2 is not None:
+                    mx.eval(top2)
+                    self._trace_top2 = top2[0].tolist()
+            else:
+                tok = self._draft_argmax(out)
             drafts.append(tok)
             hyper = x
             if step < depth - 1:
@@ -1321,6 +1381,36 @@ class FlashSpecEngine:
                 x, self.rope, mask, None, cache, cache.indexer, None, None
             )
 
+    def _trace_draft_hit(self, true0: int) -> None:
+        """MLXTURBO_DRAFT_TRACE=1 のときだけ ``_verify`` から呼ぶ。
+
+        ``_draft_chain`` の 1 段目が残した top-2 候補 (``self._trace_top2``)
+        と、この検証ラウンドで確定した真の次トークン (``true0`` -- 位置 0 の
+        logits の argmax、またはサンプル) を突き合わせて hit@1/hit@2 を
+        `mlxturbo.kernels._fire` に積む。読んで消費するだけで、受理判定
+        (``hit`` -- どこまで prefix が一致したか) には一切関わらない。
+
+        毎ラウンド、対応する ``_draft_chain`` 呼び出しが ``trace_top2=True``
+        で作った top2 を必ず 1 回だけ消費する (呼ばれなかった/取れなかった
+        ラウンドは ``self._trace_top2`` が None のままなので黙ってスキップ
+        --- パイプライン先組みの 2 本目やバッチ行など)。
+        """
+        # getattr: 一部の道具 (tools/verify_spec_sampling.py) が
+        # ``FlashSpecEngine.__new__`` で `_verify` だけを叩くため、
+        # `__init__` を経ずスロットが無い場合がある --- その場合は
+        # 「top2 が無い」と同じ扱いにする。
+        top2 = getattr(self, "_trace_top2", None)
+        self._trace_top2 = None
+        if top2 is None:
+            return
+        c1, c2 = top2
+        _fire.bump("draft_trace_rounds")
+        if true0 == c1:
+            _fire.bump("draft_trace_hit1")
+            _fire.bump("draft_trace_hit2")
+        elif true0 == c2:
+            _fire.bump("draft_trace_hit2")
+
     def _verify(self, cap, lg, drafts, temp, precomputed=None, sampler=None):
         """検証フォワードの結果から、採用するトークンと hyper を取り出す。
 
@@ -1363,6 +1453,8 @@ class FlashSpecEngine:
             mx.eval(samp, dv)
             all_vals = samp[0].tolist()
             dvals = dv[0].tolist()
+            if _DRAFT_TRACE:
+                self._trace_draft_hit(all_vals[0])
             hit = 0
             while hit < k and all_vals[hit] == dvals[hit]:
                 hit += 1
@@ -1383,6 +1475,8 @@ class FlashSpecEngine:
             mx.eval(nxt_all, dv)
         all_vals = nxt_all[0].tolist()
         dvals = dv[0].tolist()
+        if _DRAFT_TRACE:
+            self._trace_draft_hit(all_vals[0])
         hit = 0
         while hit < k and all_vals[hit] == dvals[hit]:
             hit += 1
@@ -1988,6 +2082,7 @@ class FlashSpecEngine:
                     drafts = self._draft_chain(
                         cur, hyper_prev, mtp_cache,
                         self._effective_depth(base_pos + n + len(out)),
+                        trace_top2=True,  # このラウンドの _verify がそのまま検証する
                     )
                     # draft は必ず使うので先に投げる。GPU が draft チェーンを
                     # 回している間に、CPU は下の検証フォワードのグラフを組む
@@ -2007,6 +2102,9 @@ class FlashSpecEngine:
                 snap2 = _pipeline_snapshot(model, caches, mtp_cache)
                 cur2 = mx.argmax(lg[:, total - 1], axis=-1).reshape(1, 1)
                 hyper2 = cap.hyper[:, total - 1: total]
+                # trace_top2 は渡さない: このラウンドの _verify (下) はまだ
+                # 上の drafts を検証中で、ここで self._trace_top2 を上書きすると
+                # そちらの突き合わせが壊れる (MLXTURBO_PIPELINE は既定 off)。
                 drafts2 = self._draft_chain(
                     cur2, hyper2, mtp_cache,
                     self._effective_depth(base_pos + n + len(out) + total),
@@ -2094,6 +2192,8 @@ class FlashSpecEngine:
                 next_drafts = self._draft_chain(
                     cur, hyper_prev, mtp_cache,
                     self._effective_depth(base_pos + n + len(out) + len(vals)),
+                    trace_top2=True,  # pending が None のときだけここに来る
+                    # ので、これが次ラウンドの _verify にそのまま渡る draft
                 )
                 mx.async_eval(next_drafts)
             if _ROUND_TRACE:
@@ -2126,6 +2226,15 @@ class FlashSpecEngine:
                 f"{statistics.median(self.last_round_trace):.2f} "
                 f"max={max(self.last_round_trace):.2f} "
                 f"n={len(self.last_round_trace)}",
+                flush=True,
+            )
+
+        if _DRAFT_TRACE:
+            _dt = _fire.snapshot()
+            print(
+                f"[draft-trace] rounds={_dt.get('draft_trace_rounds', 0)} "
+                f"hit1={_dt.get('draft_trace_hit1', 0)} "
+                f"hit2={_dt.get('draft_trace_hit2', 0)}",
                 flush=True,
             )
 

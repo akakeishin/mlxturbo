@@ -171,6 +171,27 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              ビット同一のはずなので対照が効く --- control_identical=True)。
              in-model の壁時計 A/B は未実施 (このファイルの変更時点では
              CPU 検査のみ)。
+
+`draft-rerank` レーン11 仮説5 の裏取り: MLXTURBO_DRAFT_RERANK (既定 1、
+             `spec_flash.FlashSpecEngine._build_rerank`) が受理率を静かに
+             削っていないか。A = trunk lm_head の 2bit 粗ヘッドで全語彙を
+             読んでから正確な top-32 だけ再採点する (既定)。B = 粗ヘッドを
+             経由せず trunk ヘッドの argmax をそのまま draft にする
+             (MLXTURBO_DRAFT_RERANK=0 相当)。env var はエンジン構築時にしか
+             読まれないので、A/B は `eng._rerank` を直接付け替えて切る
+             (`depth` knob と同じ流儀 --- 粗ヘッドの構築はやり直さず、A の
+             タプルを退避して挿し戻すだけ)。draft の argmax が top-32 の
+             外れで trunk 直読みと食い違いうるので厳密一致は要求しない
+             (`control_identical=False`)。合格条件: **tok/round** (複数
+             プロンプト x 512 の平均) が rerank off で有意に上がったら、
+             rerank が受理率を削っている証拠。`--draft-trace` を足すと
+             `MLXTURBO_DRAFT_TRACE=1` が立ち、1 段目の draft top-1/top-2 と
+             検証済みの真の次トークンを突き合わせた hit@1/hit@2 が
+             `fired` (`draft_trace_rounds`/`draft_trace_hit1`/
+             `draft_trace_hit2`) に乗る --- こちらは仮説7 (木化ドラフトの
+             上限 = hit@2 - hit@1) の裏取り用で、rerank の on/off どちらでも
+             測れる (top-2 の取り方が rerank の有無で変わるだけ、
+             `spec_flash.FlashSpecEngine._draft_argmax` 参照)。
 """
 
 from __future__ import annotations
@@ -474,6 +495,39 @@ def _knob_depth_adapt(ctx):
         eng._depth_adapt = variant == "A"
         if eng._depth_adapt:
             eng._depth_controller = DepthController()
+
+    return apply
+
+
+def _knob_draft_rerank(ctx):
+    """A = draft-rerank on (既定、trunk lm_head の 2bit 粗ヘッドで全語彙を
+    読んでから正確な top-32 だけ再採点) / B = off
+    (MLXTURBO_DRAFT_RERANK=0 相当、trunk ヘッドの argmax をそのまま draft
+    にする)。
+
+    `MLXTURBO_DRAFT_RERANK` は `FlashSpecEngine.__init__` (`_build_rerank`)
+    でしか読まれず、粗ヘッドの構築 (dequantize→requantize) はやり直すと
+    重いので、env ではなく `eng._rerank` を直接付け替える (`depth` knob と
+    同じ流儀)。A のタプルは構築済みのものを退避して挿し戻すだけ --- B は
+    `_rerank = None` にして `_draft_argmax` の rerank なし分岐 (trunk
+    ヘッドの argmax) へ落とす。
+
+    draft の argmax が変わりうる (rerank の粗い top-32 に真の argmax が
+    入らない語で trunk 直読みと食い違いうる) ので厳密一致は要求しない。
+    判定は **tok/round** (受理率、複数プロンプト x 512 の平均) --- rerank
+    off で有意に上がるなら、rerank が受理率を静かに削っている証拠
+    (レーン11 仮説5)。
+    """
+    eng = ctx["eng"]
+    saved = eng._rerank
+
+    def apply(variant):
+        if variant == "A" and saved is None:
+            raise ValueError(
+                "draft-rerank: eng._rerank が構築されていない"
+                " (lm_head 無し=tie埋め込みか非量子化パック?)"
+            )
+        eng._rerank = saved if variant == "A" else None
 
     return apply
 
@@ -1303,6 +1357,7 @@ KNOBS = {
     "wide": (_knob_wide, ["A", "B"], False, "B"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
     "depth-adapt": (_knob_depth_adapt, ["A", "B"], False, "B"),
+    "draft-rerank": (_knob_draft_rerank, ["A", "B"], False, "B"),
     "mtp-append": (_knob_mtp_append, ["A", "B"], False, "B"),
     # A = interleaved (本番既定) を基準に、B = separate (RAM 常駐) と比べる
     "ngram-layout": (_knob_ngram_layout, ["A", "B"], True, "A"),
@@ -1458,12 +1513,23 @@ def main() -> int:
                          "update_and_fetch が donation できずコピーになる "
                          "(本番の継続 decode には無い、このハーネス自身の "
                          "アーティファクト)。1 ラウンド目を除いて見ること。")
+    ap.add_argument("--draft-trace", action="store_true",
+                    help="MLXTURBO_DRAFT_TRACE=1 を立てる。_draft_chain の "
+                         "1 段目の draft top-1/top-2 と _verify が確定させた "
+                         "真の次トークンを突き合わせ、hit@1/hit@2 を "
+                         "mlxturbo.kernels._fire (draft_trace_rounds/"
+                         "draft_trace_hit1/draft_trace_hit2) に積む。既存の "
+                         "fired 収集 (_fire.snapshot()) にそのまま乗るので "
+                         "結果 JSON の fired に出る。木化ドラフト (レーン11 "
+                         "仮説7) の上限 = hit@2 - hit@1 を見るための道具。")
     args = ap.parse_args()
 
     if args.ngram:
         os.environ.setdefault("FASTMLX_NGRAM_DISK", "1")
     if args.round_trace:
         os.environ["MLXTURBO_ROUND_TRACE"] = "1"
+    if args.draft_trace:
+        os.environ["MLXTURBO_DRAFT_TRACE"] = "1"
 
     import mlx.core as mx
     from mlx_lm import load
@@ -1598,6 +1664,11 @@ def main() -> int:
         # (`pooled-cache`/`indexer-cache` と違い、こちらは decode/verify 幅
         # 限定の枝を新設した knob なので prefill には触れようがない)。
         "indexer-lean",
+        # draft-rerank (`eng._rerank`) は `FlashSpecEngine._draft_argmax`
+        # からしか読まれず、それを呼ぶのは `_draft_chain` (decode ループの
+        # 中だけ) だけ。prefill の priming (`_prime_draft_cache`) は
+        # `_draft_argmax` を経由しない素の `self.mtp(...)` forward。
+        "draft-rerank",
     }
     if args.prefill_once and args.knob not in DECODE_ONLY_KNOBS:
         print(f"knob={args.knob} は prefill に影響しうるので --prefill-once は"
