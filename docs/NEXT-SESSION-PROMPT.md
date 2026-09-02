@@ -79,7 +79,11 @@ GPU の待ち行列 (2026-09-03 03:20 時点の状態):
 - 済 (05:30): n-gram 先読み (8k -0.9%、畳む)、固定 300 ms = リクエストごとの detokenizer 構築 → 修正済み
   (温 TTFT 0.45 → 0.15 s、完全ヒット 0.003 s)、投機ラウンドの KV コピーは無し (棄却)、decode の kv 罰は
   +3 ms/round で attention 層 (indexer + gather マスク) に帰属、レーン 8 は閉じた。
-- 走行中: gather カーネルの分布ずれ (KLD 0.04) の原因調査、indexer の op 整理 (`MLXTURBO_INDEXER_LEAN`)。
+- 済 (08:00): gather カーネルは **既定 on** (KLD 0.04 は top-k 反転のカスケードで、受理済みの GDN Metal の同じ物差し
+  0.111 より小さい)。indexer-lean は畳んだ (+0.3%)。小さいベンチ (冷却強化後、既知を片付けた基準) は
+  `bench/results/self-snapshot-turbo-small-0903b.json` (gather 前) と `...-0903c.json` (gather 後、走行中)。
+- 次: 仮説 A/B (レーン 11 の 8 段目: draft の hit@2、rerank off、厳密棄却サンプリング、group_size 128、
+  `mx.metal.start_capture`)。宿題: 長文脈の品質ゲート (課題の正答率、dense 対 カーネル)。
 - その後: 小さいベンチ (mlxturbo だけ、冷、新しい冷却条件の基準) → 仮説 A/B (draft の hit@2、rerank off、
   厳密棄却サンプリング、indexer の op 整理、group_size 128) → mlx-serve 最新版でフルベンチ → 27B / 35B-A3B。
 
