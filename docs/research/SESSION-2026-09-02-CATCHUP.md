@@ -2129,3 +2129,12 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - P3 / P10 17k (`p3mix-p10wide-17k.json`): mix48 **-4.0%** (27.40 s、seg32 -1.0%、素 28.54)、qmm-wide **-2.5%** (28.08 / 28.80)。対照 OK (head 一致)、tok/round 2.667 で同一、decode ±0.6%。
   8k (-4.3% / -2.6%) と同水準で、14:05 の既定化を裏付ける。
 - 17k の prefill は素で 28.5 s → 全部入りで 26 s 台 (9/3 朝の 31.6 s から -17%、mlx-serve 27.8 s に対して 0.95x)。
+
+### 2026-09-03 15:45 P6 MIN_KV 10k と K2c 17k (chain95、worker / 別プロセス)
+
+- MIN_KV 8192 対 12288、10k (`prefill-attn-min-kv-u4-10000.json`): prefill_s **-0.8%** (15.00 / 15.12)、decode ms/round +1.5% (8 トークンの窓の揺れ)。判定線 -1% に届かない。**既定は 12288 のまま。**
+  交差点 8.1k の直上では取り分が小さく、10k で 0.8% なら効く文脈が 8〜12k に限られる。
+- K2c 17k (両側 query、512 トークン × 3 本、`qsa-decode-kernel-17k.json`): **ms/round -0.7%** (34.93 / 35.16)、tok/round +0.5%、head 一致、発火 3550〜3760 / 本 (毎 round 12 層)。
+  冷連鎖の見込み (-1.7 ms/forward = -4.8%) に対して実測 -0.25 ms。**判定線 -3% 未達、既定にしない。**小ベンチにも入れない。
+  見込みとの差の切り分け: K2 の天井スタブ (stub-indexer-topk + stub-qsa-attn、17k、query) を chain96 で取る。天井が 1 ms 未満なら「QSA の decode 費用は選択 + sdpa ではなく
+  スコア計算 (K2 が置き換えない部分) が主」で K2 は畳む。天井が 2 ms 超なら配線の固定費 (host 側のゲート、select_bits の起動) を疑う。
