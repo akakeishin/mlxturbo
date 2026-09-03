@@ -2354,3 +2354,10 @@ prefill_s: 2048 幅 12.784 / 1024 幅 12.763 / 512 幅 13.238。非 MoE のメ�
   union の比 (S=3 で 0.727) から判定線 0.70 は算術的にも届かず、理想でも 0.78。「S=3 の gather_qmv が S=1 の 3.6 倍」は trace の CB 内按分の歪みで、冷 micro では 1.96 倍。**decode の行列積は帯域の壁に既に張り付いている。**
 - 残した芽: `fused:1` (重複もソートもせず gate/up 1 本 + down 1 本、sort / gather / scatter / SwiGLU の op が消える): S=1 **0.929** / S=3 0.979 / S=6 1.056。dispatch を減らす側の手として in-model へ (判定線 短 -1%、head 丸め級)。
 - 訂正の連鎖: 18:10 の「行列積が帯域の半分」は CB 内按分の帰属の歪み。20:00 の読み直し (壁 = dispatch の床) が残る。
+
+### 2026-09-03 20:19 HC elem の再測 (burn-in、depth 2 固定、head4、`hc-elem-burnin.json`): 短 ms/round **±0.0%** (ms/tok -0.6%)、17k **-0.7%** (ms/tok -1.1%)。短の head 一致、17k は 1 ケース分岐 (prefill 幅の post 段)
+
+- 前の +2.4% (14:55) は burn-in 無しの位置 1 の段差込みだった。代金ゼロ方針で **既定を elem に** (`MLXTURBO_HC=elem`、kernel / compiled / off で切替)。発火は decode / verify 幅 (行数 <= 8) だけに絞った (`eligible_elem` に行数ゲート) ので、素とビット一致。
+  kernel (sigmoid 1 ulp、mixed 97.5% 一致) は既定から降りた = 品質は上がる側。
+- dispatch は 14 → 6 / 呼び出し (× 97 = 1 step で -776 本 = 17%) なのに壁時計は 0〜-0.7%。**「dispatch の床 5 us × 本数」の読み (19:50) も過大**: 融合で消えるのは起動の一部だけで、小さいカーネルの中の DRAM レイテンシの連鎖は残る (HC の冷 micro で -9 us/呼び出し = 62 → 53)。
+  decode の残りの取り分は「融合した先のカーネルが高い並列度で走ること」に懸かる。本数を減らすだけでは動かない。

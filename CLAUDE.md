@@ -62,7 +62,7 @@
   2026-09-01 の in-model A/B で決着 (短 decode 3 本とも +46〜52% 遅い)。
   これも「有効化しない」側。逆に
   `MLXTURBO_PREFILL_GROUP=4` / `MLXTURBO_STAGE_EVERY=2` /
-  `MLXTURBO_DRAFT_RERANK=1` / `MLXTURBO_HC=kernel` / `MLXTURBO_SORT_MIN=16`
+  `MLXTURBO_DRAFT_RERANK=1` / `MLXTURBO_HC=elem` (2026-09-03 20:20 に kernel から。decode 幅だけ、ビット一致) / `MLXTURBO_SORT_MIN=16`
   は本番の既定値そのもので、値を変えると本番の挙動が変わる。
   `MLXTURBO_GDN_METAL` (既定 on、`=0` で off) も同様に本番の既定値で、
   2026-09-02 の in-model A/B (17k prefill -1.3〜-4.5%、KLD +0.00014) で

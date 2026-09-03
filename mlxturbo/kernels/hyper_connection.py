@@ -1251,6 +1251,14 @@ def eligible_elem(
         return False
     if norm_weight.shape != (hc * d,):
         return False
+    # decode / verify 幅だけ (行数 <= 8)。M >= 62 では post 段の縮約 (mean の bf16
+    # 逐次加算の模倣) が素と食い違い軌道が分かれる (2026-09-03 14:55 の切り分け)。
+    # decode 幅では全段ビット一致。
+    rows = 1
+    for n in hyper.shape[:-1]:
+        rows *= int(n)
+    if rows > 8:
+        return False
     return True
 
 

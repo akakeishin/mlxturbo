@@ -1343,16 +1343,25 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         # kernel は 2 ディスパッチだが sigmoid が bf16 とビット一致しない
         # (kernels/hyper_connection.py の精度の節)。compiled は op 単位で
         # 素と同じ計算の記録なのでビット同一のまま起動回数だけ減る。
-        hc_mode = os.environ.get("MLXTURBO_HC", "kernel")
+        # 2026-09-03 20:20: 既定を elem (第 4 変種、elementwise だけ融合、GEMV は
+        # MLX の qmv) にした。decode / verify 幅 (行数 <= 8) だけ発火し、素と
+        # ビット一致。burn-in 付き A/B で短 ms/round ±0 / 17k -0.7%、head 一致
+        # (dispatch は 14 -> 6 / 呼び出し)。kernel は sigmoid が 1 ulp ずれる
+        # (mixed 97.5% 一致) ので既定から降ろした。MLXTURBO_HC=kernel で戻る。
+        hc_mode = os.environ.get("MLXTURBO_HC", "elem")
         if hc_mode == "compiled":
             fused.enable_hyper_connection()
             print(f"{log_prefix} hyper-connections: mx.compile 版 (ビット同一)")
         elif hc_mode == "off":
             print(f"{log_prefix} hyper-connections: 素の実装 (MLXTURBO_HC=off)")
-        else:
+        elif hc_mode == "kernel":
             fused.enable_hyper_connection_kernel()
             print(f"{log_prefix} hyper-connections 融合カーネル有効 (moe_route/rms_norm_gated は"
                   " 無効のまま)")
+        else:
+            fused.enable_hyper_connection_elem()
+            print(f"{log_prefix} hyper-connections: elem 融合 (第 4 変種、decode/verify 幅のみ、"
+                  "ビット一致。MLXTURBO_HC=kernel|compiled|off で切替)")
         fused.enable_hyper_connection_prefill_compiled(model)
         # 書き戻し側 (DecoderLayer._combine) は読み側と別のゲート。
         # **2026-09-02 に既定 on にした。**in-model A/B (--knob hc-write、
