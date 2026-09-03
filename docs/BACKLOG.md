@@ -689,3 +689,15 @@ KLD の bf16 teacher、MTP 無しの族の draft 経路 (n-gram か小さい dra
 
 **反転条件**: 2 族目で共通化できたカーネルが 2 つ未満なら、対応表は作らず族ごとの配線に留める (抽象の維持費だけ残るため)。
 mlx_lm の更新で写しが壊れる頻度が月 2 回を超えるなら、写しの数を減らす方 (層のフックで staged を組む) を先にやる。
+
+### 追記 (2026-09-03 14:40、ユーザー): MTP 頭の無い族の投機と、vision / 音声
+
+- **MTP 頭の無い族 (Gemma 4 など) の投機はこちら側で用意する。**Gemma 4 に公式の MTP 頭は無い。用意する経路は 2 段:
+  1. **n-gram / lookup の draft** (`LookupSpecRunner`、BACKLOG 3 節で一部済み)。学習なし、反復の多い文で効き、新規の文では弱い。族を問わず最初に当てる既定。
+  2. **同じ族の小さいモデルを draft にする** (`DraftSpecRunner`、Gemma 4 なら小さい Gemma 4。tokenizer が同じ族なら受理判定はそのまま)。draft の forward 費用が乗るので、
+     受理率 × 本体との大きさの比で採否を決める (小ベンチの tok/s で)。
+  3. 自前で MTP / EAGLE 型の頭を学習するのは、上 2 つで倍率が出ない族に限った後回しの選択肢 (Flash-Next では学習しない方針と同じで、本筋から外す)。
+  対応表には「draft の種類 (MTP 頭 / lookup / draft モデル)」を 1 列持たせ、族ごとに既定を決める。
+- **vision / 音声も追従の対象に含める** (BACKLOG 1 節「マルチモーダル対応」と同じ話)。Gemma 4 と Qwen の VL 系は mlx_lm 側が VLM ラッパ (`gemma4.py` + `gemma4_text.py` の形) なので、
+  8〜9 割の追従はまず text 側の経路で取り、vision / 音声の encoder は別の adapter として足す。投機 decode 側で要るのは「画像 / 音声トークンを含む prefix の prefill と、
+  その KV を持ったままの draft / verify」で、text だけの前提を置いている箇所 (prime 窓、n-gram の文脈、checkpoint の位置) を洗うのが先。
