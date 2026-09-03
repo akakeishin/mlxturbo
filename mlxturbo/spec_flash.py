@@ -662,10 +662,11 @@ def capture(model, light: bool = False):
         ):
             from .kernels import gdn_prework as gp
 
-            # 実モデルは A_log/dt_bias が bf16 で読み込まれていることがある
-            # (2026-09-02、実機ログで確認)。enable_gdn_prework_kernel(model) が
-            # 立てた fp32 の写しがあればそれを使う (無ければ従来どおり
-            # self.A_log/self.dt_bias -- fp32 でなければ eligible() で弾かれる)。
+            # A_log/dt_bias は実モデルの dtype (bf16) のまま渡す。
+            # 2026-09-03 のカーネル書き直しで、素の compute_g と同じ順に
+            # bf16 で丸めるようになった (fp32 の写しを渡すと `a + dt_bias` が
+            # fp32 になって素と別の値になるので、eligible() が断る)。
+            # 旧い写し (_A_log_f32) は enable_gdn_prework_kernel が消す。
             A_log = getattr(self, "_A_log_f32", self.A_log)
             dt_bias = getattr(self, "_dt_bias_f32", self.dt_bias)
             if gp.eligible(mixed_qkv, conv_state, self.conv1d.weight, a, b,

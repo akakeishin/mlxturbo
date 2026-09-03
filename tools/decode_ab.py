@@ -412,13 +412,51 @@ def _knob_ple_hoist(ctx):
     return apply
 
 
+def _knob_gdn_decode_fused(ctx):
+    """decode/verify 幅の GDN の非行列積を 16 本 -> 3 本にする (2026-09-03)。
+
+    - A = 前処理 + 出力 norm の両方 (3 本)
+    - C = 前処理だけ (4 本。norm の寄与を切り分ける)
+    - B = 素 (既定、16 本)
+
+    前処理カーネルは列ブロック版に書き直したもの
+    (`mlxturbo/kernels/gdn_prework.py`)。旧版は 1 threadgroup しか立たず
+    in-model で +5.3% 負けた。出力 norm は `rms_norm_gated` を
+    **decode/verify 幅 (行数 <= 768) だけ**に絞って掛ける (幅を見ずに全部
+    差し替える `--knob rms-norm-gated` は 2026-09-02 に受理率が動いて却下)。
+
+    判定線 (親): 短文脈 3 本 x 512 の **ms/round -5% 以上**、head の不一致が
+    丸め級。ビット一致はしない (silu の sigmoid が MLX 本体と 1 ulp 単位で
+    ずれる。`gdn_prework.py` の「精度」節) ので control_identical=False。
+
+    発火の確認: `mlxturbo.kernels._fire.snapshot()` の `gdn_prework` と
+    `rms_norm_gated`。
+    """
+    import os
+
+    from mlxturbo import fused
+
+    eng = ctx["eng"]
+
+    def apply(variant):
+        fused.disable_gdn_decode_fused()
+        if variant == "B":
+            os.environ.pop("MLXTURBO_GDN_DECODE_FUSED", None)
+            return
+        os.environ["MLXTURBO_GDN_DECODE_FUSED"] = "all" if variant == "A" else "pre"
+        fused.enable_gdn_decode_fused(eng.model)
+
+    return apply
+
+
 def _knob_gdn_prework(ctx):
     """A = GDN 前処理の融合カーネル on / B = off (既定)。
 
-    model を渡すのは、A_log/dt_bias が bf16 で読み込まれた実モデルでも
-    fp32 の写しを作って eligible() の dtype 判定を通すため
-    (mlxturbo/fused.py の enable_gdn_prework_kernel docstring 参照。
-    2026-09-02、実機ログで発火 0 が判明した分の修正)。"""
+    2026-09-03 にカーネルを列ブロック版へ書き直した。`model` を渡すのは
+    古い fp32 の写し (`_A_log_f32`) が残っていたら消すため -- 現行の
+    カーネルは A_log/dt_bias を bf16 のまま受ける (素の `compute_g` と
+    同じ丸め位置)。前処理 + 出力 norm をまとめて見るのは
+    `--knob gdn-decode-fused`。"""
     import os
 
     from mlxturbo import fused
@@ -2620,6 +2658,9 @@ KNOBS = {
     # (第 1 段は実測前)。出力一致は要求する (control_identical=True)。
     "ple-hoist": (_knob_ple_hoist, ["A", "B"], True, "B"),
     "gdn-prework": (_knob_gdn_prework, ["A", "B"], False, "B"),
+    # A = 前処理 + 出力 norm (3 本) / C = 前処理だけ / B = 素 (既定)。
+    # ビット一致はしない (silu の sigmoid が 1 ulp)。判定は ms/round -5%
+    "gdn-decode-fused": (_knob_gdn_decode_fused, ["A", "C", "B"], False, "B"),
     "gdn-blocked": (_knob_gdn_blocked, ["A", "B"], False, "B"),
     "gdn-metal": (_knob_gdn_metal, ["A", "B"], False, "B"),
     "hc-write": (_knob_hc_write, ["A", "C", "B"], True, "B"),
@@ -3120,6 +3161,12 @@ def run_with_model(argv, bundle) -> int:
     DECODE_ONLY_KNOBS = {
         "hc-write", "moe-verify", "gdn-prework", "depth", "null",
         "rms-norm-gated", "moe-route",
+        # gdn-decode-fused は 2 つとも幅で切れる: 前処理は gdn-prework と
+        # 同じ S<=9 の適格判定、出力 norm は差し替えたメソッドの中で
+        # 行数 (B*S*n_v) <= 768 のときだけカーネルに回す (prefill の
+        # 1 チャンク 2048 トークンは 98304 行なので必ず素へ落ちる。
+        # fused.enable_gdn_decode_fused の _GDN_NORM_MAX_ROWS)。
+        "gdn-decode-fused",
         # depth-adapt は _effective_depth 経由でしか呼ばれず、それ自体
         # decode ループの中 (generate/generate_stream の while) でしか
         # 呼ばれない (prefill の forward は素の model(...) 呼び出しで、

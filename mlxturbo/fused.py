@@ -778,31 +778,118 @@ def enable_gdn_prework_kernel(model=None) -> None:
     """
     import os
 
-    import mlx.core as mx
     import mlx_lm.models.qwen4_exp as Q
 
     if os.environ.get("MLXTURBO_GDN_PREWORK") != "1":
         return
     Q.GatedDeltaNet._gdn_prework = True
+    # 注 (2026-09-03、カーネル書き直し): **fp32 の写しはもう作らない。**
+    # 素の `compute_g` は `a + dt_bias` を bf16 で足して bf16 で softplus する
+    # ので、fp32 の写しを渡すとカーネルだけが別の丸め位置になる (前は
+    # eligible() が fp32 限定だったのでこの写しが要った)。現行のカーネルは
+    # bf16 のまま素と同じ順で丸めるので、素の重みをそのまま渡すのが正しい。
+    # 古い写しが残っていると eligible() が dtype 不一致で弾くので消す。
     if model is None:
         return
-    copies = []
     for layer in model.model.layers:
         gdn = getattr(layer, "linear_attn", None)
         if gdn is None:
             continue
-        gdn._A_log_f32 = gdn.A_log.astype(mx.float32)
-        gdn._dt_bias_f32 = gdn.dt_bias.astype(mx.float32)
-        copies.append(gdn._A_log_f32)
-        copies.append(gdn._dt_bias_f32)
-    if copies:
-        mx.eval(copies)
+        for attr in ("_A_log_f32", "_dt_bias_f32"):
+            if hasattr(gdn, attr):
+                delattr(gdn, attr)
 
 
 def disable_gdn_prework_kernel() -> None:
     import mlx_lm.models.qwen4_exp as Q
 
     Q.GatedDeltaNet._gdn_prework = False
+
+
+# `enable_gdn_decode_fused` が差し替えた `RMSNormGated.__call__` の元
+_ORIG_RNG_DECODE = None
+
+# 出力 norm を融合カーネルに回す行数の上限。行数は B*S*n_v なので、
+# n_v=48・decode/verify 幅 (gdn_prework.MAX_M=16) で 768。prefill 幅
+# (1 チャンク 2048 トークン = 98304 行) は必ず素の経路に落ちる。
+_GDN_NORM_MAX_ROWS = 768
+
+
+def enable_gdn_decode_fused(model=None) -> None:
+    """decode/verify 幅の GDN 層の「行列積以外」を 3 本にする (2026-09-03)。
+
+    前処理 (`gdn_prework`、素 9 本) + 再帰 (元から 1 本) + 出力 norm
+    (`rms_norm_gated`、素 6 本) で、GDN 1 層の非行列積が **16 本 -> 3 本**。
+    36 層で 1 step あたり約 470 dispatch (S=1 の 4499 本の 1 割) が消える。
+
+    `enable_gdn_prework_kernel` (前処理だけ、`MLXTURBO_GDN_PREWORK=1`) との
+    違いは出力 norm も畳むことと、**その norm を decode/verify 幅に限る**こと。
+    `enable_rms_norm_gated` は幅を見ずに全部差し替えるので prefill にも効き、
+    2026-09-02 の A/B で受理率が動いた (`enable_rms_norm_gated` の docstring)。
+    ここでは行数 <= :data:`_GDN_NORM_MAX_ROWS` のときだけカーネルに回す。
+
+    **既定 on** (2026-09-03 21:05: 短 ms/round -2.4% / 17k -2.0%、micro でビット一致、代金ゼロ方針)。`MLXTURBO_GDN_DECODE_FUSED=0` で off:
+
+    - `1` / `all`: 前処理 + 出力 norm (3 本)
+    - `pre`: 前処理だけ (4 本。norm の寄与を切り分けるとき)
+    - `norm`: 出力 norm だけ
+
+    採否は in-model A/B (`tools/decode_ab.py --knob gdn-decode-fused`) で決める。
+    """
+
+    global _ORIG_RNG_DECODE
+    import os
+
+    import mlx_lm.models.qwen4_exp as Q
+
+    mode = (os.environ.get("MLXTURBO_GDN_DECODE_FUSED") or "1").lower()  # 既定 on (2026-09-03 21:05)
+    if mode in ("", "0", "off"):
+        return
+    if mode not in ("1", "all", "pre", "norm"):
+        raise ValueError(
+            f"MLXTURBO_GDN_DECODE_FUSED={mode!r} は 1/all/pre/norm のいずれか")
+
+    if mode in ("1", "all", "pre"):
+        Q.GatedDeltaNet._gdn_prework = True
+        if model is not None:
+            for layer in model.model.layers:
+                gdn = getattr(layer, "linear_attn", None)
+                if gdn is None:
+                    continue
+                for attr in ("_A_log_f32", "_dt_bias_f32"):
+                    if hasattr(gdn, attr):
+                        delattr(gdn, attr)
+
+    if mode in ("1", "all", "norm") and _ORIG_RNG_DECODE is None:
+        from math import prod
+
+        from .kernels import rms_norm_gated as rng
+
+        _ORIG_RNG_DECODE = Q.RMSNormGated.__call__
+        orig = _ORIG_RNG_DECODE
+
+        def patched(self, x, gate=None):
+            if gate is None or prod(x.shape[:-1]) > _GDN_NORM_MAX_ROWS:
+                return orig(self, x, gate)
+            w = self.weight
+            if not rng.eligible(x, w, gate):
+                return orig(self, x, gate)
+            # 行数が 48〜768 しかないので 1 行 = 1 threadgroup (既定の 8 行
+            # まとめだと threadgroup が 6 個しか立たず 40 コアに散らない)
+            return rng.rms_norm_gated(x, w, gate, self.eps, self.activation,
+                                       rows_per_tg=1)
+
+        Q.RMSNormGated.__call__ = patched
+
+
+def disable_gdn_decode_fused() -> None:
+    global _ORIG_RNG_DECODE
+    import mlx_lm.models.qwen4_exp as Q
+
+    Q.GatedDeltaNet._gdn_prework = False
+    if _ORIG_RNG_DECODE is not None:
+        Q.RMSNormGated.__call__ = _ORIG_RNG_DECODE
+        _ORIG_RNG_DECODE = None
 
 
 def enable_gdn_blocked_kernel() -> None:
@@ -2594,6 +2681,7 @@ __all__ = [
     "enable_gather_sort",
     "enable_gdn_blocked_kernel",
     "enable_gdn_metal_kernel",
+    "enable_gdn_decode_fused",
     "enable_gdn_prework_kernel",
     "enable_moe_glu",
     "enable_moe_shared_fold",
@@ -2601,6 +2689,7 @@ __all__ = [
     "enable_wide_projections",
     "disable_gdn_blocked_kernel",
     "disable_gdn_metal_kernel",
+    "disable_gdn_decode_fused",
     "disable_gdn_prework_kernel",
     "disable_hc_write",
     "disable_hyper_connection",

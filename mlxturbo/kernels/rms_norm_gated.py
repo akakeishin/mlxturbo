@@ -156,8 +156,16 @@ def rms_norm_gated(
     gate: mx.array,
     eps: float,
     activation: str = "sigmoid",
+    rows_per_tg: int | None = None,
 ) -> mx.array:
-    """`RMSNormGated.__call__` の中身を 1 本のカーネルで計算する。"""
+    """`RMSNormGated.__call__` の中身を 1 本のカーネルで計算する。
+
+    `rows_per_tg` は 1 threadgroup にまとめる行数 (既定 :data:`_ROWS_PER_TG`)。
+    decode 幅では行数が n_v=48 しかないので、既定の 8 だと threadgroup が
+    6 個しか立たず 40 コアに散らない。**decode 経路からは 1 を渡すこと**
+    (1 行 = 1 simdgroup = 1 threadgroup で 48 個立つ)。prefill 幅は行数が
+    数万あるのでどちらでも変わらない。
+    """
 
     _fire.bump("rms_norm_gated")
     dv = x.shape[-1]
@@ -173,7 +181,7 @@ def rms_norm_gated(
         inputs=[flat_x, weight, flat_g],
         template=[("T", x.dtype)],
         grid=(32, rows, 1),
-        threadgroup=(32, min(_ROWS_PER_TG, max(rows, 1)), 1),
+        threadgroup=(32, min(rows_per_tg or _ROWS_PER_TG, max(rows, 1)), 1),
         output_shapes=[(rows, dv)],
         output_dtypes=[x.dtype],
     )

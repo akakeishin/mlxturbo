@@ -63,6 +63,7 @@
   これも「有効化しない」側。逆に
   `MLXTURBO_PREFILL_GROUP=4` / `MLXTURBO_STAGE_EVERY=2` /
   `MLXTURBO_DRAFT_RERANK=1` / `MLXTURBO_HC=elem` (2026-09-03 20:20 に kernel から。decode 幅だけ、ビット一致) / `MLXTURBO_SORT_MIN=16`
+  `MLXTURBO_GDN_DECODE_FUSED=1` (2026-09-03 21:05 から既定 on: decode/verify 幅の GDN の非行列積を 16 -> 3 dispatch、短 ms/round -2.4% / 17k -2.0%、micro でビット一致。`=0` で off)
   は本番の既定値そのもので、値を変えると本番の挙動が変わる。
   `MLXTURBO_GDN_METAL` (既定 on、`=0` で off) も同様に本番の既定値で、
   2026-09-02 の in-model A/B (17k prefill -1.3〜-4.5%、KLD +0.00014) で

@@ -1414,13 +1414,20 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
                   f" down_proj 前で畳む (行数>={min_s} のみ、{n_combine_fold} 層)")
         # enable_gdn_prework_kernel 自身が MLXTURBO_GDN_PREWORK=1 をゲートに
         # 持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
-        # model を渡すことで、A_log/dt_bias が bf16 で読み込まれた実モデルでも
-        # fp32 の写しが作られ、eligible() の dtype 判定で弾かれなくなる
-        # (2026-09-02、実機ログで発火 0 が判明した分の修正)。
+        # model は「fp32 の写しが残っていたら消す」ために渡す (2026-09-03 の
+        # カーネル書き直しで、A_log/dt_bias は bf16 のまま受けるようになった)。
         fused.enable_gdn_prework_kernel(model)
         if os.environ.get("MLXTURBO_GDN_PREWORK") == "1":
             print(f"{log_prefix} gdn_prework カーネル有効 (conv1d/silu/rms_norm/g/beta を"
                   " decode/verify 幅のみ 1 dispatch に融合)")
+        # enable_gdn_decode_fused 自身が MLXTURBO_GDN_DECODE_FUSED を
+        # ゲートに持っている (**既定 on**、2026-09-03 21:05: 短 ms/round -2.4% /
+        # 17k -2.0%、非行列積 16 -> 3 dispatch、micro でビット一致。=0 で off)。
+        fused.enable_gdn_decode_fused(model)
+        _gdn_dec = os.environ.get("MLXTURBO_GDN_DECODE_FUSED", "1")
+        if _gdn_dec and _gdn_dec.lower() not in ("0", "off"):
+            print(f"{log_prefix} GDN decode 融合有効 ({_gdn_dec}): 非行列積を"
+                  " decode/verify 幅のみ 16 -> 3 dispatch")
         # enable_gdn_blocked_kernel 自身が MLXTURBO_GDN_BLOCKED=1 をゲートに
         # 持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
         fused.enable_gdn_blocked_kernel()
