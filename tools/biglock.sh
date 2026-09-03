@@ -52,7 +52,8 @@ fi
 TICKET="$PRIO_DIR/$$"
 echo "$PRIO" > "$TICKET"
 case "$PRIO" in 2) POLL=3 ;; 1) POLL=5 ;; *) POLL=15 ;; esac
-trap 'rm -f "$TICKET"' EXIT INT TERM
+trap 'rm -f "$TICKET"' EXIT
+trap 'rm -f "$TICKET"; exit 143' INT TERM
 
 # ---- 常駐 worker が居れば、その 1 本の列に乗せる --------------------------
 #
@@ -73,7 +74,10 @@ AB_PID_FILE="${MLXTURBO_AB_PID:-${TMPDIR:-/tmp}/mlxturbo-ab-daemon.pid}"
 AB_STOP_FILE="${AB_PID_FILE%.pid}.stop"
 AB_DIR="${0:a:h}"
 AB_PY="${AB_DIR:h}/.venv/bin/python"
-if [ -z "$BIGLOCK_NO_WORKER" ] && [ -f "$AB_PID_FILE" ] && [ -x "$AB_PY" ]; then
+HEAVY=0
+case "$*" in *tools/decode_ab.py*|*tools/longctx_quality.py*|*tools/moe_split.py*|*bench/quant_eval.py*) HEAVY=1 ;; esac
+# worker が居れば routable なもの全部、居なくてもモデルを読む routable なもの (ab_submit が worker を立てる) は worker へ
+if [ -z "$BIGLOCK_NO_WORKER" ] && [ -x "$AB_PY" ] && { [ -f "$AB_PID_FILE" ] || [ "$HEAVY" = 1 ]; }; then
   rm -f "$TICKET"
   AB_RC=0
   "$AB_PY" "$AB_DIR/ab_submit.py" --from-biglock --prio "$PRIO" -- "$@" || AB_RC=$?
@@ -227,6 +231,7 @@ if [ "$MEM_WAITED" -ge 600 ]; then
 elif [ "$MEM_WAITED" -gt 0 ]; then
   echo "biglock: メモリ待ち ${MEM_WAITED}s (回収可能 ${FREE_GB}GB)。開始する" >&2
 fi
-trap 'rm -f "$LOCK" "$TICKET"' EXIT INT TERM
+trap 'rm -f "$LOCK" "$TICKET"' EXIT
+trap 'rm -f "$LOCK" "$TICKET"; exit 143' INT TERM
 
 "$@"
