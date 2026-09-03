@@ -2186,3 +2186,9 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - **GDN レジスタ常駐 scan の冷 micro** (`gdn-scan-micro.json`、2048 行 × 36 層の活性 1.5 GB を巡回、us/チャンク): blocked 2900、最良の reg (l4-db32) **2529 (0.87 倍)**。判定線 0.70 に届かない。
   8k の 5.4% × 13% = prefill -0.7% 相当。他の変種 (l2-db128 7.1 倍、l32-db8 2.4 倍) は大負け。報告待ち。
 - **正答率 17k、12 問 (seed 1)**: query は recall dense 12/12 / kernel 12/12、quote dense 7/12 / kernel 8/12。global は走行中。
+
+### 2026-09-03 17:25 QSA tail を query の既定に (ユーザー判断: 正答率で十分、global 側の 12 問 (30 分) は打ち切り)
+
+- 速度は中立 (17k ms/round -0.7%、prefill +0.5%、短は同一)。正答率 17k: query は recall 6/6 → 12/12、quote は dense 5/6 (global と同じ) → 12 問で dense 7/12 / kernel 8/12。
+- `mlxturbo/qsa_tail.py` の既定を query に。`MLXTURBO_QSA_TAIL=global` で旧規則。teacher (bf16、query) の作り直しは SSD が読めるようになってから (挿し直しても readdir が EINTR で読めない)。
+- K2c (decode QSA カーネル) は query が前提。-0.7% でビット一致なので代金ゼロ方針では既定候補だが、天井 13% との差の切り分けと 50k の確認を待つ。

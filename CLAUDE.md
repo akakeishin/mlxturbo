@@ -77,6 +77,9 @@
   32 GB のサイドカーをページキャッシュに残していたため。冷えたキャッシュでは mmap のページフォルトが直列化して 4k prefill が 2.1 倍遅く、
   decode も -15% (小ベンチ 0903f)。本番 (モデル 98 GB + サイドカー 32 GB > 128 GB) ではキャッシュは冷えているのが普通。
   **I/O を含む経路の A/B は、同じ機体で続けて測るとページキャッシュを共有する** (プロセスを分けても同じ)。
+  `MLXTURBO_QSA_TAIL` (既定 query、`=global` で旧規則) は QSA の端数 (tail) の可視範囲をクエリごと `[cr*floor((q+1)/cr), q]` にする本番の既定値
+  (HF / mlx-serve / oMLX と同じ。global は prefill 幅の 3/4 の行が自分を見ていなかった。速度は中立、17k の正答率は recall 12/12、2026-09-03 17:25)。
+  decode の QSA カーネル (`MLXTURBO_QSA_DECODE_KERNEL`) は query が前提。
   `MLXTURBO_PREFILL_TAIL_IN_GROUP` (既定 on、`=0` で off) は末尾 2048 チャンクを layer-major のグループに入れる本番の既定値
   (4k -4.9% / 8k -3.4% / 17k -0.6%、サーバー経路はビット一致、2026-09-03 15:35)。checkpoint 無しの経路 (generate() / ベンチ) では末尾を 2047+1 に割るので丸めが動く。
   `MLXTURBO_MOE_GEMM_MIX` (既定 48、`=0` で off) と `MLXTURBO_QMM_WIDE` (既定 auto = 非 NAX で on、`=off`) は 2026-09-03 14:00 に

@@ -42,7 +42,7 @@ import os
 
 TIEBREAK_EPS = 1e-7
 
-MODE = os.environ.get("MLXTURBO_QSA_TAIL", "global")
+MODE = os.environ.get("MLXTURBO_QSA_TAIL", "query")  # 既定 query (2026-09-03 17:25、HF / mlx-serve / oMLX と同じ規則。global は旧規則)
 if MODE not in ("query", "global"):
     raise ValueError(
         f"MLXTURBO_QSA_TAIL={MODE!r} は不正 (query か global)"
