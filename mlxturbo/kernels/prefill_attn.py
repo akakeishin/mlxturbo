@@ -115,14 +115,110 @@ def _tile_blocks(cr: int, head_dim: int, itemsize: int) -> int:
     return bb
 
 
+def _vec_elems(itemsize: int) -> int:
+    """1 つの ``uint4`` (16 バイト) に入る要素数。bf16 なら 8。"""
+    return 16 // itemsize
+
+
+def vec_ok(head_dim: int, itemsize: int, cap: int) -> bool:
+    """段階 load を ``uint4`` (16 バイト) 単位でやってよい形か。
+
+    K/V の 1 行は ``head_dim * itemsize`` バイト。行頭が 16 バイト整列して
+    いなければ `uint4` の読み書きは未定義なので、
+
+    - 1 行が 16 の倍数 (行から行への刻みが整列を崩さない)
+    - head ごとの刻み ``cap * head_dim * itemsize`` も 16 の倍数
+    - threadgroup タイルの要素数が ``uint4`` 個数で割り切れる
+
+    を全部満たすときだけ vec 版を使う。**外れたら scalar ループに戻る**
+    (カーネル自体は使える。速いか遅いかだけの話なので `eligible` は落とさない)。
+    """
+    if itemsize <= 0 or 16 % itemsize != 0:
+        return False
+    ve = _vec_elems(itemsize)
+    row_bytes = head_dim * itemsize
+    if row_bytes % 16 != 0 or head_dim % ve != 0:
+        return False
+    if (cap * row_bytes) % 16 != 0:
+        return False
+    return True
+
+
 def _source(
-    head_dim: int, gqa: int, cr: int, bb: int, kmax: int, scale: float
+    head_dim: int, gqa: int, cr: int, bb: int, kmax: int, scale: float,
+    tail_mode: str = "global", vec: bool = False, itemsize: int = 2,
 ) -> str:
     d = head_dim
     dpl = (d + 31) // 32       # 1 lane が持つ要素数 (head_dim を 32 lane で割る)
     bk = bb * cr               # 1 タイルの列数
     nsg = gqa                  # simdgroup 数 = この kv head に属する q head 数
     nth = nsg * 32
+    ve = _vec_elems(itemsize) if vec else 0
+    if vec and (bk * d) % ve != 0:
+        vec = False
+
+    if vec:
+        # K/V タイルを `uint4` 配列として確保して 16 バイト整列を保証し、
+        # スコア側は `T*` に読み替える (間に barrier が入るので順序は保たれる)。
+        tg_kv_src = f"""    threadgroup uint4 tg_k4[{bk} * {d} / {ve}];
+    threadgroup uint4 tg_v4[{bk} * {d} / {ve}];
+    threadgroup T* tg_k = (threadgroup T*)tg_k4;
+    threadgroup T* tg_v = (threadgroup T*)tg_v4;"""
+    else:
+        tg_kv_src = f"""    threadgroup T   tg_k[{bk} * {d}];
+    threadgroup T   tg_v[{bk} * {d}];"""
+
+    if vec:
+        # 1 列 = 1 simdgroup、1 レーン = 1 `uint4` (16 バイト)。列の添字計算と
+        # `tg_sel[]` 参照が **列あたり 1 回** になり、32 レーン x 16 バイト の
+        # 連続読みになる (head_dim=256/bf16 なら 1 レーン x 32 個でちょうど 1 行)。
+        vpc = d // ve   # 1 列あたりの uint4 個数
+        if vpc == 32:
+            inner = """            tg_k4[cc * 32 + (int)lane] = ksrc[lane];
+            tg_v4[cc * 32 + (int)lane] = vsrc[lane];
+"""
+        else:
+            inner = f"""            for (int dv = (int)lane; dv < {vpc}; dv += 32) {{
+                tg_k4[cc * {vpc} + dv] = ksrc[dv];
+                tg_v4[cc * {vpc} + dv] = vsrc[dv];
+            }}
+"""
+        load_src = f"""        for (int cc = (int)sg; cc < ncol; cc += {nsg}) {{
+            const int col = is_tail
+                ? (tail_base + tb + cc)
+                : (tg_sel[t0 + cc / {cr}] * {cr} + (cc % {cr}));
+            const device uint4* ksrc =
+                (const device uint4*)(kbase + (size_t)col * {d});
+            const device uint4* vsrc =
+                (const device uint4*)(vbase + (size_t)col * {d});
+{inner}        }}"""
+    else:
+        load_src = f"""        for (int e = (int)tid; e < ncol * {d}; e += {nth}) {{
+            const int cc = e / {d};
+            const int dd = e - cc * {d};
+            const int col = is_tail
+                ? (tail_base + tb + cc)
+                : (tg_sel[t0 + cc / {cr}] * {cr} + (cc % {cr}));
+            tg_k[e] = kbase[(size_t)col * {d} + dd];
+            tg_v[e] = vbase[(size_t)col * {d} + dd];
+        }}"""
+
+    if tail_mode == "query":
+        # HF 参照の tail (`mlxturbo/qsa_tail.py`)。クエリごとに
+        # 「自分の未完成ブロックの先頭から自分自身まで」= 列
+        # [cr*floor((q_col+1)/cr), q_col] だけを足す (0〜cr-1 列)。
+        # q_col % cr == cr-1 の行では 0 列 (その行のブロックは完全ブロック
+        # として top-k の候補に入っている)。選択ブロックとは重ならないので、
+        # global 側と同じく「読む範囲そのものが可視集合」のまま。
+        tail_src = f"""    const int tail_base = ((q_col + 1) / {cr}) * {cr};
+    const int ntail_vis = q_col - tail_base + 1;   // 0..{cr - 1}"""
+    else:
+        # global tail: ブロック格子の外 (端数列) を因果性の範囲で。
+        # col <= q_col なので先頭からの連続区間になる。マスクは要らない。
+        tail_src = f"""    const int tail_base = NB * {cr};
+    const int ntail = KVLEN - tail_base;
+    int ntail_vis = q_col - tail_base + 1;
+    ntail_vis = max(0, min(ntail_vis, ntail));"""
 
     return f"""
     const int S      = params[0];   // このチャンクのクエリ行数
@@ -145,8 +241,7 @@ def _source(
 
     threadgroup int tg_sel[{kmax}];   // 昇順に詰めた選択ブロックの添字
     threadgroup int tg_cnt[{nsg}];    // simdgroup ごとの本数
-    threadgroup T   tg_k[{bk} * {d}];
-    threadgroup T   tg_v[{bk} * {d}];
+{tg_kv_src}
 
     const device bool* keep_row = keep + ((size_t)b * S + s) * (size_t)NB;
 
@@ -186,12 +281,8 @@ def _source(
     }}
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // --- 2) 端数列 (ブロック格子の外) の可視範囲 ------------------------
-    // col <= q_col なので先頭からの連続区間になる。マスクは要らない。
-    const int tail_base = NB * {cr};
-    const int ntail = KVLEN - tail_base;
-    int ntail_vis = q_col - tail_base + 1;
-    ntail_vis = max(0, min(ntail_vis, ntail));
+    // --- 2) tail の可視範囲 ---------------------------------------------
+{tail_src}
 
     // --- 3) online softmax ---------------------------------------------
     const device T* qrow = q + (((size_t)b * S + s) * H + h) * {d};
@@ -220,15 +311,7 @@ def _source(
 
         // 前のタイルを読み終わるまで上書きしない
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int e = (int)tid; e < ncol * {d}; e += {nth}) {{
-            const int cc = e / {d};
-            const int dd = e - cc * {d};
-            const int col = is_tail
-                ? (tail_base + tb + cc)
-                : (tg_sel[t0 + cc / {cr}] * {cr} + (cc % {cr}));
-            tg_k[e] = kbase[(size_t)col * {d} + dd];
-            tg_v[e] = vbase[(size_t)col * {d} + dd];
-        }}
+{load_src}
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // スコア。ループ長を定数にして sc をレジスタに残す
@@ -275,15 +358,24 @@ def _source(
 """
 
 
-def _get_kernel(head_dim, gqa, cr, bb, kmax, scale):
-    key = (head_dim, gqa, cr, bb, kmax, scale)
+def _get_kernel(
+    head_dim, gqa, cr, bb, kmax, scale, tail_mode="global",
+    vec=False, itemsize=2,
+):
+    key = (head_dim, gqa, cr, bb, kmax, scale, tail_mode, vec, itemsize)
     kern = _KERNELS.get(key)
     if kern is None:
+        suffix = f"_u4{itemsize}" if vec else ""
         kern = mx.fast.metal_kernel(
-            name=f"prefill_attn_{head_dim}_{gqa}_{cr}_{bb}_{kmax}",
+            name=(
+                f"prefill_attn_{head_dim}_{gqa}_{cr}_{bb}_{kmax}"
+                f"_{tail_mode}{suffix}"
+            ),
             input_names=["q", "k", "v", "keep", "params"],
             output_names=["out"],
-            source=_source(head_dim, gqa, cr, bb, kmax, scale),
+            source=_source(
+                head_dim, gqa, cr, bb, kmax, scale, tail_mode, vec, itemsize
+            ),
         )
         _KERNELS[key] = kern
     return kern
@@ -392,6 +484,8 @@ def eligible(
             "KV キャッシュの確保済みバッファを取れない (このキャッシュ型は非対応)",
         )
         return False
+    # 16 バイト整列 (`vec_ok`) はここでは見ない。外れても scalar の段階 load で
+    # 動くので、適格性ではなく `_get_kernel` の版の選択だけの話になる。
     return True
 
 
@@ -434,7 +528,12 @@ def prefill_attn(
         [S, n_blocks, kv_len, cap, offset, n_kv], dtype=mx.int32
     )
 
-    kernel = _get_kernel(head_dim, gqa, cr, bb, block_topk, float(scale))
+    from mlxturbo import qsa_tail as _qsa_tail
+
+    kernel = _get_kernel(
+        head_dim, gqa, cr, bb, block_topk, float(scale), _qsa_tail.MODE,
+        vec_ok(head_dim, itemsize, cap), itemsize,
+    )
     (out,) = kernel(
         inputs=[q_bshd, keys, values, keep_block, params],
         template=[("T", q.dtype)],

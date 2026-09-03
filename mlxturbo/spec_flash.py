@@ -902,29 +902,35 @@ _PREFILL_PIPELINE = os.environ.get("MLXTURBO_PREFILL_PIPELINE") == "1"
 # 単独処理) に戻る。A/B は tools/decode_ab.py の knob `fold-tail`。
 _PREFILL_FOLD_TAIL = os.environ.get("MLXTURBO_PREFILL_FOLD_TAIL", "1") != "0"
 
-# 末尾チャンク (j == n) も直前のレイヤー主導グループの最終メンバーとして
-# 流すか。**既定 off** (MLXTURBO_PREFILL_TAIL_IN_GROUP=1 で on)。
+# 末尾チャンクの「最後の 1 トークンを除いた部分」を直前のレイヤー主導
+# グループの最終メンバーとして流すか。**既定 off**
+# (MLXTURBO_PREFILL_TAIL_IN_GROUP=1 で on)。
 #
 # 動機 (docs/research/IDEAS-2026-09-03.md「4k の末尾チャンク」): 4000
 # トークンは「端数 1952 の g=1 グループ + 末尾 2048 の chunk 主導」に割れ、
 # MoE が 2 回に分かれる。1 トークンあたりの費用は群と末尾でほぼ同じ (2%) で、
 # 残るのは gather_qmm の行数効果だけ (専門家あたり 36 -> 75 行)。末尾を同じ
-# グループに入れると MoE が 4000 行 1 回になる。
+# グループに入れると MoE が 1 回になる。実測 4k -4.6% / 8k -4.1% / 17k -1.3%。
 #
-# チャンク割り (grid) は変えない -- グループに入れるのは、いま chunk 主導で
-# 流している最終チャンクそのもの。だから on/off で演算は一致するはず
-# (MoE の行数だけが変わる。tools/vendor_fingerprint.py の group 検査と同じ
-# 理屈)。
+# **末尾 1 トークンはグループに入れず、従来どおり chunk 主導で流す。**そう
+# すると BPE 境界 checkpoint (prefill_common.py の split_and_checkpoint_tail)
+# と同じ割り方 (手前 n-1 + 末尾 1) になり、n-1 の checkpoint がグループ側の
+# 通常の境界 checkpoint としてそのまま積まれる。この checkpoint が無いと、
+# 会話 2 ターン目の retemplate で末尾トークンが BPE マージにより化けたとき
+# LCP が checkpoint のちょうど 1 トークン手前に落ち、セッションが毎ターン
+# ほぼ全再 prefill になる (prefill_common.py の docstring)。lm_head と最終
+# mixer も、その 1 トークンの chunk 主導フォワードがこれまでどおり通す。
 #
-# **代償: BPE 境界 checkpoint (prefill_common.py の split_and_checkpoint_tail)
-# を諦める。**あれは chunk 主導の最終チャンクを「末尾 1 トークン」と「その
-# 手前」に割って n-1 にも checkpoint を積むもので、レイヤー主導の内側では
-# 刻めない (チャンク k を全層通した状態がどの瞬間にも存在しない)。会話 2
-# ターン目の retemplate で末尾トークンが BPE マージにより化けると、LCP は
-# checkpoint のちょうど 1 トークン手前に落ちる -- その場合この knob が on
-# だとセッションの再 prefill が丸ごと走る (n の checkpoint は従来どおり
-# 積むので、末尾が化けないターンでは差が出ない)。既定にするなら、この
-# 再 prefill の頻度と 4k prefill の取り分を秤にかけること。
+# チャンク割り (grid) について:
+#   - checkpoints 有効 (サーバー経路): 既定側も 2047 + 1 に割っているので
+#     grid は完全に同一。演算の差は MoE の concat 粒度だけで、出力はビット
+#     一致するはず (tools/vendor_fingerprint.py の group 検査と同じ理屈)。
+#   - checkpoints=None (generate() / ベンチ / 検証プローブ): 既定側は末尾
+#     2048 を 1 回で流すので、この knob を on にすると 2047 + 1 に割れる。
+#     **計算は正しいが、チャンク割りが変わると量子化行列積の丸めが動きうる**
+#     (prefill_common.py の docstring と
+#     docs/research/PREFILL-CHUNKING-DETERMINISM.md)。実測では 4k/8k の
+#     in-model A/B、合成モデルの 4 形とも出力トークン列は一致した。
 _PREFILL_TAIL_IN_GROUP = os.environ.get("MLXTURBO_PREFILL_TAIL_IN_GROUP") == "1"
 
 # `_prefetch_ngram_span` が「次の境界」ぶんとして先読みする幅 (トークン数)。
@@ -2116,12 +2122,14 @@ class FlashSpecEngine:
                     frac_len = remaining - step
                     group_chunks = [ids[:, i : i + frac_len]]
                 if _PREFILL_TAIL_IN_GROUP and group_chunks is not None:
-                    # 末尾チャンクをこのグループの最終メンバーにする。grid は
-                    # 変えない -- ここで足すのは chunk 主導分岐が `j = n` として
-                    # 取っていたはずのチャンクそのもの (幅 <= step)。
+                    # 末尾チャンクの「最後の 1 トークンを除いた部分」をこの
+                    # グループの最終メンバーにする。末尾 1 トークンはこの後の
+                    # chunk 主導分岐 (`j == n`、幅 1) がそのまま流し、lm_head と
+                    # 最終 mixer もそちらが通す。BPE 境界 checkpoint (n-1) は、
+                    # このグループが積む通常の境界 checkpoint そのものになる。
                     after = remaining - sum(c.shape[1] for c in group_chunks)
-                    if 0 < after <= step:
-                        group_chunks.append(ids[:, n - after :])
+                    if 2 <= after <= step:
+                        group_chunks.append(ids[:, n - after : n - 1])
                         group_tail = True
                     elif frac_len == 0 and len(group_chunks) == 1:
                         # g_min の緩和で作った単独グループ。末尾を足せなかった
@@ -2134,17 +2142,6 @@ class FlashSpecEngine:
                     if _pf:
                         _t = time.perf_counter()
                     hys = _group_prefill_forward(model, group_chunks, caches)
-                    extra = ()
-                    if group_tail:
-                        # chunk 主導の `j == n` 分岐がやっていた仕上げをここで
-                        # やる。`_group_prefill_forward` は mixer を通さずに
-                        # 最終レイヤー出力 (= cap.hyper と同じもの) を返すので、
-                        # 最終メンバーだけ mixer に通してから末尾 1 行を
-                        # lm_head に入れる。mixer は位置ごとに独立なので、
-                        # chunk 主導 (全幅 mixer -> 末尾 1 行) と同じ値になる。
-                        out = model.model.hyper_connection_mixer(hys[-1])
-                        logits = self._head(out[:, -1:])
-                        extra = (logits,)
                     if _pf:
                         label = f"group build i={i} g={gn}"
                         if frac_len:
@@ -2182,13 +2179,13 @@ class FlashSpecEngine:
                         # レップのばらつき (±3%) に埋もれる可能性がある。
                         # 有効にする前に in-model で測ること
                         # (docs/research/IMPROVEMENT-QUEUE.md D5)。
-                        mx.async_eval(*hys, *states, *extra)
+                        mx.async_eval(*hys, *states)
                         if _pf:
                             # 非同期投入なので、ここでの dur は GPU 完了を
                             # 待っていない (build+async の意)
                             _t = _pf.log(f"group eval i={i} g={gn} build+async", _t)
                     else:
-                        mx.eval(*hys, *extra)
+                        mx.eval(*hys)
                         for st in states:
                             mx.eval(st)
                         if _pf:
@@ -2313,11 +2310,7 @@ class FlashSpecEngine:
             # above only ever runs on ``h[:, -1:]``), but stays
             # ``mx.contiguous`` too so it does not keep the last chunk's
             # (possibly wide) hidden-state graph alive.
-            # ``hyper_chunks[-1]`` is the last chunk's hyper -- ``cap.hyper``
-            # for a chunk-major tail (appended right above), or the last group
-            # member's hidden under MLXTURBO_PREFILL_TAIL_IN_GROUP, where
-            # ``cap`` is not bound at all (the whole prompt can be one group).
-            hyper_tail0 = mx.contiguous(hyper_chunks[-1][:, -1:])
+            hyper_tail0 = mx.contiguous(cap.hyper[:, -1:])
             logits_tail = mx.contiguous(logits[:, -1])
             if max_tokens == 0:
                 # Keep the successfully prefetched cache, but do not expose the

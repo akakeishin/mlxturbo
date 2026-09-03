@@ -749,6 +749,8 @@ def _ragged_indexer_call(self, x, rope, cache, offset, positions, orig):
     効く)。判定は帳簿の Python 値だけなので、QSA が働かない短い文脈で
     余計な仕事は増えない。
     """
+    from mlxturbo import qsa_tail as _qsa_tail
+
     Q = _arch()
     # ``cache`` は KV キャッシュではなく ``_IndexerCache``。行別の列対応は
     # そこに挿してある ``qsa_owner`` (RaggedAttnCache / RaggedDraftCache) が持つ。
@@ -822,6 +824,12 @@ def _ragged_indexer_call(self, x, rope, cache, offset, positions, orig):
     visible = (block_end[None, None, :] <= q_col[:, :, None]) & (
         mx.arange(n_blocks)[None, None, :] < row_blocks[:, None, None]
     )
+    if _qsa_tail.TIEBREAK:
+        # 単一系列側 (`QSAIndexer._pooled_and_top`) と同じ同点 bias。ここを
+        # 抜かすと TIEBREAK=1 のとき batch と solo でブロック選択がずれる。
+        scores = scores - (
+            mx.arange(n_blocks, dtype=mx.float32) * _qsa_tail.TIEBREAK_EPS
+        )
     scores = mx.where(visible, scores, -mx.inf)
 
     k = min(self.block_topk, n_blocks)
@@ -848,7 +856,21 @@ def _ragged_indexer_call(self, x, rope, cache, offset, positions, orig):
     # sparse が非 None のとき Attention は causal を捨てる規約なので、
     # ここで開けないとその行の mask が全面 -inf になって未来まで見える。
     need = (q_col < cr - 1)[:, :, None]
-    keep_log = mx.where(in_block & ~need, keep_log, causal)
+    if _qsa_tail.MODE == "query":
+        # 論理列の上でのクエリごと tail (`mlxturbo/qsa_tail.py`)。
+        # 列 [cr*floor((q+1)/cr), q] を必ず可視にする。ブロック格子の外
+        # (端数域) だけでなく**格子の途中にも出る**ので、`in_block` の外を
+        # まるごと causal に開ける global 側とは開け方が違う。
+        # `row_blocks == 0` の行 (論理 kv 長が budget 以下 = 単独実行なら
+        # 疎化されない行、B-1) は global 側と同じく行全体を causal に落とす
+        # --- そこだけは tail の話ではなく「疎化しない」という別の規約。
+        own = ((q_col + 1) // cr) * cr                       # (B, S)
+        own_keep = (cols[None, None, :] >= own[:, :, None]) & causal
+        keep_log = mx.where(in_block, keep_log, mx.array(False)) | own_keep
+        dense_row = (row_blocks == 0)[:, None, None]
+        keep_log = mx.where(need | dense_row, causal, keep_log)
+    else:
+        keep_log = mx.where(in_block & ~need, keep_log, causal)
     keep_log = keep_log & (cols[None, None, :] < m.kv_lens[:, None, None])
 
     # 論理 -> 物理。dead slot と右パディングは sink 列 (常に False) を指す。

@@ -32,11 +32,26 @@
   - `skew-r40` / `skew-r160`: `bench/results/moe-routing-skew.json` の
     実測分布の形 (2048 tok で median 20 / p90 90 / max ~800 / 行を持たない
     専門家 67、8192 tok はその 4 倍) を順序統計量から起こしたもの
-  - `flat20` / `flat32` / `flat160`: 全専門家が同じ行数。**端数タイルの
-    費用 c (フルタイル比) を直接出すため**にある。flat20 と flat32 は
-    どちらもタイル数が E ちょうどで、片方だけが端数なので、
-    c = t(flat20) / t(flat32)。flat160 はフルタイルだけの対照
-    (1 タイルあたりの時間が flat32 と揃うことを見る)
+  - `flat16` / `flat20` / `flat32` / `flat160`: 全専門家が同じ行数。
+    **タイル 1 枚あたりの費用を形ごとに直接出すため**にある。
+    flat20 と flat32 はどちらもタイル数が E ちょうどで片方だけが端数なので
+    c = t(flat20) / t(flat32)。flat32 は 16 行タイルだと**同じ行を 2 枚で
+    覆う**ので、t(flat32, bm16) / 2 / t(flat32, bm32) が 16 行タイル 1 枚の
+    相対費用。flat160 はフルタイルだけの対照
+
+比べるケース (全部 1 プロセス内の interleave、全部ビット一致を確認する):
+
+  - `stock`    : `mx.gather_qmm(sorted_indices=True)` (既製、BM=16 で straddle あり)
+  - `seg32`    : 自前カーネル、32 行タイル / WM=2 (128 スレッド、既定)
+  - `seg16`    : 自前カーネル、16 行タイル / WM=1 (64 スレッド)
+  - `seg32w1`  : 自前カーネル、32 行タイル / WM=1 (64 スレッド)。混合が
+                 32 行タイルを 64 スレッドで回す分の損を切り分ける対照
+  - `mix<t>`   : 専門家ごとに、行数 < t なら 16 行タイル、それ以外 32 行タイル
+                 (1 dispatch。threadgroup を揃えるため WM は必ず 1)
+  - `dense`    : 同じ総行数の `mx.quantized_matmul` (床)
+  - `pad16`    : 既製 `gather_qmm` に、各専門家のセグメントを 16 行の倍数へ
+                 ダミー行で切り上げて流したもの (`gather_qmm_pad_micro.py` と
+                 同じ作り方)。**この変種の判定線**
 
 ## 第 3 段の付帯費用 (`--stage tables`)
 
@@ -57,6 +72,12 @@
         --stage segmented --json bench/results/moe-grouped-gemm-segmented.json
     tools/biglock.sh .venv/bin/python tools/moe_grouped_gemm_micro.py \
         --stage tables --json bench/results/moe-grouped-gemm-tables.json
+
+BM=16 と混合を含む形 (閾値の掃引つき):
+
+    tools/biglock.sh .venv/bin/python tools/moe_grouped_gemm_micro.py \
+        --stage segmented --rounds 8 --mix-thresholds 24,32,40,48,64,96 \
+        --json bench/results/moe-grouped-gemm-bm16.json
 """
 
 from __future__ import annotations
@@ -342,7 +363,62 @@ def _first_diff_seg(ref: mx.array, got: mx.array, row_start: np.ndarray) -> dict
     }
 
 
-def run_segmented(rounds: int, warmup: int, seed: int) -> list[dict]:
+def pad16_layout(counts: np.ndarray, multiple: int = 16):
+    """16 行揃えのダミー行を足した layout を作る (`gather_qmm_pad_micro.py` と同じ)。
+
+    返るのは ``(src, keep, ids_pad)``:
+
+      - ``src``  : 水増し後の各行が元の x の何行目を読むか (ダミーは 0)
+      - ``keep`` : 水増し後のどの行が本物か (bool)
+      - ``ids_pad``: 水増し後の専門家添字
+
+    行数が 0 の専門家は 0 のまま (切り上げない)。
+    """
+
+    padded = np.where(counts > 0, ((counts + multiple - 1) // multiple) * multiple, 0)
+    m_pad = int(padded.sum())
+    src = np.zeros(m_pad, dtype=np.int32)
+    keep = np.zeros(m_pad, dtype=bool)
+    ids_pad = np.zeros(m_pad, dtype=np.uint32)
+    o_pad = 0
+    o_src = 0
+    for e, (c, pc) in enumerate(zip(counts, padded)):
+        c = int(c)
+        pc = int(pc)
+        if pc == 0:
+            continue
+        ids_pad[o_pad : o_pad + pc] = e
+        src[o_pad : o_pad + c] = np.arange(o_src, o_src + c, dtype=np.int32)
+        keep[o_pad : o_pad + c] = True
+        o_pad += pc
+        o_src += c
+    return src, keep, ids_pad
+
+
+def mixed_stats(counts: np.ndarray, thresh: int) -> dict:
+    """混合モード (行数 < thresh なら 16 行タイル、それ以外 32 行タイル) の枚数。"""
+
+    bm_e = np.where(counts < thresh, 16, 32)
+    tiles = np.ceil(counts / np.maximum(bm_e, 1)).astype(np.int64)
+    tiles = np.where(counts > 0, tiles, 0)
+    rows_cov = int((tiles * bm_e).sum())
+    return {
+        "threshold": int(thresh),
+        "tiles_total": int(tiles.sum()),
+        "tiles_bm16": int(tiles[bm_e == 16].sum()),
+        "tiles_bm32": int(tiles[bm_e == 32].sum()),
+        "experts_bm16": int(((bm_e == 16) & (counts > 0)).sum()),
+        "row_inflation": rows_cov / float(counts.sum()),
+    }
+
+
+def run_segmented(
+    rounds: int,
+    warmup: int,
+    seed: int,
+    mix_thresholds: list[int],
+    with_fragskip: bool = False,
+) -> list[dict]:
     E = NUM_EXPERTS
     cases: list[tuple[str, np.ndarray]] = [
         # 2048 tok の実測の形 (layer 1 @point 0: median 20 / p90 90.9 /
@@ -350,7 +426,10 @@ def run_segmented(rounds: int, warmup: int, seed: int) -> list[dict]:
         ("skew-r40", skew_counts(E, 20480, 67, 20.0, 90.0)),
         # 8192 tok は「2048 tok の 4 倍」(IDEAS の P3 の想定)
         ("skew-r160", skew_counts(E, 81920, 67, 80.0, 360.0)),
-        # 端数タイルの費用 c を出すための対照
+        # 端数タイルの費用 c と 16 行タイル 1 枚の費用を出すための対照。
+        # flat16 は bm16 でちょうど満タン、bm32 で全部端数。
+        # flat32 は bm32 で満タン 1 枚 = bm16 で満タン 2 枚 (同じ行を覆う)
+        ("flat16", np.full(E, 16, dtype=np.int64)),
         ("flat20", np.full(E, 20, dtype=np.int64)),
         ("flat32", np.full(E, 32, dtype=np.int64)),
         ("flat160", np.full(E, 160, dtype=np.int64)),
@@ -362,16 +441,21 @@ def run_segmented(rounds: int, warmup: int, seed: int) -> list[dict]:
         counts = counts.copy()
         rng.shuffle(counts)  # 行数の大小が専門家番号順に並ばないようにする
         ids = np.repeat(np.arange(E, dtype=np.uint32), counts)
-        prepared.append((name, counts, ids))
+        # 掃引は skew だけ。flat は先頭の閾値 1 つで足りる
+        th = list(mix_thresholds) if name.startswith("skew") else mix_thresholds[:1]
+        prepared.append((name, counts, ids, th))
         st16 = counts_stats(counts, 16)
         st32 = counts_stats(counts, 32)
         print(
             f"{name:10s} rows={st32['rows']:6d} active={st32['experts_active']:3d} "
             f"median={st32['median']:6.1f} p90={st32['p90']:7.1f} "
             f"max={st32['max']:5d}  "
-            f"tiles(bm32)={st32['tiles_total']:5d} "
-            f"(full {st32['tiles_full']} / 端数 {st32['tiles_partial']})  "
-            f"水増し bm16={st16['tile_inflation']:.3f} bm32={st32['tile_inflation']:.3f}"
+            f"tiles bm16={st16['tiles_total']:5d} bm32={st32['tiles_total']:5d}  "
+            f"水増し bm16={st16['tile_inflation']:.3f} "
+            f"bm32={st32['tile_inflation']:.3f} "
+            + " ".join(
+                f"mix{t}={mixed_stats(counts, t)['row_inflation']:.3f}" for t in th
+            )
         )
 
     results = []
@@ -388,13 +472,30 @@ def run_segmented(rounds: int, warmup: int, seed: int) -> list[dict]:
         b0 = mx.contiguous(biases[0])
         mx.eval(wq, scales, biases, w0, s0, b0)
 
-        for name, counts, ids_np in prepared:
+        for name, counts, ids_np, thresholds in prepared:
             M = int(counts.sum())
             x = mx.random.normal((M, K)).astype(mx.bfloat16)
             idx = mx.array(ids_np)
             x3 = x.reshape(M, 1, K)
-            tables = segment_tables(mx.array(counts.astype(np.int32)))
-            mx.eval(x, idx, *tables)
+            counts_mx = mx.array(counts.astype(np.int32))
+            tab32 = segment_tables(counts_mx, bm=32)
+            tab16 = segment_tables(counts_mx, bm=16)
+            tab_mix = {
+                t: segment_tables(counts_mx, mix_threshold=t) for t in thresholds
+            }
+            mx.eval(x, idx, *tab32, *tab16, *[a for v in tab_mix.values() for a in v])
+
+            # 16 行揃えの既製 gather_qmm (P3 の入場料チェックと同じ作り方)
+            src_np, keep_np, ids_pad_np = pad16_layout(counts)
+            m_pad = int(src_np.shape[0])
+            keep_idx = mx.array(np.nonzero(keep_np)[0].astype(np.int32))
+            x_pad = (
+                x[mx.array(src_np)]
+                * mx.array(keep_np.astype(np.float32)).reshape(m_pad, 1)
+            ).astype(x.dtype)
+            x_pad3 = x_pad.reshape(m_pad, 1, K)
+            idx_pad = mx.array(ids_pad_np)
+            mx.eval(x_pad3, idx_pad, keep_idx)
 
             assert segmented_eligible(x, wq, scales, biases), f"{name} の形が不適格"
             assert dense_eligible(x, w0, s0, b0)
@@ -412,14 +513,50 @@ def run_segmented(rounds: int, warmup: int, seed: int) -> list[dict]:
                     sorted_indices=True,
                 ).reshape(M, N)
 
-            def seg() -> mx.array:
-                return qmm_segmented(x, wq, scales, biases, None, tables=tables)
+            def pad16() -> mx.array:
+                return mx.gather_qmm(
+                    x_pad3,
+                    wq,
+                    scales,
+                    biases,
+                    rhs_indices=idx_pad,
+                    transpose=True,
+                    group_size=GROUP_SIZE,
+                    bits=BITS,
+                    sorted_indices=True,
+                ).reshape(m_pad, N)
+
+            def seg32() -> mx.array:
+                return qmm_segmented(x, wq, scales, biases, None, tables=tab32)
+
+            def seg16() -> mx.array:
+                return qmm_segmented(
+                    x, wq, scales, biases, None, tables=tab16, bm=16
+                )
+
+            def seg32w1() -> mx.array:
+                # 混合の対照: 32 行タイルを 64 スレッド (WM=1) で回す
+                return qmm_segmented(
+                    x, wq, scales, biases, None, tables=tab32, bm=32, wm=1
+                )
+
+            def make_mix(t: int):
+                def mix() -> mx.array:
+                    return qmm_segmented(
+                        x,
+                        wq,
+                        scales,
+                        biases,
+                        None,
+                        tables=tab_mix[t],
+                        mix_threshold=t,
+                    )
+
+                return mix
 
             def seg_fragskip() -> mx.array:
-                # 端数タイルで MMA を frag 単位に間引く版 (既定 off)。
-                # 出力は seg と同じで、間引きの分岐が得か損かだけを見る
                 return qmm_segmented(
-                    x, wq, scales, biases, None, tables=tables, frag_skip=True
+                    x, wq, scales, biases, None, tables=tab32, frag_skip=True
                 )
 
             def dense() -> mx.array:
@@ -433,119 +570,169 @@ def run_segmented(rounds: int, warmup: int, seed: int) -> list[dict]:
                     bits=BITS,
                 )
 
+            variants: list[tuple[str, Callable[[], mx.array]]] = [
+                ("stock", stock),
+                ("seg32", seg32),
+                ("seg16", seg16),
+                ("seg32w1", seg32w1),
+            ]
+            for t in thresholds:
+                variants.append((f"mix{t}", make_mix(t)))
+            if with_fragskip:
+                variants.append(("fragskip", seg_fragskip))
+            variants += [("dense", dense), ("pad16", pad16)]
+
+            # ビット一致 (全ケース)。pad16 は本物の行だけ取り出して比べる
             y_ref = stock()
-            y_got = seg()
-            mx.eval(y_ref, y_got)
-            y_ref2 = y_ref
-            exact = bool(mx.array_equal(y_ref, y_got).item())
-            max_diff = float(
-                mx.max(
-                    mx.abs(y_ref.astype(mx.float32) - y_got.astype(mx.float32))
-                ).item()
-            )
+            mx.eval(y_ref)
+            exact: dict[str, bool] = {}
+            max_diff: dict[str, float] = {}
+            for vname, fn in variants:
+                if vname in ("stock", "dense"):
+                    continue
+                y = fn()
+                if vname == "pad16":
+                    y = y[keep_idx]
+                mx.eval(y)
+                exact[vname] = bool(mx.array_equal(y_ref, y).item())
+                max_diff[vname] = float(
+                    mx.max(
+                        mx.abs(y_ref.astype(mx.float32) - y.astype(mx.float32))
+                    ).item()
+                )
+                del y
+
             st = counts_stats(counts, BM)
             entry: dict = {
                 "shape": shape_name,
                 "case": name,
                 "M": M,
+                "M_pad16": m_pad,
                 "K": K,
                 "N": N,
                 "bit_exact": exact,
                 "max_abs_diff": max_diff,
                 "routing": st,
+                "routing_bm16": counts_stats(counts, 16),
+                "mixed": {str(t): mixed_stats(counts, t) for t in thresholds},
                 "grid_tiles_max": n_tiles_max(M, E),
             }
-            if not exact:
-                row_start = np.concatenate([[0], np.cumsum(counts)])
-                entry["first_diff"] = _first_diff_seg(y_ref, y_got, row_start)
-            del y_got
+            del y_ref
 
-            y_fs = seg_fragskip()
-            mx.eval(y_fs)
-            entry_fragskip_exact = bool(mx.array_equal(y_ref2, y_fs).item())
-            del y_fs
-
-            times = _interleave(
-                [
-                    ("stock", stock),
-                    ("seg", seg),
-                    ("fragskip", seg_fragskip),
-                    ("dense", dense),
-                ],
-                rounds,
-                warmup,
-            )
+            times = _interleave(variants, rounds, warmup)
             med = {k: statistics.median(v) for k, v in times.items()}
-            entry.update(
-                {
-                    "stock_ms": med["stock"],
-                    "seg_ms": med["seg"],
-                    "seg_fragskip_ms": med["fragskip"],
-                    "dense_ms": med["dense"],
-                    "stock_over_dense": med["stock"] / med["dense"],
-                    "seg_over_dense": med["seg"] / med["dense"],
-                    "seg_fragskip_over_dense": med["fragskip"] / med["dense"],
-                    "seg_over_stock": med["seg"] / med["stock"],
-                    "fragskip_bit_exact": entry_fragskip_exact,
-                    "samples": len(times["stock"]),
-                }
-            )
+            dense_ms = med["dense"]
+            entry["ms"] = med
+            entry["dense_ratio"] = {k: v / dense_ms for k, v in med.items()}
+            entry["samples"] = len(times["stock"])
+            # 旧いキー (下流の _report_partial_cost と過去の json の互換)
+            entry["stock_ms"] = med["stock"]
+            entry["seg_ms"] = med["seg32"]
+            entry["dense_ms"] = dense_ms
+            entry["seg_over_dense"] = med["seg32"] / dense_ms
             results.append(entry)
 
+            order = [v for v, _ in variants]
             print(
                 f"{shape_name:8s} {name:10s} M={M:6d}  "
-                f"stock {med['stock']:8.3f}  seg {med['seg']:8.3f}  "
-                f"fragskip {med['fragskip']:8.3f}  dense {med['dense']:8.3f} ms  |  "
-                f"dense 比 stock {med['stock'] / med['dense']:5.3f} "
-                f"seg {med['seg'] / med['dense']:5.3f} "
-                f"fragskip {med['fragskip'] / med['dense']:5.3f}  "
-                f"ビット一致 {'yes' if exact else 'NO'}"
-                f"{'' if entry_fragskip_exact else ' (fragskip NO)'}"
+                + "  ".join(f"{v} {med[v]:7.3f}" for v in order)
+                + f"  ms | dense 比 "
+                + " ".join(f"{v} {med[v] / dense_ms:5.3f}" for v in order)
             )
-            if not exact:
-                print(f"           最初の差: {entry['first_diff']}")
+            bad = [v for v, ok in exact.items() if not ok]
+            if bad:
+                print(f"           ビット不一致: {bad} (max|diff| {max_diff})")
 
-            del x, x3, idx, tables, y_ref, y_ref2
+            del x, x3, idx, tab32, tab16, tab_mix, counts_mx
+            del x_pad, x_pad3, idx_pad, keep_idx
         del wq, scales, biases, w0, s0, b0
 
     _report_partial_cost(results)
+    _report_layer_totals(results, mix_thresholds)
     return results
 
 
-def _report_partial_cost(results: list[dict]) -> None:
-    """flat20 / flat32 から端数タイルの費用 c (フルタイル比) を出す。
+def _report_layer_totals(results: list[dict], mix_thresholds: list[int]) -> None:
+    """MoE 層 1 つぶん (gate + up + down = gate/up x2 + down) の合計を出す。
 
-    どちらもタイル数は E ちょうど (20 行も 32 行も 1 専門家 1 タイル) なので、
-    総時間の比がそのまま 1 タイルあたりの費用比になる。既定 (frag 間引き
-    off) では 20 行タイルも 32 行ぶんの MMA を回すので、c ~ 1 が予想値。
-    flat160 は
-    フルタイルだけ (1 専門家 5 タイル) なので、1 タイルあたりが flat32 と
-    揃うかの対照に使う。
+    P3 の判定線がこの単位 (`gather_qmm_pad_micro.py` の 22.61 ms/層) なので、
+    そこと直に比べられる形にしておく。
+    """
+
+    by = {(r["shape"], r["case"]): r for r in results}
+    print()
+    print("MoE 層 1 つぶんの合計 (gate/up x2 + down)")
+    for case in ("skew-r40", "skew-r160"):
+        gu = by.get(("gate/up", case))
+        dn = by.get(("down", case))
+        if not (gu and dn):
+            continue
+        names = [k for k in gu["ms"] if k in dn["ms"]]
+        total = {k: 2 * gu["ms"][k] + dn["ms"][k] for k in names}
+        d = total["dense"]
+        print(f"  {case}:")
+        for k in names:
+            print(f"    {k:10s} {total[k]:8.3f} ms  dense 比 {total[k] / d:5.3f}")
+        best_mix = min(
+            (f"mix{t}" for t in mix_thresholds if f"mix{t}" in total),
+            key=lambda k: total[k],
+            default=None,
+        )
+        gu["layer_total_ms"] = total
+        gu["layer_dense_ratio"] = {k: total[k] / d for k in names}
+        gu["layer_best_mix"] = best_mix
+        if best_mix:
+            print(
+                f"    -> 最良の混合 {best_mix} {total[best_mix]:.3f} ms "
+                f"(pad16 {total['pad16']:.3f} / seg32 {total['seg32']:.3f} / "
+                f"seg16 {total['seg16']:.3f})"
+            )
+
+
+def _report_partial_cost(results: list[dict]) -> None:
+    """flat の対照から、タイル 1 枚あたりの費用を 16 行と 32 行で突き合わせる。
+
+      - 端数タイルの費用 c (32 行タイル比) = t(flat20, bm32) / t(flat32, bm32)。
+        どちらもタイル数は E ちょうどなので、総時間の比がそのまま 1 枚の費用比
+      - 16 行タイル 1 枚の費用 (32 行タイル比) = t(flat32, bm16) / 2 /
+        t(flat32, bm32)。flat32 は bm16 でちょうど 2 枚 / bm32 で 1 枚と、
+        **同じ行を覆う**のでタイル形の差だけが出る
+      - flat16 は bm16 で満タン 1 枚、bm32 で全部端数。既製の BM=16 が
+        なぜ効くかの直接の対照
     """
 
     by = {(r["shape"], r["case"]): r for r in results}
     print()
     for shape_name, _, _ in SEG_SHAPES:
+        f16 = by.get((shape_name, "flat16"))
         f20 = by.get((shape_name, "flat20"))
         f32 = by.get((shape_name, "flat32"))
         f160 = by.get((shape_name, "flat160"))
         if not (f20 and f32 and f160):
             continue
-        c = f20["seg_ms"] / f32["seg_ms"]
-        c_fragskip = f20["seg_fragskip_ms"] / f32["seg_ms"]
-        per_full_32 = f32["seg_ms"] / f32["routing"]["tiles_total"]
-        per_full_160 = f160["seg_ms"] / f160["routing"]["tiles_total"]
+        c = f20["ms"]["seg32"] / f32["ms"]["seg32"]
+        tile16 = f32["ms"]["seg16"] / 2.0 / f32["ms"]["seg32"]
+        per_full_32 = f32["ms"]["seg32"] / f32["routing"]["tiles_total"]
+        per_full_160 = f160["ms"]["seg32"] / f160["routing"]["tiles_total"]
         f20["partial_tile_cost_c"] = c
-        f20["partial_tile_cost_c_fragskip"] = c_fragskip
+        f32["bm16_tile_cost_vs_bm32"] = tile16
         f20["per_tile_ms_flat32"] = per_full_32
         f20["per_tile_ms_flat160"] = per_full_160
-        print(
-            f"{shape_name:8s} 端数タイル (20 行) の費用 c = {c:5.3f} "
-            f"(frag 間引き {c_fragskip:5.3f}) フルタイル比  "
+        line = (
+            f"{shape_name:8s} 端数 (20 行) タイルの費用 c = {c:5.3f}  "
+            f"| 16 行タイル 1 枚 = 32 行タイルの {tile16:5.3f} 倍  "
             f"| 1 タイルあたり flat32 {per_full_32 * 1e3:6.2f} us "
             f"flat160 {per_full_160 * 1e3:6.2f} us "
             f"(比 {per_full_32 / per_full_160:5.3f})"
         )
+        if f16:
+            line += (
+                f"  | flat16 bm16 {f16['ms']['seg16']:6.3f} "
+                f"bm32 {f16['ms']['seg32']:6.3f} "
+                f"stock {f16['ms']['stock']:6.3f} ms"
+            )
+        print(line)
+
 
 # ---------------------------------------------------------------------------
 # 第 3 段の付帯費用 (--stage tables)
@@ -654,8 +841,19 @@ def main() -> None:
     ap.add_argument("--rounds", type=int, default=10, help="ABBA の回数 (A/B 各 20 本)")
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--mix-thresholds",
+        default="48",
+        help="混合モードの閾値 (行数 < 閾値 なら 16 行タイル)。カンマ区切りで掃引",
+    )
+    ap.add_argument(
+        "--fragskip",
+        action="store_true",
+        help="端数タイルの frag 間引き版も interleave に入れる (既定 off、負け済み)",
+    )
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
+    mix_thresholds = [int(v) for v in args.mix_thresholds.split(",") if v.strip()]
 
     info = (getattr(mx, "device_info", None) or mx.metal.device_info)()
     print(
@@ -670,7 +868,13 @@ def main() -> None:
     elif args.stage == "tables":
         results = run_tables(args.rounds, args.warmup, args.seed)
     else:
-        results = run_segmented(args.rounds, args.warmup, args.seed)
+        results = run_segmented(
+            args.rounds,
+            args.warmup,
+            args.seed,
+            mix_thresholds,
+            with_fragskip=args.fragskip,
+        )
 
     if args.json:
         payload = {
@@ -679,6 +883,7 @@ def main() -> None:
             "nax": is_nax_device(),
             "knob_on": enabled(),
             "rounds": args.rounds,
+            "mix_thresholds": mix_thresholds,
             "results": results,
         }
         with open(args.json, "w") as f:

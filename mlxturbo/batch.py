@@ -368,6 +368,8 @@ def _install_model_patches(BatchAttnCache):
     import mlx.core as mx
     import mlx_lm.models.qwen4_exp as Q
 
+    from mlxturbo import qsa_tail as _qsa_tail
+
     # ---- _AttnCache.merge --------------------------------------------
     # `KVCache.merge` returns a `BatchKVCache`. That is a different class with
     # no indexer, so the QSA state disappears the moment the caches are bundled.
@@ -443,6 +445,11 @@ def _install_model_patches(BatchAttnCache):
             # would eat up the budget, and `pooled` would get contaminated
             # with padding keys
             visible = visible & (block_starts[None, None, :] >= left_pad[:, None, None])
+        if _qsa_tail.TIEBREAK:
+            # 単一系列側 (`QSAIndexer._pooled_and_top`) と同じ同点 bias。
+            scores = scores - (
+                mx.arange(n_blocks, dtype=mx.float32) * _qsa_tail.TIEBREAK_EPS
+            )
         scores = mx.where(visible, scores, -mx.inf)
 
         k = min(self.block_topk, n_blocks)
@@ -454,13 +461,35 @@ def _install_model_patches(BatchAttnCache):
             ..., :n_blocks
         ]
 
-        keep = mx.repeat(keep_block, self.compress_ratio, axis=-1)
-        tail = kv_len - n_blocks * self.compress_ratio
-        if tail:
+        cr = self.compress_ratio
+        keep = mx.repeat(keep_block, cr, axis=-1)
+        tail = kv_len - n_blocks * cr
+        if _qsa_tail.MODE == "query":
+            # Same as the vendored module: the tail is per query, columns
+            # [cr*floor((q+1)/cr), q] (see `mlxturbo/qsa_tail.py`). The one
+            # difference here is left padding -- a query whose own block
+            # straddles the padding boundary must not get the padded columns,
+            # so the scatter is clamped to `col >= left_pad` as well.
+            keep = mx.concatenate(
+                [keep, mx.zeros((B, S, tail + 1), dtype=mx.bool_)], axis=-1
+            )
+            own = ((q_col + 1) // cr) * cr
+            cols = own[None, :, None] + mx.arange(cr - 1)[None, None, :]
+            ok = cols <= q_col[None, :, None]
+            if left_pad is not None:
+                ok = ok & (cols >= left_pad[:, None, None])
+            cols = mx.where(ok, cols, kv_len)
+            keep = mx.put_along_axis(
+                keep,
+                mx.broadcast_to(cols, (B, S, cr - 1)),
+                mx.array(True),
+                axis=-1,
+            )[..., :kv_len]
+        elif tail:
             # Same as the vendored module: the incomplete tail is visible only
             # as far as causality allows (see the comment there for why the
             # stock `ones` leaks the future).
-            tail_col = n_blocks * self.compress_ratio + mx.arange(tail)
+            tail_col = n_blocks * cr + mx.arange(tail)
             keep = mx.concatenate(
                 [keep, mx.broadcast_to(
                     tail_col[None, None, :] <= q_col[None, :, None], (B, S, tail)

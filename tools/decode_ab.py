@@ -1387,15 +1387,21 @@ def _knob_fold_tail(ctx):
 
 
 def _knob_tail_in_group(ctx):
-    """末尾チャンクをレイヤー主導グループの最終メンバーにするか。
-    A = 入れる / B = chunk 主導のまま (既定)。
+    """末尾チャンクの「最後の 1 トークンを除いた部分」をレイヤー主導グループの
+    最終メンバーにするか。A = 入れる / B = chunk 主導のまま (既定)。
 
     4000 トークンは「端数 1952 の g=1 グループ + 末尾 2048 の chunk 主導」に
-    割れ、MoE が 2 回に分かれる (専門家あたり 36 行)。まとめると 1 回 4000 行
-    (75 行) になる。チャンク境界 (grid) は変えないので出力はビット一致する
-    はず (`control_identical=True`)。判定は **prefill_s** (4k で -3% 以上が
-    採用候補)。**prefill にしか効かないので `DECODE_ONLY_KNOBS` には入れない。**
-    代償は BPE 境界 checkpoint (docs/research/IDEAS-2026-09-03.md)。
+    割れ、MoE が 2 回に分かれる (専門家あたり 36 行)。まとめると 1 回
+    (75 行) になる。末尾 1 トークンを chunk 主導に残すのは BPE 境界
+    checkpoint の割り方 (n-1 + 1) に合わせるためで、そちらが lm_head も通す。
+    判定は **prefill_s** (4k で -3% 以上が採用候補)。**prefill にしか効かない
+    ので `DECODE_ONLY_KNOBS` には入れない。**
+
+    出力は一致するはず (`control_identical=True`) だが、ビット一致が構造的に
+    保証されるのは checkpoints 有効の経路だけ。このハーネスは
+    checkpoints=None なので、B 側は末尾 2048 を 1 回で流し A 側は 2047 + 1 に
+    割る -- 計算は正しいがチャンク割りが変わると量子化行列積の丸めが動きうる
+    (mlxturbo/prefill_common.py の docstring)。食い違ったらそれ自体が報告事項。
     """
     import mlxturbo.spec_flash as SF
 

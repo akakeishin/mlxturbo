@@ -78,13 +78,26 @@ def _dense_reference(q, k, v, keep_block, cr, kv_len, n_blocks, offset, scale):
     """同じ可視集合を素の dense sdpa で計算する (基準)。
 
     `QSAIndexer.__call__` と同じ手順でブロック bool をトークン幅へ展開し、
-    端数列だけ因果窓 (``col <= q_col``) を足す。
+    tail を足す。tail の規則は `mlxturbo/qsa_tail.py` の ``MODE`` に従う
+    (``global`` = 端数列を因果窓で / ``query`` = クエリごとに
+    ``[cr*floor((q+1)/cr), q]``)。カーネル側も同じ knob を見るので、
+    この基準は両方のモードで正しい相手になる。
     """
+    from mlxturbo import qsa_tail as QT
+
     B, S, _ = keep_block.shape
     keep = mx.repeat(keep_block, cr, axis=-1)
     tail = kv_len - n_blocks * cr
-    if tail:
-        q_col = mx.arange(offset, offset + S)
+    q_col = mx.arange(offset, offset + S)
+    if QT.MODE == "query":
+        cols = mx.arange(kv_len)
+        own = ((q_col + 1) // cr) * cr
+        keep = mx.concatenate(
+            [keep, mx.zeros((B, S, tail), dtype=mx.bool_)], axis=-1
+        ) if tail else keep
+        own_keep = (cols[None, :] >= own[:, None]) & (cols[None, :] <= q_col[:, None])
+        keep = keep | own_keep[None]
+    elif tail:
         tail_col = n_blocks * cr + mx.arange(tail)
         keep = mx.concatenate(
             [

@@ -109,6 +109,15 @@ WM = 2
 WN = 2
 THREADS = WM * WN * 32  # 1 threadgroup 128 スレッド
 
+# 第 2 段の変種で使う小さいタイル。既製の非 NAX gather_qmm_rhs と同じ形
+# (quantized.cpp:1652 の bm=16 / wm=1 / wn=2 = 64 スレッド)
+BM16 = 16
+WM16 = 1
+
+# 混合モードで「小さい専門家」と見なす行数の既定の境目。48 前後を掃引した
+# 結果はレーンの記録に残す (micro の `--stage segmented --mix-sweep`)
+MIX_THRESHOLD = 48
+
 # 本番の重みの量子化 (QuantizedSwitchLinear と同じ)
 GROUP_SIZE = 64
 BITS = 4
@@ -350,36 +359,141 @@ METAL_FUNC void mlxturbo_mma_rows(
     Bs += mma_t::tile_stride_b;
   }
 }
+
+// タイル 1 枚 (専門家 e の行 rs..re、列 y_col..y_col+BN) を計算して store する。
+// BM と WM を template で受けるので、16 行 (WM=1、64 スレッド) と 32 行
+// (WM=2 の既定、または混合モードの WM=1) を同じ本文で回せる。中身は
+// もともと本文に直書きしてあったものをそのまま関数に移しただけ。
+template <
+    typename T,
+    int TBM,
+    int TBN,
+    int TBK,
+    int TWM,
+    int TWN,
+    int TGS,
+    int TBITS,
+    bool TSKIP>
+METAL_FUNC void mlxturbo_seg_tile(
+    const device T* x,
+    const device uint8_t* w8,
+    const device T* scales,
+    const device T* biases,
+    device T* y,
+    threadgroup T* Xs,
+    threadgroup T* Ws,
+    const int K,
+    const int N,
+    const int M,
+    const int e,
+    const int rs,
+    const int re,
+    const int y_col,
+    const ushort simd_group_id,
+    const ushort simd_lane_id) {
+  constexpr short BK_padded = (TBK + 16 / sizeof(T));
+
+  using mma_t = mlx::steel::
+      BlockMMA<T, T, TBM, TBN, TBK, TWM, TWN, false, true, BK_padded, BK_padded>;
+  using loader_x_t =
+      mlx::steel::BlockLoader<T, TBM, TBK, BK_padded, 1, TWM * TWN * SIMD_SIZE>;
+  using loader_w_t = QuantizedBlockLoader<
+      T,
+      TBN,
+      TBK,
+      BK_padded,
+      1,
+      TWM * TWN * SIMD_SIZE,
+      TGS,
+      TBITS>;
+
+  constexpr int pack_factor = get_pack_factor<TBITS, 8>();
+  constexpr int bytes_per_pack = get_bytes_per_pack<TBITS>();
+
+  const int K_w = K * bytes_per_pack / pack_factor;
+  const int K_g = K / TGS;
+  const int K_it = K / TBK;
+  const short num_els = short(re - rs);
+
+  const size_t stride_w = size_t(N) * size_t(K_w);
+  const size_t stride_s = size_t(N) * size_t(K_g);
+
+  const device T* xp = x + size_t(rs) * size_t(K);
+  device T* yp = y + size_t(rs) * size_t(N) + size_t(y_col);
+  const device uint8_t* wl =
+      w8 + size_t(e) * stride_w + size_t(y_col) * size_t(K_w);
+  const device T* sp =
+      scales + size_t(e) * stride_s + size_t(y_col) * size_t(K_g);
+  const device T* bp =
+      biases + size_t(e) * stride_s + size_t(y_col) * size_t(K_g);
+
+  loader_x_t loader_x(xp, K, Xs, simd_group_id, simd_lane_id);
+  loader_w_t loader_w(wl, sp, bp, K, Ws, simd_group_id, simd_lane_id);
+  mma_t mma_op(simd_group_id, simd_lane_id);
+
+  if (num_els == TBM) {
+    // 満タンのタイル。dense クローンの内側そのもの
+    gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mma_op.store_result(yp, N);
+    return;
+  }
+
+  // 端数タイル。X のはみ出しぶんは「次の専門家の行」なので、x の末尾に
+  // 掛かっていない限りそのまま読んでよい (読んだ結果は store しない)。
+  const short tm = short(mma_t::kFragSize * (simd_group_id / TWN));
+  if (rs + TBM <= M) {
+    for (int k = 0; k < K_it; k++) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_x.load_unsafe();
+      loader_w.load_unsafe();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (TSKIP) {
+        mlxturbo_mma_rows<T, mma_t, TBK, TWM, TWN>(mma_op, Xs, Ws, tm, num_els);
+      } else {
+        mma_op.mma(Xs, Ws);
+      }
+      loader_x.next();
+      loader_w.next();
+    }
+  } else {
+    // x の最後のタイルだけ。全 dispatch で高々 1 枚
+    for (int k = 0; k < K_it; k++) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      loader_x.load_safe(short2(short(TBK), num_els));
+      loader_w.load_unsafe();
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (TSKIP) {
+        mlxturbo_mma_rows<T, mma_t, TBK, TWM, TWN>(mma_op, Xs, Ws, tm, num_els);
+      } else {
+        mma_op.mma(Xs, Ws);
+      }
+      loader_x.next();
+      loader_w.next();
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  mma_op.store_result_safe(yp, N, short2(short(TBN), num_els));
+}
 """
 
 # 本体。タイルの引き当てと端数の分岐だけを書き、ローダー・MMA・store は
 # 写しをそのまま呼ぶ (dense クローンと同じ方針)。
-_SEGMENTED_SOURCE = """
-  constexpr int BM = %(bm)d;
+# 本体。タイルの引き当てだけを書き、ローダー・MMA・store は写しをそのまま
+# 呼ぶ (dense クローンと同じ方針)。TILE_M / TILE_WM は template 引数なので、
+# 32 行 (WM=2、128 スレッド) と 16 行 (WM=1、64 スレッド) が同じ本文で回る。
+_SEGMENTED_HEAD = """
   constexpr int BN = %(bn)d;
   constexpr int BK = %(bk)d;
-  constexpr int WM = %(wm)d;
   constexpr int WN = %(wn)d;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
 
-  using mma_t = mlx::steel::
-      BlockMMA<T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded>;
-  using loader_x_t =
-      mlx::steel::BlockLoader<T, BM, BK, BK_padded, 1, WM * WN * SIMD_SIZE>;
-  using loader_w_t = QuantizedBlockLoader<
-      T,
-      BN,
-      BK,
-      BK_padded,
-      1,
-      WM * WN * SIMD_SIZE,
-      GROUP_SIZE,
-      BITS>;
-
-  threadgroup T Xs[BM * BK_padded];
+  // 混合モードでは同じ dispatch に 32 行タイルも来るので、threadgroup は
+  // いつも 32 行ぶんで張る (16 行タイルは前半しか使わない)
+  threadgroup T Xs[%(bm_max)d * BK_padded];
   threadgroup T Ws[BN * BK_padded];
 
-  // dims = (K, N, M, E)。4 要素なので constant アドレス空間に載る
+  // dims = (K, N, M, E, MIX_THRESHOLD)。5 要素なので constant アドレス空間
   const int K = dims[0];
   const int N = dims[1];
   const int M = dims[2];
@@ -394,98 +508,49 @@ _SEGMENTED_SOURCE = """
   // タイル -> (専門家、行ブロック)。tile_prefix は counts から作った
   // 「専門家 e までのタイル数」の累積和なので、2 分探索 1 回で引ける
   const int e = mlxturbo_seg_search(tile_prefix, E, t);
-  const int rs = row_start[e] + (t - tile_prefix[e]) * BM;
-  const int re = min(row_start[e + 1], rs + BM);
-  const short num_els = short(re - rs);
-
-  constexpr int pack_factor = get_pack_factor<BITS, 8>();
-  constexpr int bytes_per_pack = get_bytes_per_pack<BITS>();
-
-  const int K_w = K * bytes_per_pack / pack_factor;
-  const int K_g = K / GROUP_SIZE;
-  const int K_it = K / BK;
   const int y_col = int(threadgroup_position_in_grid.x) * BN;
+  const device uint8_t* w8 = (const device uint8_t*)w;
+""" % {"bn": BN, "bk": BK, "wn": WN, "bm_max": BM}
 
-  const size_t stride_w = size_t(N) * size_t(K_w);
-  const size_t stride_s = size_t(N) * size_t(K_g);
+_SEGMENTED_SOURCE = _SEGMENTED_HEAD + """
+  const int rs = row_start[e] + (t - tile_prefix[e]) * TILE_M;
+  const int re = min(row_start[e + 1], rs + TILE_M);
+  mlxturbo_seg_tile<T, TILE_M, BN, BK, TILE_WM, WN, GROUP_SIZE, BITS, SKIP_ROWS>(
+      x, w8, scales, biases, y, Xs, Ws, K, N, M, e, rs, re, y_col,
+      simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+"""
 
-  const device T* xp = x + size_t(rs) * size_t(K);
-  device T* yp = y + size_t(rs) * size_t(N) + size_t(y_col);
-  const device uint8_t* wl = ((const device uint8_t*)w) +
-      size_t(e) * stride_w + size_t(y_col) * size_t(K_w);
-  const device T* sp =
-      scales + size_t(e) * stride_s + size_t(y_col) * size_t(K_g);
-  const device T* bp =
-      biases + size_t(e) * stride_s + size_t(y_col) * size_t(K_g);
-
-  loader_x_t loader_x(
-      xp, K, Xs, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
-  loader_w_t loader_w(
-      wl,
-      sp,
-      bp,
-      K,
-      Ws,
-      simdgroup_index_in_threadgroup,
-      thread_index_in_simdgroup);
-  mma_t mma_op(simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
-
-  if (num_els == BM) {
-    // 満タンのタイル。dense クローンの内側そのもの
-    gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    mma_op.store_result(yp, N);
-    return;
-  }
-
-  // 端数タイル。X はみ出しぶんは「次の専門家の行」なので、x の末尾に
-  // 掛かっていない限りそのまま読んでよい (読んだ結果は store しない)。
-  //
-  // SKIP_ROWS=false (既定) は MMA を削らずに写しの `mma` をそのまま回す。
-  // 出力はどちらも同じ (削る frag は元々 store されない行だから) で、
-  // 実測では削らない方が 1 割速い (`--stage segmented` の seg / fragskip)。
-  const short tm =
-      short(mma_t::kFragSize * (simdgroup_index_in_threadgroup / WN));
-  if (rs + BM <= M) {
-    for (int k = 0; k < K_it; k++) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      loader_x.load_unsafe();
-      loader_w.load_unsafe();
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (SKIP_ROWS) {
-        mlxturbo_mma_rows<T, mma_t, BK, WM, WN>(mma_op, Xs, Ws, tm, num_els);
-      } else {
-        mma_op.mma(Xs, Ws);
-      }
-      loader_x.next();
-      loader_w.next();
-    }
+# 混合モード。専門家の行数が閾値未満なら 16 行タイル、それ以外は 32 行タイル。
+# threadgroup は 64 スレッドで、32 行タイルも WM=1 (TM=4) で回す --- 1 回の
+# dispatch に 2 種のタイルを混ぜるには threadgroup の形を揃えるしかないため。
+# 32 行 / WM=1 が 32 行 / WM=2 (既定) より遅いなら、その差は micro の
+# `bm32w1` ケース (混合の対照) に出る。
+_SEGMENTED_MIXED_SOURCE = _SEGMENTED_HEAD + """
+  const int MIX_THRESHOLD = dims[4];
+  const int rows_e = row_start[e + 1] - row_start[e];
+  if (rows_e < MIX_THRESHOLD) {
+    const int rs = row_start[e] + (t - tile_prefix[e]) * %(bm16)d;
+    const int re = min(row_start[e + 1], rs + %(bm16)d);
+    mlxturbo_seg_tile<T, %(bm16)d, BN, BK, 1, WN, GROUP_SIZE, BITS, SKIP_ROWS>(
+        x, w8, scales, biases, y, Xs, Ws, K, N, M, e, rs, re, y_col,
+        simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
   } else {
-    // x の最後のタイルだけ。全 dispatch で高々 1 枚
-    for (int k = 0; k < K_it; k++) {
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      loader_x.load_safe(short2(short(BK), num_els));
-      loader_w.load_unsafe();
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      if (SKIP_ROWS) {
-        mlxturbo_mma_rows<T, mma_t, BK, WM, WN>(mma_op, Xs, Ws, tm, num_els);
-      } else {
-        mma_op.mma(Xs, Ws);
-      }
-      loader_x.next();
-      loader_w.next();
-    }
+    const int rs = row_start[e] + (t - tile_prefix[e]) * %(bm)d;
+    const int re = min(row_start[e + 1], rs + %(bm)d);
+    mlxturbo_seg_tile<T, %(bm)d, BN, BK, 1, WN, GROUP_SIZE, BITS, SKIP_ROWS>(
+        x, w8, scales, biases, y, Xs, Ws, K, N, M, e, rs, re, y_col,
+        simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  mma_op.store_result_safe(yp, N, short2(short(BN), num_els));
-""" % {"bm": BM, "bn": BN, "bk": BK, "wm": WM, "wn": WN}
+""" % {"bm16": BM16, "bm": BM}
 
 
-def _get_segmented_kernel():
-    kernel = _KERNELS.get("segmented")
+def _get_segmented_kernel(mixed: bool = False):
+    key = "segmented_mixed" if mixed else "segmented"
+    kernel = _KERNELS.get(key)
     if kernel is None:
         kernel = mx.fast.metal_kernel(
-            name="mlxturbo_steel_qmm_segmented",
+            name="mlxturbo_steel_qmm_seg_mixed" if mixed else
+            "mlxturbo_steel_qmm_segmented",
             input_names=[
                 "x",
                 "w",
@@ -496,11 +561,11 @@ def _get_segmented_kernel():
                 "dims",
             ],
             output_names=["y"],
-            source=_SEGMENTED_SOURCE,
+            source=_SEGMENTED_MIXED_SOURCE if mixed else _SEGMENTED_SOURCE,
             header=STEEL_HEADER + _SEGMENTED_HEADER,
             ensure_row_contiguous=True,
         )
-        _KERNELS["segmented"] = kernel
+        _KERNELS[key] = kernel
     return kernel
 
 
@@ -515,30 +580,45 @@ def counts_from_sorted_ids(ids: mx.array, num_experts: int) -> mx.array:
     return zeros.at[flat].add(mx.ones(flat.shape, dtype=mx.int32))
 
 
-def segment_tables(counts: mx.array) -> tuple[mx.array, mx.array]:
+def segment_tables(
+    counts: mx.array,
+    bm: int = BM,
+    mix_threshold: int | None = None,
+) -> tuple[mx.array, mx.array]:
     """`counts` (E,) から ``(row_start, tile_prefix)`` を作る。どちらも (E+1,)。
 
     ``row_start[e]`` は専門家 e の行の先頭、``tile_prefix[e]`` は専門家 e より
     前のタイル数の合計。カーネルはこの 2 本だけで tile -> (専門家, 行ブロック)
     を引く。**host 同期は入らない** (`counts` の中身を Python 側で見ない)。
+
+    ``mix_threshold`` を渡すと混合モードの表になる: 行数がその値未満の
+    専門家は 16 行タイル、それ以外は 32 行タイルで数える。カーネル側も
+    同じ比較 (`rows_e < MIX_THRESHOLD`) をするので、両者は必ず一致する。
     """
 
     counts = counts.astype(mx.int32)
     zero = mx.zeros((1,), dtype=mx.int32)
     row_start = mx.concatenate([zero, mx.cumsum(counts)])
-    tiles = (counts + (BM - 1)) // BM
+    if mix_threshold is None:
+        tiles = (counts + (bm - 1)) // bm
+    else:
+        bm_e = mx.where(counts < mix_threshold, BM16, BM)
+        tiles = (counts + bm_e - 1) // bm_e
     tile_prefix = mx.concatenate([zero, mx.cumsum(tiles)])
     return row_start, tile_prefix
 
 
-def n_tiles_max(num_rows: int, num_experts: int) -> int:
+def n_tiles_max(num_rows: int, num_experts: int, bm: int = BM) -> int:
     """タイル数の静的上限。grid をこれで張る。
 
-    Σ_e ceil(c_e / BM) <= Σ_e floor(c_e / BM) + (行を持つ専門家の数)
-                       <= floor(M / BM) + min(E, M)
+    Σ_e ceil(c_e / bm) <= Σ_e floor(c_e / bm) + (行を持つ専門家の数)
+                       <= floor(M / bm) + min(E, M)
+
+    混合モードは専門家ごとに 16 か 32 なので、最悪 (全部 16) の
+    ``bm=BM16`` で張る。
     """
 
-    return num_rows // BM + min(num_experts, num_rows)
+    return num_rows // bm + min(num_experts, num_rows)
 
 
 def segmented_eligible(
@@ -595,6 +675,9 @@ def qmm_segmented(
     segments_are: str = "auto",
     tables: tuple[mx.array, mx.array] | None = None,
     frag_skip: bool = False,
+    bm: int = BM,
+    wm: int | None = None,
+    mix_threshold: int | None = None,
     group_size: int = GROUP_SIZE,
     bits: int = BITS,
 ) -> mx.array:
@@ -615,6 +698,14 @@ def qmm_segmented(
     計測で 10 % 負けたから** (上の「第 2 段」を参照)。残してあるのは
     別の機種で取り直せるようにするためで、既定を戻すなら
     `--stage segmented` の seg / fragskip を測り直してからにすること。
+
+    ``bm`` はタイルの行数 (16 か 32、既定 32)。``wm`` を渡すと simdgroup の
+    行方向の本数を上書きできる (既定は bm=32 で 2、bm=16 で 1)。
+    ``mix_threshold`` を渡すと**専門家ごとに** 16 行タイルと 32 行タイルを
+    選ぶ混合モードになり、``bm`` / ``wm`` は無視される (混合は 1 dispatch に
+    2 種のタイルを混ぜるので threadgroup を 64 スレッドに揃える必要があり、
+    WM は必ず 1)。``tables`` を渡すときは同じ ``bm`` /
+    ``mix_threshold`` で作った表であること。
     """
 
     _fire.bump("moe_grouped_gemm_segmented")
@@ -640,21 +731,37 @@ def qmm_segmented(
             counts = segments
         else:
             raise ValueError(f"segments_are={segments_are!r} が不正")
-        tables = segment_tables(counts)
+        tables = segment_tables(counts, bm=bm, mix_threshold=mix_threshold)
     row_start, tile_prefix = tables
 
-    dims = mx.array([K, N, M, E], dtype=mx.int32)
-    kernel = _get_segmented_kernel()
+    mixed = mix_threshold is not None
+    if mixed:
+        tile_wm = 1
+        grid_bm = BM16  # 最悪 (全専門家が 16 行タイル) で grid を張る
+    else:
+        if bm not in (BM16, BM):
+            raise ValueError(f"bm={bm} は 16 か 32 のみ")
+        tile_wm = (WM16 if bm == BM16 else WM) if wm is None else wm
+        grid_bm = bm
+    threads = tile_wm * WN * 32
+
+    dims = mx.array(
+        [K, N, M, E, int(mix_threshold or 0)], dtype=mx.int32
+    )
+    kernel = _get_segmented_kernel(mixed)
+    template = [
+        ("T", x.dtype),
+        ("GROUP_SIZE", group_size),
+        ("BITS", bits),
+        ("SKIP_ROWS", bool(frag_skip)),
+    ]
+    if not mixed:
+        template += [("TILE_M", int(bm)), ("TILE_WM", int(tile_wm))]
     (out,) = kernel(
         inputs=[x, w, scales, biases, row_start, tile_prefix, dims],
-        template=[
-            ("T", x.dtype),
-            ("GROUP_SIZE", group_size),
-            ("BITS", bits),
-            ("SKIP_ROWS", bool(frag_skip)),
-        ],
-        grid=(THREADS * (N // BN), n_tiles_max(M, E), 1),
-        threadgroup=(THREADS, 1, 1),
+        template=template,
+        grid=(threads * (N // BN), n_tiles_max(M, E, grid_bm), 1),
+        threadgroup=(threads, 1, 1),
         output_shapes=[(M, N)],
         output_dtypes=[x.dtype],
     )

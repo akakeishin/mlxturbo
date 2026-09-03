@@ -132,11 +132,34 @@ def build_case(kv_len: int, S: int, seed: int = 0):
     )
 
 
-def run(variants, kvs, S, reps, out_path):
+def load_pre(path: str):
+    """移植前の `prefill_attn.py` の写しを、パッケージの一員として読み込む。
+
+    モジュール名を ``mlxturbo.kernels.prefill_attn_pre`` にしてやると、写しの
+    中の ``from . import _fire`` が本物の `mlxturbo.kernels._fire` に解決する
+    (ファイルの置き場所はリポジトリの外でよい)。移植前後のビット一致を
+    **同じプロセスで** 見るための口。
+    """
+    import importlib.util
+
+    name = "mlxturbo.kernels.prefill_attn_pre"
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def run(variants, kvs, S, reps, out_path, pre_path=None):
     results = []
     PA2 = None
+    PAP = None
     if "c" in variants or "d" in variants:
         from mlxturbo.kernels import prefill_attn_v2 as PA2  # noqa: N806
+    if "e" in variants:
+        if not pre_path:
+            raise SystemExit("variant e には --pre <移植前の prefill_attn.py> が要る")
+        PAP = load_pre(pre_path)  # noqa: N806
 
     for kv_len in kvs:
         case = build_case(kv_len, S)
@@ -159,6 +182,12 @@ def run(variants, kvs, S, reps, out_path):
             )
         if "d" in variants:
             fns["d_u4"] = lambda c=case: PA2.prefill_attn_v2_u4(
+                c["q"], c["k"], c["v"], c["keep_block"], c["cache"],
+                cr=c["cr"], kv_len=c["kv_len"], n_blocks=c["n_blocks"],
+                block_topk=c["block_topk"], offset=c["offset"], scale=c["scale"],
+            )
+        if "e" in variants:
+            fns["e_pre"] = lambda c=case: PAP.prefill_attn(
                 c["q"], c["k"], c["v"], c["keep_block"], c["cache"],
                 cr=c["cr"], kv_len=c["kv_len"], n_blocks=c["n_blocks"],
                 block_topk=c["block_topk"], offset=c["offset"], scale=c["scale"],
@@ -202,6 +231,11 @@ def run(variants, kvs, S, reps, out_path):
             row["d_bitident_b"] = bool(
                 mx.array_equal(outs["d_u4"], outs["b_current"]).item()
             )
+        if "b_current" in row and "e_pre" in row:
+            row["b_over_e"] = row["b_current"] / row["e_pre"]
+            row["b_bitident_e"] = bool(
+                mx.array_equal(outs["b_current"], outs["e_pre"]).item()
+            )
 
         err_str = "  ".join(
             f"{k}={v:.2e}" for k, v in row.items() if k.endswith("err")
@@ -213,6 +247,10 @@ def run(variants, kvs, S, reps, out_path):
             + (
                 f"  bitident(d==b)={row['d_bitident_b']}"
                 if "d_bitident_b" in row else ""
+            )
+            + (
+                f"  bitident(b==e)={row['b_bitident_e']}"
+                if "b_bitident_e" in row else ""
             ),
             flush=True,
         )
@@ -316,7 +354,14 @@ def main() -> None:
     ap.add_argument("--S", type=int, default=2048)
     ap.add_argument(
         "--variants", default="a,b,c",
-        help="a=dense基準 b=現行カーネル c=新カーネル d=uint4 load 版 (P6)",
+        help=(
+            "a=dense基準 b=現行カーネル c=新カーネル d=uint4 load 版 (P6) "
+            "e=移植前の本番カーネル (--pre で写しを渡す)"
+        ),
+    )
+    ap.add_argument(
+        "--pre", default=None,
+        help="variant e が読む、移植前の prefill_attn.py の写しのパス",
     )
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--stage-breakdown", action="store_true", help="現行カーネルの3パス内訳を測る")
@@ -338,7 +383,7 @@ def main() -> None:
         )
     else:
         variants = set(a.variants.split(","))
-        run(variants, kvs, a.S, a.reps, a.out)
+        run(variants, kvs, a.S, a.reps, a.out, a.pre)
     os._exit(0)
 
 

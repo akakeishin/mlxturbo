@@ -42,6 +42,13 @@ from .cache import ArraysCache, KVCache, _BaseCache
 from .gated_delta import gated_delta_update
 from .switch_layers import SwitchGLU
 
+# QSA の tail (未完成ブロック) の可視規則と同点規則の knob。このファイルは
+# `mlx_lm.models.qwen4_exp` として読み込まれるので相対 import は mlx_lm 側を
+# 指す --- 絶対 import で取る (`_gather_forward` の prefill_attn と同じ作法)。
+# 解決した時点で `mlxturbo` は必ず初期化済み (このモジュールを解決する
+# meta_path フック自体が `mlxturbo/__init__.py` から入る) なので循環しない。
+from mlxturbo import qsa_tail as _qsa_tail
+
 # mlxturbo: switch to keeping the n-gram table (51.2B params) out of RAM and
 # reading only the needed rows from disk. This flag has to be set both at
 # conversion time and at load time.
@@ -468,6 +475,14 @@ class QSAIndexer(nn.Module):
 
         # a block is only a candidate if it lies entirely in the query's past
         visible = block_end[None, None, :] <= q_col[None, :, None]
+        if _qsa_tail.TIEBREAK:
+            # HF は `torch.topk` なので同点は小さい添字が残る。`argpartition`
+            # にその保証は無いので、添字に比例した極小の bias を引いて前の
+            # ブロックを優先させる (mlx-serve が HF 比較で使う bias と同じ)。
+            # 既定 off (`MLXTURBO_QSA_TIEBREAK=1`)。
+            scores = scores - (
+                mx.arange(n_blocks, dtype=mx.float32) * _qsa_tail.TIEBREAK_EPS
+            )
         scores = mx.where(visible, scores, -mx.inf)
 
         k = min(self.block_topk, n_blocks)
@@ -506,10 +521,40 @@ class QSAIndexer(nn.Module):
         # speculative verify rounds (there a draft token sees the drafts that
         # follow it). Synthetic probe: logits move by ~9e-2 with the stock
         # `ones`, exactly 0 with this.
-        keep = mx.repeat(keep_block, self.compress_ratio, axis=-1)
-        tail = kv_len - n_blocks * self.compress_ratio
-        if tail:
-            tail_col = n_blocks * self.compress_ratio + mx.arange(tail)
+        cr = self.compress_ratio
+        keep = mx.repeat(keep_block, cr, axis=-1)
+        tail = kv_len - n_blocks * cr
+        if _qsa_tail.MODE == "query":
+            # HF 参照の tail: クエリ q ごとに列 [cr*floor((q+1)/cr), q] を必ず
+            # 可視にする (自分自身を含む 0〜cr-1 列)。global tail (下の else)
+            # と違い**ブロック格子の途中にも出る**ので、端数列だけでは足りない。
+            #
+            # 選ばれた完全ブロックとは重ならない: tail が空でない行は
+            # q % cr != cr-1 で、その行のブロックは block_end = cr*(q//cr)+cr-1
+            # > q なので `visible` を満たさず、top-k の候補ですらない。
+            # 逆に q % cr == cr-1 の行では tail が空になり、その行のブロックが
+            # 完全ブロックとして候補に入る --- HF と同じ切り替わり方。
+            #
+            # 端数列は「その行の tail に入るときだけ」見える (global tail の
+            # 因果窓ではない) ので False で始め、下の散布で立てる。
+            # 立てる列は 1 行あたり高々 cr-1 なので、大きい (B,S,kv_len) の
+            # マスクに対して比較を張らず `put_along_axis` で書く。捨て列を
+            # 1 本足しておき、無効な添字 (自分より後ろ) をそこへ逃がす
+            # (`_pooled_and_top` の top-k が n_blocks 番のダミーを使うのと同じ手)。
+            keep = mx.concatenate(
+                [keep, mx.zeros((B, S, tail + 1), dtype=mx.bool_)], axis=-1
+            )
+            own = ((q_col + 1) // cr) * cr          # (S,) 自分のブロックの先頭
+            cols = own[:, None] + mx.arange(cr - 1)[None, :]   # (S, cr-1)
+            cols = mx.where(cols <= q_col[:, None], cols, kv_len)
+            keep = mx.put_along_axis(
+                keep,
+                mx.broadcast_to(cols[None], (B, S, cr - 1)),
+                mx.array(True),
+                axis=-1,
+            )[..., :kv_len]
+        elif tail:
+            tail_col = n_blocks * cr + mx.arange(tail)
             keep = mx.concatenate(
                 [
                     keep,
@@ -725,7 +770,24 @@ class Attention(nn.Module):
 
         sel_tok = sel_blocks[:, :, None] * cr + mx.arange(cr)[None, None, :]
         sel_tok = sel_tok.reshape(B, U * cr)
-        if tail:
+        own_idx = None
+        if _qsa_tail.MODE == "query":
+            # クエリごとの tail (HF 参照、`mlxturbo/qsa_tail.py`)。行 q が足す
+            # 列は [cr*floor((q+1)/cr), q] で、このタイルの行が使う列は連続区間
+            # [own_lo, q_hi] に収まる (幅 <= T + cr - 1)。global tail と違い
+            # 端数列は含めない --- この規則の外では端数列も見えない。
+            # 選ばれた完全ブロックとは重ならない (`QSAIndexer.__call__` の注記)。
+            s_all = blocks.q_col.shape[0]
+            q_lo = blocks.kv_len - s_all + t0
+            q_hi = blocks.kv_len - s_all + t1 - 1
+            own_lo = (q_lo // cr) * cr
+            own_idx = mx.arange(own_lo, q_hi + 1)
+            sel_tok = mx.concatenate(
+                [sel_tok,
+                 mx.broadcast_to(own_idx[None], (B, q_hi + 1 - own_lo))],
+                axis=1,
+            )
+        elif tail:
             # 端数列 (最後の未満ブロック) は block 添字を持たないので、
             # union の対象外のまま常に列末尾へ足す。可視かどうかは下の
             # クエリごとマスクが因果窓 (tail_col <= q_col) で決める。
@@ -751,7 +813,17 @@ class Attention(nn.Module):
         idx_bsu = mx.broadcast_to(sel_blocks[:, None, :], (B, T, U))
         keep_sel = mx.take_along_axis(keep_block, idx_bsu, axis=-1)  # (B,T,U)
         keep_sel = mx.repeat(keep_sel, cr, axis=-1)  # (B,T,U*cr)
-        if tail:
+        if own_idx is not None:
+            own = ((q_col + 1) // cr) * cr
+            own_keep = (own_idx[None, :] >= own[:, None]) & (
+                own_idx[None, :] <= q_col[:, None]
+            )
+            keep_sel = mx.concatenate(
+                [keep_sel,
+                 mx.broadcast_to(own_keep[None], (B, T, own_idx.shape[0]))],
+                axis=-1,
+            )
+        elif tail:
             tail_col = n_blocks * cr + mx.arange(tail)
             tail_keep = mx.broadcast_to(
                 (tail_col[None, :] <= q_col[:, None])[None], (B, T, tail)
