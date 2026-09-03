@@ -284,3 +284,5 @@ Flash-Next の的は一巡 (単独レイテンシは方針の中では 55〜60 t
 段取り: (1) MTP サイドカーの読み込み修正 (mtp.py の quantize の順) → (2) 相手の起動方法と harness の下調べ (scout) → (3) 基準測定 (同じ冷却、同じ池、4 者) → (4) 27B の内訳 (prefill / decode の部品) → (5) 契約が合う部品から当てる (GDN Metal、sdpa 行タイル、BM=64 qmm の MLP 込み)。
 Flash-Next のフルベンチは後回し (ユーザーの指示があるまで回さない)。
 - **Mirai / uzu (07:55、`docs/research/EXTERNAL-MIRAI-UZU-2026-09.md`)**: Qwen3.6 27B を M5 Max で 105 tok/s (specdec、<50 MB の学習した draft、蒸留した独自 4bit)。同じ機体なら MTPLX 55 / MLX 26。物理の差ではなく機体 + draft の学習 + 独自量子化。27B の比較には MTPLX (`tools/compare/mtplx-venv/`) も入れる。uzu は別重みなので参考点。
+- **方針 (ユーザー 08:30)**: フルベンチは回さない。**汎用的に動かせる移植 (動的に部品を当てる) と高速化を先に。**27B の 5 者比較の本番パスは script だけ用意して後回し (煙試験の数字は COMPARE-QUEUE)。
+  走行中: GDN 部品の qwen3_5 移植、sdpa 行タイル + MLP qmm_wide の移植、qwen3_5 用の 1 プロセス A/B 道具 (`tools/decode_ab_generic.py`)。次の段は decode 経路 (SpecEngine + staged) の段階投入と糊の融合を 27B に。
