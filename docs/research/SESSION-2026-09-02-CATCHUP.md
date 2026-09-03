@@ -1981,8 +1981,25 @@ MoE 層 1 つ (gate/up ×2 + down) の ms。r=40 は末尾チャンク相当、r
 
 HC 97 組 (682 MB)、GDN 36 組を巡回。us/call: hc_gated_residual fused 48.5 / plain 205.5 (0.236)、gdn_recurrent with_states 37.6 / mlx_lm 17.3 (2.17、機能が違う)、
 gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。床 3.2〜4.2 us。
-- **注意: この HC 項目の plain (205 us) は、12:00 の帰属で使った `custom_kernel_overhead_micro.py` の本番 plain (冷 62.5 us) と合わない。**項目の写し方が本番経路と違う疑い。
-  HC の判定ゲートは overhead micro (48 組 157 MB、fused 140.8 / plain 62.5) のまま。HC v4 は同じ物差しで測る。
+- **注意: この HC 項目の plain (205 us) は、12:00 の帰属で使った `custom_kernel_overhead_micro.py` の本番 plain (冷 62.5 us) と合わない。**
+  原因は 12:35 に判明 (下の HC v4 の節): 連鎖ツールの `_quant_linear` が 8bit 既定で、実モデルの HC (4bit/gs64、inject は bf16) と違う。
+  8bit で測ると符号が反転して「融合が素より 4.3 倍速い」と出る。4bit に直すと 135.5 / 61.9 で CATCHUP の数字を再現する。ゲートは修正中。
 - gdn_prework / rms_norm_gated の重みは 3 MB 以下で冷を再現できない (警告どおり)。gdn_prework は既定 off の knob なので判定は据え置き。
 - 待ち手が走っている最中に `tools/biglock.sh` を同じ inode に上書きしたら、待ち手のループ後の続きが化けて `command not found: nue` が出た (コマンド自体は走り終わっていたので実害なし)。
   直すときは別名に書いてから mv で入れ替える。
+
+### 2026-09-03 12:35 HC v4 (elementwise だけ融合、MLX の qmv は素のまま): 速度は棄却、ビット一致と受理率の手がかりが残った (`bench/results/hc-elem.json`)
+
+- 実装: `mlxturbo/kernels/hyper_connection.py` に `fused_gated_residual_elem` (+327 行、既存 3 変種は無傷)、`mlxturbo/fused.py` に `enable_hyper_connection_elem`、`tools/decode_ab.py` に `--knob hc-elem`。
+  dispatch は素の 14 → 6 (自前 3 + MLX qmv 3)。
+- **ビット一致**: MLX 本体の bf16 sigmoid は `y = 1/(1+exp(|x|)); x<0 ? y : 1-y` (`unary_ops.h:308`)。`hyper_connection.py` 冒頭の総当たりは `exp(-|x|)` 側しか試しておらず、
+  それが 1 ulp 差の原因だった。写すと bf16 全 65536 パターンで 65535 一致。elem の mixed / inject は S=1 (4bit / 8bit) で素とビット一致、S=6 4bit で 15360 中 1 個 1 ulp。
+  対照の現行 `kernel` 変種は mixed 97.5% 一致、max_abs 7.8e-3。
+- 冷連鎖 (97 組、実モデルの 4bit/gs64 + bf16 inject、367.5 MB): 素 61.85 / kernel 135.46 (+119%) / **elem 52.75 (-9.1 us、-14.7%)** / 床 qmv 3 本 36.94、自前 3 本 14.49。
+  elem ≈ qmv3 + elem3 で加法的。**判定線 (-25 us) 未達**: 素の elementwise 11 op が 25 us しかなく、3 本に畳んでも 9 us しか取れない。
+- in-model (17k、短長 3 本 × 512、A,B,B,A): 短 ms/round +2.4% / 長 +0.1%、tok/round 短 +2.3% / 長 +3.7%、ms/tok 短 +0.1% / 長 -3.3%。**速度の判定線 (ms/round -4%) 未達、棄却。**
+- 手がかり: elem (素とビット一致) の tok/round が本番既定 (HC=kernel) より短長とも高い。既定の kernel は 106 呼び出し中 9 だけ発火 (`MLXTURBO_HC_INJECT_BF16` 未設定のため残りは素へ)。
+  素直に読むと「既定の融合カーネルが受理率を削っている」。切り分けは A = elem、B = HC=off の 1 プロセス A/B (elem と off はビット一致なので tok/round が完全一致するはず)。**投入済み** (`hc-elem-off.json`)。
+  判定線: elem = off がビット一致で、kernel 既定の tok/round が両方の長さで 2% 以上低ければ、HC=kernel を既定から降ろす (品質を売って速度を買わない)。
+- ゲートのバグ: `tools/micro_kernel_latency.py` / `kernel_chain_cost.py` の `_quant_linear` は QBITS=8 既定。実モデルの HC は 4bit/gs64、inject は bf16。8bit だと
+  素 205 / kernel 48 / elem 198 と符号が反転する (committed の kernel_chain_cost も fused 46 / plain 200)。**HC 項目を 4bit/gs64 + bf16 inject に直す (修正中)。**

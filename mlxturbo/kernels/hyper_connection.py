@@ -989,10 +989,337 @@ def fused_gated_residual(
     return mixed, inj.reshape((*lead, hc))
 
 
+# --------------------------------------------- 第 4 変種: elementwise だけを畳む
+#
+# 上の 3 変種 (hc_pre/hc_post、prefill 1 ディスパッチ) は GEMV 2 本も融合の中に
+# 取り込んでいる。重みを 100MB 超巡回させた冷の連鎖で測ると、この取り込みが
+# そのまま負けの正体になる (CATCHUP 2026-09-03 12:00): down/up の逆量子化内積は
+# 20 threadgroup / 32 simdgroup 中 10 本 / 最後は 1 lane の逐次なので、DRAM の
+# レイテンシを隠す並列度が無い。MLX の qmv は出力行ごとに threadgroup を立てて
+# ベクトル load するので隠せる。冷で +78us/回 の差はここから出ている。
+#
+# そこで GEMV は `mx.quantized_matmul` (量子化でなければ素の行列積) にそのまま
+# 残し、**その前後の elementwise だけ**を自前カーネルに畳む。畳む対象は重みを
+# 読まない (hyper 20KB + norm_weight 20KB + 中間 20KB 程度) ので、冷の DRAM
+# レイテンシの問題そのものが起きない。
+#
+#   hc_elem_pre  : レーンごとの rms -> normed              (素の 3 op)
+#   (qmv down)   : mx.quantized_matmul                     -- MLX のまま
+#   (qmv inject) : mx.quantized_matmul / 素の行列積        -- MLX のまま
+#   hc_elem_mid  : silu(down / hc)                         (素の 2 op)
+#   (qmv up)     : mx.quantized_matmul                     -- MLX のまま
+#   hc_elem_post : sigmoid(up) * normed の hc 平均 + inject (素の 6 op)
+#
+# 素の 14 ディスパッチ (combine あり。rms_norm / 1+w / 乗算 / qmv down / 除算 /
+# silu (mx.compile 済みなので 1 本) / qmv up / sigmoid / 乗算 / mean / qmv inject /
+# 除算 / sigmoid / 2 倍) が 6 (自前 3 + qmv 3) になる。1 要素 1 thread で、
+# threadgroup ごとの重複読みは作らない (pre は 1 threadgroup = 1 レーン、
+# post は 1 thread = 出力 1 要素)。
+#
+# 数値は素の実装と同じ順・同じ丸め位置を踏む。sigmoid も MLX 本体
+# (mlx/backend/metal/kernels/unary_ops.h の `struct Sigmoid`) の式を
+# **そのままの形で**書き写す (下の `_MLX_SIGMOID_HEADER`)。冒頭の「精度」の節が
+# 言う 1 ulp 差は、その総当たりが `exp(-abs(x))` 側の変形だけを試していたため:
+# 本体は `exp(+abs(x))` で組み立てていて、丸め位置が違う。bf16 の全ビットパターン
+# (65536 個、非有限を 0 に置換) で mx.sigmoid と突き合わせると、写しは 65535/65536
+# 一致、`exp(-abs(x))` 変形は 63747/65536 (97.3%) しか一致しない (2026-09-03 実測)。
+# その結果、この変種の mixed / inject は素の実装と**ビット一致**する
+# (S=1 と S=6、量子化 inject と bf16 inject の 4 通りで確認)。
+
+_KERNELS_ELEM: dict[tuple, Any] = {}
+
+_ELEM_THREADS = 256
+
+# MLX 本体の bf16 sigmoid をそのままの式で写す。`metal::exp(metal::abs(x))`
+# (符号を反転しない側) と `(x < 0) ? y : 1 - y` の組み合わせがちょうど本体の
+# 丸め位置になる。式を数学的に等価な形へ書き換えると bf16 では 1 ulp ずれる
+# ので、**この 2 行は本体の写しとして触らないこと** (本体を追うときは
+# mlx/backend/metal/kernels/unary_ops.h の `struct Sigmoid` を見る)。
+_MLX_SIGMOID_HEADER = """
+template <typename T>
+inline T mlx_sigmoid(T x) {
+    auto y = 1 / (1 + metal::exp(metal::abs(x)));
+    return (x < 0) ? y : 1 - y;
+}
+"""
+
+
+def _elem_pre_source(cfg: dict) -> str:
+    """レーンごとの rms_norm と (1 + weight) の適用。1 threadgroup = 1 レーン。
+
+    grid は (threads, hc, m) なので threadgroup は hc*m 本。レーンの要素
+    (d 個) は 1 threadgroup が丸ごと持つので、レーンをまたぐ重複読みは無い。
+    """
+    hc, d, eps = cfg["hc"], cfg["d"], cfg["eps"]
+    hcd = hc * d
+    tpg = _ELEM_THREADS
+    nsimd = tpg // 32
+    per = (d + tpg - 1) // tpg
+    return f"""
+    uint tid = thread_position_in_threadgroup.x;
+    uint sgi = simdgroup_index_in_threadgroup;
+    uint sli = thread_index_in_simdgroup;
+    int  l   = (int)threadgroup_position_in_grid.y;
+    int  m   = (int)threadgroup_position_in_grid.z;
+
+    threadgroup float tg_part[{nsimd}];
+
+    const device T* xrow = hyper       + (size_t)m * {hcd} + (size_t)l * {d};
+    const device T* wrow = norm_weight + (size_t)l * {d};
+    device T*       orow = normed      + (size_t)m * {hcd} + (size_t)l * {d};
+
+    // 1) レーンの二乗和。mx.fast.rms_norm と同じく fp32 で溜める。読んだ値は
+    //    レジスタに残して 2 パス目で device メモリを読み直さない
+    float xv[{per}];
+    float ss = 0.0f;
+    for (int p = 0; p < {per}; p++) {{
+        int i = (int)tid + p * {tpg};
+        float v = (i < {d}) ? (float)xrow[i] : 0.0f;
+        xv[p] = v;
+        ss += v * v;
+    }}
+    ss = simd_sum(ss);
+    if (sli == 0) tg_part[sgi] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0f;
+    for (int q = 0; q < {nsimd}; q++) tot += tg_part[q];
+    float r = metal::rsqrt(tot / {float(d)}f + {eps!r}f);
+
+    // 2) 参照は rms_norm の出力と (1 + weight) をそれぞれ bf16 に落とすので、
+    //    その丸めを再現する
+    for (int p = 0; p < {per}; p++) {{
+        int i = (int)tid + p * {tpg};
+        if (i < {d}) {{
+            T nrm   = (T)(xv[p] * r);
+            T scale = (T)(1.0f + (float)wrow[i]);
+            orow[i] = (T)((float)nrm * (float)scale);
+        }}
+    }}
+"""
+
+
+def _elem_mid_source(cfg: dict) -> str:
+    """down の出力に silu(x / hc) をかける。lowrank 個しかないので 1 次元。"""
+    hc, lowrank = cfg["hc"], cfg["lowrank"]
+    return f"""
+    int i = (int)thread_position_in_grid.x;
+    int m = (int)thread_position_in_grid.z;
+    if (i < {lowrank}) {{
+        size_t off = (size_t)m * {lowrank} + (size_t)i;
+        // 参照: nn.silu(qmm(normed) / hc) = x * sigmoid(x)、各段 bf16
+        T x = (T)((float)down_raw[off] / {float(hc)}f);
+        T s = mlx_sigmoid<T>(x);
+        t[off] = (T)((float)x * (float)s);
+    }}
+"""
+
+
+def _elem_post_source(cfg: dict) -> str:
+    """sigmoid(up) * normed のレーン平均、ついでに inject の elementwise。
+
+    出力 1 要素 = 1 thread。thread j は入力の (l*d + j) だけを hc 回読むので、
+    up_raw と normed はカーネル全体でちょうど 1 回ずつ読まれる。
+    """
+    hc, d, combine = cfg["hc"], cfg["d"], cfg["combine"]
+    hcd = hc * d
+    inject_body = ""
+    if combine:
+        inject_body = f"""
+    // inject は hc 個しかないので、先頭の thread に相乗りさせる
+    // (専用ディスパッチを 1 本足すより安い)。参照: 2 * sigmoid(qmm(normed) / hc)
+    if (j < {hc}) {{
+        size_t io = (size_t)m * {hc} + (size_t)j;
+        T x = (T)((float)inject_raw[io] / {float(hc)}f);
+        T s = mlx_sigmoid<T>(x);
+        inject[io] = (T)(2.0f * (float)s);
+    }}"""
+    return f"""
+    int j = (int)thread_position_in_grid.x;
+    int m = (int)thread_position_in_grid.z;
+
+    if (j < {d}) {{
+        // 参照の mean(axis=-2) は **bf16 で逐次加算**する (fp32 で溜めて最後に
+        // 丸める形ではない。_post_source の同じ注記を参照)
+        float total = 0.0f;
+        for (int l = 0; l < {hc}; l++) {{
+            size_t idx = (size_t)m * {hcd} + (size_t)l * {d} + (size_t)j;
+            T sg = mlx_sigmoid<T>(up_raw[idx]);
+            float prod = (float)((T)((float)sg * (float)normed[idx]));
+            total = (float)((T)(total + prod));
+        }}
+        // bf16 で溜めた総和を hc で割る (hc=4 なら bf16 でも厳密)
+        mixed[(size_t)m * {d} + (size_t)j] = (T)(total / {float(hc)}f);
+    }}
+{inject_body}
+"""
+
+
+def _get_kernels_elem(cfg: dict):
+    key = tuple(sorted(cfg.items()))
+    built = _KERNELS_ELEM.get(key)
+    if built is not None:
+        return built
+
+    tag = "c" if cfg["combine"] else "p"
+    suffix = f"{cfg['hc']}x{cfg['d']}_{cfg['lowrank']}_{tag}{len(_KERNELS_ELEM)}"
+
+    pre = mx.fast.metal_kernel(
+        name=f"hc_elem_pre_{suffix}",
+        input_names=["hyper", "norm_weight"],
+        output_names=["normed"],
+        source=_elem_pre_source(cfg),
+    )
+    mid = mx.fast.metal_kernel(
+        name=f"hc_elem_mid_{suffix}",
+        input_names=["down_raw"],
+        output_names=["t"],
+        source=_elem_mid_source(cfg),
+        header=_MLX_SIGMOID_HEADER,
+    )
+    post_inputs = ["normed", "up_raw"]
+    post_outputs = ["mixed"]
+    if cfg["combine"]:
+        post_inputs.append("inject_raw")
+        post_outputs.append("inject")
+    post = mx.fast.metal_kernel(
+        name=f"hc_elem_post_{suffix}",
+        input_names=post_inputs,
+        output_names=post_outputs,
+        source=_elem_post_source(cfg),
+        header=_MLX_SIGMOID_HEADER,
+    )
+    _KERNELS_ELEM[key] = (pre, mid, post)
+    return pre, mid, post
+
+
+def _elem_qmm(x: mx.array, w: tuple):
+    """量子化線形 (5-tuple) と素の線形 (1-tuple) のどちらも受ける。
+
+    ここは MLX の qmv/gemv をそのまま呼ぶ -- 第 4 変種の要点は「GEMV を
+    自前カーネルに取り込まない」ことなので、この関数の中身を融合カーネルに
+    差し替えると変種の意味が消える。
+    """
+    if len(w) == 1:
+        return x @ w[0].T
+    wt, sc, bi, gs, bits = w
+    return mx.quantized_matmul(
+        x, wt, scales=sc, biases=bi, transpose=True, group_size=gs, bits=bits
+    )
+
+
+def eligible_elem(
+    hyper: mx.array,
+    norm_weight: mx.array,
+    hc: int,
+    d: int,
+) -> bool:
+    """第 4 変種で扱える形か。
+
+    GEMV を MLX に任せるので、:func:`eligible` と違って重みの量子化 (bits /
+    group_size / 3 層の一致) を一切見ない。見るのは hyper と norm_weight の
+    dtype と形だけ。
+    """
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return False
+    if hyper.dtype not in (mx.float16, mx.bfloat16):
+        return False
+    if norm_weight.dtype != hyper.dtype:
+        return False
+    if hyper.shape[-1] != hc * d:
+        return False
+    if norm_weight.shape != (hc * d,):
+        return False
+    return True
+
+
+def fused_gated_residual_elem(
+    hyper: mx.array,
+    norm_weight: mx.array,
+    eps: float,
+    hc: int,
+    d: int,
+    down: tuple,
+    up: tuple,
+    inject: tuple | None,
+):
+    """`GatedResidual.__call__` の elementwise だけを 3 本のカーネルに畳む。
+
+    ``down`` / ``up`` / ``inject`` は量子化 5-tuple
+    ``(weight, scales, biases, group_size, bits)`` か、素の 1-tuple
+    ``(weight,)``。戻り値は ``mixed``、``inject`` があれば
+    ``(mixed, inject)`` (:func:`fused_gated_residual` と同じ)。
+    """
+
+    _fire.bump("hc_elem")
+    lowrank = down[0].shape[0]
+    combine = inject is not None
+    cfg = {
+        "hc": hc,
+        "d": d,
+        "lowrank": lowrank,
+        "eps": float(eps),
+        "combine": combine,
+    }
+    pre, mid, post = _get_kernels_elem(cfg)
+
+    lead = hyper.shape[:-1]
+    m = prod(lead) if lead else 1
+    dt = hyper.dtype
+    flat = hyper.reshape((m, hc * d))
+
+    (normed,) = pre(
+        inputs=[flat, norm_weight],
+        template=[("T", dt)],
+        grid=(_ELEM_THREADS, hc, m),
+        threadgroup=(_ELEM_THREADS, 1, 1),
+        output_shapes=[(m, hc * d)],
+        output_dtypes=[dt],
+    )
+
+    down_raw = _elem_qmm(normed, down)
+    inject_raw = _elem_qmm(normed, inject) if combine else None
+
+    mid_x = ((lowrank + _ELEM_THREADS - 1) // _ELEM_THREADS) * _ELEM_THREADS
+    (t,) = mid(
+        inputs=[down_raw],
+        template=[("T", dt)],
+        grid=(mid_x, 1, m),
+        threadgroup=(_ELEM_THREADS, 1, 1),
+        output_shapes=[(m, lowrank)],
+        output_dtypes=[dt],
+    )
+
+    up_raw = _elem_qmm(t, up)
+
+    post_x = ((d + _ELEM_THREADS - 1) // _ELEM_THREADS) * _ELEM_THREADS
+    post_inputs = [normed, up_raw]
+    post_shapes = [(m, d)]
+    post_dtypes = [dt]
+    if combine:
+        post_inputs.append(inject_raw)
+        post_shapes.append((m, hc))
+        post_dtypes.append(dt)
+    outs = post(
+        inputs=post_inputs,
+        template=[("T", dt)],
+        grid=(post_x, 1, m),
+        threadgroup=(_ELEM_THREADS, 1, 1),
+        output_shapes=post_shapes,
+        output_dtypes=post_dtypes,
+    )
+
+    if not combine:
+        return outs[0].reshape((*lead, d))
+    mixed, inj = outs
+    return mixed.reshape((*lead, d)), inj.reshape((*lead, hc))
+
+
 __all__ = [
     "eligible",
     "fused_gated_residual",
     "eligible_prefill",
     "fused_gated_residual_prefill",
+    "eligible_elem",
+    "fused_gated_residual_elem",
     "PREFILL_M_THRESHOLD",
 ]
