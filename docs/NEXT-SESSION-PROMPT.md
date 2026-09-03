@@ -95,9 +95,13 @@ A/B は `--knobs a,b,c` で 1 プロセスにまとめ、プロセス内 ABBA �
    - 未: サーバー経由の 1 リクエストで `[round]` trace を取り、decode_ab の 43 ms との差を見る (detokenize / SSE の GPU 遊び)。
 2. 済 (08:28): モデル無しの proof-of-life。P1 (2 stream) は直列化 0.965 で畳む、D5 (専門家共有) は重複行が既に安いので畳む、
    D4 (command buffer 粒度) は ±1% で畳む。既製 gather_qmm に 16 行揃えのダミー行を足すと r=40 -11% / r=160 -3.6% (P3 の variant C)。
-3. 天井スタブ (chain86、`--knob stub-*`) で上限を取ってから、通った案だけ Sonnet に実装させて ABBA: D1 → D2 → D3。
-   D6 は stub-indexer-topk の天井が 1 ms/round 未満なら D7 (top-k select カーネル) ごと畳む。
-4. P3: MoE の grouped GEMM。第 1 段 (dense クローン、ビット一致 1.000 倍) と第 2 段 (segmented BM=32、r=160 で 1.098 対 1.167) は済。
+3. 済 (10:20): D1 (+1.7%、隠れていた draft を壁に出しただけ)、D2b (1 ラウンド遅れの信号は AUC 0.567)、D3 (17k -2.1% / 50k -2.6%) はいずれも畳んだ。
+   **最優先 (品質)**: QSA の tail の意味論が HF と違う (HF はクエリごとに自分の未完成ブロックを可視、うちは global tail)。`MLXTURBO_QSA_TAIL=query` を
+   実装中 (Opus)。通ったら既定にし、teacher (bf16) を作り直して KLD を取り直す。verify の受理率にも効く可能性。
+   decode 側: 天井スタブ (chain89、`--knobs`) → K2 (radix select K2a を実装中、K2b は 2-pass vector の写し)。
+   prefill 側: P5 行タイル (4k -1.1% / 8k -1.2%、17k と発火確認待ち → 既定化)、P6 (uint4 load、micro 待ち) → gather カーネル作り直し、
+   `tail-in-group` (末尾チャンクをグループに、4k -3〜5% 見込み、A/B 待ち)、BM=16 の segmented (micro 待ち)。K1 の mask arm は後回し。
+4. P3: MoE の grouped GEMM。in-model は 4k ±0 / 8k -1.4% / 17k -0.6% (換算率は 8k で予測どおり。MoE 行列積は prefill の 3 割)。既定には入れない。
    第 3 段 (fused.py のフック + knob `moe-grouped-gemm` の A=segmented / B=既製 / C=pad16+既製、4k/8k/17k) を Opus が実施中。
    判定線: 17k -2% 未満かつ 4k -4% 未満なら BM=16 経路 (専門家ごとに BM を選ぶ) を足してから再 A/B。KLD はビット一致なので出力一致で代替。
    **NAX 対応機 (M5 系) でも使う** (ユーザー方針 08:30): カーネルは NAX 専用 intrinsic を使わず、`MLXTURBO_MOE_GEMM=auto|on|off` で
