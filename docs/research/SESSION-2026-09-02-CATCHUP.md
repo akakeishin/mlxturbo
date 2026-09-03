@@ -1857,3 +1857,7 @@ D2b の補足 (10:20): 1 ラウンド遅れのマージン (前ラウンドの�
   `ngram_sync_ms` が C だけ 6 割減る (同期が GPU を空にする直接の証拠)。改良しても届かない。
 - 次: `tail-in-group` (末尾をグループに) が通れば r=40 は短文脈だけに縮む。その後、BM=16 の segmented を micro (`--stage segmented`) で pad16 の 22.61 ms/層に届くか確かめてから in-model。
 - 注意: `control_identical` の自動判定は `kind == "short"` の行しか見ないので `--only long` では無検査 (head の突き合わせは手で確認済み)。温めは `variants[0]` だけ。→ decode_ab の直し (小)。
+
+P5 の micro (`tools/sdpa_rowtile_micro.py`、S=2048、Hq 24 / Hk 2、D 256、ms/層): kv 2048: whole 10.52 → R512 7.27 / R256 6.71 / R128 6.81。
+kv 4096: 20.57 → 17.40 / 16.74 / 16.65。kv 8192: 40.71 → 38.73 / 39.97 / 40.78。max|diff| は 3 形とも 0.0 (この形ではビット一致)。
+kv が大きいほど取り分が縮む (8k では R512 が最良で -2.0 ms)。R を kv で切り替える (kv < 8k は 256、以上は 512) 余地あり。
