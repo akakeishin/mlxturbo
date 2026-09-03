@@ -2122,3 +2122,10 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - elem の tok/round が高く出たのは品質ではなく別の軌道: elem は decode / verify 幅 (M ≤ 6) では全段ビット一致だが、**M ≥ 62 で post 段 (mean の bf16 逐次加算の模倣か、写した sigmoid の 1 パターン) が素と食い違う**
   (mixed の不一致率 M=62 3.2e-5、M=2048 2.5e-4、normed も M=2048 で 7e-6)。prefill がこの経路を通るので軌道が分かれる。ビット一致で使うなら行数の上限が要るが、速度で棄却済みなので実装しない。
 - **HC v4 は完全に閉じる。**`hc-elem` / `hc-off` knob は残す (docstring に実測を記録)。
+
+### 2026-09-03 15:35 chain95 の判定 (worker 経由、17k、3 本 × 回文): 末尾 v2 → 既定 on、P3 / P10 は 17k でも退行なし
+
+- 末尾 v2 17k: A 26.43 / B 26.58 s (**-0.6%**、A 25.9〜26.8 / B 26.5〜27.0)。4k -4.9% / 8k -3.4% と合わせて **`MLXTURBO_PREFILL_TAIL_IN_GROUP` を既定 on** (`=0` で off)。
+- P3 / P10 17k (`p3mix-p10wide-17k.json`): mix48 **-4.0%** (27.40 s、seg32 -1.0%、素 28.54)、qmm-wide **-2.5%** (28.08 / 28.80)。対照 OK (head 一致)、tok/round 2.667 で同一、decode ±0.6%。
+  8k (-4.3% / -2.6%) と同水準で、14:05 の既定化を裏付ける。
+- 17k の prefill は素で 28.5 s → 全部入りで 26 s 台 (9/3 朝の 31.6 s から -17%、mlx-serve 27.8 s に対して 0.95x)。

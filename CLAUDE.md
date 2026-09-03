@@ -75,6 +75,8 @@
   (既定 512) も 2026-09-03 に A/B と KLD で入れた本番の既定値。
   `FASTMLX_NGRAM_BACKEND` (既定 mmap、`=pread` で旧経路) と `MLXTURBO_NGRAM_PREFETCH` (mmap では既定 on、`=0` で off) も
   本番の既定値で、2026-09-03 の別プロセス比較 (8k -6%、17k -7%) で切り替えた。n-gram の行取得を mmap + 背景 madvise で行う。
+  `MLXTURBO_PREFILL_TAIL_IN_GROUP` (既定 on、`=0` で off) は末尾 2048 チャンクを layer-major のグループに入れる本番の既定値
+  (4k -4.9% / 8k -3.4% / 17k -0.6%、サーバー経路はビット一致、2026-09-03 15:35)。checkpoint 無しの経路 (generate() / ベンチ) では末尾を 2047+1 に割るので丸めが動く。
   `MLXTURBO_MOE_GEMM_MIX` (既定 48、`=0` で off) と `MLXTURBO_QMM_WIDE` (既定 auto = 非 NAX で on、`=off`) は 2026-09-03 14:00 に
   8k の in-model (混合タイル -4.3%、BM=64 dense 射影 -2.6%、どちらも素とビット一致) で入れた本番の既定値。NAX 機では
   `MLXTURBO_MOE_GEMM=auto` の判定でどちらも off になる (自前カーネルは NAX 機で auto=off の方針)。

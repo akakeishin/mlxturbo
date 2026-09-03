@@ -904,7 +904,8 @@ _PREFILL_FOLD_TAIL = os.environ.get("MLXTURBO_PREFILL_FOLD_TAIL", "1") != "0"
 
 # 末尾チャンクの「最後の 1 トークンを除いた部分」を直前のレイヤー主導
 # グループの最終メンバーとして流すか。**既定 off**
-# (MLXTURBO_PREFILL_TAIL_IN_GROUP=1 で on)。
+# (**既定 on**、MLXTURBO_PREFILL_TAIL_IN_GROUP=0 で off。2026-09-03: 4k -4.9% / 8k -3.4% / 17k -0.6%、
+#  サーバー経路 (checkpoint あり) は chunk 主導とビット一致)。
 #
 # 動機 (docs/research/IDEAS-2026-09-03.md「4k の末尾チャンク」): 4000
 # トークンは「端数 1952 の g=1 グループ + 末尾 2048 の chunk 主導」に割れ、
@@ -931,7 +932,7 @@ _PREFILL_FOLD_TAIL = os.environ.get("MLXTURBO_PREFILL_FOLD_TAIL", "1") != "0"
 #     (prefill_common.py の docstring と
 #     docs/research/PREFILL-CHUNKING-DETERMINISM.md)。実測では 4k/8k の
 #     in-model A/B、合成モデルの 4 形とも出力トークン列は一致した。
-_PREFILL_TAIL_IN_GROUP = os.environ.get("MLXTURBO_PREFILL_TAIL_IN_GROUP") == "1"
+_PREFILL_TAIL_IN_GROUP = os.environ.get("MLXTURBO_PREFILL_TAIL_IN_GROUP", "1") != "0"
 
 # `_prefetch_ngram_span` が「次の境界」ぶんとして先読みする幅 (トークン数)。
 # 既定グループ幅 (_PREFILL_GROUP チャンク) に、fold-tail が畳み込みうる
