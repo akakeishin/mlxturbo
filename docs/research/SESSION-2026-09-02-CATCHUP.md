@@ -2031,3 +2031,28 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - 既定を query にする前に残ること: 上の 3 本、teacher の bf16 再生成 (現行 teacher は global で作られているので、そのままでは KLD が「悪化」に見える)、TIEBREAK の単独 A/B、
   未配線 2 か所 (`kernels/qsa_prefill_attn.py`、`kernels/qsa_select.py` の K2) を起こすときに query 規則を入れる。
 - 運用: この GPU 列は 2 時間以上、同じ段の新しい待ち手 (poll が短い) に追い越され続けた。biglock の同じ段を先着順 (札の mtime) にした。
+
+### 2026-09-03 13:10 K2b: decode 幅の QSA attention カーネル (`mlxturbo/kernels/qsa_attn_decode.py`、`tools/verify_qsa_attn_decode.py`)。ビット一致、置換対象を 2.0〜2.7 倍
+
+- 訂正: この機械の devc は `'s'` (`applegpu_g15s`)。本家 sdpa の blocks は 4k 128 / 8.5k〜25k **256** / 50k 512 (設計メモの `'d'` 表は誤り、17k は 512×33 回ではなく 256×67 回)。
+- ビット一致: 本番の並び (per-query tail の `QSAIndexer.__call__` → S≥3 は 2 行ずつ sdpa → concat) と S∈{1,2,3,4,6} × kv∈{2049..50000} × 選択 4 種 = **120 通り `mx.array_equal`**、tail 位相 16 通りも一致、
+  `MLX_SDPA_BLOCKS` 32/64 に釘付けしても (両側同じなら) 一致。`fast::exp` / FMA は問題にならず: 本家 metallib は `-fno-fast-math`、`metal_kernel` の JIT 既定 `math_mode="safe"` で同じ。
+- 可視条件は排他ではなく参照どおりの和集合 `bit(i/cr) || (tail_base <= i <= q_col)` (keep_block に不可視ブロックが混ざっても参照と一致する側)。
+- 冷連鎖 (12 層の K/V 418 MB を巡回、us/層、blocks は本家の表どおり):
+
+| S | kv | 現行 計 (sdpa) | K2a+K2b | K2a | K2b | 比 |
+|---|---|---|---|---|---|---|
+| 1 | 17k | 203 (99) | 86 | 13 | 74 | 2.35 |
+| 2 | 17k | 281 (173) | 139 | 16 | 123 | 2.03 |
+| 2 | 50k | 533 (382) | 194 | 24 | 170 | 2.75 |
+| 4 | 17k | 461 (334) | 231 | 14 | 217 | 1.99 |
+| 6 | 17k | 627 (498) | 326 | 21 | 305 | 1.92 |
+| 6 | 50k | 1278 (1108) | 481 | 37 | 444 | 2.66 |
+
+  判定線 (17k S=2 で K2b ≤ 75 us) は未達 (123) だが、置換対象 (選択 + マスク + sdpa) 全体では 17k S=2 281 → 139 (12 層で **-1.7 ms/forward**)、50k S=6 1278 → 481 (**-9.6 ms**)。
+  K/V を threadgroup メモリへ 16 列ずつ載せて 12 simdgroup で共有する改良で 8〜10% (演算順不変)。残りの床は帯域ではなく online softmax の直列鎖と占有率。
+- `MLX_SDPA_BLOCKS` を 32/64 に釘付けすると K2b は kv にほぼ依存しなくなる (17k S=2 123 → 92 / 90、50k S=6 444 → 244 / 230): 読む列が budget 2048 + 端数で頭打ちなので、blocks を減らすと 1 threadgroup の仕事が kv でなく budget で決まる。
+  本家は全キーのマスクを走査するので kv に比例。partials の往復が blocks に比例するのが表どおりが遅い理由。
+  分岐: (a) 表どおり = 現行とビット一致 (既定、`mirror_blocks`)、(b) カーネルだけ 64 = 再結合順が違う「close」、(c) プロセス全体を 64 = ビット一致で速いが QSA 以外の decode sdpa も 64 (4k は速く、50k は 13% 遅い)。
+- 配線の前提: `MLXTURBO_QSA_TAIL=query` 必須 (`eligible()` は global で False)、B>1 は本家の `query_transposed` の添字が B=1 前提なので必ず退く。
+- **判定: K2c (配線 + in-model) へ進める。**両側 query で速度だけを見る (ビット一致なので KLD 0)。判定線 17k ms/round -3%、tok/round と head 一致 → 既定 on (query の既定化とセット)。(b)/(c) は後で。
