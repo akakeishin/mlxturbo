@@ -2095,3 +2095,20 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
   3 つの呼び手 (batch / batch_spec / spec_flash) は別口の射影を持たない。ビット一致は `scratchpad/verify_p3p10_wiring.py` で 15 通り + 混合 5 通り確認、指紋 4 つ一致。
 - **判定: 両方とも既定に入れる** (判定線 -2%、品質の代金ゼロ)。`MLXTURBO_MOE_GEMM_MIX=48` (0 で off)、`MLXTURBO_QMM_WIDE=auto` (非 NAX で on)。17k は chain95 で確認 (悪化していれば戻す)。
 - 素の seg32 だけでは -0.2% で意味が無かった。WM=1 (64 スレッド) と 16 行タイルの組が効いている。
+
+### 2026-09-03 14:39 QSA tail (query) の GPU 3 本 (`scratchpad/ab-qsa-tail.json`、`lcq-{query,global}.json`、gpu3.sh、別プロセス、burn-in 無し)
+
+- decode A/B (A = query、B = global、短長 3 本 × 512、A,B,B,A): 短は位置 1 の段差 (各ケースの最初の A が 41.8〜42.1、2 本目は B と同じ 36.8〜37.3) を除けば同一
+  (短は kv < budget で疎化しないので当然)。**17k: ms/round -0.7%、tok/round -0.3%、prefill_s +0.5% = 速度は中立。**2 本目の A (35.1〜35.3) は B (36.1〜37.5) より速いが位置の効果と区別が付かない。
+- 正答率 17k (n=6): recall は query / global とも dense 6/6、kernel 6/6。quote は dense 5/6 (両モード同じ)、kernel は query 5/6 / global 6/6 (1 問の差、n=6 では決め手にならない)。
+  kernel と dense の一致率は recall で query 1.00 / global 0.83 (query の方が dense と揃う = カーネルの per-query 意味論が dense と一致する側)。
+- **判定: 速度は中立、正答率は同等 (n=6 の 1 問差は保留)。HF / mlx-serve / oMLX と同じ意味論なので query を既定候補にする。**小ベンチには K2c とセットで env で入れる (K2c の 17k が通れば)。
+  コードの既定に入れる前に、n を増やした正答率 (seed を変えて 12 問) と teacher の再生成 → KLD。
+
+### 2026-09-03 14:45 P6 の移植 (uint4 load を本番カーネルへ) と MIN_KV 8192 (`mlxturbo/kernels/prefill_attn.py`、`tools/verify_prefill_attn.py` 修正)
+
+- 移植後は v2 と 0.2〜0.5% 以内で同速、移植前比 -27〜-28% (kv 8k〜17k、3 者 1 プロセス交互)、3 点とも移植前とビット一致。scalar フォールバックのソースは移植前と文字列一致。
+  dense との交差点 8.14k。
+- in-model: prefill-attn 17k **-3.7%** (旧 -0.9%)、50k **-23.2%** (旧 -21.3%)。min-kv 17k: 8192 対 12288 で -0.3% (誤差、効く層が 9 チャンク中 2 つ)。品質ゲート 17k n=8: 両方 recall 1.0 / quote 0.625 で同一。
+- MIN_KV 8192 の採否は 10k の A/B (chain95) で決める (-1% 以上なら 8192)。
+- `verify_prefill_attn.py` のモデルレベルは MIN_S=64 と MIN_KV 12288 の 2 つで発火していなかった。合成側を S=64 に広げ、check_model の中だけ MIN_KV=0 にして戻す形に直し、配列・モデルとも合格。

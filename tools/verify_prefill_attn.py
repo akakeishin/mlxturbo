@@ -27,6 +27,7 @@ gather 経路 (汎用 op 2 段) を見るのに対し、こちらは **GPU で�
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -189,18 +190,31 @@ def _run_model(model, mode, calls):
     return out
 
 
+# 合成モデルの prefill 幅チャンクの列数。**`prefill_attn.MIN_S` 以上にすること。**
+#
+# 元は 32 だった。2026-09-03 に `MIN_S=64` (decode/verify 幅をカーネルから外す
+# ための下限) が入り、S=32 では `PA.eligible` が必ず False を返してカーネルが
+# 一度も走らなくなった --- `check_model` の「走った回数 0」で不合格になる。
+# 合成側を広げて本番と同じゲートを通す (ツール側で MIN_S を下げると、
+# **検査したいゲートそのものを外して**しまう)。
+_PREFILL_S = max(64, PA.MIN_S)
+
+
 def _build_calls(vocab):
     """verify_gather_attn.py と同じ割り方 (prefill 幅チャンクと decode 幅)。"""
-    ids = [(i * 7 + 3) % vocab for i in range(102)]
+    head, tail = 59, 11
+    total = head + _PREFILL_S + tail
+    ids = [(i * 7 + 3) % vocab for i in range(total)]
     calls = []
-    body = ids[:59]
+    body = ids[:head]
     for lo in range(0, len(body), 8):
         calls.append(body[lo : lo + 8])
-    calls.append(ids[59:91])          # prefill 幅チャンク (S=32)
-    for i in range(91, 95):
+    p = head + _PREFILL_S
+    calls.append(ids[head:p])         # prefill 幅チャンク (S=_PREFILL_S)
+    for i in range(p, p + 4):
         calls.append([ids[i]])
-    calls.append(ids[95:97])          # verify 幅を模した S=2
-    for i in range(97, 102):
+    calls.append(ids[p + 4 : p + 6])  # verify 幅を模した S=2
+    for i in range(p + 6, total):
         calls.append([ids[i]])
     return calls
 
@@ -221,11 +235,23 @@ def check_model(budget=8):
         fired[0] += 1
         return orig(*a, **kw)
 
+    # 発火下限 (`MLXTURBO_PREFILL_ATTN_MIN_KV`、既定 12288) は本番の kv 長を
+    # 想定した**速度**のしきい値で、正しさとは関係ない。合成モデルの kv は
+    # 100 程度なので、そのままでは `_gather_forward` が下限で早期 return して
+    # カーネルに届かない。ここだけ 0 に落として通す (`os.environ` は
+    # 呼び出しのたびに読まれるので、戻せば他へ漏れない)。
+    _MIN_KV = "MLXTURBO_PREFILL_ATTN_MIN_KV"
+    saved = os.environ.get(_MIN_KV)
+    os.environ[_MIN_KV] = "0"
     PA.prefill_attn = counted
     try:
         kern = _run_model(model, "kernel", calls)
     finally:
         PA.prefill_attn = orig
+        if saved is None:
+            os.environ.pop(_MIN_KV, None)
+        else:
+            os.environ[_MIN_KV] = saved
 
     ok = True
     print(f"  カーネルが走った回数: {fired[0]}")

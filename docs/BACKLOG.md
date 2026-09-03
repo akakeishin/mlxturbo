@@ -697,9 +697,8 @@ mlx_lm の更新で写しが壊れる頻度が月 2 回を超えるなら、写�
   手元にもある (`~/models/gemma4-31b-assistant` / `gemma4-26b-assistant`、4 層 hidden 1024 head_dim 256)。これを使う。
   ただし機構が Qwen の MTP (同一 forward の nextn 頭) とも `DraftSpecRunner` (独立の小モデル) とも違い、**drafter が target の KV を読むので、
   KV 共有型の drafter エンジンを新設**する (`docs/research/EXPANSION-BOTTLENECKS.md` の Gemma 4 の節)。
-  経路の優先: 1. 族が配る drafter (Qwen は MTP 頭、Gemma 4 は assistant) → 2. n-gram / lookup (`LookupSpecRunner`、学習なし、族を問わない既定の保険)
-  → 3. 同じ族の小モデル (`DraftSpecRunner`) → 4. 自前の頭の学習は後回し (本筋から外す)。
-  対応表には「draft の種類 (MTP 頭 / KV 共有 drafter / lookup / draft モデル)」を 1 列持たせ、族ごとに既定を決める。
+  **方針 (ユーザー 2026-09-03 14:50): 公式の MTP 頭 (drafter) が配られていない族は、基本的に投機に対応しない** (素の decode + 汎用カーネルまで)。
+  lookup / 小モデル draft / 自前の頭の学習を代用にはしない。対応表の「draft の種類」は MTP 頭 / KV 共有 drafter / なし、の 3 値。
 - **vision / 音声も追従の対象に含める** (BACKLOG 1 節「マルチモーダル対応」と同じ話)。Gemma 4 と Qwen の VL 系は mlx_lm 側が VLM ラッパ (`gemma4.py` + `gemma4_text.py` の形) なので、
   8〜9 割の追従はまず text 側の経路で取り、vision / 音声の encoder は別の adapter として足す。投機 decode 側で要るのは「画像 / 音声トークンを含む prefix の prefill と、
   その KV を持ったままの draft / verify」で、text だけの前提を置いている箇所 (prime 窓、n-gram の文脈、checkpoint の位置) を洗うのが先。
