@@ -2056,3 +2056,16 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
   分岐: (a) 表どおり = 現行とビット一致 (既定、`mirror_blocks`)、(b) カーネルだけ 64 = 再結合順が違う「close」、(c) プロセス全体を 64 = ビット一致で速いが QSA 以外の decode sdpa も 64 (4k は速く、50k は 13% 遅い)。
 - 配線の前提: `MLXTURBO_QSA_TAIL=query` 必須 (`eligible()` は global で False)、B>1 は本家の `query_transposed` の添字が B=1 前提なので必ず退く。
 - **判定: K2c (配線 + in-model) へ進める。**両側 query で速度だけを見る (ビット一致なので KLD 0)。判定線 17k ms/round -3%、tok/round と head 一致 → 既定 on (query の既定化とセット)。(b)/(c) は後で。
+
+### 2026-09-03 13:50 常駐 worker (`tools/ab_daemon.py` / `ab_submit.py` / `ab_bundle.py`、`tools/biglock.sh` はクライアントに)。読み直しゼロを確認、**起動直後の 1 行目が +7〜9% 遅い段差**を発見
+
+- 同じ `--knob null --only short --tokens 64` を 2 回: 読み込み 1 回 (140 s)、ジョブ 18.8 / 18.0 s、head と tok/round は 16 桁一致、prefill_s +0.11%、**ms/round -2.03%**。
+  -2% は揺れではない: 1 回目のプロセスでは各ケースの最初の計測行 (A,B,B,A の A) が 40.3〜40.5 ms、残りは ~36.9 (+7.4〜8.9%)。2 回目では消える。
+  decode_ab の温めでは吸収されず、回文順でも位置 1 の段差は打ち消せない。**新しいプロセスでは A に約 5% (ms/round で約 2%) の不利が付いていた** (prefill_s は無影響)。
+  worker には burn_in (読み込み直後に 32 トークンの捨て A/B、~10 s) を既定で入れた。過去の decode 側 A/B (A = 新変種) の ms/round は 2% ほど A に不利に出ている
+  (HC elem の短 +2.4%、D1 の +1.7% はこの範囲。判定は動かさないが、再測するときは burn-in 付きで)。
+- ジョブ種: decode_ab (in-process、knob は enable/disable で戻す。戻しは env → patch-point 一覧 → `enable_default_fusions` の 3 段)、tool (`run_with_model(argv, bundle)`)、exec (subprocess、worker はモデルを抱えたまま GPU の番を渡す)。
+  乗らないもの: oracle-draft (クラス属性を戻せない)、ngram-layout (32 GB の RamNGram)、--round-trace / --draft-trace (import 時)。self_snapshot / mlx-serve は従来どおり (biglock が 64 で自分でロックを取り、worker に降りてもらう)。
+- コードの鮮度: `mlxturbo/**`、`_vendor`、`decode_ab.py`、run_with_model を持つ `tools/*.py` の mtime が変わっていたらジョブ前に自分を作り直す (実地で 1 回発火、ジョブは生き残った)。
+- 段 2 (micro) のメモリ待ちは 8 GB。worker が居ると旧 biglock の `pgrep` に「ロック無しの python」と見なされて待ち手が固まった → 両ツールは絶対パスで `os.execv` する。
+- 段の待ち規則は biglock と同じ (上の段、同じ段は札の mtime 順)。**先着順と STOP を組み合わせると、止めた古い札に新しい待ち手が譲り続けて固まる** (13:40〜13:52 に gpu3 が 12 分止まった)。止めるなら札を消す (kill) こと。

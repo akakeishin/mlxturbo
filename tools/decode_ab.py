@@ -3,6 +3,20 @@
 A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ごとに
 「どう切り替えるか」と「何をもって合格とするか」を `KNOBS` に書いてある。
 
+## 走らせ方
+
+    tools/biglock.sh .venv/bin/python tools/decode_ab.py --knob ... --model ...
+
+同じモデルで何本も測るなら、**98GB を読み直さない常駐 worker** に投げる
+ほうが速い (読み直しは 1 本 3 分、所要時間の 3〜4 割):
+
+    .venv/bin/python tools/ab_submit.py -- --knob ... --model ...
+
+引数もログも終了コードも上と同じ。worker は `tools/ab_daemon.py` で、
+このファイルを `build_parser` / `parse_args` (引数) → `load_bundle`
+(モデル読み込み) → `run_with_model` (計測本体) に分けてあるのはそのため。
+**CLI の挙動と出力は分ける前と変えていない。**
+
 ## 共通の作法 (CLAUDE.md の計測の作法に従う)
 
 - 1 プロセス内でプロンプトごとに A→B→B→A。線形の熱ドリフトを相殺する。
@@ -73,6 +87,13 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
              B が現行の汎用 op 2 段。**注意する集合は同じ**で、加算順と
              スケーリングの順だけが変わる。判定は **prefill_s** で見る
              (decode 幅では比の判定が先に効いて両者とも従来経路へ落ちる)。
+
+`qsa-decode-kernel` decode/verify 幅の QSA attention を自前の 2 カーネル
+             (選択 + attention) に畳む (段 K2c、MLXTURBO_QSA_DECODE_KERNEL、
+             既定 off)。A がカーネル、B が現行。MLX の 2-pass vector の写し
+             なので**出力はビット一致するはず**。**両側を
+             `MLXTURBO_QSA_TAIL=query` にして走らせること** (global tail では
+             A が 1 回も発火しない)。判定は **ms/round** (17k で -3% 以上)。
 
 `moe-verify` 共有タイル gather v2 (MLXTURBO_MOE_VERIFY、既定 off)。
              verify 幅の MoE だけを差し替える。
@@ -661,7 +682,7 @@ def _knob_temp(ctx):
 
     詳細はモジュール docstring の `temp` 節を参照。`--temp` フラグの値は
     ここでは使わない (常に variant で上書きされる) --- `run_once`/`run_resumed`
-    は呼び出し側 (`main`) が `ctx["args"].temp` を読んで
+    は呼び出し側 (`run_with_model`) が `ctx["args"].temp` を読んで
     `generate_stream(..., temp=...)` に渡す。
     """
     args = ctx["args"]
@@ -751,6 +772,91 @@ def _knob_hc_kernel(ctx):
     def apply(variant):
         fused.disable_hyper_connection_kernel()
         if variant == "A":
+            fused.enable_hyper_connection_kernel()
+
+    return apply
+
+
+def _knob_hc_off(ctx):
+    """A = hyper-connection を素の vendor 実装のまま使う (`MLXTURBO_HC=off` 相当)
+    / B = 本番既定 (`fused.enable_hyper_connection_kernel`、`MLXTURBO_HC=kernel`)。
+
+    `hc-elem` の tok/round の切り分け用。`hc-elem` の A/B では A (elem、素と
+    ビット一致) の tok/round が短 +2.3% / 長 +3.7% と両方の長さで B より
+    高く出た (2026-09-03、`bench/results/hc-elem.json`)。B は 1 forward
+    あたり約 9 / 106 の `GatedResidual` 呼び出しを旧融合カーネルへ通していて、
+    そこの `mixed` は素と 97.5% しか一致しない (max_abs 7.8e-3、sigmoid の
+    bf16 1 ulp 差)。**この knob の A は素そのもの**なので、
+    「B の受理率低下が旧カーネルの代金なのか、単なるテキスト運なのか」を
+    A(off) と elem の突き合わせで切り分けられる:
+
+    - elem と off で tok/round と head (出力トークン列) が完全一致するなら
+      elem は素とビット一致で走れている (elem は合成入力ではビット一致を
+      確認済み)。そのうえで B (kernel) の tok/round だけが両方の長さで
+      落ちるなら、旧カーネルが受理率を売っている。
+    - elem と off が食い違うなら、まず測定側 (elem の in-model のビット一致)
+      を疑うこと。
+
+    `enable_hyper_connection_kernel` は `_ORIG_HC_KERNEL is not None` なら
+    何もしないので、切替のたびに elem/kernel/compiled の disable を先に
+    呼んでから貼り直す (`hc-elem` の `apply` と同じ書き方)。
+
+    prefill にも効く (B の融合カーネルが prefill 幅の呼び出しも通る) ので
+    **`--prefill-once` は使えない** (`DECODE_ONLY_KNOBS` には入れない、
+    `hc-kernel` と同じ理由)。
+
+    判定は親が行う。見るのは短・長それぞれの tok/round (第一) と ms/round。
+    出力一致は要求しない (`control_identical=False`) -- A と B は旧カーネルの
+    1 ulp 差ぶん食い違いうる。**一致するかどうかそのものが報告事項。**
+    """
+    from mlxturbo import fused
+
+    def apply(variant):
+        fused.disable_hyper_connection_elem()
+        fused.disable_hyper_connection_kernel()
+        fused.disable_hyper_connection()
+        if variant != "A":
+            fused.enable_hyper_connection_kernel()
+        # A は素の vendor 実装のまま (どの差し替えも貼らない)
+
+    return apply
+
+
+def _knob_hc_elem(ctx):
+    """A = hyper-connection の **elementwise だけ** を Metal カーネルに畳む
+    第 4 変種 (`fused.enable_hyper_connection_elem`) / B = 本番既定
+    (`fused.enable_hyper_connection_kernel`、`MLXTURBO_HC=kernel`)。
+
+    A は down/up/inject の GEMV を `mx.quantized_matmul` のまま残し、その前後の
+    elementwise (rms_norm と (1+w)、silu(down/hc)、sigmoid(up) のレーン平均、
+    inject の sigmoid) だけを 3 本のカーネルに畳む。素の 14 ディスパッチが
+    6 (自前 3 + qmv 3) になる。既存の融合カーネル (B) が冷の連鎖で負ける原因は自前の逆量子化内積の
+    並列度不足なので (CATCHUP 2026-09-03 12:00)、そこを MLX に戻した形。
+
+    B (本番既定) は `MLXTURBO_HC_INJECT_BF16` が立っていない限り 97 層中 96 層で
+    素の実装へ落ちる (`block_inject_weight` が bf16 の `nn.Linear` のまま)。
+    つまり実質は「素 + mixer 1 層だけ融合」で、そこが比較の相手になる。
+
+    合格条件: **ms/round が -4% 以上、tok/round は不変**。出力一致は
+    `control_identical=False` で扱う -- A は素とビット一致を狙って組んである
+    (sigmoid は MLX 本体の式の写し) が、B 側の 1 層が旧カーネルを通るので
+    A/B のビット一致は構造的に保証されない。**一致すればそれ自体が報告事項。**
+
+    prefill 幅にも効く (`eligible_elem` は行数を見ない) ので
+    `DECODE_ONLY_KNOBS` には入れない -- `--prefill-once` は使えない
+    (`hc-kernel` と同じ理由)。
+
+    発火の確認: `mlxturbo.kernels._fire.snapshot()` の `hc_elem` (層数ぶん、
+    既定モデルなら 97)。
+    """
+    from mlxturbo import fused
+
+    def apply(variant):
+        fused.disable_hyper_connection_elem()
+        fused.disable_hyper_connection_kernel()
+        if variant == "A":
+            fused.enable_hyper_connection_elem()
+        else:
             fused.enable_hyper_connection_kernel()
 
     return apply
@@ -1808,6 +1914,86 @@ def _knob_moe_grouped_gemm(ctx):
     return apply
 
 
+def _knob_moe_mix48(ctx):
+    """P3 混合タイル。prefill 幅の MoE 行列積を専門家ごとに 16/32 行で切る。
+
+    A = mix48 (専門家の行数 < 48 なら 16 行タイル、それ以外 32 行。
+        threadgroup は 64 スレッドなので WM は必ず 1。1 dispatch) /
+    B = seg32 (現行の自前 grouped GEMM、BM=32 / WM=2 / 128 スレッド) /
+    C = 素の `mx.gather_qmm` (**今の本番の既定**。自前カーネルを当てない)
+
+    C を足してあるのは、seg32 が既定に入っていないから (2026-09-03 09:15 の
+    `moe-grouped-gemm` は 4k +0.3% / 8k -1.4% / 17k -0.6% で見送り)。
+    「mix48 を既定に入れるか」の判定は A 対 C で、A 対 B はタイル形だけの
+    取り分。3 者を同じプロセスに入れれば両方が同じ熱で取れる。
+
+    micro (`tools/moe_grouped_gemm_micro.py --stage segmented`、MoE 層 1 つ)
+    の取り分は mix48 が r=40 で -9.9%、r=160 で -5.4% (WM=1 だけでも
+    -2.6% / -4.5%)。80/80 ビット一致。
+
+    3 者ともビット一致するはず (`control_identical=True`)。**一致しなければ
+    それ自体が報告事項** -- 混合モードは `segment_tables` の数え方と
+    カーネルの分岐が同じ閾値で切れていることが前提なので、食い違うと行が
+    壊れて出力が変わる。
+
+    判定は **prefill_s**。行数ゲート (`MLXTURBO_MOE_GEMM_MIN_ROWS`=1024) で
+    decode/verify 幅は必ず素に落ちるが、`--prefill-once` では差が消えるので
+    `DECODE_ONLY_KNOBS` には入れない。
+
+    発火の確認: `mlxturbo.kernels._fire.snapshot()` の
+    `moe_grouped_gemm_segmented` (A と B で同数のはず)。
+    """
+    from mlxturbo import fused
+
+    eng = ctx["eng"]
+
+    def apply(variant):
+        if variant == "A":
+            fused.enable_moe_grouped_gemm(eng.model, mode="seg", mix_threshold=48)
+        elif variant == "B":
+            fused.enable_moe_grouped_gemm(eng.model, mode="seg", mix_threshold=0)
+        else:
+            fused.disable_moe_grouped_gemm()
+
+    return apply
+
+
+def _knob_qmm_wide(ctx):
+    """P10 BM=64 の dense qmm。prefill 幅の dense 射影だけを差し替える。
+
+    A = `kernels/qmm_wide.qmm_wide` (タイル m64n32k32w2x2r8) /
+    B = 素の `mx.quantized_matmul` (現行の既定)
+
+    対象は本番で当たる 5 種 (`fused._QMM_WIDE_TARGETS`): attention の
+    q_proj 2560->12288 と o_proj 6144->2560、GDN の in_proj_qkv 2560->10240 /
+    in_proj_z 2560->6144 / out_proj 6144->2560。行数 (B*S) が 1024 未満なら
+    素に落ちるので、decode/verify 幅は 1 op も変わらない。
+
+    素の dense qmm_t は BM=32 なので W タイル 1 枚の逆量子化を 32 行ごとに
+    払い直す。BM=64 は同じ W タイルで 64 行を養うので逆量子化が半分になる。
+    micro (`tools/qmm_wide_micro.py`) では素の 0.935〜0.947 (M=2048 / 8192)。
+
+    **ビット一致する** (`control_identical=True`)。K の縮約順は steel の
+    `BlockMMA::mma` が kFragSize=8 刻みで回るだけでタイル形に依らない
+    (`mlxturbo/kernels/qmm_wide.py` の「数値」の節)。一致しなければタイルの
+    張り方を間違えている合図。
+
+    判定は **prefill_s**。発火の確認は `mlxturbo.kernels._fire.snapshot()` の
+    `qmm_wide_m64n32k32w2x2r8`。
+    """
+    from mlxturbo import fused
+
+    eng = ctx["eng"]
+
+    def apply(variant):
+        if variant == "A":
+            fused.enable_qmm_wide(eng.model, mode="auto")
+        else:
+            fused.disable_qmm_wide()
+
+    return apply
+
+
 # ------------------------------------------------------------------------
 # 天井スタブ (ceiling stub) knob 5 種。「その部品を 0 費用にしたら壁時計は
 # どれだけ減るか」を in-model で測るための道具。出力の正しさは問わない --
@@ -2234,6 +2420,54 @@ def _knob_oracle_draft(ctx):
     return apply
 
 
+def _knob_qsa_decode_kernel(ctx):
+    """段 K2c: decode/verify 幅の QSA attention を自前の 2 カーネルにする。
+    A = カーネル (`Attention._decode_qsa_forward`) / B = 現行 (既定)。
+
+    A 側は「ブロック top-k の argpartition (GPU では全ソート) + (B,1,S,kv_len)
+    の bool マスク実体化 + `ceil(S*gqa/32)` 回の sdpa 呼び + concatenate」を
+    `kernels/qsa_select.py` (段 K2a) と `kernels/qsa_attn_decode.py` (段 K2b)
+    の 2 dispatch に畳む。K2b は MLX の 2-pass vector の**写し**で、選ぶ集合
+    (同点は添字の昇順) も加算順も同じなので **出力はビット一致するはず**
+    (`control_identical=True`)。一致しなければそれ自体が報告事項。
+
+    **例外: kv >= 25k の 50k 級では対照 NG が正常。**そこでは B 側 (現行の
+    既定) の decode 幅が `_gather_forward` の比のガードを通って
+    `_gather_tile_attn` に入っており、そちらは加算順が変わるので密の sdpa と
+    ビット一致しない (`gather_attn.py` の docstring)。A 側は密の sdpa の
+    写しなので、両者は正しく食い違う。17k は B が密のマスク経路なので一致
+    するはずで、そこで食い違ったら本物の不一致。
+
+    **両側を `MLXTURBO_QSA_TAIL=query` にして走らせること。**K2b が写した
+    参照は HF と同じ per-query tail 1 本だけで、global tail (現在の既定) では
+    A 側が 1 回も発火しない。プロセスの環境変数で決まるので、この knob は
+    tail を切り替えない (速度だけを見る)。
+
+    可視集合は A/B で同じ (どちらも query tail の top-k) なので、
+    `_decode_qsa_forward` の適格判定は `S <= 8` と `B == 1` を要求する ---
+    prefill 幅 (チャンク 2048) では 1 op も変わらないので
+    `DECODE_ONLY_KNOBS` に入れてある (`--prefill-once` が使える)。
+
+    発火の確認: `mlxturbo.kernels._fire.snapshot()` の `qsa_decode_kernel`
+    (層数 × フォワード回数)。`qsa_select` / `qsa_attn_decode` も同数出る。
+    判定は **ms/round** (17k で -3% 以上) と、tok/round・head の不変。
+    """
+    from mlxturbo.qsa_decode import (
+        disable_qsa_decode_kernel,
+        enable_qsa_decode_kernel,
+    )
+
+    model = ctx["eng"].model
+
+    def apply(variant):
+        if variant == "A":
+            enable_qsa_decode_kernel(model)
+        else:
+            disable_qsa_decode_kernel(model)
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
@@ -2254,6 +2488,13 @@ KNOBS = {
     "moe-route": (_knob_moe_route, ["A", "C", "B"], False, "B"),
     "hc-prefill": (_knob_hc_prefill, ["A", "C", "B"], False, "C"),
     "hc-kernel": (_knob_hc_kernel, ["A", "B"], False, "B"),
+    # A = elementwise だけ畳む第 4 変種 / B = 本番既定の融合カーネル。
+    # A は素とビット一致を狙うが B 側の 1 層が旧カーネルを通るので
+    # control_identical=False。判定は ms/round (-4% 以上) と tok/round 不変
+    "hc-elem": (_knob_hc_elem, ["A", "B"], False, "B"),
+    # A = 素の vendor 実装 (MLXTURBO_HC=off) / B = 本番既定。hc-elem の
+    # tok/round の切り分け用 (knob 関数の docstring 参照)。判定は親
+    "hc-off": (_knob_hc_off, ["A", "B"], False, "B"),
     "hc-kernel-stage": (_knob_hc_kernel_stage, ["A", "B", "C", "D"], False, "B"),
     "hc-compiled": (_knob_hc_compiled, ["A", "B"], True, "B"),
     "hc-prefill-compile": (_knob_hc_prefill_compile, ["A", "B"], False, "B"),
@@ -2277,6 +2518,10 @@ KNOBS = {
     # -1 は gather 自体を切る (現行既定)。0 はタイルなしの gather
     "gather-tile": (_knob_gather_tile, ["-1", "0", "256"], False, "-1"),
     "prefill-attn": (_knob_prefill_attn, ["A", "B"], False, "B"),
+    # 段 K2c。A = 自前の 2 カーネル / B = 現行 (既定)。K2b は MLX の 2-pass
+    # vector の写しなのでビット一致するはず (control_identical=True)。
+    # **両側を MLXTURBO_QSA_TAIL=query にして走らせること。**判定は ms/round
+    "qsa-decode-kernel": (_knob_qsa_decode_kernel, ["A", "B"], True, "B"),
     "prefill-attn-min-kv": (
         _knob_prefill_attn_min_kv, ["8192", "12288"], False, "12288"),
     "wide": (_knob_wide, ["A", "B"], False, "B"),
@@ -2299,6 +2544,13 @@ KNOBS = {
     # A = 自前 grouped GEMM / B = 既製 gather_qmm (既定) / C = 16 行揃え + 既製。
     # どちらもビット一致のはず (control_identical=True)。判定は prefill_s
     "moe-grouped-gemm": (_knob_moe_grouped_gemm, ["A", "B", "C"], True, "B"),
+    # 段 P3 混合タイル。A = mix48/WM=1 / B = seg32 / C = 素の gather_qmm。
+    # 基準は C (今の本番の既定。seg32 は既定に入っていない)。ビット一致のはず。
+    # 判定は prefill_s
+    "moe-mix48": (_knob_moe_mix48, ["A", "B", "C"], True, "C"),
+    # 段 P10。A = BM=64 の自前 dense qmm / B = 素 (既定)。ビット一致のはず。
+    # 判定は prefill_s
+    "qmm-wide": (_knob_qmm_wide, ["A", "B"], True, "B"),
     # 天井スタブ 5 種 (docs 参照は各 knob 関数の docstring)。出力の正しさは
     # 問わないので control_identical は全部 False
     "stub-draft": (_knob_stub_draft, ["A", "B"], False, "B"),
@@ -2428,7 +2680,8 @@ def _ngram_stream_instance(model):
     return None
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """CLI の引数定義。`parse_args` から呼ぶ (単体でも import できる)。"""
     ap = argparse.ArgumentParser()
     ap.add_argument("--knob", default=None, choices=sorted(KNOBS))
     ap.add_argument("--knobs", default=None,
@@ -2519,7 +2772,18 @@ def main() -> int:
                          "`rows[].prompt_ids` を使う) へのパス。真の続き "
                          "トークン列を draft として流す (`_knob_oracle_draft` "
                          "の docstring 参照)。他の knob では無視される。")
-    args = ap.parse_args()
+    return ap
+
+
+def parse_args(argv=None):
+    """引数を解釈して ``(args, knob_names)`` を返す。
+
+    98GB のモデルを読む前に弾けるものはここで全部弾く。CLI (`main`) と
+    常駐 worker (`tools/ab_daemon.py`) の両方がこれを通る。``argv`` が
+    None なら `sys.argv[1:]`。誤りは argparse の作法どおり SystemExit(2)。
+    """
+    ap = build_parser()
+    args = ap.parse_args(argv)
 
     # --knob / --knobs はどちらか片方。モデル読み込み (98GB) の前に弾く
     if bool(args.knob) == bool(args.knobs):
@@ -2539,45 +2803,55 @@ def main() -> int:
     else:
         knob_names = [args.knob]
 
-    if args.ngram:
-        os.environ.setdefault("FASTMLX_NGRAM_DISK", "1")
+    return args, knob_names
+
+
+def load_bundle(args):
+    """`args` の指すモデル / MTP / n-gram を読んで `ab_bundle.AbBundle` を返す。
+
+    中身は `tools/ab_bundle.py` に移した (他の道具も同じ一式を worker から
+    受け取れるように)。ここに残っているのは、**このハーネス固有の
+    「読み込み時にしか読まれない環境変数」**だけ:
+    `MLXTURBO_ROUND_TRACE` / `MLXTURBO_DRAFT_TRACE` は `spec_flash` の
+    import 時に 1 回だけ評価されるので、読み込みより前に立てる必要がある
+    (だから常駐 worker はこの 2 つのフラグを持つジョブを受けない ---
+    `tools/ab_daemon.py` の `LOAD_TIME_FLAGS`)。
+    """
+    from ab_bundle import load_bundle as _load
+
     if args.round_trace:
         os.environ["MLXTURBO_ROUND_TRACE"] = "1"
     if args.draft_trace:
         os.environ["MLXTURBO_DRAFT_TRACE"] = "1"
 
     import mlx.core as mx
-    from mlx_lm import load
 
     mx.random.seed(args.seed)
+    return _load(args.model, ngram_path=args.ngram, mtp_path=args.mtp,
+                 mtp_bits=args.mtp_bits, log_prefix="[decode_ab]")
 
-    import mlxturbo  # noqa: F401
-    from mlxturbo import mtp_flash, spec_flash
 
-    model_path = os.path.expanduser(args.model)
-    model, tok = load(model_path)
-    if args.ngram:
-        from mlxturbo.ngram_stream import install
+def run_with_model(argv, bundle) -> int:
+    """読み込み済みの一式で計測本体を走らせる (`tool` ジョブの入口)。
 
-        install(model, os.path.expanduser(args.ngram))
-    # 出荷経路と同じ融合を当てる。以前ここが
-    # enable_hyper_connection_kernel() だけで、gather のソート (既定 16) が
-    # 入らないまま測っていた (fable-advisor 指摘)。同一ハーネス内の相対比較
-    # なら符号は生き残るが、閾値や交差点は構成で動く。
+    引数の形は `tools/ab_bundle.py` が決めた道具共通の規約
+    (`run_with_model(argv: list[str], bundle: AbBundle) -> int`)。
+    `main` はこれを 1 回だけ呼ぶ。`tools/ab_daemon.py` は同じ束で何度も
+    呼ぶので、**この関数はエンジンの状態を借り物として扱う** --- 触った
+    ものは呼び出し側 (daemon) が戻す約束で、ここでは戻さない (1 プロセス
+    1 回の CLI の挙動を変えないため)。
+    """
+    import mlx.core as mx
+
     from mlxturbo.kernels import _fire
-    from mlxturbo.runner import enable_default_fusions, set_wired_limit_default
 
-    enable_default_fusions(model, log_prefix="[decode_ab]")
-    # engine を直叩きなので server.py の _load() を経由しない --
-    # 常駐条件を本番と揃えるため、ここで自前で wire する
-    # (mlxturbo/runner.py の set_wired_limit_default 参照)。
-    set_wired_limit_default(log_prefix="[decode_ab]")
-    mtp_path = args.mtp or os.path.join(model_path, "mtp.safetensors")
-    q = {"group_size": 64, "bits": args.mtp_bits} if args.mtp_bits else None
-    mtp = mtp_flash.load_flash_mtp(os.path.expanduser(mtp_path),
-                                   model.args.text, quantize=q)
-    mx.eval(mtp.parameters())
-    eng = spec_flash.FlashSpecEngine(model, mtp)
+    args, knob_names = parse_args(argv)
+
+    eng = bundle.engine
+    tok = bundle.tokenizer
+    eos_ids = bundle.eos_ids
+
+    mx.random.seed(args.seed)
     if args.depth is not None:
         # `_knob_depth` と同じ理由 (このファイル内のコメント参照): ここで
         # ctx_limit も上げておかないと、文脈長が indexer_budget を越えた
@@ -2585,9 +2859,6 @@ def main() -> int:
         # まま全位置を観測できない。
         eng.depth = args.depth
         eng.depth_ctx_limit = 1 << 30
-
-    eos = tok.eos_token_ids if hasattr(tok, "eos_token_ids") else ()
-    eos_ids = tuple(eos) if eos else ()
 
     # ---- プロンプトを組む -------------------------------------------
     from _bench_text import long_prompts
@@ -2723,6 +2994,12 @@ def main() -> int:
         # 分岐する (S>=64 の prefill 幅は orig にそのまま逃がす、knob 自身の
         # docstring 参照)。prefill 幅は 1 op も変わらない。
         "stub-indexer-topk",
+        # qsa-decode-kernel (段 K2c、`Attention._decode_qsa_forward`) は
+        # 入口で `S > 8` と `B != 1` を弾く。prefill のチャンク幅 (既定
+        # 2048、`mlxturbo/spec.py` の PREFILL_STEP_SIZE) は常にそれを越える
+        # ので、on にしても prefill 幅の経路は 1 op も変わらない
+        # (`indexer-lean` / `sdpa-split` と同じ理由)。
+        "qsa-decode-kernel",
         # stub-qsa-attn は `Attention.__call__` に入った時点で S<=8 を見て
         # 分岐する (S>8 の prefill 幅は orig にそのまま逃がす、knob 自身の
         # docstring 参照)。prefill 幅は 1 op も変わらない。
@@ -2962,6 +3239,16 @@ def main() -> int:
                 _p = _p.with_name(f"{_p.stem}-{_name}{_p.suffix}")
             _p.write_text(json.dumps(rows, ensure_ascii=False, indent=1))
             print(f"\n書き出し: {_p}")
+    return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    args, _knob_names = parse_args(argv)   # モデルを読む前に引数を弾く
+    bundle = load_bundle(args)
+    rc = run_with_model(argv, bundle)
+    if rc:
+        return rc
     # 計測ツールなので destructor (スレッドプール等の後始末) に用は無い。
     # interpreter shutdown 待ちでプロセスが Metal のメモリを握ったまま
     # 1 時間以上残った実測があるので、結果を書き終えたら即 _exit で落とす
