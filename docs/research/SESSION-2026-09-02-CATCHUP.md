@@ -1872,3 +1872,7 @@ kv 6k〜17k で uint4 版は約 41 ms 平坦、6 点全部で現行とビット�
 判定線 (load < 30 ms) 通過。本番 `prefill_attn.py` への移植は 3 箇所 (threadgroup の uint4 宣言、列主体の load ループ、整列ガード)。
 発火下限 `MLXTURBO_PREFILL_ATTN_MIN_KV` 12288 → 8192 に下げる場合は kv 8k〜12k の課題正答率ゲートを取り直す。
 汚れたプロセス (98 GB ジョブの直後) は load が逆に遅く出た。部品の引き算は帰属が壊れるのでフルの数字だけ信じる。
+
+P5 の KLD (10:20、`quant_eval.py compare --fusions`、tag sdpa-rowtile-on-0903): kld_mean 0.012891 = 基準 (moe-combine-on-0903) と差 0.0、top-1 一致 0.9667 同一。
+発火は 4k で 25 回/リクエスト (12 層 × 2 チャンク相当)。**既定 on で確定** (`MLXTURBO_SDPA_ROWTILE=256`、CLAUDE.md に記載)。
+decode 側 mmap 確認 (chain85 B1、pread): 短 3 本 ms/round 37.44 (null A/B の B)。A1 (mmap) は連鎖の組み替えで落ちたので A2 の 1 本で比べる。

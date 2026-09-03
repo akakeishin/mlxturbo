@@ -67,6 +67,8 @@
   (既定 512) も 2026-09-03 に A/B と KLD で入れた本番の既定値。
   `FASTMLX_NGRAM_BACKEND` (既定 mmap、`=pread` で旧経路) と `MLXTURBO_NGRAM_PREFETCH` (mmap では既定 on、`=0` で off) も
   本番の既定値で、2026-09-03 の別プロセス比較 (8k -6%、17k -7%) で切り替えた。n-gram の行取得を mmap + 背景 madvise で行う。
+  `MLXTURBO_SDPA_ROWTILE` (既定 256、`=0` で off) も本番の既定値: head_dim 256 の sdpa は MLX の fallback でタイルを飛ばさないので、
+  prefill の dense 経路で q を 256 行ずつに割り前方の K/V だけ渡す (4k -1.1% / 8k -1.2% / 17k -1.0%、KLD 差 0.0、2026-09-03)。
 - 品質を売って速度を買わない。fake を実物より緩くしない。KLD の受け入れ幅は
   現行比 +0.0005 (bench/quant_eval.py compare)。
 
