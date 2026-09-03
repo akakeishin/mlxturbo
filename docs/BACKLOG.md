@@ -787,5 +787,6 @@ M=256 で相対 0.53、M=512 で 0.373、M ≥ 2048 で 0.0。調査 (`tools/qmm
 - **順序 (ユーザー)**: フルベンチ → 27B。GPU の基準測定はフルベンチの指示の後。
 - 追記 (04:45): 回帰は直した (`fused._model_layers` に寄せ、契約が合わなければ何もしない。`bench/test_fusions_other_family.py`)。27B の煙試験 (32 トークン) は起動・生成 OK。
   落ちなくなった結果、契約の合う部品は 27B にも当たる: `qmm_wide` が 176 射影 (q/o_proj、prefill 幅 ≥ 1024)。速度は未測定 (27B レーンの基準測定で on/off を取る。`MLXTURBO_QMM_WIDE=off` で切れる)。
+  27B の射影の形 (K=5120→N=6144、K=6144→N=5120、M=1024 / 2048) では `qmm_wide` は素とビット一致 (`tools/qmm_wide_shape_micro.py`、`bench/results/qmm-wide-shapes-27b.json`、04:50)。品質の代金は無い。
   **27B の MTP サイドカー (`~/models/qwen38-27b-mtp`、量子化済み) は読めない**: `mtp.py:125-138` が重みを読んでから `nn.quantize` する順なので、`fc.scales` 等 16 個が
   「model に無い」と弾かれて None に落ち、lookup だけの投機になる (起動は続く)。`--mtp` 自体は `FASTMLX_MTP_PATH` 経由で 27B 経路に届いている。27B レーンの最初の直しはこれ。
