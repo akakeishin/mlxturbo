@@ -104,7 +104,11 @@ A/B は `--knobs a,b,c` で 1 プロセスにまとめ、プロセス内 ABBA �
    `tail-in-group` (末尾チャンクをグループに、4k -3〜5% 見込み、A/B 待ち)、BM=16 の segmented (micro 待ち)。K1 の mask arm は後回し。
    **custom kernel が in-model で負ける理由の調査** (ユーザー依頼、Opus 実施中): 仮説 5 つ (per-call CPU 費用 / command buffer 分断 / 段階投入との相性 /
    非連続入力のコピー / 出力割り当て) を micro と in-model の 2×2 (HC 変種 × STAGE_EVERY 2/0) で切り分ける。
-4. P3: MoE の grouped GEMM。in-model は 4k ±0 / 8k -1.4% / 17k -0.6% (換算率は 8k で予測どおり。MoE 行列積は prefill の 3 割)。既定には入れない。
+4. P3: MoE の grouped GEMM。in-model は 4k ±0 / 8k -1.4% / 17k -0.6% (換算率は 8k で予測どおり。MoE 行列積は prefill の 3 割)。
+   **ユーザー方針 (11:20): P3 と P10 (BM=64 の自前 qmm) は M3 Max 向けに入れる** (非 NAX で auto=on、NAX 機では off)。P3 は BM=16 / 混合版の micro →
+   pad16 の 22.6 ms/層に届けば in-model → 4k -3% 以上で既定。P10 は micro (qmm の 0.87 倍以下) → `enable_wide_projections` の口で in-model + KLD。
+   prefill の追加レーン (台帳 P7〜P9): P7 MoE の行列積以外 800 ms/チャンクの内訳 (`tools/moe_split.py`、chain93)、P8 dense 射影の bf16 GEMM
+   (`tools/dequant_gemm_micro.py`、chain92)、P9 チャンク 8192 (P7 / P8 の後)。目標は prefill 1.5 倍、decode 2 倍 (K2 + HC + depth)。
    第 3 段 (fused.py のフック + knob `moe-grouped-gemm` の A=segmented / B=既製 / C=pad16+既製、4k/8k/17k) を Opus が実施中。
    判定線: 17k -2% 未満かつ 4k -4% 未満なら BM=16 経路 (専門家ごとに BM を選ぶ) を足してから再 A/B。KLD はビット一致なので出力一致で代替。
    **NAX 対応機 (M5 系) でも使う** (ユーザー方針 08:30): カーネルは NAX 専用 intrinsic を使わず、`MLXTURBO_MOE_GEMM=auto|on|off` で
