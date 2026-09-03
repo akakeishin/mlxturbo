@@ -220,12 +220,21 @@ def tail_until_done(job_path: Path, log_path: Path) -> int:
 
 
 def enqueue(spec: dict) -> tuple[Path, Path]:
+    """ジョブを置く。**自分の `MLXTURBO_*` / `FASTMLX_*` を全部載せる。**
+
+    `MLXTURBO_QSA_TAIL=query tools/biglock.sh ... decode_ab.py --knob ...` の
+    ように env で構成を変える A/B があるので、載せないと worker が起動時の
+    構成で黙って測ることになる。worker 側は起動時の env と突き合わせ、
+    読み込み時に効くものが違えば**その env で自分を作り直してから**走る
+    (`tools/ab_daemon.py` の `RUNTIME_ENV`)。
+    """
     AD.QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     stamp = f"{time.time_ns()}-{os.getpid()}"
     job_path = AD.QUEUE_DIR / f"{stamp}.json"
     log_path = AD.QUEUE_DIR / f"{stamp}.log"
     log_path.write_text("")
-    spec = dict(spec, log=str(log_path), submitted=time.time(), cwd=os.getcwd())
+    spec = dict(spec, log=str(log_path), submitted=time.time(), cwd=os.getcwd(),
+                env=AD.ab_env())
     tmp = job_path.with_suffix(".staging")
     tmp.write_text(json.dumps(spec, ensure_ascii=False, indent=1))
     tmp.replace(job_path)  # 半端な JSON を worker に読ませない

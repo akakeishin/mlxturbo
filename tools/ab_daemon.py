@@ -118,6 +118,57 @@ UNSAFE_KNOBS = {
     # RAM に抱える。98GB の常駐と足すと 128GB に収まらない。
     "ngram-layout",
 }
+# ---- 環境変数 ------------------------------------------------------------
+#
+# 投入側 (`tools/ab_submit.py`) は自分の `MLXTURBO_*` / `FASTMLX_*` を全部
+# ジョブに載せる。worker は起動時の env と突き合わせ、**違えばその env で
+# 自分を作り直してから** ジョブを走らせる (3 分の読み直しを払う)。
+# これが無いと `MLXTURBO_QSA_TAIL=query tools/biglock.sh ... decode_ab.py` の
+# ような「env で構成を変える A/B」が、黙って worker の起動時の構成で走る。
+ENV_PREFIXES = ("MLXTURBO_", "FASTMLX_")
+# worker 自身の配管。モデルの挙動に関係しないので突き合わせから外す
+# (これを見ていると、キューの場所を変えただけで読み直しになる)。
+ENV_IGNORE = {
+    "MLXTURBO_AB_QUEUE", "MLXTURBO_AB_PID", "MLXTURBO_AB_DAEMON_LOG",
+    "MLXTURBO_MIN_FREE_GB",
+}
+# **実行中に切り替えられると確かめた変数だけ**をここに置く。ここに無いものは
+# 全部「読み込み時に効く」扱いで作り直す --- 判断を誤ったときの代金が
+# 非対称だから (作り直しは 3 分、取りこぼしは *嘘の数字*)。
+#
+# 根拠 (2026-09-03 に読んだ場所):
+#   PIPELINE            spec_flash.py:2380  generate_stream の中で毎ラウンド
+#   PREFILL_ATTN_MIN_KV _vendor/qwen4_exp.py:1224  attention の forward の中
+#   PHASE_TIMERS        spec_flash.py:2359  generate_stream の中
+#   DEPTH_CAP / _COST   spec_flash.py:346 / :374  controller が毎ラウンド読む
+#   DEPTH_BETA / _EXPLORE / _MARGIN
+#                       spec_flash.py:239 / :270 / :299  DepthController.__init__
+#                       -- worker はジョブの頭で controller を作り直す
+#                       (`reset_engine`) ので、**env を当ててから reset する
+#                       限り**効く。順番を入れ替えないこと。
+# 逆に `fused.enable_*` が読むもの (MLXTURBO_HC / _SORT_MIN / _MOE_* /
+# _GDN_* / _SDPA_* / _QMM_* / _WIDE* / _GATHER_* / _PREFILL_ATTN / _FAST_*)
+# は**融合を当てる瞬間にしか読まれない**。読み込み済みの worker に後から
+# env だけ置いても何も起きないので、runtime 側には入れない。
+# モジュール先頭で読まれるもの (spec_flash の _STAGE_EVERY / PRIME_WINDOW /
+# _PREFILL_* / _MTP_CACHE_APPEND / _DRAFT_PRESYNC / MLXTURBO_DEPTH_ADAPT、
+# qsa_tail の MODE / TIEBREAK、_vendor の NGRAM_ON_DISK / _SORT_MIN、
+# kernels/gated_delta_blocked の MIN_T / BLOCK / SUB_BLOCK) も同じ。
+RUNTIME_ENV = {
+    "MLXTURBO_PIPELINE",
+    "MLXTURBO_PREFILL_ATTN_MIN_KV",
+    "MLXTURBO_PHASE_TIMERS",
+    "MLXTURBO_DEPTH_CAP",
+    "MLXTURBO_DEPTH_COST",
+    "MLXTURBO_DEPTH_BETA",
+    "MLXTURBO_DEPTH_EXPLORE",
+    "MLXTURBO_DEPTH_MARGIN",
+}
+# 同じジョブで 2 回続けて作り直そうとしたら止める (読み直しの無限ループ避け)。
+# 値はジョブファイル名。MLXTURBO_/FASTMLX_ で始めないこと -- 突き合わせに
+# 混ざって、それ自体が「env が違う」理由になってしまう。
+ENV_JOB_MARK = "AB_DAEMON_ENV_JOB"
+
 # フラグ: 読み込み時にしか読まれない環境変数を立てるもの。
 # `spec_flash._ROUND_TRACE` / `_DRAFT_TRACE` は import 時の 1 回だけ評価
 # されるので、読み込み済みの daemon に後から効かせられない。
@@ -357,7 +408,8 @@ def code_fingerprint() -> dict:
     # `tool` ジョブで in-process に走る道具も同じ扱い。**読み込み済みの
     # モデルの上で走る以上、古い写しで測るのは decode_ab と同じ罪。**
     # 判定は「run_with_model を持つか」で、テキストを見るだけ (import しない)。
-    files += [t for t in sorted(REPO_ROOT.glob("tools/*.py"))
+    files += [t for t in sorted([*REPO_ROOT.glob("tools/*.py"),
+                                 *REPO_ROOT.glob("bench/*.py")])
               if t.name not in ("decode_ab.py", "ab_bundle.py", "ab_daemon.py")
               and tool_has_entry(t)]
     fp = {}
@@ -621,6 +673,23 @@ def call_tool(rel: str, argv: list[str], bundle) -> int:
     return int(rc or 0)
 
 
+def ab_env(environ=None) -> dict:
+    """突き合わせの対象になる環境変数だけを抜き出す。"""
+    src = os.environ if environ is None else environ
+    return {k: v for k, v in src.items()
+            if k.startswith(ENV_PREFIXES) and k not in ENV_IGNORE}
+
+
+def env_delta(job_env: dict, launch_env: dict) -> tuple[set, set]:
+    """(違うキー全部, そのうち作り直しが要るキー) を返す。
+
+    判定はキー集合と値の一致だけ。片方にしか無いキーも「違う」。
+    """
+    diff = {k for k in set(job_env) | set(launch_env)
+            if job_env.get(k) != launch_env.get(k)}
+    return diff, diff - RUNTIME_ENV
+
+
 def bundle_matches(args, load_args) -> str | None:
     def norm(p):
         return os.path.realpath(os.path.expanduser(p)) if p else None
@@ -723,6 +792,10 @@ def main() -> int:
     load_args, _ = decode_ab.parse_args(load_argv)
 
     fp0 = code_fingerprint()
+    # **読み込みの前に**控えること。`ab_bundle.load_bundle` が
+    # `FASTMLX_NGRAM_DISK=1` を立てるので、読み込み後の env と投入側の env は
+    # 必ず食い違い、毎ジョブ読み直しの無限ループになる。
+    launch_env = ab_env()
     PID_FILE.write_text(json.dumps({
         "pid": os.getpid(),
         "model": os.path.realpath(os.path.expanduser(daemon_args.model)),
@@ -851,6 +924,42 @@ def main() -> int:
                                          reason=reason, argv=argv))
                 continue
 
+            # ---- 環境変数の突き合わせ。読み込み時に効くものが違えば、
+            # **その env で自分を作り直してから**測る (3 分は払う価値がある)。
+            job_env = {str(k): str(v) for k, v in (spec.get("env") or {}).items()
+                       if str(k).startswith(ENV_PREFIXES)
+                       and str(k) not in ENV_IGNORE}
+            diff, need_reload = env_delta(job_env, launch_env)
+            if kind == "exec":
+                # 別プロセスなので env はそのまま渡せばよい。**読み直しは要らない**
+                # (micro 1 本のために 98GB を読み直すのは割に合わない)。
+                need_reload = set()
+            if need_reload:
+                if os.environ.get(ENV_JOB_MARK) == path.name:
+                    # 作り直したのにまだ食い違う。**2 回目は諦める** ---
+                    # 読み直しの無限ループのほうが害が大きい。
+                    reason = ("env を当てて作り直したのに一致しない: "
+                              + ", ".join(sorted(need_reload)))
+                    log(f"{path.name}: {reason}")
+                    log_path.write_text(reason + "\n")
+                    finish(path, False, dict(code=3, error="env", reason=reason,
+                                             argv=argv))
+                    continue
+                log(f"{path.name}: 読み込み時に効く env が違う "
+                    f"({', '.join(sorted(need_reload))})。その env で作り直す")
+                refresh_pid("restarting", {"job": path.name})
+                new_env = {k: v for k, v in os.environ.items()
+                           if not (k.startswith(ENV_PREFIXES)
+                                   and k not in ENV_IGNORE)}
+                new_env.update(job_env)
+                new_env[ENV_JOB_MARK] = path.name
+                biglock_release()
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os.execve(sys.executable,
+                          [sys.executable, os.path.abspath(__file__)] + sys.argv[1:],
+                          new_env)
+
             log(f"開始 {path.name} 段={prio} {label}")
             refresh_pid("running", {"job": path.name})
             try:
@@ -868,12 +977,28 @@ def main() -> int:
                     # モデルを読まない道具 (micro / verify / smoke / 連鎖)。
                     # **worker はモデルを抱えたまま GPU の番だけ渡す。**
                     # 別プロセスなので bundle は触られず、状態も戻さなくてよい。
+                    child_env = {k: v for k, v in os.environ.items()
+                                 if not (k.startswith(ENV_PREFIXES)
+                                         and k not in ENV_IGNORE)}
+                    child_env.update(job_env)
+                    child_env.pop(ENV_JOB_MARK, None)
                     code = subprocess.call(
                         [str(c) for c in spec["cmd"]],
                         stdout=out_stream, stderr=subprocess.STDOUT,
-                        stdin=subprocess.DEVNULL,
+                        stdin=subprocess.DEVNULL, env=child_env,
                         cwd=spec.get("cwd") or str(REPO_ROOT))
                 else:
+                    if diff:
+                        # ここに来るのは RUNTIME_ENV だけの差。**reset_engine
+                        # より先に当てる** -- DepthController は reset で
+                        # 作り直され、そのとき BETA/EXPLORE/MARGIN を読む。
+                        for k in diff:
+                            if k in job_env:
+                                os.environ[k] = job_env[k]
+                            else:
+                                os.environ.pop(k, None)
+                        log(f"env を当てた (実行中に効くぶんだけ): "
+                            f"{', '.join(sorted(diff))}")
                     old_out, old_err = sys.stdout, sys.stderr
                     try:
                         reset_engine(bundle)
