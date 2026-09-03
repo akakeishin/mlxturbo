@@ -87,6 +87,8 @@ decode 51.7 / 47.5 / 47.5 / 44.8 / 47.0 tok/s (相手比 -7 / -3 / -22 / -5 / +2
 3. HC の pre / post (decode 幅ならビット一致の elem 変種を土台に)。
 4. その後: 受理率 (draft の top-k 命中率 → rerank / depth 4)、MTP の draft 層に K2c 等を当てる (enable の順序)。
 判定は 1 プロセス ABBA (burn-in、depth 固定) の短 / 17k の ms/round、head の一致。冷連鎖 micro は重みを 100 MB 超巡回。「本数が減ったのに遅い」ときはカーネルの並列度を疑う。
+**訂正 (20:25)**: HC elem で dispatch を -776/step (17%) 減らしても壁時計は 0〜-0.7%。「本数の床 5 us × 本数」の読みは過大で、消えるのは起動の一部だけ。
+取り分は「融合した先のカーネルが高い並列度で走ること」に懸かる (HC の冷 micro: 素 62 → 融合 53 us = -9 us/呼び出し止まり)。判定線は本数ではなく冷 micro の us と in-model の ms/round。
 prefill も並行 (ユーザー 20:10「prefill もやる」): (a) サーバー経路の +15% (17k 30.3 対 decode_ab 26.4) の切り分けと修正 (最大の的、切り分け中)、
 (b) P7 の残り (router 0.82 + sort/topk 0.65 + swiglu 0.40 = 1.9 ms/層 ≈ チャンクの 3%)、(c) 8k〜12k の attention (MIN_KV 8192 で gather に寄せた。dense 側の行タイルとの交差の再確認)、
 (d) MoE GEMM の残り (mix48 は dense 比 1.04〜1.24。r=40 の末尾チャンクで 24% 損、専門家あたりの行数が少ない形の効率)。27B / 動的判定はその後。
