@@ -144,9 +144,9 @@ def main(argv: list[str] | None = None) -> int:
         help="MTP ヘッドを単一 safetensors サイドカーから読み込む場合のパス"
         " (cli.py/server.py の --mtp と同じ)。qwen4_exp (Flash-Next) では"
         " 自動発見より優先、qwen3_5 (27B 系) では単一ファイルの draft head"
-        " を期待する (mlxturbo/mtp.py の load_mtp_file 参照。既に量子化済みの"
-        " MTP 専用パックはこの形を満たさず読み込みに失敗することがある —"
-        " その場合もクラッシュせず理由を出して MTP 無しに倒れる)",
+        " を期待する (mlxturbo/mtp.py の load_mtp_file 参照。量子化済みの"
+        " MTP 専用パック (ディレクトリでも単一ファイルでも) は 2026-09-04 から"
+        " 読める。読めないときもクラッシュせず理由を出して MTP 無しに倒れる)",
     )
     args_cli = ap.parse_args(argv)
 
