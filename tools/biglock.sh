@@ -208,7 +208,7 @@ fi
 if [ "$PRIO" -ge 2 ]; then
   MEM_NEED_GB="${MLXTURBO_MIN_FREE_GB:-8}"
 else
-  MEM_NEED_GB="${MLXTURBO_MIN_FREE_GB:-100}"
+  MEM_NEED_GB="${MLXTURBO_MIN_FREE_GB:-95}"
 fi
 MEM_WAITED=0
 while [ "$MEM_WAITED" -lt 600 ]; do
