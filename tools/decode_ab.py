@@ -1299,6 +1299,25 @@ def _knob_fold_tail(ctx):
     return apply
 
 
+def _knob_tail_in_group(ctx):
+    """末尾チャンクをレイヤー主導グループの最終メンバーにするか。
+    A = 入れる / B = chunk 主導のまま (既定)。
+
+    4000 トークンは「端数 1952 の g=1 グループ + 末尾 2048 の chunk 主導」に
+    割れ、MoE が 2 回に分かれる (専門家あたり 36 行)。まとめると 1 回 4000 行
+    (75 行) になる。チャンク境界 (grid) は変えないので出力はビット一致する
+    はず (`control_identical=True`)。判定は **prefill_s** (4k で -3% 以上が
+    採用候補)。**prefill にしか効かないので `DECODE_ONLY_KNOBS` には入れない。**
+    代償は BPE 境界 checkpoint (docs/research/IDEAS-2026-09-03.md)。
+    """
+    import mlxturbo.spec_flash as SF
+
+    def apply(variant):
+        SF._PREFILL_TAIL_IN_GROUP = variant == "A"
+
+    return apply
+
+
 def _knob_mtp_append(ctx):
     """独立レビュー A-1 の修正。A = 検証で確定した中間トークンを MTP
     キャッシュへ積む (既定) / B = 積まない (修正前の挙動)。
@@ -2152,6 +2171,7 @@ KNOBS = {
     "prefill-group": (_knob_prefill_group, ["2", "4", "8"], True, "4"),
     "prefill-pipeline": (_knob_prefill_pipeline, ["A", "B"], True, "B"),
     "fold-tail": (_knob_fold_tail, ["A", "B"], True, "A"),
+    "tail-in-group": (_knob_tail_in_group, ["A", "B"], True, "B"),
     "qsa": (_knob_qsa, ["A", "B"], False, "A"),
     "bool-mask": (_knob_bool_mask, ["A", "B"], False, "B"),
     "sdpa-split": (_knob_sdpa_split, ["A", "B"], False, "B"),
@@ -2629,15 +2649,20 @@ def main() -> int:
     # は初回発火で JIT コンパイルするので、A 側 (回文順の先頭) のカーネルを
     # ここで一度焼いておかないと、その knob の 1 本目だけコンパイル時間を
     # 抱えて計測に混ざる
+    # 3 変種以上の knob (A/B/C) では variants[0] しか焼かないと C の 1 本目に
+    # JIT が乗る (2026-09-03 の moe-grouped-gemm で 1 ブロック目の C だけ
+    # +0.2〜2 s)。全変種を 1 本ずつ焼く。1 変種あたり 32 トークンなので
+    # 変種が増えても温めは数十秒しか伸びない。
     for name in knob_names:
         st = knob_setup(name)
-        st["set_variant"](st["variants"][0])
-        for want in ("short", "long"):
-            for kind, ids in cases:
-                if kind == want:
-                    eng.depth_trace_prompt_id = f"warmup:{name}:{kind}"
-                    run_once(eng, ids, 32, eos_ids, temp=args.temp)
-                    break
+        for _v in st["variants"]:
+            st["set_variant"](_v)
+            for want in ("short", "long"):
+                for kind, ids in cases:
+                    if kind == want:
+                        eng.depth_trace_prompt_id = f"warmup:{name}:{kind}"
+                        run_once(eng, ids, 32, eos_ids, temp=args.temp)
+                        break
         st["set_variant"](st["baseline"])
 
     for case_idx, (kind, ids) in enumerate(cases):
@@ -2812,15 +2837,19 @@ def main() -> int:
                     print(f"  {kind:5s} ngram_{metric:9s} {cells}   [基準 {baseline}]")
 
         if control_identical:
-            # 対照: 短文脈は A と B で出力が完全一致するはず
-            for c in sorted({r["ctx"] for r in rows if r["kind"] == "short"}):
-                sub = [r for r in rows if r["ctx"] == c]
+            # 対照: 同じ (kind, ctx) の行は A と B で出力 (head) が完全一致するはず。
+            # 以前は短文脈だけを見ていたので `--only long` では無検査のまま
+            # 「対照 OK」が出ていた (2026-09-03 に発覚)。長文脈も含めて見る。
+            n_checked = 0
+            for kc in sorted({(r["kind"], r["ctx"]) for r in rows}):
+                sub = [r for r in rows if (r["kind"], r["ctx"]) == kc]
+                n_checked += 1
                 if len({tuple(r["head"]) for r in sub}) != 1:
                     ok = False
-                    print(f"  対照 NG: ctx={c} で条件間の出力が食い違う"
+                    print(f"  対照 NG: {kc[0]} ctx={kc[1]} で条件間の出力が食い違う"
                           " (一致するはずの領域。測定は無効)")
             if ok:
-                print("  対照 OK: 短文脈は条件間で出力が一致")
+                print(f"  対照 OK: {n_checked} 組の (kind, ctx) で条件間の出力が一致")
 
         if args.out:
             # --knobs で複数回したときは basename に -<knob> を足す
