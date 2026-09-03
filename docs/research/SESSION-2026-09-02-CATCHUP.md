@@ -2312,7 +2312,7 @@ prefill_s: 2048 幅 12.784 / 1024 幅 12.763 / 512 幅 13.238。非 MoE のメ�
 - 訂正: moe-combine-glue の行は knob 関数名の衝突 (`_knob_moe_combine` が既存と同名) で既存の fold knob を呼んでいた。「compile 版でビット一致が崩れた」は fold の既知の負け方の再現で、compile 版は未計測。残る 3 つの判定は有効。
 - 4 knob のコードは取り除く (方針: 効かない変種を二重に持たない)。`decode_copy_probe.py` は残す。
 
-### 2026-09-03 20:00 読み直し: decode の壁は「dispatch あたりの床 ≈ 5 us × 4499 本」
+### 2026-09-03 19:50 読み直し: decode の壁は「dispatch あたりの床 ≈ 5 us × 4499 本」
 
 - depth 0 の round 22〜25 ms ÷ 4499 dispatch = **4.9〜5.6 us/dispatch**。Lily は 5.4 ms ÷ 795 = 6.8 us/dispatch。**1 本あたりの費用は同じで、本数が 5.7 倍違う。**
 - 行列積そのものは遅くない: 1 トークンの dense 射影 ≈ 1.3 GB (GDN 36 層の in_proj / out_proj が 1 GB、attention 12 層 0.28 GB) + MoE 0.25 GB + lm_head 0.3 GB (4bit) ≈ 1.9 GB を 10 ms = 190〜220 GB/s。
@@ -2322,13 +2322,13 @@ prefill_s: 2048 幅 12.784 / 1024 幅 12.763 / 512 幅 13.238。非 MoE のメ�
 - 手の順: (1) MoE decode の融合 (PoL 走行中: ルーティング + gather + gate/up + SwiGLU + down + combine を 3 本程度に、行間で専門家を共有)、(2) GDN の層まるごと (prework は前に負けたが、並列度を直して再挑戦)、(3) HC の pre/post (elem 変種は decode 幅ならビット一致)。
   それぞれ「本数を 1/3 に」を目安に、in-model の ms/round で判定。
 
-### 2026-09-03 20:15 K2c の S 依存の確認: **K2c は無関係** (S=2 / 3 / 6 で on/off とも一致、on≡off 9/9、128 トークン全部一致、round 数も同一)
+### 2026-09-03 19:58 K2c の S 依存の確認: **K2c は無関係** (S=2 / 3 / 6 で on/off とも一致、on≡off 9/9、128 トークン全部一致、round 数も同一)
 
 - `mirror_blocks` は 17k で S によらず 256、pass 1 は行の絶対位置の可視集合で縮約、K2a の select も同じ → 構造的に S 依存を持ち込めない。
 - 天井スタブのエージェントが見た「S=3 の参照と S=2 / S=6 の分岐」の容疑は (1) P7 第 2 段 (combine の縮約が M = B·S で並びを変える、丸め級)、(2) 凍結前のプロンプト池の揺れ (観察 19:18、凍結 19:24)。どちらも丸め級で品質の代金ではない。
 - 既知の S 依存 (K2c 前から): 17k S=1 は `_gather_forward` の ratio guard を通って gather 経路、S ≥ 2 は dense。
 
-### 2026-09-03 20:25 受理率の余地 (`bench/results/topk-trace.jsonl` 2356 round、depth 4 固定、8bit 頭、`tools/draft_topk_stats.py`): **受理率側は閉じる**
+### 2026-09-03 20:00 受理率の余地 (`bench/results/topk-trace.jsonl` 2356 round、depth 4 固定、8bit 頭、`tools/draft_topk_stats.py`): **受理率側は閉じる**
 
 - 真のトークンが draft の top-k に入る率 (短 / 17k): d=1 top-1 **0.655 / 0.654**、top-2 0.776 / 0.761、top-4 0.864 / 0.830、top-8 0.918 / 0.885。d=2 以降は 17k の方が速く落ちる (0.611 対 0.490)。
   rerank は既に効いている (2bit 粗頭の top-1 に対し +0.06〜0.11)。
@@ -2338,7 +2338,7 @@ prefill_s: 2048 幅 12.784 / 1024 幅 12.763 / 512 幅 13.238。非 MoE のメ�
 - **残るのは draft 頭の top-1 そのものを上げること (0.655 → 0.776 で top-2 の取り分に相当) = MTP 頭の学習。方針で学習はしないので、受理率側の手は無い。**decode の tok/s は forward の費用 (dispatch 1/3) だけが手。
 - 道具: `spec_flash._draft_topk_probe` (属性ゲート、既定 off)、`decode_ab --draft-topk K --topk-trace`、`ab_daemon.reset_engine` でスロットを消す。
 
-### 2026-09-03 20:35 サーバー経路と decode_ab の 17k prefill の差 (+15%): **サーバー固有の費用は無い** (上限 20 ms = 0.07%)
+### 2026-09-03 20:03 サーバー経路と decode_ab の 17k prefill の差 (+15%): **サーバー固有の費用は無い** (上限 20 ms = 0.07%)
 
 - 1 プロセス内 A/B (`checkpoints=[]` 対 `None`、4 窓 × 2 巡、直交配置): 定常 28.425 対 28.447 s (-0.08%)。段ごとの ms も checkpoint 0.1 / tail split 0 / n-gram 先読み 0 / prime 43 / clear_cache 28 / tail forward 44 で両側同一。
   チャンク割りも同一 (末尾 v2 で最終チャンクが幅 1 なので `split_and_checkpoint_tail` は no-op)。head4 パックでも 27.7〜28.2 s。サーバーのリクエスト処理は parse → template 15〜19 ms が最大。
@@ -2346,7 +2346,7 @@ prefill_s: 2048 幅 12.784 / 1024 幅 12.763 / 512 幅 13.238。非 MoE のメ�
   加えて走行間のばらつき ±5〜7% (今日の 17k は decode_ab 25.5〜29.3、サーバー 27.0〜28.2)。15:12 の 26.43 は動的プール + MIN_KV 8192 / P7 前のコード。
 - **手**: サーバー起動時の空焼きに長文 (目標文脈と同じ桁) の prefill を 1 本入れる → ユーザーの最初の長文リクエストが 5〜10% 速くなる。品質の代金ゼロ、代金は起動時間 (17k で ~30 s) とメモリの先触り。ベンチの冷 TTFT もこれで定常値になる (相手と同じ harness で公平)。
 
-### 2026-09-03 20:45 MoE decode の融合カーネル PoL (`kernels/moe_decode_fused.py`、E=512 の重み 2.83 GB を巡回、毎回別の専門家): **重複をまとめる筋は畳む**
+### 2026-09-03 20:08 MoE decode の融合カーネル PoL (`kernels/moe_decode_fused.py`、E=512 の重み 2.83 GB を巡回、毎回別の専門家): **重複をまとめる筋は畳む**
 
 - 正しさ: fp32 参照に対し自前の方が素より誤差が 2〜4 倍小さい (累算 fp32、1 回丸め)。
 - 冷 micro (MoE 1 層 us): S=1 素 130.7 / まとめ rmax2 144.9 (1.11) / rmax4 165.7 (1.27)、S=3 256.3 / 273.2 (1.07) / 319.5 (1.25)、S=6 420.5 / 490.6 (1.17)。判定線 (S=3 で 0.70) 未達。
