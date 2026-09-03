@@ -311,7 +311,7 @@ class StreamNGram:
         rows_bin = self.dir / "rows.bin"
 
         # 既定は mmap (2026-09-03: 8k / 17k prefill で pread より -6%。`=pread` で旧経路)
-        self.backend = backend or os.environ.get("FASTMLX_NGRAM_BACKEND", "mmap")
+        self.backend = backend or os.environ.get("FASTMLX_NGRAM_BACKEND", "pread")
         if self.backend not in ("mmap", "pread"):
             raise ValueError(f"backend は mmap/pread のどちらか ({self.backend})")
         # `_gather_pread` の「64 行未満は行ごと submit / それ以上はスライス
@@ -836,7 +836,7 @@ def install(model, sidecar: str | Path) -> None:
     if stream.backend == "pread":
         how = f"backend=pread threads={stream.n_threads}"
     else:
-        how = "backend=mmap (既定。FASTMLX_NGRAM_BACKEND=pread で旧経路)"
+        how = "backend=mmap (FASTMLX_NGRAM_BACKEND=mmap。既定は pread: ページキャッシュが冷えていると mmap は 4k prefill が 2 倍遅い、2026-09-03 16:15)"
     print(
         f"[mlxturbo] n-gram をサイドカー参照に差し替えた "
         f"({n} 層, {stream.bits}bit, RAM 0, {how}) <- {stream.dir}"

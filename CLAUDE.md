@@ -73,8 +73,10 @@
   bf16 参照が無いので、この物差しではなく課題の正答率で見ること (CATCHUP 2026-09-03 07:40)。
   `MLXTURBO_MOE_COMBINE_FOLD` (既定 on、行数 ≥ 64 の prefill 幅だけ、`=0` で off) と `MLXTURBO_PRIME_WINDOW`
   (既定 512) も 2026-09-03 に A/B と KLD で入れた本番の既定値。
-  `FASTMLX_NGRAM_BACKEND` (既定 mmap、`=pread` で旧経路) と `MLXTURBO_NGRAM_PREFETCH` (mmap では既定 on、`=0` で off) も
-  本番の既定値で、2026-09-03 の別プロセス比較 (8k -6%、17k -7%) で切り替えた。n-gram の行取得を mmap + 背景 madvise で行う。
+  `FASTMLX_NGRAM_BACKEND` は **既定 pread に戻した** (2026-09-03 16:15)。mmap は同じ機体で続けて測ると -6〜-7% に見えたが、それは前の走行が
+  32 GB のサイドカーをページキャッシュに残していたため。冷えたキャッシュでは mmap のページフォルトが直列化して 4k prefill が 2.1 倍遅く、
+  decode も -15% (小ベンチ 0903f)。本番 (モデル 98 GB + サイドカー 32 GB > 128 GB) ではキャッシュは冷えているのが普通。
+  **I/O を含む経路の A/B は、同じ機体で続けて測るとページキャッシュを共有する** (プロセスを分けても同じ)。
   `MLXTURBO_PREFILL_TAIL_IN_GROUP` (既定 on、`=0` で off) は末尾 2048 チャンクを layer-major のグループに入れる本番の既定値
   (4k -4.9% / 8k -3.4% / 17k -0.6%、サーバー経路はビット一致、2026-09-03 15:35)。checkpoint 無しの経路 (generate() / ベンチ) では末尾を 2047+1 に割るので丸めが動く。
   `MLXTURBO_MOE_GEMM_MIX` (既定 48、`=0` で off) と `MLXTURBO_QMM_WIDE` (既定 auto = 非 NAX で on、`=off`) は 2026-09-03 14:00 に
