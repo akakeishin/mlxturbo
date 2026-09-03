@@ -194,3 +194,10 @@ CLAUDE.md の knob の段落も直す。フルテスト (対 mlx-serve) と over
 
 実装は Sonnet のサブエージェント、親 (Fable) は方針・計測の判定・commit。判断に分岐があるときだけ
 `opus-advisor`。横断検索は `scout`。
+
+## compact 前の控え (2026-09-03 11:50)
+
+走行中のエージェントと連鎖の一覧 (ID 付き) は scratchpad の `INFLIGHT-2026-09-03.md`。判定待ちの決め事もそこに。
+今日の判定と数字は全部 `docs/research/SESSION-2026-09-02-CATCHUP.md` の 2026-09-03 の節、案の台帳は `docs/research/IDEAS-2026-09-03.md`。
+既定に入ったもの (今日): mmap (`FASTMLX_NGRAM_BACKEND`)、P5 行タイル (`MLXTURBO_SDPA_ROWTILE`)。knob で待機中: tail-in-group、prefill-attn の uint4 版、qsa-tail、moe-grouped-gemm。
+小さいベンチは chain94 (未起動、P6 と tail v2 が入ったら起動)。フルベンチは小さいベンチで「decode 同着以上、prefill 1.03x 以内」が出てから。
