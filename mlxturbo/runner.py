@@ -1498,11 +1498,11 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
 
         # 段 P3 (混合タイル): prefill 幅の MoE 行列積を自前の grouped GEMM に
         # 置き換え、専門家ごとに 16 行 / 32 行タイルを選ぶ (`MLXTURBO_MOE_GEMM_MIX`、
-        # 既定 0 = 素の `mx.gather_qmm` のまま呼ばない、48 で mix48/WM=1)。
-        # 素の segmented (mix なし) は in-model で 8k -1.4% / 17k -0.6% しか
-        # 出ず既定に入れていない (2026-09-03 09:15)。混合タイルの採否は
-        # `tools/decode_ab.py --knob moe-mix48` の prefill_s で決める。
-        _mix = int(os.environ.get("MLXTURBO_MOE_GEMM_MIX", "0") or "0")
+        # **既定 48** = mix48/WM=1、0 で素の `mx.gather_qmm` のまま)。
+        # 素の segmented (mix なし) は 8k -0.2% で意味が無かったが、混合タイルは
+        # 8k -4.3% (対 素、ビット一致、2026-09-03 14:00) で既定に入れた。
+        # NAX 機は `MLXTURBO_MOE_GEMM=auto` の判定で segmented ごと off になる。
+        _mix = int(os.environ.get("MLXTURBO_MOE_GEMM_MIX", "48") or "0")
         if _mix > 0:
             fused.enable_moe_grouped_gemm(model, mode="seg", mix_threshold=_mix)
             print(f"{log_prefix} MoE grouped GEMM 有効 (段 P3、混合タイル"
@@ -1511,7 +1511,7 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         # 段 P10: prefill 幅の dense 射影 (q_proj / o_proj / in_proj_qkv /
         # in_proj_z / out_proj) を BM=64 の自前 qmm に通す。素とビット一致、
         # micro では素の 0.935〜0.947 (M=2048 / 8192)。enable_qmm_wide 自身が
-        # MLXTURBO_QMM_WIDE (auto|on|off、**既定 off**) を読むので、ここでは
+        # MLXTURBO_QMM_WIDE (auto|on|off、**既定 auto** = 非 NAX で on、8k -2.6%) を読むので、ここでは
         # 呼ぶだけ。auto は非 NAX 機だけ on。行数 < 1024 (decode/verify 幅) は
         # 常に素の `mx.quantized_matmul` に落ちる。
         n = fused.enable_qmm_wide(model)

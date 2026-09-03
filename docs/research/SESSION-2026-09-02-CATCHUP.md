@@ -2079,3 +2079,19 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - 検証: 指紋バイト一致、`verify_qsa_attn_decode.py` の配線節 (実 Attention、kv=6000、S=1..6) で knob on/off ビット一致・全 S 発火、`bench/test_server.py` 417 pass。
 - decode_ab knob `qsa-decode-kernel` (control_identical、DECODE_ONLY)。50k の対照 NG は想定内 (B 側が `_gather_tile_attn` を通り dense と非一致)、17k の不一致は本物。
 - **両側 `MLXTURBO_QSA_TAIL=query` 必須。worker は投入側の環境変数を読まないので、この A/B は別プロセス (`BIGLOCK_NO_WORKER=1`) で流す** (chain95)。worker への環境変数の受け渡しは要望済み。
+
+### 2026-09-03 14:05 P3 混合タイル + P10 BM=64 dense 射影の in-model 8k (1 プロセス、`--knobs moe-mix48,qmm-wide`、長文脈 3 本 × 回文、`scratchpad/agent-8k-*.json`)
+
+| knob | 変種 | prefill_s 中央値 | 対 素 |
+|---|---|---|---|
+| moe-mix48 | A mix48 / WM=1 | 12.328 | **-4.3%** |
+| | B seg32 (現行の segmented) | 12.855 | -0.2% |
+| | C 素の gather_qmm (基準) | 12.887 | 0 |
+| qmm-wide | A BM=64 タイル (5 射影、行数 ≥ 1024) | 12.752 | **-2.6%** |
+| | B 素 (基準) | 13.091 | 0 |
+
+- 6 本すべてで A < B < C、位置 1 の段差なし。tok/round は 3 変種とも 2.444、head は変種間で完全一致 (対照 OK)。発火 segmented 291、qmm_wide 528。
+- 配線: `fused.enable_moe_grouped_gemm(mode, mix_threshold, bm, wm)` (表とカーネルに同じ設定、キャッシュ鍵に (bm, mix))、`fused.enable_qmm_wide` (`nn.QuantizedLinear.__call__` 1 個の差し替え、対象は q_proj / o_proj / in_proj_qkv / in_proj_z / out_proj の属性付きだけ、2 次元 M / 3 次元 B·S ≥ 1024)。
+  3 つの呼び手 (batch / batch_spec / spec_flash) は別口の射影を持たない。ビット一致は `scratchpad/verify_p3p10_wiring.py` で 15 通り + 混合 5 通り確認、指紋 4 つ一致。
+- **判定: 両方とも既定に入れる** (判定線 -2%、品質の代金ゼロ)。`MLXTURBO_MOE_GEMM_MIX=48` (0 で off)、`MLXTURBO_QMM_WIDE=auto` (非 NAX で on)。17k は chain95 で確認 (悪化していれば戻す)。
+- 素の seg32 だけでは -0.2% で意味が無かった。WM=1 (64 スレッド) と 16 行タイルの組が効いている。

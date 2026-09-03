@@ -281,6 +281,78 @@ def disable_hyper_connection_kernel() -> None:
     _ORIG_HC_KERNEL = None
 
 
+_ORIG_HC_ELEM = None
+
+
+def enable_hyper_connection_elem() -> None:
+    """`GatedResidual.__call__` の **elementwise だけ** を Metal カーネルに畳む
+    (第 4 変種、`kernels/hyper_connection.py` の `fused_gated_residual_elem`)。
+
+    `enable_hyper_connection_kernel` (GEMV 2 本も融合の中に取り込む版) との
+    違いは、down/up/inject の行列積を `mx.quantized_matmul` のまま残すこと。
+    冷の連鎖では自前の逆量子化内積が DRAM レイテンシを隠せず負ける
+    (CATCHUP 2026-09-03 12:00) ので、重みを読む部分は MLX の qmv に任せて
+    起動回数だけを減らす。素の 14 ディスパッチが 6 (自前 3 + qmv 3) になる
+    (combine あり)。
+
+    量子化されていない `nn.Linear` もそのまま扱える (`_hc_prefill_compile_pack`
+    が `(weight,)` を返し、カーネル側の `_elem_qmm` が素の行列積に落とす)。
+    97 層中 96 層の `block_inject_weight` が bf16 のまま残っている構成でも
+    全層で発火する -- `enable_hyper_connection_kernel` が
+    `MLXTURBO_HC_INJECT_BF16` を要求するのは、あちらが inject の逆量子化も
+    自前で持っているから。
+
+    `enable_hyper_connection_kernel` / `enable_hyper_connection` /
+    `enable_hyper_connection_prefill_compiled` と同じ
+    `Q.GatedResidual.__call__` を取り合うので同時に使わない。切り替えるときは
+    先に相手の disable を呼ぶこと。
+
+    発火の確認は `mlxturbo.kernels._fire.snapshot()` の `hc_elem`。
+    """
+
+    global _ORIG_HC_ELEM
+    import mlx_lm.models.qwen4_exp as Q
+
+    from .kernels import hyper_connection as hck
+
+    if _ORIG_HC_ELEM is not None:
+        return
+    _ORIG_HC_ELEM = Q.GatedResidual.__call__
+    orig = _ORIG_HC_ELEM
+
+    def patched(self, hyper):
+        if not hck.eligible_elem(hyper, self.hc_norm.weight, self.hc, self.d):
+            return orig(self, hyper)
+        combine = self.block_inject_weight is not None
+        out = hck.fused_gated_residual_elem(
+            hyper,
+            self.hc_norm.weight,
+            self.hc_norm.eps,
+            self.hc,
+            self.d,
+            _hc_prefill_compile_pack(self.input_mix_weight_down),
+            _hc_prefill_compile_pack(self.input_mix_weight_up),
+            _hc_prefill_compile_pack(self.block_inject_weight) if combine else None,
+        )
+        if not combine:
+            return out
+        mixed, inj = out
+        # 素の実装と同じく hyper はそのまま返す (残差が合流する側で使われる)
+        return mixed, hyper, inj
+
+    Q.GatedResidual.__call__ = patched
+
+
+def disable_hyper_connection_elem() -> None:
+    global _ORIG_HC_ELEM
+    if _ORIG_HC_ELEM is None:
+        return
+    import mlx_lm.models.qwen4_exp as Q
+
+    Q.GatedResidual.__call__ = _ORIG_HC_ELEM
+    _ORIG_HC_ELEM = None
+
+
 def _hc_prefill_compile_pack(lin):
     """`input_mix_weight_down`/`up`/`block_inject_weight` から重みを取り出す。
 
@@ -1722,6 +1794,13 @@ _MOE_GEMM_STOCK = None        # 素の SL.QuantizedSwitchLinear.__call__
 _MOE_GEMM_MODE = "off"
 _MOE_GEMM_MIN_ROWS = 1024     # インストール時に 1 回だけ読む (ホットパスで getenv しない)
 _MOE_GEMM_TRACE = False
+# seg のタイル設定 (P3 混合タイル)。`enable_moe_grouped_gemm` の引数か
+# `MLXTURBO_MOE_GEMM_MIX` で決める。mix が None なら現行の seg32 (BM=32/WM=2)。
+# **`segment_tables` と `qmm_segmented` に同じ値を渡すこと。**表とカーネルで
+# 数え方が食い違うと行の割り当てが壊れる (どちらも `rows_e < mix` で分ける)。
+_MOE_GEMM_BM = 32
+_MOE_GEMM_WM = None           # None = bm 既定 (bm=32 なら WM=2、16 なら 1)
+_MOE_GEMM_MIX = None          # 48 なら行数 < 48 の専門家だけ 16 行タイル (WM=1)
 # (indices, num_experts, tables) の 1 段キャッシュ。`_moe_combine_fold` も
 # `gather_sort` も gate/up/down の 3 本に**同じ添字オブジェクト**を渡すので、
 # 同一性 (`is`) で引けばテーブル構築は 3 回に 1 回で済む。参照を持っている
@@ -1741,16 +1820,25 @@ def _moe_gemm_tables(indices, num_experts):
 
     host 同期は入らない (`counts_from_sorted_ids` も `segment_tables` も
     mx op だけ)。同じ添字での 2 回目以降はキャッシュを返す。
+
+    タイル設定 (`_MOE_GEMM_BM` / `_MOE_GEMM_MIX`) も鍵に入れる。A/B で設定を
+    切り替えたときに、前の設定で作った表を使い回さないため。
     """
     global _MOE_GEMM_TABLES
 
     from .kernels import moe_grouped_gemm as mgg
 
+    key = (_MOE_GEMM_BM, _MOE_GEMM_MIX)
     cached = _MOE_GEMM_TABLES
-    if cached is not None and cached[0] is indices and cached[1] == num_experts:
-        return cached[2]
-    tables = mgg.segment_tables(mgg.counts_from_sorted_ids(indices, num_experts))
-    _MOE_GEMM_TABLES = (indices, num_experts, tables)
+    if (cached is not None and cached[0] is indices
+            and cached[1] == num_experts and cached[2] == key):
+        return cached[3]
+    tables = mgg.segment_tables(
+        mgg.counts_from_sorted_ids(indices, num_experts),
+        bm=_MOE_GEMM_BM,
+        mix_threshold=_MOE_GEMM_MIX,
+    )
+    _MOE_GEMM_TABLES = (indices, num_experts, key, tables)
     return tables
 
 
@@ -1841,7 +1929,13 @@ def _moe_gemm_trace(rows: int, n_out: int) -> None:
     )
 
 
-def enable_moe_grouped_gemm(model=None, mode: str = "seg") -> None:
+def enable_moe_grouped_gemm(
+    model=None,
+    mode: str = "seg",
+    mix_threshold: int | None = None,
+    bm: int | None = None,
+    wm: int | None = None,
+) -> None:
     """prefill 幅の `mx.gather_qmm(sorted_indices=True)` を差し替える。
 
     ``mode`` は 2 通り:
@@ -1878,8 +1972,25 @@ def enable_moe_grouped_gemm(model=None, mode: str = "seg") -> None:
     **`runner.enable_default_fusions` には配線していない。**in-model A/B
     (`tools/decode_ab.py --knob moe-grouped-gemm`) で prefill が勝ってから
     配線する。micro (行列積だけ) の取り分は r=160 で -5.2%、r=40 で -4.1%。
+
+    ``mode="seg"`` のタイル設定 (P3 混合タイル、2026-09-03):
+
+      - ``mix_threshold``: 専門家ごとに行数がこの値未満なら 16 行タイル、
+        それ以外は 32 行タイル (1 dispatch、threadgroup は 64 スレッドなので
+        WM は必ず 1)。``None`` なら現行の seg32。micro
+        (`tools/moe_grouped_gemm_micro.py --stage segmented`) の取り分は
+        mix48 が MoE 層 1 つで r=40 -9.9% / r=160 -5.4%
+      - ``bm`` / ``wm``: 混合しないときのタイル行数と simdgroup の本数
+        (既定 32 / None = WM 2)。``wm=1`` だけを試す対照用
+
+    引数が ``None`` のときは環境変数 `MLXTURBO_MOE_GEMM_MIX` (既定 `48`、`0` =
+    混合なし、`48` で mix48/WM=1) を読む。**設定は `segment_tables` と
+    `qmm_segmented` の両方に同じ値が渡る** (`_moe_gemm_tables` と
+    `dispatched` がどちらもモジュール変数を見る)。差し替え本体は 1 回しか
+    入れ替えないので、A/B で交互に呼んでも設定だけが切り替わる。
     """
     global _MOE_GEMM_STOCK, _MOE_GEMM_MODE, _MOE_GEMM_MIN_ROWS, _MOE_GEMM_TRACE
+    global _MOE_GEMM_BM, _MOE_GEMM_WM, _MOE_GEMM_MIX
     import os
 
     import mlx.core as mx
@@ -1891,6 +2002,13 @@ def enable_moe_grouped_gemm(model=None, mode: str = "seg") -> None:
     if mode not in ("seg", "pad16"):
         raise ValueError(f"mode={mode!r} は seg / pad16 のどちらかにすること")
     _MOE_GEMM_MODE = mode if (mode == "pad16" or mgg.enabled()) else "off"
+    if mix_threshold is None:
+        mix_threshold = int(os.environ.get("MLXTURBO_MOE_GEMM_MIX", "48") or "0")
+    # 0 (と env の未設定) は「混合しない」。`qmm_segmented` は
+    # `mix_threshold is not None` で混合モードに入るので、ここで None に潰す
+    _MOE_GEMM_MIX = int(mix_threshold) if mix_threshold else None
+    _MOE_GEMM_BM = 32 if bm is None else int(bm)
+    _MOE_GEMM_WM = wm
     if _MOE_GEMM_STOCK is not None:
         return
     _MOE_GEMM_MIN_ROWS = int(os.environ.get("MLXTURBO_MOE_GEMM_MIN_ROWS", "1024"))
@@ -1965,6 +2083,10 @@ def enable_moe_grouped_gemm(model=None, mode: str = "seg") -> None:
                     biases,
                     None,
                     tables=_moe_gemm_tables(indices, w.shape[0]),
+                    # 表と同じ設定を渡す (食い違うと行の割り当てが壊れる)
+                    bm=_MOE_GEMM_BM,
+                    wm=_MOE_GEMM_WM,
+                    mix_threshold=_MOE_GEMM_MIX,
                     group_size=self.group_size,
                     bits=self.bits,
                 )
@@ -1987,6 +2109,156 @@ def disable_moe_grouped_gemm() -> None:
     _MOE_GEMM_TABLES = None
     _MOE_GEMM_PAD_TABLES = None
     _MOE_GEMM_PAD_X = None
+
+
+# --- P10: prefill 幅の dense 射影を BM=64 の自前 qmm へ -------------------
+#
+# MLX の dense qmm_t は BM=32 (quantized.cpp:1058-1065) なので、W タイル 1 枚の
+# 逆量子化を 32 行ごとに払い直す。BM=64 のタイル
+# (`kernels/qmm_wide.py` の `m64n32k32w2x2r8`) は同じ W タイルで 64 行を養う
+# ので逆量子化が半分になる。micro では素の 0.935〜0.947 (M=2048 / 8192)、
+# **ビット一致** (K の縮約順はタイル形を変えても動かない -- qmm_wide.py の
+# 「数値」の節)。
+#
+# 差し替えは `nn.QuantizedLinear.__call__` に 1 個だけ。どの射影を通すかは
+# `enable_qmm_wide` が層を歩いてモジュール属性 `_qmm_wide` (タイル) を
+# 置くかどうかで決める。3 つの呼び手 (`batch.py` / `batch_spec.py` /
+# `spec_flash.py`) はどれもモジュール呼び出し (`self.q_proj(x)` など) で
+# 射影に入る -- `spec_flash._staged_forward` / `_group_prefill_forward` の
+# 写しも `self.out_proj(...)` を呼ぶだけで、別口の qmm は持たない
+# (`MLXTURBO_WIDE` の連結射影は別の口で、既定 off のまま触らない)。
+_QMM_WIDE_STOCK = None        # 素の nn.QuantizedLinear.__call__
+_QMM_WIDE_ON = False          # A/B で交互に切り替えるのはこれだけ
+_QMM_WIDE_MIN_ROWS = 1024     # decode/verify 幅は BM=64 が行を無駄にする
+# 本番で当たる dense 射影 (K -> N): attention の q_proj 2560->12288 と
+# o_proj 6144->2560、GDN の in_proj_qkv 2560->10240 / in_proj_z 2560->6144 /
+# out_proj 6144->2560。k_proj / v_proj (N=512) は micro で測っていないので
+# 入れない。
+_QMM_WIDE_TARGETS = (
+    ("self_attn", ("q_proj", "o_proj")),
+    ("linear_attn", ("in_proj_qkv", "in_proj_z", "out_proj")),
+)
+
+
+def _qmm_wide_dispatch(self, x):
+    """`nn.QuantizedLinear.__call__` の身代わり。素通しの判定を先に済ませる。"""
+    tile = getattr(self, "_qmm_wide", None)
+    if _QMM_WIDE_ON and tile is not None:
+        from .kernels import qmm_wide as qw
+
+        if x.ndim == 2:
+            if x.shape[0] >= _QMM_WIDE_MIN_ROWS:
+                return qw.qmm_wide(
+                    x, self["weight"], self["scales"], self["biases"],
+                    tile=tile, group_size=self.group_size, bits=self.bits)
+        elif x.ndim == 3 and x.shape[0] * x.shape[1] >= _QMM_WIDE_MIN_ROWS:
+            B, S, K = x.shape
+            out = qw.qmm_wide(
+                x.reshape(B * S, K), self["weight"], self["scales"],
+                self["biases"], tile=tile, group_size=self.group_size,
+                bits=self.bits)
+            return out.reshape(B, S, -1)
+    return _QMM_WIDE_STOCK(self, x)
+
+
+def enable_qmm_wide(model, mtp=None, mode: str | None = None,
+                    tile_name: str = "m64n32k32w2x2r8",
+                    min_rows: int | None = None) -> int:
+    """prefill 幅の dense 射影を `kernels/qmm_wide.qmm_wide` に通す (P10)。
+
+    戻り値は印を付けた射影の数 (層数 x 種類)。0 なら 1 つも発火しない。
+
+    ``mode``: ``"auto"`` (非 NAX 機だけ on) / ``"on"`` / ``"off"``。``None``
+    なら環境変数 `MLXTURBO_QMM_WIDE` を読む (**既定 auto** = 非 NAX で on)。NAX 機の判定は
+    `moe_grouped_gemm.is_nax_device` と同じもの -- あちらは MLX 側が別
+    カーネルを持っていて A/B 未実施なので、自前カーネルは当てない。
+
+    行数 (2 次元なら M、3 次元なら B*S) が ``min_rows``
+    (`MLXTURBO_QMM_WIDE_MIN_ROWS`、既定 1024) 未満なら素の
+    `mx.quantized_matmul` に落ちる。prefill のチャンク幅 (既定 2048) は超え、
+    decode/verify 幅 (数行) は必ず落ちる。
+
+    形の適格判定 (`qmm_wide.eligible` と同じ内容) はここで 1 回だけ済ませ、
+    通った射影にだけタイルを属性で置く。ホットパスは属性 1 つと行数の比較
+    だけ。**素とビット一致する**ので `--knob qmm-wide` は
+    `control_identical=True` で回せる。
+    """
+    global _QMM_WIDE_STOCK, _QMM_WIDE_ON, _QMM_WIDE_MIN_ROWS
+    import os
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from .kernels import moe_grouped_gemm as mgg
+    from .kernels import qmm_wide as qw
+
+    if mode is None:
+        mode = os.environ.get("MLXTURBO_QMM_WIDE", "auto").strip().lower() or "auto"
+    if mode not in ("auto", "on", "off"):
+        raise ValueError(f"mode={mode!r} は auto / on / off のどれかにすること")
+    if mode == "off" or (mode == "auto" and mgg.is_nax_device()):
+        _QMM_WIDE_ON = False
+        return 0
+    if mx.default_device() != mx.gpu:
+        _QMM_WIDE_ON = False
+        return 0
+
+    tile = qw.TILES.get(tile_name)
+    if tile is None:
+        raise ValueError(f"tile={tile_name!r} は qmm_wide.TILES に無い"
+                         f" (候補: {', '.join(sorted(qw.TILES))})")
+    if min_rows is None:
+        min_rows = int(os.environ.get("MLXTURBO_QMM_WIDE_MIN_ROWS", "1024"))
+    _QMM_WIDE_MIN_ROWS = int(min_rows)
+
+    if _QMM_WIDE_STOCK is None:
+        _QMM_WIDE_STOCK = nn.QuantizedLinear.__call__
+        nn.QuantizedLinear.__call__ = _qmm_wide_dispatch
+
+    def each_layer():
+        for layer in model.model.layers:
+            yield layer
+        if mtp is not None:
+            for layer in mtp.layers:
+                yield layer
+
+    n = 0
+    for layer in each_layer():
+        for holder, names in _QMM_WIDE_TARGETS:
+            mod = getattr(layer, holder, None)
+            if mod is None:
+                continue
+            for name in names:
+                lin = getattr(mod, name, None)
+                if lin is None or not isinstance(lin, nn.QuantizedLinear):
+                    continue
+                if "bias" in lin or getattr(lin, "mode", "affine") != "affine":
+                    continue
+                w, scales = lin["weight"], lin["scales"]
+                biases = lin.get("biases")
+                if biases is None:
+                    continue
+                # `eligible` は x の dtype / K だけを見るので、形を合わせた
+                # 空の probe で判定できる (実際の x は (行, K) の bf16)
+                x_probe = mx.zeros(
+                    (1, w.shape[1] * 32 // lin.bits), dtype=scales.dtype)
+                if not qw.eligible(x_probe, w, scales, biases, tile,
+                                   lin.group_size, lin.bits):
+                    continue
+                lin._qmm_wide = tile
+                n += 1
+    _QMM_WIDE_ON = n > 0
+    return n
+
+
+def disable_qmm_wide() -> None:
+    """`enable_qmm_wide` を打ち消す (フラグを下ろすだけ)。
+
+    差し替えと属性は残るが `_qmm_wide_dispatch` が素通しに固定される。A/B で
+    交互に測るためにこの形にしてある (`disable_moe_grouped_gemm` と同じ理屈)。
+    """
+    global _QMM_WIDE_ON
+    _QMM_WIDE_ON = False
 
 
 def enable_fast_rope(model) -> int:
