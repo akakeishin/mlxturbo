@@ -86,9 +86,11 @@ import argparse
 import json
 import statistics
 import time
+from functools import partial
 from typing import Callable
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
 
 from mlxturbo.kernels.moe_grouped_gemm import (
@@ -418,6 +420,8 @@ def run_segmented(
     seed: int,
     mix_thresholds: list[int],
     with_fragskip: bool = False,
+    bns: list[int] | None = None,
+    bks: list[int] | None = None,
 ) -> list[dict]:
     E = NUM_EXPERTS
     cases: list[tuple[str, np.ndarray]] = [
@@ -480,6 +484,7 @@ def run_segmented(
             counts_mx = mx.array(counts.astype(np.int32))
             tab32 = segment_tables(counts_mx, bm=32)
             tab16 = segment_tables(counts_mx, bm=16)
+            tab8 = segment_tables(counts_mx, bm=8)
             tab_mix = {
                 t: segment_tables(counts_mx, mix_threshold=t) for t in thresholds
             }
@@ -578,6 +583,44 @@ def run_segmented(
             ]
             for t in thresholds:
                 variants.append((f"mix{t}", make_mix(t)))
+
+            # 列タイル幅 (BN) の掃引 (P7 第 3 段)。BN を広げると 1 枚の
+            # threadgroup が受け持つ出力が増え、タイル 1 枚あたりの固定費
+            # (dispatch と x タイルの読み) が薄まる。行数の少ない専門家が
+            # 多い r=40 で効くかを見る。表 (row_start/tile_prefix) は BN に
+            # 依らないので使い回せる
+            def make_shape(fn_name: str, bn: int = 32, bk: int = 32):
+                if fn_name == "mix":
+                    kw = dict(tables=tab_mix[thresholds[0]],
+                              mix_threshold=thresholds[0])
+                elif fn_name == "seg16":
+                    kw = dict(tables=tab16, bm=16)
+                elif fn_name == "seg8":
+                    kw = dict(tables=tab8, bm=8)
+                else:
+                    kw = dict(tables=tab32, bm=32, wm=1)
+
+                def run() -> mx.array:
+                    return qmm_segmented(x, wq, scales, biases, None,
+                                         bn=bn, bk=bk, **kw)
+
+                return run
+
+            variants.append(("seg8", make_shape("seg8")))
+            for bn in bns or []:
+                if N % bn != 0:
+                    continue
+                for base in ("mix", "seg16", "seg32w1"):
+                    label = (f"mix{thresholds[0]}" if base == "mix" else base)
+                    variants.append(
+                        (f"{label}-bn{bn}", make_shape(base, bn=bn)))
+            for bk in bks or []:
+                if K % bk != 0 or GROUP_SIZE % bk != 0:
+                    continue
+                for base in ("mix", "seg16", "seg8", "seg32w1"):
+                    label = (f"mix{thresholds[0]}" if base == "mix" else base)
+                    variants.append(
+                        (f"{label}-bk{bk}", make_shape(base, bk=bk)))
             if with_fragskip:
                 variants.append(("fragskip", seg_fragskip))
             variants += [("dense", dense), ("pad16", pad16)]
@@ -643,7 +686,7 @@ def run_segmented(
             if bad:
                 print(f"           ビット不一致: {bad} (max|diff| {max_diff})")
 
-            del x, x3, idx, tab32, tab16, tab_mix, counts_mx
+            del x, x3, idx, tab32, tab16, tab8, tab_mix, counts_mx
             del x_pad, x_pad3, idx_pad, keep_idx
         del wq, scales, biases, w0, s0, b0
 
@@ -732,6 +775,118 @@ def _report_partial_cost(results: list[dict]) -> None:
                 f"stock {f16['ms']['stock']:6.3f} ms"
             )
         print(line)
+
+
+# ---------------------------------------------------------------------------
+# SwiGLU を up GEMM の store に畳む (--stage glu、P7 第 3 段)
+# ---------------------------------------------------------------------------
+
+
+@partial(mx.compile, shapeless=True)
+def _swiglu_compiled(gate: mx.array, up: mx.array) -> mx.array:
+    """`nn.silu(gate) * up` を 1 カーネルに畳む。
+
+    素は `nn.silu` (それ自体 compile 済み = 1 本) と乗算の **2 本**で、
+    26 MB の往復が 1 回余計に要る (M=20480, N=640, bf16)。
+    """
+
+    return (gate * mx.sigmoid(gate)) * up
+
+
+def run_glu(rounds: int, warmup: int, seed: int, mix_threshold: int) -> list[dict]:
+    """gate GEMM -> up GEMM -> `silu(gate) * up` を、SwiGLU の作り方だけ
+    変えて比べる。
+
+    素の `nn.silu(gate) * up` は 2 本 (`nn.silu` 自体は `mx.compile` 済みで
+    1 本 + 乗算 1 本) で、26 MB (M=20480 x N=640 bf16) の往復が 1 回余計に
+    要る。1 本に畳んだ `compiled` は **素とビット一致**する。
+
+    実測 (2026-09-03、M3 Max): 素 15.130 / compiled 15.062 ms (-0.5% =
+    -0.068 ms/層)。**up GEMM の store に畳む変種 (TGLU) は取り除いた** --
+    -0.123 ms/層と少し速いがビット一致せず、frag の並び (8 行 x 2 要素) で
+    読むので coalescing が悪く、in-model 8k では ±0.3% (揺れの中) だった
+    (`docs/research/SESSION-2026-09-02-CATCHUP.md` の 2026-09-03 20:55)。
+    """
+
+    E = NUM_EXPERTS
+    K, N = 2560, 640
+    counts = skew_counts(E, 20480, 67, 20.0, 90.0)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(counts)
+    ids = np.repeat(np.arange(E, dtype=np.uint32), counts)
+    M = int(counts.sum())
+
+    mx.random.seed(seed)
+    x = mx.random.normal((M, K)).astype(mx.bfloat16)
+    wq_g = _rand_u32((E, N, K * BITS // 32))
+    wq_u = _rand_u32((E, N, K * BITS // 32))
+    groups = K // GROUP_SIZE
+    sc_g = (mx.random.normal((E, N, groups)) * 0.02).astype(mx.bfloat16)
+    bi_g = (mx.random.normal((E, N, groups)) * 0.02).astype(mx.bfloat16)
+    sc_u = (mx.random.normal((E, N, groups)) * 0.02).astype(mx.bfloat16)
+    bi_u = (mx.random.normal((E, N, groups)) * 0.02).astype(mx.bfloat16)
+    counts_mx = mx.array(counts.astype(np.int32))
+    tab = segment_tables(counts_mx, mix_threshold=mix_threshold)
+    mx.eval(x, wq_g, wq_u, sc_g, bi_g, sc_u, bi_u, tab)
+    del ids
+
+    kw = dict(tables=tab, mix_threshold=mix_threshold)
+
+    def stock() -> mx.array:
+        g = qmm_segmented(x, wq_g, sc_g, bi_g, None, **kw)
+        u = qmm_segmented(x, wq_u, sc_u, bi_u, None, **kw)
+        return nn.silu(g) * u
+
+    def compiled() -> mx.array:
+        g = qmm_segmented(x, wq_g, sc_g, bi_g, None, **kw)
+        u = qmm_segmented(x, wq_u, sc_u, bi_u, None, **kw)
+        return _swiglu_compiled(g, u)
+
+    ys = {}
+    for nm, fn in (("stock", stock), ("compiled", compiled)):
+        ys[nm] = fn()
+    mx.eval(list(ys.values()))
+    base = ys["stock"].astype(mx.float32)
+    scale = float(mx.mean(mx.abs(base)).item())
+    diff = {
+        nm: {
+            "mean_abs_vs_stock": float(
+                mx.mean(mx.abs(ys[nm].astype(mx.float32) - base)).item()),
+            "max_abs_vs_stock": float(
+                mx.max(mx.abs(ys[nm].astype(mx.float32) - base)).item()),
+            "bit_exact_vs_stock": bool(
+                mx.array_equal(ys["stock"], ys[nm]).item()),
+        }
+        for nm in ("compiled",)
+    }
+    del ys, base
+
+    times = _interleave(
+        [("stock", stock), ("compiled", compiled)], rounds, warmup)
+    med = {k: statistics.median(v) for k, v in times.items()}
+    entry = {
+        "shape": "gate/up+swiglu",
+        "M": M,
+        "K": K,
+        "N": N,
+        "mix_threshold": mix_threshold,
+        "ms": med,
+        "ratio": {k: v / med["stock"] for k, v in med.items()},
+        "mean_abs_stock": scale,
+        "vs_stock": diff,
+        "samples": len(times["stock"]),
+    }
+    print(
+        f"gate/up+swiglu M={M}  "
+        + "  ".join(f"{k} {v:7.3f}" for k, v in med.items())
+        + "  ms | 比 "
+        + " ".join(f"{k} {v:5.3f}" for k, v in entry["ratio"].items())
+    )
+    print(f"  素との差 (素の平均絶対値 {scale:.4g}): "
+          + " ".join(
+              f"{k} mean {v['mean_abs_vs_stock']:.3e} "
+              f"max {v['max_abs_vs_stock']:.3e}" for k, v in diff.items()))
+    return [entry]
 
 
 # ---------------------------------------------------------------------------
@@ -836,7 +991,8 @@ def run_tables(rounds: int, warmup: int, seed: int) -> list[dict]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=["dense", "segmented", "tables"],
+    ap.add_argument("--stage",
+                    choices=["dense", "segmented", "tables", "glu"],
                     default="dense")
     ap.add_argument("--rounds", type=int, default=10, help="ABBA の回数 (A/B 各 20 本)")
     ap.add_argument("--warmup", type=int, default=3)
@@ -851,9 +1007,22 @@ def main() -> None:
         action="store_true",
         help="端数タイルの frag 間引き版も interleave に入れる (既定 off、負け済み)",
     )
+    ap.add_argument(
+        "--bn",
+        default="",
+        help="列タイル幅 BN の掃引 (カンマ区切り、既定 32 は常に入っている)。"
+             "例 --bn 64",
+    )
+    ap.add_argument(
+        "--bk",
+        default="",
+        help="K タイル幅 BK の掃引 (カンマ区切り、既定 32)。例 --bk 64",
+    )
     ap.add_argument("--json", default=None)
     args = ap.parse_args()
     mix_thresholds = [int(v) for v in args.mix_thresholds.split(",") if v.strip()]
+    bns = [int(v) for v in args.bn.split(",") if v.strip()]
+    bks = [int(v) for v in args.bk.split(",") if v.strip()]
 
     info = (getattr(mx, "device_info", None) or mx.metal.device_info)()
     print(
@@ -867,6 +1036,9 @@ def main() -> None:
         results = run_dense(args.rounds, args.warmup, args.seed)
     elif args.stage == "tables":
         results = run_tables(args.rounds, args.warmup, args.seed)
+    elif args.stage == "glu":
+        results = run_glu(args.rounds, args.warmup, args.seed,
+                          mix_thresholds[0])
     else:
         results = run_segmented(
             args.rounds,
@@ -874,6 +1046,8 @@ def main() -> None:
             args.seed,
             mix_thresholds,
             with_fragskip=args.fragskip,
+            bns=bns,
+            bks=bks,
         )
 
     if args.json:

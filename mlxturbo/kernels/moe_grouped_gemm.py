@@ -644,7 +644,11 @@ METAL_FUNC void mlxturbo_seg_tile(
 # 本体。タイルの引き当てだけを書き、ローダー・MMA・store は写しをそのまま
 # 呼ぶ (dense クローンと同じ方針)。TILE_M / TILE_WM は template 引数なので、
 # 32 行 (WM=2、128 スレッド) と 16 行 (WM=1、64 スレッド) が同じ本文で回る。
-_SEGMENTED_HEAD = """
+#
+# ``bn`` (列タイル幅) だけは呼び出しごとに変えられるようにしてある (P7 第 3 段
+# の掃引用)。既定の 32 では生成される文字列が以前と 1 文字も変わらない
+# (`_SEGMENTED_HEAD` 以下の 3 つの定数がそれを固定している)。
+_SEG_HEAD_TMPL = """
   constexpr int BN = %(bn)d;
   constexpr int BK = %(bk)d;
   constexpr int WN = %(wn)d;
@@ -672,9 +676,16 @@ _SEGMENTED_HEAD = """
   const int e = mlxturbo_seg_search(tile_prefix, E, t);
   const int y_col = int(threadgroup_position_in_grid.x) * BN;
   const device uint8_t* w8 = (const device uint8_t*)w;
-""" % {"bn": BN, "bk": BK, "wn": WN, "bm_max": BM}
+"""
 
-_SEGMENTED_SOURCE = _SEGMENTED_HEAD + """
+
+def _seg_head(bn: int = BN, bk: int = BK) -> str:
+    return _SEG_HEAD_TMPL % {"bn": bn, "bk": bk, "wn": WN, "bm_max": BM}
+
+
+_SEGMENTED_HEAD = _seg_head(BN)
+
+_SEG_BODY_ONE = """
   const int rs = row_start[e] + (t - tile_prefix[e]) * TILE_M;
   const int re = min(row_start[e + 1], rs + TILE_M);
   mlxturbo_seg_tile<T, TILE_M, BN, BK, TILE_WM, WN, GROUP_SIZE, BITS, SKIP_ROWS>(
@@ -682,12 +693,14 @@ _SEGMENTED_SOURCE = _SEGMENTED_HEAD + """
       simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
 """
 
+_SEGMENTED_SOURCE = _SEGMENTED_HEAD + _SEG_BODY_ONE
+
 # 混合モード。専門家の行数が閾値未満なら 16 行タイル、それ以外は 32 行タイル。
 # threadgroup は 64 スレッドで、32 行タイルも WM=1 (TM=4) で回す --- 1 回の
 # dispatch に 2 種のタイルを混ぜるには threadgroup の形を揃えるしかないため。
 # 32 行 / WM=1 が 32 行 / WM=2 (既定) より遅いなら、その差は micro の
 # `bm32w1` ケース (混合の対照) に出る。
-_SEGMENTED_MIXED_SOURCE = _SEGMENTED_HEAD + """
+_SEG_MIXED_BODY = """
   const int MIX_THRESHOLD = dims[4];
   const int rows_e = row_start[e + 1] - row_start[e];
   if (rows_e < MIX_THRESHOLD) {
@@ -705,6 +718,8 @@ _SEGMENTED_MIXED_SOURCE = _SEGMENTED_HEAD + """
   }
 """ % {"bm16": BM16, "bm": BM}
 
+_SEGMENTED_MIXED_SOURCE = _SEGMENTED_HEAD + _SEG_MIXED_BODY
+
 # P7 第 2 段の 2 つの変種。本文は上の 2 つと同じで、`mlxturbo_seg_tile` の
 # template 定数と末尾の引数だけが違う:
 #
@@ -715,7 +730,8 @@ _SEGMENTED_MIXED_SOURCE = _SEGMENTED_HEAD + """
 #
 # 素の 2 つ (`_SEGMENTED_SOURCE` / `_SEGMENTED_MIXED_SOURCE`) は 1 文字も
 # 動かさない (既定の経路のコンパイル結果を変えないため)。
-def _seg_variant_source(mixed: bool, epi: bool, src: bool) -> str:
+def _seg_variant_source(mixed: bool, epi: bool, src: bool,
+                        bn: int = BN, bk: int = BK) -> str:
     tail = ", true" if epi else ", false"
     tail += ", true" if src else ""
     args = ",\n      row_dst, row_scale" if epi else ""
@@ -730,8 +746,9 @@ def _seg_variant_source(mixed: bool, epi: bool, src: bool) -> str:
       x, w8, scales, biases, y, Xs, Ws, K, N, M, e, rs, re, y_col,
       simdgroup_index_in_threadgroup, thread_index_in_simdgroup%(args)s);
 """
+    head_str = _seg_head(bn, bk)
     if not mixed:
-        return _SEGMENTED_HEAD + body_one % {
+        return head_str + body_one % {
             "bm": "TILE_M", "wm": "TILE_WM", "tail": tail, "args": args}
     head = """
   const int MIX_THRESHOLD = dims[4];
@@ -739,13 +756,15 @@ def _seg_variant_source(mixed: bool, epi: bool, src: bool) -> str:
   if (rows_e < MIX_THRESHOLD) {"""
     small = body_one % {"bm": str(BM16), "wm": "1", "tail": tail, "args": args}
     big = body_one % {"bm": str(BM), "wm": "1", "tail": tail, "args": args}
-    return (_SEGMENTED_HEAD + head + small + "  } else {" + big + "  }\n")
+    return (head_str + head + small + "  } else {" + big + "  }\n")
 
 
 def _get_segmented_kernel(mixed: bool = False, epilogue: bool = False,
-                          src: bool = False):
+                          src: bool = False, bn: int = BN, bk: int = BK):
+    shaped = bn != BN or bk != BK
     key = "segmented" + ("_epi" if epilogue else "") + ("_src" if src else "") \
-        + ("_mixed" if mixed else "")
+        + ("_mixed" if mixed else "") \
+        + ("" if not shaped else f"_bn{bn}_bk{bk}")
     kernel = _KERNELS.get(key)
     if kernel is None:
         names = [
@@ -762,10 +781,13 @@ def _get_segmented_kernel(mixed: bool = False, epilogue: bool = False,
         if src:
             names += ["row_src"]
         if epilogue or src:
-            source = _seg_variant_source(mixed, epilogue, src)
+            source = _seg_variant_source(mixed, epilogue, src, bn, bk)
+        elif shaped:
+            source = _seg_head(bn, bk) + (_SEG_MIXED_BODY if mixed
+                                          else _SEG_BODY_ONE)
         else:
             source = _SEGMENTED_MIXED_SOURCE if mixed else _SEGMENTED_SOURCE
-        if epilogue or src:
+        if epilogue or src or shaped:
             name = "mlxturbo_steel_qmm_" + key
         else:
             name = "mlxturbo_steel_qmm_seg_mixed" if mixed else \
@@ -896,6 +918,8 @@ def qmm_segmented(
     row_dst: mx.array | None = None,
     row_scale: mx.array | None = None,
     row_src: mx.array | None = None,
+    bn: int = BN,
+    bk: int = BK,
 ) -> mx.array:
     """`mx.gather_qmm(..., transpose=True, sorted_indices=True)` の写し。
 
@@ -934,6 +958,13 @@ def qmm_segmented(
     ``row_src`` (uint32 の (M,)) を渡すと、GEMM の行 r が読むのは
     ``x[row_src[r]]`` になる (MoE の x gather を GEMM に畳む)。このとき
     ``x`` の行数は M と無関係でよく、**M は ``row_src`` の長さ**になる。
+
+    ``bn`` は列タイルの幅 (既定 32 = steel の dense qmm_t と同じ)。64 に
+    すると 1 threadgroup の受け持つ出力が倍になり、タイル 1 枚あたりの
+    固定費 (dispatch と x タイルの読み) が半分の枚数に薄まる。行数の少ない
+    専門家が多いとき (r=40) に効くかを見るための掃引用で、``N`` が ``bn`` で
+    割り切れることが要る (`segmented_eligible` の判定も同じ ``bn`` で行う
+    こと)。
     """
 
     _fire.bump("moe_grouped_gemm_segmented")
@@ -968,9 +999,11 @@ def qmm_segmented(
         tile_wm = 1
         grid_bm = BM16  # 最悪 (全専門家が 16 行タイル) で grid を張る
     else:
-        if bm not in (BM16, BM):
-            raise ValueError(f"bm={bm} は 16 か 32 のみ")
-        tile_wm = (WM16 if bm == BM16 else WM) if wm is None else wm
+        # 8 は掃引用 (P7 第 3 段)。行数の少ない専門家が多いとき、タイルの
+        # 端数で捨てる行が減る。WM は必ず 1 (TM = 8/(8*WM) が 1 以上)
+        if bm not in (8, BM16, BM):
+            raise ValueError(f"bm={bm} は 8 / 16 / 32 のみ")
+        tile_wm = (WM if bm == BM else WM16) if wm is None else wm
         grid_bm = bm
     threads = tile_wm * WN * 32
 
@@ -992,7 +1025,12 @@ def qmm_segmented(
     if row_src is not None and row_src.dtype != mx.uint32:
         row_src = row_src.astype(mx.uint32)
 
-    kernel = _get_segmented_kernel(mixed, epilogue, row_src is not None)
+    if N % bn != 0:
+        raise ValueError(f"N={N} が bn={bn} で割り切れない")
+    if K % bk != 0 or group_size % bk != 0:
+        raise ValueError(f"K={K} / group_size={group_size} が bk={bk} と合わない")
+    kernel = _get_segmented_kernel(
+        mixed, epilogue, row_src is not None, bn, bk)
     template = [
         ("T", x.dtype),
         ("GROUP_SIZE", group_size),
@@ -1009,7 +1047,7 @@ def qmm_segmented(
     (out,) = kernel(
         inputs=ins,
         template=template,
-        grid=(threads * (N // BN), n_tiles_max(M, E, grid_bm), 1),
+        grid=(threads * (N // bn), n_tiles_max(M, E, grid_bm), 1),
         threadgroup=(threads, 1, 1),
         output_shapes=[(M, N)],
         output_dtypes=[x.dtype],

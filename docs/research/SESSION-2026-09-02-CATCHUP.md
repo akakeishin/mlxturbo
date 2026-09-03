@@ -2367,3 +2367,211 @@ prefill_s: 2048 幅 12.784 / 1024 幅 12.763 / 512 幅 13.238。非 MoE のメ�
 - 16384 トークンの空焼き (痕跡なし、`session=None`、`bench/textpool-frozen.txt` の先頭) を起動時に 1 本。self_snapshot 17k、0 対 16384 を連続で: 冷 TTFT **27.21 対 27.36 s (+0.6%)**、温 TTFT 0.197 / ctx 0 は同一、起動 +27.1 s。
 - 効かない理由: self_snapshot は測定前に 4000 トークンの温めを既に 1 本流している (20:03 の「1 本目」はその後の 1 本目)。4 本かけて収束する立ち上がりのうち、空焼き 1 本で買えるのは最初の 1 段だけで、既存の温めが既に取っている。
 - 今回の 2 本とも 27.2〜27.4 s で、19:14 の小ベンチ 30.3 s より 10% 速い (作業ツリーの GDN の未 commit 変更か、走行間のばらつき ±5〜7%)。**17k の冷 TTFT はこの幅で揺れる**と読むこと。
+
+### 2026-09-03 20:55 P7 第 3 段 (行列積以外の残り) と低行数 MoE GEMM の掃引: **畳んだ**
+
+**結論を先に: P7 第 3 段は畳んだ (knob のコードも取り除いた)。**判定線 (-1%) に届かない。残り 4 つ (router 0.82 /
+topk 0.31 / sort 0.34 / swiglu 0.40 = 1.87 ms/層 = 8k prefill の 2.9%) を部品ごとに
+測ったところ、**router は既に床**で、取り分は topk 0.083 + swiglu 0.068〜0.123 の
+0.15〜0.21 ms/層 = **8k prefill の -0.24〜-0.33%** しかない。残っている唯一の的は
+**sort (0.26〜0.33 ms/層)** で、これは計数ソートのカーネルを書かないと取れない。
+
+#### micro (`tools/moe_route_micro.py`、モデル無し、rows=2048 / E=512 / top_k=10 / K=2560、16 組を巡回、`bench/results/moe-route-micro{,2}.json`)
+
+router (ms/層):
+
+| 変種 | ms |
+|---|---|
+| fp32_qmm (現行 = `x.astype(fp32)` + 4bit qmm) | 0.843 |
+| fp32_qmm (scales/biases は bf16 のまま = 本番の形) | 0.841 |
+| fp32_qmm、cast を計測の外に出す | **0.764** |
+| bf16_qmm | 0.698 |
+| bf16_qmm -> fp32 | 0.777 |
+| f16_qmm -> fp32 | 0.760 |
+| cast だけ (`x.astype(fp32)`) | 0.258 |
+
+- **cast は単独では 0.258 ms だが、qmm と同じ eval に入れると 0.079 ms しか増えない**
+  (0.764 -> 0.843)。fp32 の x を書いてすぐ読むのでキャッシュに乗る。cast を消す
+  (bf16 を読んで threadgroup で fp32 に上げる自前 GEMM) の取り分は 0.08 ms/層 =
+  8k の 0.12% しかない。**割に合わない。**
+- bf16 で回すと -0.145 ms/層 (-0.23%) だが、**top-k スロットの 2.2% (453/20480) が
+  入れ替わる** (logits の平均相対誤差 1.7%。logits は打ち消しが効くので、重みを
+  bf16 に丸めた誤差が相対では大きく出る)。品質を売って速度を買わないので却下。
+- **router は床。**この項目は閉じる。
+
+topk: 素 (符号反転 + argpartition + 切り出し + take_along_axis + softmax) 0.299 ->
+`kernels/moe_route.py` のカーネル 0.216 (**-0.083 ms/層**)。選ぶ集合は 20480/20480 一致
+(順序は降順で素と違う)。2026-09-01 に decode 幅で負けた (+0.34 ms/token) のと逆で、
+prefill 幅は 2048 threadgroup 立つので逐次 top_k 回のパスが隠れる。
+
+sort: `argsort` だけで 0.224、並べ替えまで 0.239、`_inv_perm` 込み 0.247、表
+(`counts_from_sorted_ids` + `segment_tables`) 込み 0.293。`counts` 単体が 0.167。
+**20480 要素 (80 KB) の並べ替えに 0.24 ms は MLX の汎用ソートの多段起動ぶん**で、
+計数ソートなら 0.05〜0.08 に落ちるはず。
+
+swiglu (`tools/moe_grouped_gemm_micro.py --stage glu`、gate/up GEMM 込み、M=20480):
+
+| | ms | 比 | 素との差 |
+|---|---|---|---|
+| 素 (`nn.silu(g) * u` = 2 op) | 15.130 | 1.000 | — |
+| `epi` (up GEMM の store に畳む) | 15.007 | 0.992 | 平均 4.0e-2 (素の平均絶対値 25.44) |
+| `compile` (2 op を 1 op に) | 15.062 | 0.995 | **ビット一致** |
+
+`nn.silu` 自体が `mx.compile` 済みなので素は 2 本 (silu + 乗算)。1 本に畳むと 26 MB の
+往復が 1 回消えて -0.068 ms/層で**ビット一致**。GEMM の store に畳む (`epi`) 方が
+速いが (-0.123)、frag の並び (8 行 x 2 要素) で読むので coalescing が悪く、期待した
+-0.3 には届かない。
+
+#### 配線 (測ったときの形。取り除き済み)
+
+- vendor `SparseMoeBlock.__call__` にフック `_MOE_ROUTE` を 1 個追加
+  (`_MOE_DOWN_EPILOGUE` と同じ作法。差された関数が `(idx, w)` か `None` を返す)
+- `fused.enable_moe_route_kernel` (`MLXTURBO_MOE_ROUTE_KERNEL=1`、行数 >= 1024)
+- `fused.enable_moe_swiglu` (`MLXTURBO_MOE_SWIGLU=off|compile|epi`)
+- `kernels/moe_grouped_gemm.qmm_segmented` に `glu=` (TGLU) を追加。ついでに
+  `bn` / `bk` (列 / K のタイル幅) と `bm=8` を掃引用に開けた。**既定 (bn=32/bk=32)
+  では生成される source が 1 文字も変わらない**ことを assert で確認している
+- knob `moe-route3` (A = compile + topk カーネル / B = epi + topk カーネル / C = 現行)
+
+合成の `SparseMoeBlock` (本番と同じ形、`enable_moe_grouped_gemm` +
+`enable_moe_down_epilogue` を当てた本番経路) で A/B/C を突き合わせ:
+A は平均絶対差 4.1e-10 (|C| 平均 0.0115)、B は 3.0e-5。どちらも丸め級。
+
+#### in-model 8k (`bench/results/moe-route3-8k.json`、1 プロセス、長文脈 3 本 x 回文、`--tokens 8`)
+
+| | prefill_s | ms/round | tok/round |
+|---|---|---|---|
+| A (compile + topk カーネル) | 12.560 (+0.3%) | 37.505 (+1.2%) | 2.222 |
+| B (epi + topk カーネル) | 12.492 (-0.3%) | 38.097 (+2.8%) | 2.222 |
+| C (現行の既定) | 12.527 | 37.050 | 2.222 |
+
+**判定: 落ちる。**prefill_s は A/B とも ±0.3% で、micro から見積もった -0.24〜-0.33%
+は揺れに埋まって見えない (判定線 -1% には遠い)。発火は確認済み (`moe_route=48`、
+`moe_combine=48` と同数 = 同じ MoE 層で発火している)。ms/round の +1.2/+2.8% は
+decode 側の揺れ (3 ラウンドしか無く、行数ゲートで decode 幅は 1 op も変わらない)。
+
+**4k は測っていない。**per-層の取り分は文脈長に依らないので、8k で揺れに埋まる
+ものが 4k で出る理由が無い。
+
+**畳んだ (2026-09-03、親の判定)。**「効かない変種を二重に持たない」方針に沿って、
+配線のコードは全部取り除いた: vendor の `_MOE_ROUTE` フック、
+`fused.enable_moe_route_kernel` / `enable_moe_swiglu`、`qmm_segmented` の `glu=`
+(TGLU)、knob `moe-route3`。残したのは測り直せる道具だけ --
+`tools/moe_route_micro.py` (新規) と `tools/moe_grouped_gemm_micro.py` の
+`--stage glu` (素 対 compile) / `--bn` / `--bk` / `seg8`、および
+`qmm_segmented` の掃引用引数 `bn` / `bk` / `bm=8` (**既定 bn=32/bk=32 では生成
+される source が 1 文字も変わらないことを assert で確認**)。
+
+#### 低行数 MoE GEMM (別の的): **BN=64 / BM=8 / BK=64 は全部負け。mix48 が最良のまま**
+
+`tools/moe_grouped_gemm_micro.py --stage segmented`、MoE 層 1 つ (gate/up x2 + down)、
+dense 比。`--bn 64` の回と `--bk 64` + `seg8` の回は別プロセス (後者は全体に ~7% 遅い
+回) なので、比べるのは各回の中だけ。
+
+| 変種 | r=40 | r=160 |
+|---|---|---|
+| mix48 (現行の既定) | **1.253 / 1.248** | **1.056 / 1.067** |
+| mix48-bn64 | 1.296 | 1.053 |
+| seg16-bn64 | 1.350 | 1.162 |
+| seg8 (BM=8) | 1.478 | 1.405 |
+| mix48-bk64 | 1.373 | 1.154 |
+| seg8-bk64 | 1.580 | 1.453 |
+| seg32w1-bk64 | 1.462 | 1.146 |
+
+**なぜ 1.10 に寄らないか (実測 2 つから)**:
+
+- 16 行タイル 1 枚 = 32 行タイルの **0.519 倍** (gate/up) / 0.511 (down)、
+  端数 (20 行) タイルの費用 c = 0.970 / 0.974 (どちらも今回も再現)
+- `seg8` の実測から cost(8)/cost(32) = **0.33** (seg8/seg16 の時間比 1.169 x
+  タイル枚数比 1497/2755 x 0.519)。ここから a + 8b = 0.33、a + 16b = 0.519 を解くと
+  **タイル 1 枚の固定費 a = 32 行タイルの 14%**、行あたり b = 0.0236
+- r=40 の行の水増し Σceil(c_e/BM)·BM / M は BM=8 で 1.076、16 で 1.170、32 で 1.375、
+  mix48 で 1.212
+
+固定費 14% と水増しの積で、**「タイル 1 枚 = 専門家 1 つ」の枠内の床は 1.19〜1.25**。
+BM を下げると水増しは減るが固定費が増えて相殺し (seg8 が実測 1.478)、BN / BK を
+広げるとタイル数が減るぶん占有率が落ちて負ける。**1.10 はこの枠では届かない。**
+
+寄せる唯一の筋は「タイルが専門家境界をまたぐ」形: 専門家セグメントを **8 行**に
+揃えて (水増し 1.076)、frag の行グループ (8 行) ごとに B タイルを選ぶ (threadgroup
+メモリに W タイルを最大 4 枚)。モデル上は 689 タイル x 1.0 + 444 straddle x 0.14 =
+**1.17** で、-6% (4k prefill の -1.5% 相当)。steel の写し (`mlxturbo_mma_rows`) に
+per-frag の B 選択を足す大きい変更で、しかも 1.10 には届かない。**優先度は低い。**
+
+### 2026-09-03 21:10 GDN decode の「行列積以外」を 16 本 → 3 本に (PoL、`MLXTURBO_GDN_DECODE_FUSED`)
+
+**結論: 機構は完成した (素とビット一致、dispatch 16→3) が、in-model は ms/round -2.4% で
+判定線 (-5%) に届かない。**取れた 0.88 ms/round の内訳から、20:00 の「dispatch 1 本 5 us」は
+糊には当てはまらないことが分かった (糊 1 本は 1.9 us)。
+
+**現状の本数** (`tools/gdn_decode_micro.py --mode count`、GPU 不使用。GDN 1 層の前処理+再帰+出力 norm、
+view で済む op は除く)。S=1 と S=3 で同じ:
+
+| | 素 | 自前 |
+|---|---|---|
+| 合計 | **16** | **3** |
+| 内訳 | RMSNorm 3 / Multiply 3 / AsType 3 / Sigmoid 2 / Concatenate 1 / Convolution 1 / silu(compiled) 1 / compute_g(compiled) 1 / 再帰カーネル 1 | 前処理カーネル 1 / 再帰カーネル 1 / 出力 norm カーネル 1 |
+
+36 層で 1 forward あたり **468 dispatch** が消える (S=1 の 4499 本の 10.4%)。
+
+**設計 (`mlxturbo/kernels/gdn_prework.py` を書き直した)**: 旧版は 1 threadgroup = 1 トークン位置で、
+S=1 では threadgroup が 1 個しか立たず 40 コアの 1 コアで 250 KB を読んでいた (2026-09-03 12:00 の
+HC と同じ形の負け方)。現行は **1 threadgroup = (1 トークン位置, 連続 128 チャネル)** で、S=1 でも
+81 個立つ。1 スレッド 1 チャネル、`conv_w` の 4 タップは 8 B の連続読み。BLOCK は dk の倍数なので
+q/k の 1 head が threadgroup 内に収まり、rms_norm の縮約が閉じる (threadgroup メモリの部分和 1 回、
+旧版の tg_q/tg_k 退避は不要)。g/beta は専用の最終ブロックが持つ。
+
+**正しさ: S ∈ {1,2,3,6} で q/k/v/g/beta/conv 状態・ブロック出力・再帰状態 (fp32) が全部ビット一致。**
+判定線 (bf16 1e-2、fp32 1e-5) より強い。ここに行くのに丸め位置の総当たり (196608 標本) が要った:
+
+| 変種 | `compute_g` との不一致 |
+|---|---|
+| log1p の結果を float のまま足す | 2.99% |
+| softplus 内の exp を float / precise / fast にする | 15.45% |
+| g の外側の exp を素の `metal::exp` にする | 32.68% |
+| **全部 T (bf16) で丸め、外側 2 つだけ `metal::precise::exp`** | **0.00%** |
+
+MLX 本体は `Exp` だけ `precise` を明示 (`unary_ops.h:177`)、`LogAddExp` の中は素の `metal::exp`。
+`A_log`/`dt_bias` は実モデルどおり bf16 のまま受ける (旧版が作らせていた fp32 の写しは
+`a + dt_bias` を fp32 に上げてしまい、素と別の値になる。**写しは作らないよう `enable_gdn_prework_kernel`
+から外した**)。silu の sigmoid も本体の写し (`hyper_connection.py` の `mlx_sigmoid`)。
+
+**冷の連鎖 micro** (`tools/gdn_decode_micro.py --mode bench`、36 組巡回、ABBA×4、焼き入れ 1 往復捨て。
+前処理+再帰+出力 norm の 3 段だけの us/呼び出し):
+
+| S | block | 自前 | 素 | 比 |
+|---|---|---|---|---|
+| 1 | 128 | 48.3 | 72.1 | **0.670** |
+| 1 | 256 | 51.4 | 71.3 | 0.722 |
+| 3 | 128 | 64.1 | 81.8 | 0.784 |
+| 3 | 256 | 64.5 | 82.1 | 0.786 |
+
+S=1 の判定線 0.70 は最良配置 (block=128) で通る。ただし**素の側だけ ±20% 揺れる** (S=1 の
+plain は 4 セットで 60.2 / 71.3 / 72.1 / 74.0)。S=3 は 4 配置とも 0.78〜0.79 で安定。
+GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷条件は原理的に作れない
+(量子化行列を持たないため。`--with-proj` で in_proj/out_proj を連鎖に入れると 620 MB になる)。
+
+**in-model、短文脈 3 本 × 512** (`--knob gdn-decode-fused`、A=前処理+norm / C=前処理だけ / B=素、
+`MLXTURBO_DEPTH_ADAPT=0 --depth 2`、`bench/results/gdn-decode-fused-short.json`):
+
+| | ms/round | tok/round | ms/tok |
+|---|---|---|---|
+| A (3 本) | 36.06 (**-2.4%**) | 2.090 (-2.2%) | 17.41 (+0.5%) |
+| C (前処理だけ、4 本) | 36.15 (**-2.1%**) | 2.114 (-1.1%) | 17.18 (-0.8%) |
+| B (素、16 本) | 36.94 | 2.137 | 17.32 |
+
+- **ms/round は 3 本 × 2 反復すべてで -2.4%**(prompt ごとに -2.4 / -2.4 / -2.4%)。ばらつきが無い。
+- 出力 norm の寄与は -0.4% だけ (前処理が -2.0%)。
+- tok/round は prompt ごとに +1.2 / **-10.0** / +1.7% とばらける。**系統差ではなくテキスト運**
+  (micro では S∈{1,2,3,6} でビット一致なので、残る差は `mx.conv1d` の fp32 加算順だけ)。
+  3 本平均の -2.2% はこの 1 本に引かれた値で、ms/tok の判定には使えない。
+- 発火 `gdn_prework=8640` (= 36 層 × 240 forward = 1 round 1 forward)、`rms_norm_gated=8640`。
+
+**判定: -2.4% は判定線 (-5%) 未達。** 既定 off のまま置く (`MLXTURBO_GDN_DECODE_FUSED=1|pre|norm`)。
+
+**取れた数字の読み替え (20:00 の見立ての訂正)**: 468 dispatch を消して 0.88 ms/round =
+**糊 1 本あたり 1.9 us**。20:00 の「round 22〜25 ms ÷ 4499 = 5 us/dispatch」は平均であって、
+5 us は 855 本の量子化行列積 (10.9〜17.9 us/本) が持ち上げている。**elementwise の糊は 1.9 us/本。**
+全部の糊 (~3600 本) を消しても 6.8 ms (23 ms の 30%) が上限で、「本数を 1/3 にすれば壁時計も
+1/3」にはならない。19:35 の「4〜5% 減では動かない」と今回の「10% 減で 2.4%」は同じ直線に乗る。
+**GDN の非行列積はこれで閉じる**(残り 3 本を全部消しても、あと -0.5% しか無い)。
