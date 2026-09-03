@@ -77,6 +77,8 @@ GPU は `tools/biglock.sh` で 1 本ずつ直列。親の連鎖スクリプト�
 いま 80 番台) にあり、前の連鎖の終了を `pgrep -f run_chainNN.sh` で待って順番を付けている。
 
 案出し Studio (Scout 5 本 + decode advisor) の凍結ポートフォリオと落とした的は `docs/research/IDEAS-2026-09-03.md`。
+**最終ゴール (ユーザー 11:35): 短文脈で 100 tok/s。MTP 頭の学習はしない。** 算数は IDEAS の「最終ゴール」の節 (S=1 forward 17 ms 以下、行 2.5 ms 以下、depth 4)。
+prefill は 1.5 倍 (相手の 1.2〜1.3 倍速) が現実線。ANE は見送り (INT8 の重みコピーでメモリが増える)。M5 Max / Ultra の机上見込みも IDEAS に。
 ユーザーの Commit (07:50): 選抜は親に任せる。**カーネル (P3) はフルベンチの前に書く。**
 ユーザー方針 (09:15): **decode より先に prefill をもっとやる** (attention は長文脈有利のままでよいが、まだ手があるはず)。
 小さいベンチは **prefill の深掘り (GPU 稼働率トレース、attention、MoE カーネル、融合小物の 1:1) が終わってから** 1 回 (6 文脈)。decode 案はその後 (ユーザー 09:25、10 時の途中ベンチは取り下げ)。
