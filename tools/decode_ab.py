@@ -91,9 +91,9 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
 `qsa-decode-kernel` decode/verify 幅の QSA attention を自前の 2 カーネル
              (選択 + attention) に畳む (段 K2c、MLXTURBO_QSA_DECODE_KERNEL、
              既定 off)。A がカーネル、B が現行。MLX の 2-pass vector の写し
-             なので**出力はビット一致するはず**。**両側を
-             `MLXTURBO_QSA_TAIL=query` にして走らせること** (global tail では
-             A が 1 回も発火しない)。判定は **ms/round** (17k で -3% 以上)。
+             なので**出力はビット一致するはず**。`MLXTURBO_QSA_TAIL=query`
+             が要る (2026-09-03 に既定化済み)。判定は **ms/round**
+             (17k 実測 -4.1%、`bench/results/qsa-decode-kernel-17k-v2.json`)。
 
 `moe-verify` 共有タイル gather v2 (MLXTURBO_MOE_VERIFY、既定 off)。
              verify 幅の MoE だけを差し替える。
@@ -654,6 +654,137 @@ def _knob_moe_route(ctx):
     return apply
 
 
+def _knob_moe_sort_min(ctx):
+    """MoE の gather をソートする閾値 (`fused._MOE_DISPATCH_SORT_MIN`、既定 16)。
+
+    段 P11-a。decode 1 step の Metal trace (2026-09-03 18:45) で、**短
+    (S=3) の `carg_block_sort_uint32` が 96 本 x 24.2 us = 2.32 ms/round
+    (全体の 6%)** だった。96 = 48 層 x 2 で、`SL._gather_sort` の
+    `argsort(indices)` と `argsort(order)` そのもの。
+
+    閾値は `indices.size` (= 行数 x top_k、top_k=10) に掛かるので、
+    S=1 は 10 < 16 でもともとソートされず、S=3 (30) から発火する。
+    512 人のエキスパートに対して 30 行しかない decode 幅では、同じ
+    エキスパートを引く行はまず隣り合わないので、**ソートの狙い
+    (重みタイルの再利用) が成立しない**というのが仮説。
+
+    variants は閾値そのもの。`16` が本番の既定 (`MLXTURBO_SORT_MIN`)、
+    `128` は行数 11 以下 (= decode / verify 幅) でだけソートを止める値
+    (prefill のチャンク幅 512〜2048 行は 5000 を超えるので変わらない)。
+    `MLXTURBO_SORT_MIN` は読み込み時にしか読まれないので、env ではなく
+    `fused` のモジュール属性を直接動かす (`wide` knob と同じ流儀)。
+
+    並べ替えて戻すだけなので値は不変のはず (`control_identical=True`)。
+    ただし `sorted_indices` の真偽で `gather_qmm` が別のカーネル変種を
+    選ぶ余地はあるので、**一致しなければそれ自体が報告事項**。
+
+    **`--prefill-once` は使えない** (`DECODE_ONLY_KNOBS` に入れない):
+    checkpoint 無しの経路は末尾チャンクを n-1 + 1 に割るので、n-1 が
+    2〜11 行になるプロンプトでは prefill 側も 1 チャンクだけ経路が変わる。
+    実害は無いに等しいが「prefill 幅で 1 op も変わらない」とは言えない。
+    """
+    from mlxturbo import fused
+
+    def apply(variant):
+        fused._MOE_DISPATCH_SORT_MIN = int(variant)
+
+    return apply
+
+
+def _knob_glue_compile(ctx):
+    """A = silu 系の 2〜3 op を `mx.compile` で畳む / B = 素 (既定)。
+
+    段 P11-c。trace の depth 0 で `v_Sigmoid` 289 x 3.8 us = 1.09 ms、
+    `vv_Multiply` 257 x 5.3 = 1.36 ms。その多くが
+    ``x * sigmoid(x)`` (silu) と ``silu(gate) * x`` (swiglu) という、
+    同じ形の elementwise が 2〜3 本並ぶだけの糊。`mx.compile` は
+    **MLX 本体の融合**なので、decode 幅の自前カーネルが冷 DRAM で負ける
+    筋 (HC 3 変種 / MOE_GLU / moe_verify / gdn_prework) には当たらない。
+
+    畳む先は `fused.enable_glue_compile` の docstring を参照 (nn.silu /
+    swiglu / shared expert の MLP)。演算の順序は素と同じなので
+    **出力はビット一致するはず** (`control_identical=True`)。
+
+    prefill 幅にも同じ関数が掛かる (形が違うだけ) ので
+    `DECODE_ONLY_KNOBS` には入れない。
+    """
+    from mlxturbo import fused
+
+    def apply(variant):
+        fused.disable_glue_compile()
+        if variant == "A":
+            fused.enable_glue_compile()
+
+    return apply
+
+
+def _knob_moe_combine(ctx):
+    """MoE の top_k 合成の書き方。A = mx.compile / C = matmul / B = 素 (既定)。
+
+    段 P11-d。素は ``(switch_mlp(x, idx) * w[..., None]).sum(-2)`` で、
+    bf16 の (rows, top_k, 2560) と fp32 のルータ重みが混ざるため
+    **fp32 の (top_k, 2560) を丸ごと実体化する** `Broadcast strided`
+    (trace の depth 0 で 96 x 10 us = 0.96 ms/round) が出る。
+
+    A は式をそのまま `mx.compile` に通すだけ (broadcast + 乗算が 1 本に
+    なる、ビット一致するはず)。C は同じものを長さ 10 の内積と見て
+    matmul 1 本にする (総和が matmul 側に移るのでビット一致しない --- A が
+    負けて C が勝ったときだけ KLD を見る話になる)。
+
+    3 変種のうち A だけがビット一致するはずなので、対照は要求しない
+    (`control_identical=False`)。**A と B の head が食い違ったらそれ自体が
+    報告事項** (要約の head 比較ではなく、A/B/C の JSON を見て確かめる)。
+
+    行数 >= 64 の prefill 幅は `_moe_combine_fold` 側に落ちるのでこの
+    書き換えは通らないが、fold が off の構成では prefill も通る。
+    `DECODE_ONLY_KNOBS` には入れない。
+    """
+    from mlxturbo import fused
+
+    def apply(variant):
+        fused.disable_moe_combine_glue()
+        if variant == "A":
+            fused.enable_moe_combine_glue(1)
+        elif variant == "C":
+            fused.enable_moe_combine_glue(2)
+
+    return apply
+
+
+def _knob_wide_decode(ctx):
+    """A = attention の連結射影を decode 幅にも掛ける / B = 素 (既定)。
+
+    段 P11-e。`wide-attn` knob は `_wide_min_rows` (既定 64) のせいで
+    prefill 幅しか動かさない。ここは同じ連結を `_wide_min_rows=1` で
+    仕込み、**decode / verify 幅 (行数 1〜4) の qkv 射影 3 本を 1 本に
+    まとめる**。過去に `wide` が負けた記録は 4 種まとめて (experts の
+    gather 連結込み) のもので、しかも位置 1 の段差 (burn-in 無し) が
+    入っていた疑いがある。ここは attn だけに絞り、burn-in 込みで測り直す。
+
+    連結は「同じ入力に掛かる量子化行列を出力次元で連結するだけ」なので
+    出力は一致するはず (`control_identical=True`、`wide-attn` と同じ根拠)。
+    qmv のカーネル変種が N で変わるため崩れる可能性はあり、崩れたら
+    それ自体が報告事項。
+    """
+    import os
+
+    from mlxturbo import fused
+
+    eng = ctx["eng"]
+    applied = {"on": False}
+
+    def apply(variant):
+        if variant == "A" and not applied["on"]:
+            os.environ["MLXTURBO_WIDE_MIN_ROWS"] = "1"
+            fused.enable_wide_projections(eng.model, scope={"attn"})
+            os.environ.pop("MLXTURBO_WIDE_MIN_ROWS", None)
+            applied["on"] = True
+        elif variant == "B" and applied["on"]:
+            fused.disable_wide_projections(eng.model)
+            applied["on"] = False
+
+    return apply
+
 
 def _knob_null(ctx):
     """A も B も**何もしない**。ハーネス自身のばらつきを測るための対照。
@@ -1165,6 +1296,52 @@ def _knob_prefill_group(ctx):
 
     def apply(variant):
         SF._PREFILL_GROUP = int(variant)
+
+    return apply
+
+
+def _knob_prefill_width(ctx):
+    """非 MoE 部分のチャンク幅 W だけを振る (P9 チャンク 8192 の取り分の上限)。
+
+    `spec_flash.PREFILL_STEP_SIZE` を W にし、同時に `_PREFILL_GROUP` を
+    `16384 // W` に上げる。どちらもモジュール属性で、prefill のチャンクループ
+    (`generate_stream`) は毎回そこから読み直すので 1 プロセス内で振れる。
+
+    **狙い: MoE の行数を固定したまま、チャンクの個数だけを変える。**8k の
+    プロンプト (n≈8000) では、どの W でも「先頭から n-1 行が 1 グループ、
+    末尾 1 トークンだけ chunk 主導」という同じ割り方になる (`_PREFILL_GROUP`
+    を上げてあるので g が上限で頭打ちにならない)。`_group_prefill_forward`
+    は MoE をグループ全体で 1 回しか呼ばないので、**MoE は W によらず
+    M=n-1 の 1 回**。境界の同期 (`mx.eval` + `clear_cache`) もグループに
+    1 回で W によらない。変わるのは非 MoE (attention / indexer / GDN /
+    HC / norm / PLE) を何個に割って流すかだけ:
+
+        W=2048 → 4 個 (本番の既定)   W=1024 → 8 個   W=512 → 16 個
+
+    P5 の sdpa 行タイル (既定 256) が入っているので、attention のスコア
+    FLOP は W によらず同じ (行タイルが前方の K/V だけを見るので、
+    2048 幅 4 個でも 8192 幅 1 個でも三角の面積は一致する。
+    `docs/research/IDEAS-2026-09-03.md` の K1 メモ)。**したがって W の差は
+    「チャンク 1 個あたりの固定費」だけを映す。**
+
+    読み方: 非 MoE の時間を `T(k) = A + B*k` (k = チャンク個数) と置くと、
+    測れる差 T(16)-T(8) = 8B、T(8)-T(4) = 4B。P9 (W=8192, k=1) の取り分は
+    T(4)-T(1) = 3B なので、**P9 の非 MoE 側の取り分 ≈ 0.75 × (W を 1024 から
+    2048 に上げたときの短縮)**。B が W で一定でない (小さい W ほど 1 個
+    あたりが重い) なら測った B は過大評価になるので、この見積もりは上限。
+
+    **8k 専用の knob。**--ctx を上げると 1 グループが n-1 行まで太り、MoE の
+    行数まで本番と変わる (17k で M=17000)。使うのは `--only long --ctx 8000
+    --tokens 8`。判定は **prefill_s** だけ。チャンク割りが変わるので量子化
+    行列積の丸めが動き、出力は一致しない (`control_identical=False`、
+    `docs/research/PREFILL-CHUNKING-DETERMINISM.md`)。
+    """
+    import mlxturbo.spec_flash as SF
+
+    def apply(variant):
+        w = int(variant)
+        SF.PREFILL_STEP_SIZE = w
+        SF._PREFILL_GROUP = 16384 // w
 
     return apply
 
@@ -1977,6 +2154,64 @@ def _knob_moe_mix48(ctx):
     return apply
 
 
+def _knob_moe_down_epi(ctx):
+    """P7 第 2 段。MoE の「行列積以外」を GEMM の口に畳む。
+
+    A = combine + x gather 畳み (gate/up が `row_src[行]` 経由で x を読む) /
+    B = combine だけ (down は現行のまま。その後ろの「unsort の gather +
+        ルータ重み + top_k の和」を 1 カーネルに畳む、
+        `kernels/moe_combine.py`) /
+    C = 現行の既定 (x を gather -> `(act*w)` を実体化 -> down GEMM ->
+        `out[inv_order]` -> `sum`)
+
+    畳める費用 (`bench/results/moe-split.json`、層 20、M=2048、ms/層):
+    weight_mul_cast 0.87 + unsort_sum 1.07 + (A だけ) gather 0.49。
+    ルータ重みは down_proj が線形なので前でも後でも同じ値になる --
+    combine は「後で掛ける」ことで unsort の読みに相乗りさせ、往復をゼロに
+    する。
+
+    micro (本番の形、M=16384、E=512、`scratchpad/verify_moe_down_epi.py`、
+    2026-09-03): down 側 -0.98 ms/層 (6.63 -> 5.65)、gather 畳み -0.56 ms/層
+    (11.35 -> 10.79)。down の store に畳む変種 (`mode="epi"`) は -0.97 で
+    combine と同着なので、down GEMM を触らない combine を既定候補にした。
+
+    in-model 8k (`bench/results/moe-down-epi-8k.json`、長文脈 3 本 x 回文、
+    1 プロセス): prefill_s **A -3.8%** (12.433) / B -1.7% (12.705) /
+    C 12.919。6 本すべてで A < C、tok/round は 3 変種とも 2.667、head も
+    3 変種で完全一致 (対照 OK)。17k (`moe-down-epi-17k.json`) は
+    **A -4.1%** (28.228) / B -3.3% (28.462) / C 29.430、decode +0.4% (揺れ)。
+
+    17k は 3 本中 1 本で head が C と分かれる (A と B は完全一致)。丸めが
+    2 回減るぶんの差で、**分かれた先は厳密解に近い側**
+    (`scratchpad/accuracy_check.py`: fp32 参照に対する平均絶対誤差が
+    現行 1.28e-3 -> combine 7.14e-4、最大も 3.09e-2 -> 1.37e-2)。
+
+    `enable_moe_grouped_gemm(mode="seg")` が有効なときだけ発火する
+    (フックが gate/up/down を自前カーネルで通すため)。行数ゲートは P3 と
+    同じ (`MLXTURBO_MOE_GEMM_MIN_ROWS`=1024) なので decode/verify 幅は
+    1 op も変わらない。
+
+    **C とはビット一致しない** (`control_identical=False`): 現行は `(act*w)`
+    を bf16 に丸めてから down GEMM に入れるが、A / B は fp32 の累算器に w を
+    掛けて 1 回だけ丸めるので、丸めが 1 回減る (exact に近い側にずれる)。
+    合成での実測は 1〜2 ulp (相対 4.3e-3)。**A と B は互いにビット一致する**
+    (`row_src` は読む値を変えないため、合成で確認済み)。
+
+    判定は **prefill_s** (8k で -2% 以上なら既定に入れる)。
+    """
+    from mlxturbo import fused
+
+    def apply(variant):
+        if variant == "A":
+            fused.enable_moe_down_epilogue(mode="combine", gather_fold=True)
+        elif variant == "B":
+            fused.enable_moe_down_epilogue(mode="combine", gather_fold=False)
+        else:
+            fused.disable_moe_down_epilogue()
+
+    return apply
+
+
 def _knob_qmm_wide(ctx):
     """P10 BM=64 の dense qmm。prefill 幅の dense 射影だけを差し替える。
 
@@ -2057,7 +2292,14 @@ def _knob_stub_draft(ctx):
     orig_chain = FlashSpecEngine._draft_chain
     orig_prime = FlashSpecEngine._prime_accepted_gap
 
-    def stub_chain(self, cur, hyper_prev, cache, depth, trace_top2=False):
+    def stub_chain(self, cur, hyper_prev, cache, depth, trace_top2=False,
+                   first=None):
+        # `first` (案 D1 = `MLXTURBO_DRAFT_PRESYNC`、既定 off) は呼び手の
+        # `_presync_step0` が先に計算・同期した 1 段目。この knob は MTP を
+        # 一切呼ばないので受け取っても捨てる。D1 有効時は step 0 の費用が
+        # `_presync_step0` 側に移っているぶん天井が緩むが、そのときは呼び手
+        # 自身が `trim_attn_cache(mtp_cache, presync[0] + len(toks))` まで
+        # やるので、キャッシュの整合性は保たれる。
         return [cur for _ in range(depth)]
 
     def stub_prime(self, toks, hypers, cache):
@@ -2399,18 +2641,27 @@ def _knob_oracle_draft(ctx):
         state["pos"] = 0
         state["fresh"] = False
 
-    def stub_chain(self, cur, hyper_prev, cache, depth, trace_top2=False):
+    def stub_chain(self, cur, hyper_prev, cache, depth, trace_top2=False,
+                   first=None):
         if state["fresh"]:
             _resolve()
-        # cur 自身の MTP キャッシュ書き込みだけは本物 (素の _draft_chain の
-        # step 0 と同じ形)。予測結果は使わず捨てる -- docstring 参照。
-        Q = spec_flash._arch()
-        keep = cache.size() + 1
-        emb = self.model.model.embed_tokens(cur)
-        mask = Q.create_attention_mask(emb, None)
-        x = self.mtp.combine(emb, hyper_prev)
-        self.mtp.layers[0](x, self.rope, mask, None, cache, cache.indexer, None, None)
-        trim_attn_cache(cache, keep)
+        if first is None:
+            # cur 自身の MTP キャッシュ書き込みだけは本物 (素の _draft_chain
+            # の step 0 と同じ形)。予測結果は使わず捨てる -- docstring 参照。
+            Q = spec_flash._arch()
+            keep = cache.size() + 1
+            emb = self.model.model.embed_tokens(cur)
+            mask = Q.create_attention_mask(emb, None)
+            x = self.mtp.combine(emb, hyper_prev)
+            self.mtp.layers[0](
+                x, self.rope, mask, None, cache, cache.indexer, None, None)
+            trim_attn_cache(cache, keep)
+        # `first` (案 D1 = `MLXTURBO_DRAFT_PRESYNC`、既定 off) があるときは
+        # `_presync_step0` が同じ (embed(cur), hyper_prev) の行を既に積んで
+        # あり、trim も呼び手がやる (素の `_draft_chain` が first のとき
+        # step 0 を丸ごと飛ばし keep に +1 しないのと同じ)。ここで書き足すと
+        # 二重になるので何もしない。draft の中身は first[0] ではなく oracle
+        # の値で上書きする -- この knob の目的そのものなので。
 
         seq = state["seq"]
         pos = state["pos"]
@@ -2457,10 +2708,11 @@ def _knob_qsa_decode_kernel(ctx):
     写しなので、両者は正しく食い違う。17k は B が密のマスク経路なので一致
     するはずで、そこで食い違ったら本物の不一致。
 
-    **両側を `MLXTURBO_QSA_TAIL=query` にして走らせること。**K2b が写した
-    参照は HF と同じ per-query tail 1 本だけで、global tail (現在の既定) では
-    A 側が 1 回も発火しない。プロセスの環境変数で決まるので、この knob は
-    tail を切り替えない (速度だけを見る)。
+    **`MLXTURBO_QSA_TAIL=query` が要る** (2026-09-03 の commit 11790ee で
+    既定になったので通常は何もしなくてよい)。K2b が写した参照は HF と同じ
+    per-query tail 1 本だけで、旧既定の global tail では A 側が 1 回も
+    発火しない。tail はプロセスの環境変数で決まるので、この knob は
+    そちらを切り替えない (速度だけを見る)。
 
     可視集合は A/B で同じ (どちらも query tail の top-k) なので、
     `_decode_qsa_forward` の適格判定は `S <= 8` と `B == 1` を要求する ---
@@ -2505,6 +2757,19 @@ KNOBS = {
     "hc-write": (_knob_hc_write, ["A", "C", "B"], True, "B"),
     "rms-norm-gated": (_knob_rms_norm_gated, ["A", "C", "B"], True, "B"),
     "moe-route": (_knob_moe_route, ["A", "C", "B"], False, "B"),
+    # 段 P11-a。閾値そのものが variant。16 が本番の既定、128 は decode /
+    # verify 幅 (行数 <= 11) だけソートを止める。並べ替えて戻すだけなので
+    # ビット一致するはず (control_identical=True)。判定は ms/round
+    "moe-sort-min": (_knob_moe_sort_min, ["128", "16"], True, "16"),
+    # 段 P11-c。A = silu/swiglu を mx.compile で畳む / B = 素 (既定)。
+    # 式も順序も素のままなのでビット一致するはず。判定は ms/round
+    "glue-compile": (_knob_glue_compile, ["A", "B"], True, "B"),
+    # 段 P11-d。A = compile (ビット一致するはず) / C = matmul (しない) /
+    # B = 素 (既定)。C があるので対照は要求しない。判定は ms/round
+    "moe-combine-glue": (_knob_moe_combine, ["A", "C", "B"], False, "B"),
+    # 段 P11-e。A = attn の連結射影を decode 幅にも (min_rows=1) / B = 素。
+    # 連結は出力次元をつなぐだけなのでビット一致するはず。判定は ms/round
+    "wide-decode": (_knob_wide_decode, ["A", "B"], True, "B"),
     "hc-prefill": (_knob_hc_prefill, ["A", "C", "B"], False, "C"),
     "hc-kernel": (_knob_hc_kernel, ["A", "B"], False, "B"),
     # A = elementwise だけ畳む第 4 変種 / B = 本番既定の融合カーネル。
@@ -2526,6 +2791,9 @@ KNOBS = {
     "indexer-lean": (_knob_indexer_lean, ["A", "B"], True, "B"),
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),
     "prefill-group": (_knob_prefill_group, ["2", "4", "8"], True, "4"),
+    # 段 P9 の取り分の上限。MoE の行数を固定したままチャンク個数だけ振る
+    # (8k 専用、--only long --ctx 8000)。判定は prefill_s
+    "prefill-width": (_knob_prefill_width, ["512", "1024", "2048"], False, "2048"),
     "prefill-pipeline": (_knob_prefill_pipeline, ["A", "B"], True, "B"),
     "fold-tail": (_knob_fold_tail, ["A", "B"], True, "A"),
     "tail-in-group": (_knob_tail_in_group, ["A", "B"], True, "B"),
@@ -2567,6 +2835,9 @@ KNOBS = {
     # 基準は C (今の本番の既定。seg32 は既定に入っていない)。ビット一致のはず。
     # 判定は prefill_s
     "moe-mix48": (_knob_moe_mix48, ["A", "B", "C"], True, "C"),
+    # 段 P7 第 2 段。A = combine カーネル + x gather 畳み / B = combine だけ /
+    # C = 現行の既定。丸めが 1 回減るので出力は C と一致しない。判定は prefill_s
+    "moe-down-epi": (_knob_moe_down_epi, ["A", "B", "C"], False, "C"),
     # 段 P10。A = BM=64 の自前 dense qmm / B = 素 (既定)。ビット一致のはず。
     # 判定は prefill_s
     "qmm-wide": (_knob_qmm_wide, ["A", "B"], True, "B"),
