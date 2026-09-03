@@ -1484,6 +1484,18 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
             print(f"{log_prefix} prefill attention 融合カーネル有効"
                   f" (段 P1、{n} 層、MLXTURBO_PREFILL_ATTN=1)")
 
+        # 2026-09-03 (段 P5): head_dim 256 の sdpa は MLX の fallback でタイルを
+        # 飛ばさないので、dense 経路 (kv < MLXTURBO_PREFILL_ATTN_MIN_KV) の q を
+        # 256 行ずつに割って前方の K/V だけを渡す。現チャンクの上三角ぶんを回収
+        # (4k -1.1% / 8k -1.2% / 17k -1.0%、micro は max|diff| 0)。
+        # enable_sdpa_rowtile 自身が MLXTURBO_SDPA_ROWTILE (未設定 = 256、
+        # =0 で off) を読むので、ここでは呼ぶだけ。decode/verify 幅 (S < 64) は
+        # 常に素の sdpa に落ちる。
+        fused.enable_sdpa_rowtile(model)
+        _rt = os.environ.get("MLXTURBO_SDPA_ROWTILE", "256")
+        if _rt not in ("0", ""):
+            print(f"{log_prefix} sdpa 行タイル有効 (段 P5、R={_rt}、MLXTURBO_SDPA_ROWTILE=0 で off)")
+
         # QK-norm 後の rope (cos/sin 生成 + _rope_partial x2) を mx.fast.rope
         # 1 dispatch x2 (q/k) に畳む。enable_fast_rope 自身が MLXTURBO_FAST_ROPE=1
         # をゲートに持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。

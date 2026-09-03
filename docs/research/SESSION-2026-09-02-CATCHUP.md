@@ -1864,3 +1864,11 @@ kv が大きいほど取り分が縮む (8k では R512 が最良で -2.0 ms)。
 
 P5 の 17k (10:13): prefill_s A 28.95 / B 29.25 (-1.0%)、tok/round 同一。4k -1.1% / 8k -1.2% / 17k -1.0% で揃った。micro では max|diff| 0。
 発火確認 (trace 付き再走) と runner への配線が済んだら既定 on にし、`quant_eval.py compare --fusions` で KLD を 1 回取る。
+
+### 2026-09-03 10:30 P6 T=1 gather カーネルの段階 load を uint4 化 (`prefill_attn_v2.py`、`qsa_gather_micro.py --variants d`)
+
+kv=16896、S=2048、清浄な 3 プロセス × 9 反復の中央値: load 36.9 → 25.5 ms (-31%、DRAM 床 21.5 の 1.19 倍)、フル 56.4 → 40.8 ms/層 (-27.6%)。
+kv 6k〜17k で uint4 版は約 41 ms 平坦、6 点全部で現行とビット一致。dense (-2.86 + 5.51·kv/1000 ms/層) との交差点は 10.8k → 8.1k。
+判定線 (load < 30 ms) 通過。本番 `prefill_attn.py` への移植は 3 箇所 (threadgroup の uint4 宣言、列主体の load ループ、整列ガード)。
+発火下限 `MLXTURBO_PREFILL_ATTN_MIN_KV` 12288 → 8192 に下げる場合は kv 8k〜12k の課題正答率ゲートを取り直す。
+汚れたプロセス (98 GB ジョブの直後) は load が逆に遅く出た。部品の引き算は帰属が壊れるのでフルの数字だけ信じる。
