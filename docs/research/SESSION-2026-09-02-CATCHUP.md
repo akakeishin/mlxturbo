@@ -2246,3 +2246,11 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 ### 2026-09-03 18:21 K2c 50k (`qsa-decode-kernel-50k.json`、両側 query、512 トークン): ms/round **-4.3%**、ms/tok -5.0%、tok/round +0.8%。既定 on を裏付け
 
 対照 NG (case 0) は想定内: 50k では B 側が `_gather_tile_attn` を通り dense sdpa とビット一致しない (knob の docstring に記載)。A (K2c) は dense 意味論の並びと一致する側。
+
+### 2026-09-03 18:35 P7 第 2 段の 8k (`moe-down-epi-8k.json`、1 プロセス、3 本 × 回文): **A (combine + x gather 畳み) -4.1%、head 一致 → 既定へ**。oracle の再走は無効
+
+- A 12.40 / B (combine だけ) 12.62 / C (現行: x gather → (act·w) 実体化 → down GEMM → unsort gather + 和) 12.93 s。head は A/B/C で 6 本とも一致。発火 moe_combine 48。
+- 仕組み (`kernels/moe_combine.py`、`fused.enable_moe_down_epilogue`): down の後ろの「unsort の gather + ルータ重み + top_k の和」を 1 カーネルに畳み、ルータ重みを down の後で掛けるので `(act·w)` の実体化 (126 MB 往復) も消える。
+  x の gather も gate/up GEMM の行の読み方 (`row_src`) に畳む (micro では負けたが in-model では A > B)。丸めが 1 回減るので素より exact に近い側 (ビット一致はしないが head 一致)。
+- 既定: `MLXTURBO_MOE_DOWN_EPI=combine` + `MLXTURBO_MOE_GATHER_FOLD=1` (runner への配線と 17k の確認は P7 のエージェントが続行)。
+- **oracle-draft の再走は無効**: variant 2 / 6 の tok/round がどちらも 1.067 で draft が受理されていない (ms/round 36.2 / 57.4)。stub の `first=` の扱いか saveout の位置合わせ。差し戻し。
