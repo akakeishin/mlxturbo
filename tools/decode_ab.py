@@ -2819,7 +2819,8 @@ def main() -> int:
                 # ms/token は ms/round と tok/round の比なので、**費用と受理が
                 # 混ざる**。出力が変わりうる knob では ms/round を見ないと、
                 # テキスト運による受理の増減を実装の速さと取り違える
-                rows.append(dict(kind=kind, ctx=n, variant=v, n_out=len(out),
+                rows.append(dict(kind=kind, ctx=n, case_idx=case_idx, variant=v,
+                                 n_out=len(out),
                                  prefill_s=tp, decode_s=td, ms_per_tok=ms,
                                  ms_per_round=td / max(rounds, 1) * 1000,
                                  accepted=acc, rounds=rounds, tok_per_round=tpr,
@@ -2933,16 +2934,19 @@ def main() -> int:
             # 対照: 同じ (kind, ctx) の行は A と B で出力 (head) が完全一致するはず。
             # 以前は短文脈だけを見ていたので `--only long` では無検査のまま
             # 「対照 OK」が出ていた (2026-09-03 に発覚)。長文脈も含めて見る。
+            # (kind, ctx) でまとめると、長さがたまたま同じ別プロンプト同士を
+            # 突き合わせて偽の NG が出る (long 3 本のうち 2 本が 3873 トークン、
+            # 2026-09-03 の tail-in-group で発覚)。ケース番号でまとめる。
             n_checked = 0
-            for kc in sorted({(r["kind"], r["ctx"]) for r in rows}):
-                sub = [r for r in rows if (r["kind"], r["ctx"]) == kc]
+            for kc in sorted({(r["kind"], r["case_idx"]) for r in rows}):
+                sub = [r for r in rows if (r["kind"], r["case_idx"]) == kc]
                 n_checked += 1
                 if len({tuple(r["head"]) for r in sub}) != 1:
                     ok = False
-                    print(f"  対照 NG: {kc[0]} ctx={kc[1]} で条件間の出力が食い違う"
-                          " (一致するはずの領域。測定は無効)")
+                    print(f"  対照 NG: {kc[0]} case={kc[1]} ctx={sub[0]['ctx']} で"
+                          "条件間の出力が食い違う (一致するはずの領域。測定は無効)")
             if ok:
-                print(f"  対照 OK: {n_checked} 組の (kind, ctx) で条件間の出力が一致")
+                print(f"  対照 OK: {n_checked} ケースで条件間の出力が一致")
 
         if args.out:
             # --knobs で複数回したときは basename に -<knob> を足す
