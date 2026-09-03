@@ -1921,3 +1921,16 @@ MLX の `sum(axis=-1)` は 0.0 起点の逐次和 (木状ではない)、argpart
 時間 (us/呼び出し、まとめ eval の GPU 実働 / 1 本ずつの露出レイテンシ): 17k S=2 13.4 / 31.5 (argpartition 73.2 / 127.6)、S=6 14.0 / 30.8、50k S=2 14.7 / 51.6 (常駐上限 6400 ブロック超でキー再読み)。
 判定線 (17k S=2 ≤ 30 us) 通過。**K2b (2-pass vector の写し + 常駐ビットマップ + per-query tail) に進む。**
 配線の口: `_pooled_and_top` を einsum (466 行) と `mx.maximum` (467 行) の間で `_block_scores` / `_select` に割り、`select_kernel` を別メソッドで足す。`n_vis` は `visible_counts_host` (Python だけ) で作る。
+
+### 2026-09-03 12:00 custom kernel が decode の in-model で負ける理由 (確定、`tools/custom_kernel_overhead_micro.py`、`--knob hc-kernel-stage`)
+
+- CPU 側 (H1) は棄却: 構築費は融合 11.1 us 対 素 16.4 us で**融合の方が安い** (source 8 KB のコピーやハッシュは 1〜2 us)。
+- 段階投入との相性 (H3) は棄却: 2×2 で負け幅は段階投入あり +8.17 ms、完全直列 +7.16 ms (直列で縮む = 構築は負けの原因ではない)。
+- command buffer 分断 (H2)、非連続入力のコピー (H4、差 1〜2%、本番の入力は連続)、出力割り当て (H5) も余地なし。
+- **正体: 連鎖 micro が重み 1 組 (3〜7 MB) を 200 回読む温キャッシュだった。** 重みを 48 組 (157 MB) 巡回させると、素の op 列は 68 → 62.5 us で不変、
+  融合カーネルは 81 → 140.8 us (+74%)。差 78 us × 97 層 = +7.6 ms/forward で in-model の +8.2 ms を全量説明。
+  融合カーネルは threadgroup と lane の並列度が足りず (hc_pre は grid.y=20、hc_post は 32 lane 中 10 本、その後 1 lane の逐次)、DRAM レイテンシを隠せない。
+  MLX の qmv は行ごとに threadgroup を立ててベクトル load するので隠せる。
+- **一般化**: decode 幅 (S=1) で qmv / qmm を自前カーネルに置き換える筋は構造的に不利 (moe_glu、moe_route、HC 融合、moe_verify の敗北は全部同じ形)。
+  自前カーネルの勝ちは全部 prefill 幅。**判定ゲートは「重みを 100 MB 超巡回させた冷の連鎖」に移す** (温の連鎖で速くても採用しない)。
+- HC の現実線: 融合で勝つには冷で 2.25 倍の改善が要る (lane 占有と threadgroup 数)。見込みは 4.7 → 4 ms 級 (-0.5〜-1 ms)。「HC で -2.5 ms」の前提は下方修正。
