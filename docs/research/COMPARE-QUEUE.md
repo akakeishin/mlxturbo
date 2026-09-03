@@ -218,3 +218,143 @@ MTPLX は Apache-2.0 + NOTICE。`tools/compare/mtplx-venv/` は pip 経由のイ
 「使った」と主張・公開する場合は NOTICE の attribution 要求
 （"Powered by MTPLX" の表示）を満たす必要がある — これは配布物側の話で、
 このリポジトリのコードには影響しない。
+
+---
+
+# 27B の 5 者の起動コマンドと状態 (2026-09-04)
+
+対象は **同じ重み**: `~/models/qwen38-27b-4bit` (mlx-community の Qwen3.8-27B 4bit、
+dense・64 層・hidden 5120・head_dim 256・vocab 248320) と MTP サイドカー
+`~/models/qwen38-27b-mtp` (同 MTP-4bit、238 MB)。計測は `bench/bench_http_engine.py`
+(新規) で 5 者とも同じ経路 (OpenAI 互換 SSE、`bench/vs_mlx_serve.py` の `stream_once`)。
+
+## ハーネスの使い方
+
+```bash
+BIGLOCK_NO_WORKER=1 tools/biglock.sh .venv/bin/python bench/bench_http_engine.py \
+    --engine <名前> --port <N> \
+    --tokenizer ~/models/qwen38-27b-4bit \
+    --argv '<サーバーの起動コマンド 1 行>' \
+    --thinking-how {reasoning_effort,chat_template_kwargs,prompt,none} \
+    --ctxs 0,4000 --tokens 64 --reps 1 \
+    --server-log scratchpad/log-<名前>.txt \
+    --out bench/results/smoke-27b-<名前>-0904.json
+```
+
+行の形は `bench/self_snapshot.py` と同じ (`ctx` / `cold_ttft` / `warm_ttft` /
+`decode_tps` / `n_tokens` / `colds` / `warms` / `decs` / `ntoks` / `prompts`)。
+`--model-id` は `/v1/models` の名乗りを使わずに送る id を固定するためのもの
+(mlx-lm と oMLX で要る、下記)。
+
+**`n_tokens` はチャンク数ではなく本文をトークナイザで数え直した値。**
+oMLX は 1 チャンクに 4 トークンほど詰めて流すので、チャンクで割ると decode が
+1/4 に見える (64 トークンが 16 チャンク)。チャンク基準の値も
+`decode_tps_chunks` / `n_chunks` に残してあるので、1 チャンク = 1 トークンの
+エンジンでは両者の一致を突き合わせに使える。
+
+## 5 者の起動コマンドと状態
+
+| エンジン | 起動 | 投機 (MTP) | 証拠 |
+|---|---|---|---|
+| mlxturbo | OK | **効く** | `投機デコード有効 (MTP: あり / lookup: 有効)`、`tok/step=2.33〜3.50` |
+| mlx-lm 0.31.3 | OK | 無し | `qwen3_5_mtp` を読めない (`--draft-model` は別モデル用) |
+| oMLX 0.6.4 | OK | **効く** | `VLM MTP enabled for qwen38-27b-4bit, drafter=qwen38-27b-mtp`、`tokens_per_round=1.75` |
+| MTPLX 2.9.2 | OK | 無し (AR) | quickstart が自分で `--depth 0 --generation-mode ar --no-load-mtp` を選ぶ |
+| mlx-serve 26.9.1-dev | OK | 無し (PLD のみ) | `[mtp] no head found: ... — MTP off` |
+
+```bash
+# 1) mlxturbo  (port 8151)
+.venv/bin/python -m mlxturbo.server --model ~/models/qwen38-27b-4bit \
+    --mtp ~/models/qwen38-27b-mtp --host 127.0.0.1 --port 8151
+# thinking: --thinking-how reasoning_effort ("none" が enable_thinking=False に落ちる)
+
+# 2) mlx-lm  (port 8152)
+.venv/bin/mlx_lm.server --model ~/models/qwen38-27b-4bit --host 127.0.0.1 --port 8152
+# thinking: --thinking-how chat_template_kwargs (server.py:547 が per-request で読む)
+# **--model-id ~/models/qwen38-27b-4bit が要る。** mlx_lm.server の /v1/models は
+# HF キャッシュのモデルを全部並べるので、名乗りの先頭を拾うと別モデル (gemma-4-12B) を
+# 取りに行って 404 になる。HF_HUB_OFFLINE=1 も付けること。
+
+# 3) oMLX  (port 8153)
+omlx serve --model-dir ~/models/omlx-27b --host 127.0.0.1 --port 8153 \
+    --no-hf-cache --log-level info
+# --model-dir は 27B と mtp だけを symlink した専用ディレクトリ:
+#   ~/models/omlx-27b/qwen38-27b-4bit -> ~/models/qwen38-27b-4bit
+#   ~/models/omlx-27b/qwen38-27b-mtp  -> ~/models/qwen38-27b-mtp
+# --no-hf-cache が無いと HF キャッシュの他モデルも並ぶ。--model-id qwen38-27b-4bit。
+# thinking: --thinking-how chat_template_kwargs
+
+# 4) MTPLX  (port 8154) -- quickstart --dry-run --json が吐く server_command をそのまま使う
+tools/compare/mtplx-venv/bin/python -m mtplx.server.openai \
+    --model ~/models/qwen38-27b-4bit --backend-id qwen3_next --host 127.0.0.1 --port 8154 \
+    --depth 0 --generation-mode ar --profile sustained ... --no-load-mtp ...
+# thinking: --thinking-how chat_template_kwargs (openai.py:24563 が読む)
+
+# 5) mlx-serve  (port 8155)
+~/dev/mlx-serve/zig-out/bin/mlx-serve --serve --model ~/models/mlxserve-27b \
+    --host 127.0.0.1 --port 8155 --mtp --log-level debug
+# --model は 27B の各ファイルを symlink し、mtp.safetensors を足した専用ディレクトリ:
+#   ~/models/mlxserve-27b/* -> ~/models/qwen38-27b-4bit/*
+#   ~/models/mlxserve-27b/mtp.safetensors -> ~/models/qwen38-27b-mtp/model.safetensors
+# thinking: --thinking-how reasoning_effort
+```
+
+## MTP のペア付け
+
+- **oMLX**: CLI ではなく `~/.omlx/model_settings.json` (無ければ新規作成)。
+  **サーバー起動前に書くこと** — 設定は起動時にメモリへ読み込まれる。
+  ```json
+  {"version": 1, "models": {"qwen38-27b-4bit": {
+      "vlm_mtp_enabled": true, "vlm_mtp_draft_model": "qwen38-27b-mtp"}}}
+  ```
+  admin の `PUT /admin/api/models/{id}/settings` でも同じ場所に書けるが、
+  セッション cookie 認証が要る (`omlx/admin/auth.py:257`)。
+  ドラフタは `qwen3_5_mtp` として自動判別され (`mlx_vlm.speculative.drafters`)、
+  失敗しても警告だけで本体は起動する (fail-soft) ので、**ログを見ないと
+  効いていないことに気付けない。**
+- **mlx-serve**: **今の構成では MTP が付かない。**サイドカーのキーが接頭辞なし
+  (`fc.weight` / `layers.0.*` / `pre_fc_norm_*`) で、mlx-serve の marker gate
+  (`src/mtp.zig:926`) が探すのは `mtp.fc.weight` / `language_model.mtp.fc.weight` /
+  `mtp.eh_proj.weight`。ログは
+  `skipping mtp.safetensors: not named by model.safetensors.index.json` と
+  `[mtp] no head found: no mtp/ sidecar and no [language_model.]mtp.* keys resolvable
+  from the index — MTP off`。
+  量子化サイドカー自体は受け付ける設計 (`loadLinear` が `<prefix>.{weight,scales,biases}`
+  を読み、bits/group_size を scales の形から導く。`src/mtp.zig:395-410`)。
+  **足りないのはキーの接頭辞だけ**なので、`mtp.` を付けた写しを作れば通る見込み。
+  作るかどうか (同じ重みの比較として妥当か) は未決。
+  推奨パック `ddalcu/Qwen3.8-27B-MLX-Serve-4bit` (18.2 GB、draft head baked in) は
+  ローカルに無く、ダウンロードしていない。
+- **MTPLX**: `mtplx inspect` が `runtime_compatibility: native-ar-only-missing-mtp`
+  (base 単体) / `invalid-mtp-tensor-layout` (mtp.safetensors を置いた構成) を返す。
+  MTPLX も `mtp.` 接頭辞のキーを期待する (`mtplx/artifacts.py:71` の
+  `MTP_KEY_PREFIXES`)。quickstart は自動で AR (`--depth 0 --no-load-mtp`) に落ちるので、
+  **起動はするが投機は効かない。**別配布の `Youssofal/...MTPLX-Optimized-Speed` は
+  重みが違うので「同じ重みの比較」には使えない。
+- **mlx-lm**: `qwen3_5_mtp` を読めない。投機無しが正しい姿。
+
+## 煙試験 (2026-09-04 08:16-08:19、`--ctxs 0,4000 --tokens 64 --reps 1`、冷却無し)
+
+| エンジン | 冷 TTFT (ctx0) | decode (ctx0) | 冷 TTFT (4k) | 温 TTFT (4k) | decode (4k) |
+|---|---|---|---|---|---|
+| mlxturbo | 0.24s | 28.1 tok/s | 17.52s | **0.27s** | 27.3 tok/s |
+| mlx-lm | 0.43s | 21.8 tok/s | 18.92s | **0.44s** | 20.9 tok/s |
+| oMLX | 0.45s | **33.7 tok/s** | 18.98s | 20.24s | **32.8 tok/s** |
+| MTPLX | 0.29s | 21.4 tok/s | 18.54s | 21.40s | 20.6 tok/s |
+| mlx-serve | 0.32s | 24.3 tok/s | **15.88s** | **0.74s** | 25.3 tok/s |
+
+**これは煙試験であって比較ではない** (1 本ずつ、冷却なし、`--warm-long` 無し、
+プロセス起動直後の段差も消していない)。判定に使わないこと。
+結果 JSON: `bench/results/smoke-27b-<engine>-0904.json`。
+
+本番計測の前に決めること:
+
+- **oMLX と MTPLX は 4k の温 TTFT が冷とほぼ同じ** (20.24s / 21.40s) = 接頭辞を
+  再利用していない。oMLX は `--paged-ssd-cache-dir` を渡さないと接頭辞キャッシュが
+  有効にならない。mlxturbo・mlx-lm・mlx-serve は既定で効いている。
+  **揃えないと温 TTFT の比較は「機能の有無」を測ることになる。**
+- MTPLX の quickstart 既定は `--ssd-session-cache on --ssd-session-cache-max-size 100GB`。
+  ディスクに書く。揃えるかどうか。
+- 4000 の冷 TTFT が 5 者とも 15.9〜19.0s (prefill 200〜240 tok/s) に固まっている。
+  27B の prefill でここまで揃うのは、どのエンジンでも同じ律速に当たっている可能性がある。
+  本番では `--warm-long` を入れて重みのページインを分離すること。
