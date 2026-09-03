@@ -72,6 +72,8 @@ MoE router 融合、union gather (真の union が 6 割)、wide 連結。理由
 
 ## いまの段取り (2026-09-03 08:00 時点。何をやっているか見失ったらここを読む)
 
+**優先度最低 (ユーザー 2026-09-03 17:35)**: KLD の teacher (bf16、query) の作り直し。SSD (`/Volumes/Mobile SSD`) が読めるようになってから `bench/teacher_bf16.py --src <bf16 dir> --continuations bench/results/qe-cont.json --out bench/results/qe-ref-bf16.npz` を `MLXTURBO_QSA_TAIL=query` で (251 GB 読み、約 10 分)。それまで品質の判定は課題の正答率で。
+
 GPU は `tools/biglock.sh` で 1 本ずつ直列。親の連鎖スクリプトは scratchpad
 (`/private/tmp/claude-501/-Users-ht-dev-fastmlx/65b31683-391c-444c-b255-622b126131f9/scratchpad/run_chainNN.sh`、
 いま 80 番台) にあり、前の連鎖の終了を `pgrep -f run_chainNN.sh` で待って順番を付けている。
