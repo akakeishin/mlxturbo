@@ -792,3 +792,10 @@ M=256 で相対 0.53、M=512 で 0.373、M ≥ 2048 で 0.0。調査 (`tools/qmm
   27B の射影の形 (K=5120→N=6144、K=6144→N=5120、M=1024 / 2048) では `qmm_wide` は素とビット一致 (`tools/qmm_wide_shape_micro.py`、`bench/results/qmm-wide-shapes-27b.json`、04:50)。品質の代金は無い。
   **27B の MTP サイドカー (`~/models/qwen38-27b-mtp`、量子化済み) は読めない**: `mtp.py:125-138` が重みを読んでから `nn.quantize` する順なので、`fc.scales` 等 16 個が
   「model に無い」と弾かれて None に落ち、lookup だけの投機になる (起動は続く)。`--mtp` 自体は `FASTMLX_MTP_PATH` 経由で 27B 経路に届いている。27B レーンの最初の直しはこれ。
+  **直した (2026-09-04 08:10)**: `load_mtp_file` が量子化済みサイドカーなら「quantize → load_weights」の順に切り替え、ディレクトリ指定も受ける (`mlxturbo/mtp.py`、`bench/test_mtp_quantized_sidecar.py`)。
+  `投機デコード有効 (MTP: あり / lookup: 有効)` が出て、4k の煙試験で tok/step 1.00 → 2.33〜3.97、decode 22.2 → 29.0 tok/s (`bench/results/smoke-27b-mtp-0904.json`)。
+  貪欲の出力は 2 プロンプト x 96 トークンで 1 箇所だけ食い違い、そこは top-2 が bf16 で完全同値 (どちらも +16.125) の同点。MTP あり / 無しとも自己再現する。
+- 追記 (08:05、scout): 相手の 27B の動かし方。**mlx-lm** は `qwen3_5_mtp` を読まず (`sanitize` が `mtp.` を捨てる)、投機は `--draft-model` の別モデルだけ → 素の基準。**oMLX 0.6.4** (`/opt/homebrew/bin/omlx`、ソース `~/dev/omlx`) は
+  `omlx serve --model-dir <親>` で発見、`qwen3_5_mtp` を drafter として識別 (ペア付けは model_settings の `vlm_mtp_draft_model`、CLI 無し)。**MTPLX 2.9.2** は `tools/compare/mtplx-venv/`。
+  **mlx-serve** は `ddalcu/Qwen3.8-27B-MLX-Serve-4bit` (18.2 GB、draft head baked in) が推奨でローカルに無い。sidecar 探索は同一ディレクトリ直下の `mtp.safetensors` 等。rapid-mlx は無し。
+  HTTP harness は `bench/vs_mlx_serve.py` の `stream_once` (エンジン非依存)、`self_snapshot.py` は mlxturbo / mlx-serve の argv 直書き。池は 27B でも同じ (vocab 完全一致)。
