@@ -274,6 +274,38 @@ def _knob_qsa_tail(ctx):
     return apply
 
 
+def _knob_qsa_tail_query(ctx):
+    """QSA の tail の意味論 (`mlxturbo/qsa_tail.py`)。
+    **A = query (HF 参照のクエリごと tail) / B = global (現行の既定)。**
+
+    既存の `qsa-tail` knob とは別物なので注意 --- あちらは「端数列を因果性で
+    切るか、修正前のように常に可視にするか」で、こちらは「tail をクエリごとに
+    取るか、kv 末尾の端数列として取るか」。
+
+    HF transformers main の `Qwen4ExpTextQSAIndexer.forward` は tail を
+    クエリごと (列 ``[4*floor((q+1)/4), q]``、自分自身を含む) に取る。
+    うちの global tail は S=1 の decode (最終行) では同じ集合になるが、
+    S>1 の行 --- prefill の全行と検証の非最終行 --- では
+    ``(q+1)%4 != 0`` の 3/4 の行が **自分自身と直前 0〜2 トークンを見ずに**
+    logits を出している。検証行の受理判定がそれで決まっているので、
+    **判定は tok/round (受理率)** が第一、次に ms/round と prefill_s。
+    `control_identical=False` (可視集合が変わるので出力は変わる)。
+
+    可視集合そのものの一致は `tools/verify_qsa_tail.py` (CPU、HF の規則を
+    numpy で書いた参照との突き合わせ) で別に見ている。
+
+    **prefill にも効くので `DECODE_ONLY_KNOBS` には入れない**
+    (`--prefill-once` は使えない --- 片方の変種で組んだキャッシュから
+    もう片方が decode を再開してしまう)。
+    """
+    from mlxturbo import qsa_tail as QT
+
+    def apply(variant):
+        QT.MODE = "query" if variant == "A" else "global"
+
+    return apply
+
+
 def _knob_moe_verify(ctx):
     """A = 共有タイル gather v2 on / B = off (既定)。"""
     import os
@@ -723,6 +755,41 @@ def _knob_hc_kernel(ctx):
 
     return apply
 
+
+def _knob_hc_kernel_stage(ctx):
+    """HC 融合カーネル x 段階投入の 2x2。「micro で勝って in-model で負ける」
+    のが CPU 側の構築費なのか GPU 側なのかを分ける。
+
+    A = カーネル on + 段階投入 2 (既定)  / B = 素 + 段階投入 2 (本番既定)
+    C = カーネル on + 段階投入 0 (直列) / D = 素 + 段階投入 0
+
+    段階投入 (`spec_flash._STAGE_EVERY`) が 2 のときは CPU の構築と GPU の
+    実行が重なるので、壁時計は max(構築, 実行) に近い。0 にすると
+    「全部組む → eval」の直列になり、壁時計は 構築 + 実行 になる。
+
+    読み方: (A-B) は既定の負け幅。(C-D) は直列にしたときの負け幅。
+    - (C-D) が (A-B) より**大きい**なら、負けの主因は CPU 側の構築費
+      (直列では構築が丸ごと露出するので差が開く)。
+    - (C-D) が (A-B) と同じか小さいなら、負けは GPU 側の実行時間。
+
+    97 層すべてで発火させるには `MLXTURBO_HC_INJECT_BF16=1` を付けて起動する
+    こと (`fused.enable_hyper_connection_kernel` が起動時に 1 回だけ読む)。
+    無いと発火は 1 層だけで A/C は B/D とほぼ同じになる
+    (`_fire.snapshot()` の `hc_kernel` が 97 になっているか確認する)。
+
+    出力は sigmoid の bf16 1 ulp 差で一致しない (control_identical=False)。
+    prefill にも効くので `--prefill-once` は使えない (`hc-kernel` と同じ)。
+    """
+    from mlxturbo import fused
+    import mlxturbo.spec_flash as SF
+
+    def apply(variant):
+        fused.disable_hyper_connection_kernel()
+        if variant in ("A", "C"):
+            fused.enable_hyper_connection_kernel()
+        SF._STAGE_EVERY = 2 if variant in ("A", "B") else 0
+
+    return apply
 
 
 def _knob_hc_compiled(ctx):
@@ -1262,6 +1329,26 @@ def _knob_prefill_attn(ctx):
         else:
             disable_prefill_attn(model)
             enable_gather_attn(model)
+
+    return apply
+
+
+def _knob_prefill_attn_min_kv(ctx):
+    """融合カーネル (段 P1) の発火下限 ``MLXTURBO_PREFILL_ATTN_MIN_KV``。既定 12288。
+
+    `Attention._gather_forward` は毎回この環境変数を読む
+    (`mlxturbo/_vendor/qwen4_exp.py`) ので、1 プロセス内で値を差し替えるだけで
+    交互に測れる。下限より短い kv は dense マスク経路へ落ちる。
+
+    P6 (段階 load の uint4 化) で合成のクロスオーバーが 10.8k → 8.1k へ動いた
+    ので、下限を 8192 まで下げてよいかを in-model の壁時計で見るための口。
+    判定は **prefill_s**。出力は変わりうる (kv 8k〜12k の層が dense から
+    カーネルへ移り、加算順が変わる) ので ``control_identical=False``。
+    """
+    import os as _os
+
+    def apply(variant):
+        _os.environ["MLXTURBO_PREFILL_ATTN_MIN_KV"] = str(int(variant))
 
     return apply
 
@@ -2145,6 +2232,9 @@ KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
     "qsa-tail": (_knob_qsa_tail, ["A", "B"], True, "B"),
+    # A = query (HF 参照) / B = global (既定)。可視集合が変わるので出力は
+    # 一致しない (control_identical=False)。判定は tok/round が第一
+    "qsa-tail-query": (_knob_qsa_tail_query, ["A", "B"], False, "B"),
     "moe-verify": (_knob_moe_verify, ["A", "B"], False, "B"),
     "fast-rope": (_knob_fast_rope, ["A", "B"], False, "B"),
     # A = PLE 埋め込みを層ループ前に一括計算 / B = 素 (既定)。判定は決めていない
@@ -2158,6 +2248,7 @@ KNOBS = {
     "moe-route": (_knob_moe_route, ["A", "C", "B"], False, "B"),
     "hc-prefill": (_knob_hc_prefill, ["A", "C", "B"], False, "C"),
     "hc-kernel": (_knob_hc_kernel, ["A", "B"], False, "B"),
+    "hc-kernel-stage": (_knob_hc_kernel_stage, ["A", "B", "C", "D"], False, "B"),
     "hc-compiled": (_knob_hc_compiled, ["A", "B"], True, "B"),
     "hc-prefill-compile": (_knob_hc_prefill_compile, ["A", "B"], False, "B"),
     "pipeline": (_knob_pipeline, ["A", "B"], False, "B"),
@@ -2180,6 +2271,8 @@ KNOBS = {
     # -1 は gather 自体を切る (現行既定)。0 はタイルなしの gather
     "gather-tile": (_knob_gather_tile, ["-1", "0", "256"], False, "-1"),
     "prefill-attn": (_knob_prefill_attn, ["A", "B"], False, "B"),
+    "prefill-attn-min-kv": (
+        _knob_prefill_attn_min_kv, ["8192", "12288"], False, "12288"),
     "wide": (_knob_wide, ["A", "B"], False, "B"),
     "wide-attn": (_knob_wide_attn, ["A", "B"], True, "B"),
     "depth": (_knob_depth, ["1", "2", "3"], False, "2"),
