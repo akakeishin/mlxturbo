@@ -138,6 +138,9 @@ CLAUDE.md の knob の段落も直す。フルテスト (対 mlx-serve) と over
    **overnight tier はやらない** (ユーザー方針 2026-09-03 08:00)。フルベンチで課題が見つかったら、もう一度
    仮説検証に戻る。
 4. **フルベンチの後**: Qwen3.8-27B 4-bit と Qwen3.6-35B-A3B 4-bit を検証に加える (量子化ビットは揃える)
+   → 27B / 35B-A3B の入口で **Lily の知見 (`docs/research/EXTERNAL-PERPLEXITY-LILY-2026-09.md`) の 5 と 6** をやる (ユーザー 2026-09-03 16:40):
+     (5) GQA packing (4 head で KV 行を共有) と 32K 以上の固定ブロック attention (dense の族で 32K +7.7% / 128K +40%。MLX の sdpa_vector の GQA 共有の実態を先に確認)、
+     (6) 35B-A3B は AR 対 MTP を最初に測る (Lily は別モデル drafter で -18%。うちは MTP 頭なので事情が違うが、verify 行が違う専門家を読む増分は同じ)。
    → 27B を 2 族目として載せるときに **アーキテクチャの対応表を切る** (`docs/BACKLOG.md` の「アーキテクチャ追従の投資」、
    ユーザー方針 2026-09-03: 全モデル最高ではなく 8〜9 割の追従が既定で得られる状態を目指す。qwen4_exp の最適化が終わってから)。
    まず Qwen 系を仕上げる。Gemma はその後。
