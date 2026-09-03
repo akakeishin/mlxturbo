@@ -2300,7 +2300,7 @@ prefill_s: 2048 幅 12.784 / 1024 幅 12.763 / 512 幅 13.238。非 MoE のメ�
 |---|---|---|---|---|
 | moe-sort-min=128 | verify 幅の MoE gather を argsort 無しに | 0 / -384 (4.7%) | **+0.6%** | ±0 |
 | glue-compile | MLP の `*up` と shared 合流を `mx.compile` で 1 本に | -192 / -192 | **+1.2%** | ±0 |
-| moe-combine-glue (compile / matmul) | `(y·w).sum(-2)` を 1 本に | -96 | +0.3% / -0.1% | -3.4% (compile はビット一致が GPU で崩れた) / ±0 |
+| moe-combine-glue (compile / matmul) | `(y·w).sum(-2)` を 1 本に | -96 | (無効: 関数名の衝突で既存の fold knob を呼んでいた。未計測) | — |
 | wide-decode | attention の qkv 連結を decode 幅にも | — | +0.1% | **-4.1%** (qmv の変種が N で変わり出力が割れる) |
 | fast-rope (既存) | rope の slice/concat を `mx.fast.rope` に | -96 | -0.0% | +0.3% |
 
@@ -2309,5 +2309,5 @@ prefill_s: 2048 幅 12.784 / 1024 幅 12.763 / 512 幅 13.238。非 MoE のメ�
   **短文脈 100 tok/s は M3 Max では現行の構造で届かない (現実線 55〜58)。**長文脈 (K2c) と prefill が勝ち筋。
 - copy 133 本の出所 (`tools/decode_copy_probe.py`、グラフの op を出所別に数える): Attention 84 (うち rope の slice/concat 48)、GDN 36 (conv 窓の concat、消すには棄却済みの prework 融合が要る)、indexer 12、PLE 2。
   `Broadcast strided` 96 本 = ルータ重みの実体化 48 + shared gate の sigmoid 48。消しても速くならなかった。
-- 危ない教訓: **CPU の合成モデルでビット一致しても GPU で崩れる** (moe-combine-glue の compile 版、bf16/fp32 の昇格の順)。ビット一致の主張は GPU で取る。
+- 訂正: moe-combine-glue の行は knob 関数名の衝突 (`_knob_moe_combine` が既存と同名) で既存の fold knob を呼んでいた。「compile 版でビット一致が崩れた」は fold の既知の負け方の再現で、compile 版は未計測。残る 3 つの判定は有効。
 - 4 knob のコードは取り除く (方針: 効かない変種を二重に持たない)。`decode_copy_probe.py` は残す。
