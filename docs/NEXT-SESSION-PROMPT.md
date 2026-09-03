@@ -258,3 +258,19 @@ CLAUDE.md の knob の段落も直す。フルテスト (対 mlx-serve) と over
 追記 (12:15、compact 前の 2 回目): 今日の午前後半の決着 — custom kernel が decode で負ける正体は「温キャッシュの連鎖 micro」(CATCHUP 12:00、CLAUDE.md の作法に追加)。
 K2a (radix select) は集合 100% 一致・13 us で通過、K2b を実装中。HC は第 4 変種 (elementwise だけ融合、GEMV は MLX の qmv) を実装中で見込み 4.7 → 2.2 ms。
 ANE は見送り (INT8 の重みコピーでメモリが増える)。最終ゴールは短文脈 100 tok/s (MTP 学習なし)。P8 は保留 (P10 次第)。走行中の一覧は scratchpad の INFLIGHT-2026-09-03.md の「12:15 時点」。
+
+## 現在地 (2026-09-04 03:26、commit 8e52d93 まで。小ベンチ 0903h は走行中、数字は下に追記)
+
+深夜に API 500 でエージェント 4 本が消え、出し直して決着 (全部 CATCHUP 2026-09-04 の項に数字):
+- **既定に入れた 3 つ**: n-gram 先読み (pread では走っていなかった。on + group forward の前に投入、17k 冷 -2.9% / 温 -1.8%、出力一致)、
+  HC の細長 GEMM に qmm_wide (ビット一致、17k -0.9%)、fused:1 (MoE decode 幅、短 -1.2〜-1.3% / 17k -1.4%、Δ KLD +0.00036、参照テスト反転 0)。
+- **畳んだ**: 小 kv の疎 attention (union タイル化、kv=4096 で 0.99x)、HC elem の prefill 幅拡張 (非ビット一致で tok/round -4.8%)、n-gram の late 配置、
+  fused:1 の prefill 抑止 (要らなかった)。decode の糊の融合レーンは閉じた (勝ち 2 本: GDN、fused:1)。
+- **規則にした**: decode 幅だけの非ビット一致カーネルの 3 条件 (CLAUDE.md の品質段落)。S=1 の KLD は `quant_eval compare --fusions --step 1`。
+- **道具**: `tools/qsa_vis_stats.py`、`tools/hc_prefill_micro.py`、`tools/ngram_prefill_diag.py` / `ngram_fetch_micro.py`、`tools/moe_decode_fused_ref_model.py` (worker の tool job)。
+  ビット一致ゲート `verify_prefill_bitident` は判定を checkpoints=[] に直した (checkpoints=None の不一致は末尾 v2 で既知)。
+- **次**: (1) prefill の小 kv attention は疎性ではなく「スコアを実体化しない融合」(K1 arm A、4k -1〜2% 見込み)。(2) 27B レーン (部品の置き換え、Lily 5/6、teacher)。
+  (3) BACKLOG の小物: qmm_wide の M<1024 の食い違い (本番のゲート 1024 の外、未調査)、worker が降ろされる原因 2 つ (FASTMLX_NGRAM_DISK の突き合わせ、回収可能メモリ 99 GB 待ち)、計数ソート、HF パックの 4bit 頭化。
+- **罠 18**: サブエージェントは `scratchpad/agent-<name>.md` に節目ごとの台帳を書かせる (API 落ちで再開できるように)。セッションの scratchpad は消えるので台帳・ベンチのスクリプトはリポジトリ直下 `scratchpad/`。
+- **小ベンチ 0903h (03:41)**: 冷 prefill 4k 5.74 / 17k 26.5 / 25k 40.8 / 32k 50.3 / 50k 80.1 s (相手 5.70 / 27.8 / 41.3 / 51.6 / 82.1 → **4k 同着、17k 以上は 0.95〜0.99x で勝ち**)、
+  decode 53.6 / 58.5 / 47.4 / 52.5 / 49.9 / 44.8 tok/s (1 回 × 256 なので ±10% の運)、温 TTFT 0.15〜0.31 s。次の節目はフルベンチ (反復 2、同冷却) で相手と同時刻に取り直すこと。
