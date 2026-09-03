@@ -53,6 +53,50 @@ _HC_PREFILL_COMPILE_PRE: dict = {}
 _HC_PREFILL_COMPILE_POST: dict = {}
 
 
+# --- 層の列挙 (族ごとにラッパの形が違う) --------------------------------
+#
+# `enable_default_fusions` は model_type で分岐せずに全部の enable_* を呼ぶ。
+# クラスを差し替えるだけのもの (`Q.<Class>.<attr> = ...`) は他の族では
+# 単に呼ばれないので素通りするが、**モデルの構造を直接舐める**もの
+# (`model.model.layers`) は族が違うと AttributeError で落ちる。
+#
+#   qwen4_exp (Flash-Next)       model.model.layers
+#   qwen3_5   (Qwen3.8-27B)      model.language_model.model.layers
+#                                (`Model.layers` プロパティも同じものを返す)
+#
+# 契約が合わない族では「何もしない」(エラーにしない) のが方針
+# (`docs/BACKLOG.md` の「動的な構造の探索 (duck typing)」)。
+
+
+def _model_body(model):
+    """層を持つ本体 (`model.model` / `model.language_model.model` / `model`
+    自身) を返す。どれも `layers` を持たなければ None。"""
+    if model is None:
+        return None
+    for path in (("model",), ("language_model", "model"), ()):
+        obj = model
+        for name in path:
+            obj = getattr(obj, name, None)
+            if obj is None:
+                break
+        if obj is not None and getattr(obj, "layers", None) is not None:
+            return obj
+    return None
+
+
+def _model_layers(model) -> list:
+    """`model` のデコーダ層を並び順のまま返す。見つからなければ空リスト。
+
+    qwen4_exp では `list(model.model.layers)` と 1 ビットも変わらない
+    (同じ順の同じオブジェクト)。他の族や層を持たないスタブでは空になり、
+    呼び手のループが 1 周も回らないので enable_* は 0 / None を返す。
+    """
+    body = _model_body(model)
+    if body is None:
+        return []
+    return list(body.layers)
+
+
 def _build(hc: int, d: int, eps: float, use_combine: bool):
     """Compile exactly one instance per (hc, d, eps, use_combine)."""
 
@@ -797,7 +841,7 @@ def enable_gdn_prework_kernel(model=None) -> None:
     # 古い写しが残っていると eligible() が dtype 不一致で弾くので消す。
     if model is None:
         return
-    for layer in model.model.layers:
+    for layer in _model_layers(model):
         gdn = getattr(layer, "linear_attn", None)
         if gdn is None:
             continue
@@ -858,7 +902,7 @@ def enable_gdn_decode_fused(model=None) -> None:
     if mode in ("1", "all", "pre"):
         Q.GatedDeltaNet._gdn_prework = True
         if model is not None:
-            for layer in model.model.layers:
+            for layer in _model_layers(model):
                 gdn = getattr(layer, "linear_attn", None)
                 if gdn is None:
                     continue
@@ -1353,7 +1397,7 @@ def disable_wide_projections(model, mtp=None) -> int:
     n = 0
 
     def each_layer():
-        for layer in model.model.layers:
+        for layer in _model_layers(model):
             yield layer
         if mtp is not None:
             for layer in mtp.layers:
@@ -1408,7 +1452,7 @@ def enable_wide_projections(model, mtp=None, scope=None) -> dict:
     counts = {"gdn": 0, "attn": 0, "shared": 0, "experts": 0}
 
     def each_layer():
-        for layer in model.model.layers:
+        for layer in _model_layers(model):
             yield layer
         if mtp is not None:
             for layer in mtp.layers:
@@ -1732,7 +1776,7 @@ def enable_moe_shared_fold(model) -> int:
         return lin.weight
 
     n = 0
-    for layer in model.model.layers:
+    for layer in _model_layers(model):
         mlp = getattr(layer, "mlp", None)
         se = getattr(mlp, "shared_expert", None) if mlp is not None else None
         sw = getattr(mlp, "switch_mlp", None) if mlp is not None else None
@@ -1970,7 +2014,7 @@ def enable_moe_combine_fold(model) -> int:
         return 0
     min_s = int(os.environ.get("MLXTURBO_MOE_COMBINE_FOLD_MIN_S", "64"))
     n = 0
-    for layer in model.model.layers:
+    for layer in _model_layers(model):
         mlp = getattr(layer, "mlp", None)
         if mlp is not None and hasattr(mlp, "switch_mlp"):
             mlp._combine_fold_min_s = min_s
@@ -1981,7 +2025,7 @@ def enable_moe_combine_fold(model) -> int:
 def disable_moe_combine_fold(model) -> int:
     """`enable_moe_combine_fold` を打ち消す。戻り値は外した数。A/B で交互に測るために要る。"""
     n = 0
-    for layer in model.model.layers:
+    for layer in _model_layers(model):
         mlp = getattr(layer, "mlp", None)
         if mlp is not None and getattr(mlp, "_combine_fold_min_s", None) is not None:
             mlp._combine_fold_min_s = None
@@ -2368,7 +2412,8 @@ _MOE_GATHER_FOLD_ON = False
 _MOE_FOLD_MODE = "combine"
 
 
-def _moe_fold_block(switch_mlp, x_rows, row_src, idx_s, order, w_flat):
+def _moe_fold_block(switch_mlp, x_rows, row_src, idx_s, order, w_flat,
+                    extra=None):
     """`_moe_combine_fold` から呼ばれる gate/up -> SwiGLU -> down。
 
     ``switch_mlp`` 以外は `_moe_combine_fold` が持っている並べ替えの材料:
@@ -2464,7 +2509,9 @@ def _moe_fold_block(switch_mlp, x_rows, row_src, idx_s, order, w_flat):
     # 「unsort + 重み掛け + 和」を 1 カーネルに畳む。カーネルは
     # (t, k) の並びで読むので、重みは**トークン順**の w_flat をそのまま渡す
     out_sorted = mgg.qmm_segmented(act, w_dn, s_dn, b_dn, None, **kw_dn)
-    return mc.combine(out_sorted, _inv_perm(order), w_flat, rows, top_k)
+    if inv is None:
+        inv = _inv_perm(order)
+    return mc.combine(out_sorted, inv, w_flat, rows, top_k)
 
 
 def _inv_perm(order):
@@ -2544,7 +2591,7 @@ def enable_moe_down_epilogue(model=None, mode: str | None = None,
     # フックは `_moe_combine_fold` の中にあるので、届くのは combine-fold が
     # 効いている MoE 層だけ (行数ゲートは呼び出し時に見る)
     return sum(
-        1 for layer in model.model.layers
+        1 for layer in _model_layers(model)
         if getattr(getattr(layer, "mlp", None), "_combine_fold_min_s", None)
         is not None
     )
@@ -2661,7 +2708,7 @@ def enable_qmm_wide(model, mtp=None, mode: str | None = None,
         nn.QuantizedLinear.__call__ = _qmm_wide_dispatch
 
     def each_layer():
-        for layer in model.model.layers:
+        for layer in _model_layers(model):
             yield layer
         if mtp is not None:
             for layer in mtp.layers:
@@ -2706,7 +2753,7 @@ _HC_QMM_WIDE_NAMES = ("input_mix_weight_down", "input_mix_weight_up")
 def _hc_gated_residuals(model, mtp=None):
     """`GatedResidual` を 97 個 (48 層 x 2 + mixer) 全部たどる。"""
     holders = list(_HC_QMM_WIDE_HOLDERS)
-    layers = list(model.model.layers)
+    layers = _model_layers(model)
     if mtp is not None:
         layers += list(mtp.layers)
     for layer in layers:
@@ -2714,7 +2761,8 @@ def _hc_gated_residuals(model, mtp=None):
             mod = getattr(layer, holder, None)
             if mod is not None:
                 yield mod
-    mixer = getattr(model.model, "hyper_connection_mixer", None)
+    body = _model_body(model)
+    mixer = getattr(body, "hyper_connection_mixer", None) if body is not None else None
     if mixer is not None:
         yield mixer
 
@@ -2851,7 +2899,7 @@ def enable_fast_rope(model) -> int:
     if os.environ.get("MLXTURBO_FAST_ROPE") != "1":
         return 0
     n = 0
-    for layer in model.model.layers:
+    for layer in _model_layers(model):
         sa = getattr(layer, "self_attn", None)
         if sa is not None and hasattr(sa, "q_norm"):
             sa._fast_rope = True
@@ -2862,7 +2910,7 @@ def enable_fast_rope(model) -> int:
 def disable_fast_rope(model) -> int:
     """`enable_fast_rope` を打ち消す。戻り値は外した数。A/B で交互に測るために要る。"""
     n = 0
-    for layer in model.model.layers:
+    for layer in _model_layers(model):
         sa = getattr(layer, "self_attn", None)
         if sa is not None and getattr(sa, "_fast_rope", False):
             sa._fast_rope = False

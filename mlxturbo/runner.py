@@ -1339,6 +1339,18 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
     if no_fused:
         print(f"{log_prefix} --no-fused: hyper-connections 融合カーネルと連結射影を無効化")
     else:
+        # ここは model_type で分岐しない。クラスを差し替えるだけの enable_*
+        # (`Q.<Class>.<attr> = ...`) は qwen4_exp 以外の族には当たらないので
+        # 素通りする。モデルの構造を舐める enable_* は `fused._model_layers`
+        # で層を探し、契約が合わない族では 0 層 = 何もしない (エラーにしない、
+        # `docs/BACKLOG.md` の「動的な構造の探索 (duck typing)」)。
+        n_layers = len(fused._model_layers(model))
+        if n_layers:
+            print(f"{log_prefix} 層の列挙に当たった ({n_layers} 層)")
+        else:
+            print(f"{log_prefix} 層の列挙に当たらなかった"
+                  f" ({type(model).__module__}.{type(model).__name__}):"
+                  " 構造を舐める融合は全部素通り")
         # HC の実装は MLXTURBO_HC で選ぶ: kernel (既定) / compiled / off。
         # kernel は 2 ディスパッチだが sigmoid が bf16 とビット一致しない
         # (kernels/hyper_connection.py の精度の節)。compiled は op 単位で

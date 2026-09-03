@@ -44,7 +44,13 @@ from __future__ import annotations
 
 
 def _each_layer(model, mtp=None):
-    for layer in model.model.layers:
+    # 層の列挙は `fused._model_layers` に寄せる (族ごとにラッパの形が違う。
+    # qwen4_exp は `model.model.layers`、qwen3_5 (27B) は
+    # `model.language_model.model.layers`)。見つからなければ 0 層で、
+    # 呼び手は何もせず 0 を返す。
+    from .fused import _model_layers
+
+    for layer in _model_layers(model):
         yield layer
     if mtp is not None:
         for layer in mtp.layers:
