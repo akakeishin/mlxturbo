@@ -903,7 +903,7 @@ _PREFILL_PIPELINE = os.environ.get("MLXTURBO_PREFILL_PIPELINE") == "1"
 _PREFILL_FOLD_TAIL = os.environ.get("MLXTURBO_PREFILL_FOLD_TAIL", "1") != "0"
 
 # 末尾チャンクの「最後の 1 トークンを除いた部分」を直前のレイヤー主導
-# グループの最終メンバーとして流すか。**既定 off**
+# グループの最終メンバーとして流すか。**既定 on**
 # (**既定 on**、MLXTURBO_PREFILL_TAIL_IN_GROUP=0 で off。2026-09-03: 4k -4.9% / 8k -3.4% / 17k -0.6%、
 #  サーバー経路 (checkpoint あり) は chunk 主導とビット一致)。
 #
