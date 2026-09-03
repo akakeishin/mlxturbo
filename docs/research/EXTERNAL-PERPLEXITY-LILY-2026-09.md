@@ -45,3 +45,17 @@ Lily は単一モデル・batch 1・chat completions + streaming のみ。継続
 ## 参照する価値のあるもの
 
 - GitHub のデモの Metal ソース: Metal 4 tensor op (= NAX) を使う grouped GEMM、GQA packing、固定ブロック attention、register 常駐の GDN scan。NAX 機の経路と 27B / 35B レーンの参考実装。
+
+---
+
+# 外部の知見 2: rapid-mlx 0.13.x (raullenchai/Rapid-MLX、OpenAI 互換サーバー + Desktop、2026-09-03 に読んだ)
+
+- 0.13.2 (8/30): Flash-Next のネイティブ MTP。decode 128 tok 25.17 → **34.85 tok/s** (+38.5%)、2K 33.53、8K 32.20、32K 28.82。受理率 76.41%、追加メモリ最大 6.6 GB。
+  長文脈 prefill の「QSA インデックスキャッシュのバッチ処理」: 2K 3.346 → 2.262 s、**8K 13.689 → 9.236 s (-32.5%)**、32K 62.851 → **44.659 s** (-28.9%)。
+  セマンティック接頭辞スナップショット: 5,288 トークンの温リクエストで 5,273 を再利用、6.497 → 0.539 s。
+- 0.13.4 (9/3): Qwen3.8 27B に MTP + 継続スケジューラ (+25.9%、同時実行で 128 tok 1.43x / 32K 2.34x)。Flash-Next の「単一トークン GDN カーネル融合」で decode +6.35% (既定 off、証拠収集中)。
+- ハード: SCORECARD は **M3 Ultra 256 GB**。Flash-Next の数字も同じ機体の見込み (明記なし、「128 GB 以上」)。
+- うち (M3 Max 128 GB) との比較: decode 短 52 tok/s 対 34.85、17k 46 対 (8K 32.2 / 32K 28.8)。prefill 8k 11.2 s 対 9.24 s、32k 約 52 s 対 44.7 s。
+  **M3 Ultra は M3 Max の約 2 倍の GPU なので、同じ機体ならうちが prefill でも 1.6 倍以上速い見込み。**ただし同一機体の実測は無い。温 TTFT はうち 0.16〜0.3 s 対 0.54 s。
+- 取り込み候補: (a) QSA インデックスの計算をチャンクをまたいでまとめる (彼らの -30% は元が遅い可能性が高いが、うちの indexer のチャンクごとの費用は未計測)。
+  (b) decode の GDN 単一トークン融合 (+6%): うちは GDN Metal 既定 on で同種。(c) 27B の MTP + 継続バッチの同時実行の数字を、27B レーンの比較表に入れる (mlx-lm / mlx-serve / oMLX / rapid-mlx / うち)。
