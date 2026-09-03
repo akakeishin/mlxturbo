@@ -2014,3 +2014,20 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - 合成モデル 4 形で on/off の出力一致、`bench/test_server.py` + `test_depth_controller.py` 435 passed、fingerprint exit 0。
 - 残る性質: グループ内部の中間 checkpoint が消える (末尾の n-1 / n は残る)。LCP が末尾 2048 の内側かつ n-1 以外に落ちるターンでは復元点が 1 グループ手前まで下がる (グループ prefill が元から持つ性質を最後の 1 境界ぶん広げる)。
 - **判定: 17k を測り直してから既定 on にする** (v1 は 17k -1.3%。17k で遅くならなければ `MLXTURBO_PREFILL_TAIL_IN_GROUP=1` を既定に)。checkpoints=None 経路の丸めの違いは、本番 (サーバー) に影響しないので許容する。17k は投入済み (`tail-in-group-v2-17000.json`)。
+
+### 2026-09-03 13:00 QSA tail を HF のクエリごと規則に直す knob (`MLXTURBO_QSA_TAIL=query|global`、既定 global = 不変、`mlxturbo/qsa_tail.py`)。実装と CPU 検証は完了、GPU は待ち行列
+
+- tail 規則の写しは **5 か所** (台帳の 3 か所 + カーネル + `batch_spec.py` の `_ragged_indexer_call`)。5 つ目を直さないと batch と solo の受理数が食い違い `tools/verify_batch_spec.py` が落ちる。
+  - vendor `QSAIndexer.__call__`: 行ごとの列 `[cr*floor((q+1)/cr), q]` を `put_along_axis` で立てる (1 行 cr-1 列、全面の比較を張らない)。`_gather_tile_attn` の端数列はタイルの own 列区間に。
+  - `batch.py` の `indexer_call`: 同じ規則 + 左パディング境界 (`col >= left_pad`)。`batch_spec.py`: 論理列版、`row_blocks == 0` の行は行全体 causal のまま。
+  - `kernels/prefill_attn.py`: fallback 不要。`tail_base = ((q_col+1)/cr)*cr`、`ntail_vis = q_col - tail_base + 1` (0〜3) だけ。tail が空でない行のブロックは候補に入らないので「読む範囲 = 可視集合」の前提が保たれる。P6 の uint4 化と同居。
+  - シーム (`_positions` / `_final_mask` / `_make_masks`) の引数・返り値は不変。`MLXTURBO_QSA_TIEBREAK=1` (同点は添字の若い方、既定 off) は別 knob。
+- 可視集合の一致 (`tools/verify_qsa_tail.py`、HF 規則の numpy 参照、S∈{1,2,3,2048} × kv∈{2049..17000}): query は全部 0 セル不一致。global は S=1 だけ 0、S=2048 で 3066〜3072 セル / 1533〜1536 行
+  (セル数まで予言と一致)。**prefill 幅では 3/4 の行が自分自身を見ていない、が数字で確定。**
+- 副産物: 指紋の `budget=8 chunk=4` と `chunk=19` は global では別のトークン列、**query では同じ列**。可視集合がチャンクの割り方に依存しなくなった (HF 意味論そのもの)。K1 の「チャンク 8192」の前提確認はこれで済む。
+- 既定 global で不変: fingerprint 13 行完全一致、`bench/test_server.py` 417 pass、`verify_batch_cache` / `verify_batch_spec` 両モード合格、`verify_gather_attn` query でも 1.2e-07。
+- 既知の陳腐化 (私の変更と無関係): `verify_prefill_attn.py` のモデルレベルは、合成モデルの最大 S=32 に対し今日入った `MIN_S=64` ゲート (`_vendor/qwen4_exp.py:1025`) でカーネルが発火せず不合格。合成側の S を 64 以上にするかツール側で MIN_S を下げる。
+- GPU (`scratchpad/gpu3.sh`、待ち行列): query の配列レベル検証 → `decode_ab --knob qsa-tail-query --only both --ctx 17000 --tokens 512` (prefill-once は使えない: 可視集合が変わるので) → `longctx_quality --ctxs 17000 --n 6` を query / global。
+- 既定を query にする前に残ること: 上の 3 本、teacher の bf16 再生成 (現行 teacher は global で作られているので、そのままでは KLD が「悪化」に見える)、TIEBREAK の単独 A/B、
+  未配線 2 か所 (`kernels/qsa_prefill_attn.py`、`kernels/qsa_select.py` の K2) を起こすときに query 規則を入れる。
+- 運用: この GPU 列は 2 時間以上、同じ段の新しい待ち手 (poll が短い) に追い越され続けた。biglock の同じ段を先着順 (札の mtime) にした。

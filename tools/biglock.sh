@@ -53,7 +53,9 @@ TICKET="$PRIO_DIR/$$"
 echo "$PRIO" > "$TICKET"
 case "$PRIO" in 2) POLL=3 ;; 1) POLL=5 ;; *) POLL=15 ;; esac
 trap 'rm -f "$TICKET"' EXIT INT TERM
-# 自分より高い段の札 (自分以外) が生きているか。死んだ札は掃除する
+# 自分より先に通すべき札 (自分以外) が生きているか: 上の段、または同じ段で自分より古い札。
+# 同じ段を先着順にしないと、poll の短い新しい待ち手が古い待ち手を追い越し続ける (2 時間待ちの前例)。
+# 死んだ札は掃除する
 live_higher() {
   local t o lv
   for t in "$PRIO_DIR"/*(N); do
@@ -62,6 +64,7 @@ live_higher() {
     if kill -0 "$o" 2>/dev/null; then
       lv=$(cat "$t" 2>/dev/null); [ -z "$lv" ] && lv=1
       [ "$lv" -gt "$PRIO" ] && return 0
+      [ "$lv" -eq "$PRIO" ] && [ "$t" -ot "$TICKET" ] && return 0
     else
       rm -f "$t"
     fi
@@ -93,6 +96,11 @@ while true; do
     [ "$_pid" = "$$" ] && continue
     case "$(ps -o command= -p "$_pid" 2>/dev/null)" in
       *biglock.sh*) continue ;;
+      # 常駐 worker (tools/ab_daemon.py) は 98GB を抱えたまま何時間も居るが、
+      # ジョブを走らせる間だけこの LOCK を正規に取る。投入側 (ab_submit.py)
+      # は待っているだけ。**どちらも「ロック無しで走っている python」では
+      # ない** -- 数えると全員が永久に待つ (待機中の wrapper と同じ罠)。
+      *ab_daemon.py*|*ab_submit.py*) continue ;;
     esac
     OTHER=$_pid
     break
@@ -128,7 +136,15 @@ done
 #
 # 他のプロセス (Claude Code の多重起動を含む) がメモリを握っている場合も
 # 同じ待ちで守れる。ここは 91GB を読む全経路が通る唯一の場所。
-MEM_NEED_GB="${MLXTURBO_MIN_FREE_GB:-100}"
+# 段 2 (micro) だけは 8GB でよい。モデルを読まない数分の仕事なのに、常駐
+# worker (tools/ab_daemon.py) が 98GB を抱えている間は 100GB が空くことは
+# 無く、毎回 10 分待って警告付きで始まることになる。段 0/1 (98GB を読む側)
+# は 100 のまま -- あちらは本当に空きが要る。
+if [ "$PRIO" -ge 2 ]; then
+  MEM_NEED_GB="${MLXTURBO_MIN_FREE_GB:-8}"
+else
+  MEM_NEED_GB="${MLXTURBO_MIN_FREE_GB:-100}"
+fi
 MEM_WAITED=0
 while [ "$MEM_WAITED" -lt 600 ]; do
   # 空き + 非活性 (回収可能) を見る。圧縮済みは「使用中」なので数えない
