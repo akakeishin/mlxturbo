@@ -1508,6 +1508,23 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
             print(f"{log_prefix} MoE grouped GEMM 有効 (段 P3、混合タイル"
                   f" mix={_mix}、MLXTURBO_MOE_GEMM_MIX=0 で off)")
 
+            # 段 P7 第 2 段: MoE の「行列積以外」を GEMM とその後ろの 1 本の
+            # カーネルに畳む (x の gather は gate/up の行の読み方へ、ルータ
+            # 重み掛け + unsort + top_k の和は `kernels/moe_combine.py` へ)。
+            # in-model 8k prefill -3.8% (combine だけなら -1.7%、
+            # `bench/results/moe-down-epi-8k.json`)。head は素と完全一致。
+            # **P3 (segmented) が入っているときだけ意味がある** ので同じ枝に
+            # 置く (NAX 機は P3 ごと off になるので追加のゲートは要らない)。
+            # 行数ゲートは P3 と同じ 1024 で、decode/verify 幅は素のまま。
+            _n_epi = fused.enable_moe_down_epilogue(model)
+            if _n_epi:
+                print(f"{log_prefix} MoE combine 畳み込み有効 (段 P7、"
+                      f"{_n_epi} 層、mode="
+                      f"{os.environ.get('MLXTURBO_MOE_DOWN_EPI', 'combine')}"
+                      f"、gather="
+                      f"{os.environ.get('MLXTURBO_MOE_GATHER_FOLD', '1')}"
+                      f"、MLXTURBO_MOE_DOWN_EPI=off で off)")
+
         # 段 P10: prefill 幅の dense 射影 (q_proj / o_proj / in_proj_qkv /
         # in_proj_z / out_proj) を BM=64 の自前 qmm に通す。素とビット一致、
         # micro では素の 0.935〜0.947 (M=2048 / 8192)。enable_qmm_wide 自身が

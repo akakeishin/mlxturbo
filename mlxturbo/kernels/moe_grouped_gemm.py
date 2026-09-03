@@ -119,6 +119,32 @@ seg32 を呼ぶままで、既定 (`bm=32` / `wm=None` / `mix_threshold=None`) �
 変えていない。in-model の見込みは prefill の MoE が 43% (8k の内訳) なので、
 seg32 -> mix48 で prefill -2.3%、既製 -> mix48 で -4.5%。
 
+## 第 3 段: 行列積以外を GEMM の口に畳む (P7 第 2 段、2026-09-03)
+
+`qmm_segmented` の ``row_dst`` / ``row_scale`` / ``row_src`` がこれ。MoE の
+prefill で残っていた「行列積以外」(`bench/results/moe-split.json`、層 20、
+M=2048、ms/層) のうち 3 つを GEMM の store と loader に畳む:
+
+  - ``row_dst`` + ``row_scale``: 行 s の結果を `row_dst[s]` の位置へ
+    `row_scale[s]` 倍して書く。これで combine の weight_mul_cast (0.87) と
+    unsort (`out[inv_order]` の gather) が消え、`inv_order` を作る 2 本目の
+    argsort (sort 0.34 の半分) も要らなくなる。掛け算は累算器 (fp32) の
+    ままなので、**丸めは現行より 1 回少ない** (ビット一致しない)
+  - ``row_src``: 行 s が読む x を `x[row_src[s]]` にする。これで x の
+    gather (0.49、16384x2560 = 84MB の実体化) が消える。読む値は同じなので
+    「gather してから GEMM」と**ビット一致する**。micro で gate/up 2 本が
+    11.35 -> 10.79 ms (-0.56 ms/層)
+
+畳めないのは top_k 軸の和だけ (専門家をまたぐ行の和なのでタイル内では
+取れず、atomic は非決定になる)。配線は `fused.enable_moe_down_epilogue`
+(vendor `_moe_combine_fold` のフック 1 個)、A/B は
+`tools/decode_ab.py --knob moe-down-epi`。
+
+**既定に入ったのは ``row_src`` と `kernels/moe_combine.py` の組**
+(in-model 8k で prefill -3.8%)。``row_dst`` / ``row_scale`` (epilogue) は
+combine と同着 (micro -0.97 対 -0.98) だったので、down GEMM を触らない
+combine のほうを採った。`mode="epi"` として残してある。
+
 ## NAX 機 (M5 以降) の扱い
 
 カーネル本体は NAX 専用の intrinsic を **1 つも使わない**。写した範囲は
@@ -411,10 +437,58 @@ METAL_FUNC void mlxturbo_mma_rows(
   }
 }
 
+// epilogue 版の store (P7 第 2 段)。`BlockMMA::store_result` の写しだが、
+// 行を「タイル内の並び」ではなく `row_dst[行]` の位置へ書き (scatter)、
+// 書く直前に `row_scale[行]` を掛ける。frag (i, j) が持つのは
+// 行 sm + i*TM_stride、列 sn + j*TN_stride の 2 要素 (kElemsPerFrag=2、
+// `_steel_flat.py` の BaseMMAFrag<T,8,8>) なので、行は frag ごとに 1 本しか
+// 無く、行ごとの分岐で足りる (simdgroup 一様である必要も無い -- ここには
+// simdgroup 命令が無い)。
+//
+// 端数タイルでは row_lim 未満の行だけ書く (store_result_safe と同じ条件)。
+// 掛け算は累算器 (fp32) のまま行って最後に T へ丸めるので、素の
+// 「bf16 に丸めてから掛ける」よりも丸めが 1 回少ない。
+template <typename T, typename mma_t>
+METAL_FUNC void mlxturbo_seg_store_scatter(
+    thread mma_t& mma_op,
+    device T* y,
+    const int N,
+    const int y_col,
+    const device uint* row_dst,
+    const device float* row_scale,
+    const int rs,
+    const short row_lim) {
+  constexpr short kelems = mma_t::MMAFrag_acc_t::kElemsPerFrag;
+
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < mma_t::TM; i++) {
+    const short r = mma_op.sm + i * mma_t::TM_stride;
+    if (r >= row_lim) {
+      continue;
+    }
+    device T* drow = y + size_t(row_dst[rs + r]) * size_t(N)
+        + size_t(y_col) + size_t(mma_op.sn);
+    const float s = row_scale[rs + r];
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < mma_t::TN; j++) {
+      thread const auto& accum = mma_op.Ctile.frag_at(i, j);
+      const int off = j * mma_t::TN_stride;
+      STEEL_PRAGMA_UNROLL
+      for (short k = 0; k < kelems; k++) {
+        drow[off + k] = static_cast<T>(accum[k] * s);
+      }
+    }
+  }
+}
+
 // タイル 1 枚 (専門家 e の行 rs..re、列 y_col..y_col+BN) を計算して store する。
 // BM と WM を template で受けるので、16 行 (WM=1、64 スレッド) と 32 行
 // (WM=2 の既定、または混合モードの WM=1) を同じ本文で回せる。中身は
 // もともと本文に直書きしてあったものをそのまま関数に移しただけ。
+//
+// TEPI が true のときだけ store が scatter + 重み掛けになる (row_dst /
+// row_scale を読む)。false の側は `nullptr` が渡り、分岐は template 定数
+// なので消える -- 行列積とローダーは 2 つの経路で完全に同じ命令列。
 template <
     typename T,
     int TBM,
@@ -424,7 +498,9 @@ template <
     int TWN,
     int TGS,
     int TBITS,
-    bool TSKIP>
+    bool TSKIP,
+    bool TEPI = false,
+    bool TSRC = false>
 METAL_FUNC void mlxturbo_seg_tile(
     const device T* x,
     const device uint8_t* w8,
@@ -441,7 +517,10 @@ METAL_FUNC void mlxturbo_seg_tile(
     const int re,
     const int y_col,
     const ushort simd_group_id,
-    const ushort simd_lane_id) {
+    const ushort simd_lane_id,
+    const device uint* row_dst = nullptr,
+    const device float* row_scale = nullptr,
+    const device uint* row_src = nullptr) {
   constexpr short BK_padded = (TBK + 16 / sizeof(T));
 
   using mma_t = mlx::steel::
@@ -469,7 +548,27 @@ METAL_FUNC void mlxturbo_seg_tile(
   const size_t stride_w = size_t(N) * size_t(K_w);
   const size_t stride_s = size_t(N) * size_t(K_g);
 
-  const device T* xp = x + size_t(rs) * size_t(K);
+  // TSRC のときは x の行を `row_src` 経由で読む (MoE の x gather を GEMM に
+  // 畳む)。BlockLoader はコンストラクタで `src + bi*src_ld + bj` を作るので、
+  // ここで先に bi ぶんを引いておけば、あとは素の loader がそのまま使える。
+  // bi はスレッド id と compile-time 定数だけで決まる
+  // (`_steel_flat.py` の BlockLoader: TCOLS = BCOLS / n_reads、
+  // bi = thread_idx / TCOLS)。本番の 3 構成はどれも 1 スレッド 1 行
+  // (n_rows == 1) なので、行は 1 本引くだけで足りる。
+  static_assert(!TSRC || loader_x_t::n_rows == 1,
+                "TSRC は 1 スレッド 1 行の loader 構成でだけ正しい");
+  const device T* xp;
+  if (TSRC) {
+    constexpr short xl_tcols = TBK / loader_x_t::vec_size;
+    const short xl_bi =
+        short(simd_group_id * SIMD_SIZE + simd_lane_id) / xl_tcols;
+    // 端数タイルでは rs + xl_bi が M を超えうる。読んだ結果は store しない
+    // ので、クランプして手前の行を読ませるだけでよい
+    const int src_row = int(row_src[min(rs + int(xl_bi), M - 1)]);
+    xp = x + (long(src_row) - long(xl_bi)) * long(K);
+  } else {
+    xp = x + size_t(rs) * size_t(K);
+  }
   device T* yp = y + size_t(rs) * size_t(N) + size_t(y_col);
   const device uint8_t* wl =
       w8 + size_t(e) * stride_w + size_t(y_col) * size_t(K_w);
@@ -486,14 +585,21 @@ METAL_FUNC void mlxturbo_seg_tile(
     // 満タンのタイル。dense クローンの内側そのもの
     gemm_loop_aligned(Xs, Ws, mma_op, loader_x, loader_w, K_it);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    mma_op.store_result(yp, N);
+    if (TEPI) {
+      mlxturbo_seg_store_scatter<T, mma_t>(
+          mma_op, y, N, y_col, row_dst, row_scale, rs, TBM);
+    } else {
+      mma_op.store_result(yp, N);
+    }
     return;
   }
 
   // 端数タイル。X のはみ出しぶんは「次の専門家の行」なので、x の末尾に
   // 掛かっていない限りそのまま読んでよい (読んだ結果は store しない)。
   const short tm = short(mma_t::kFragSize * (simd_group_id / TWN));
-  if (rs + TBM <= M) {
+  // TSRC のときは行の添字をクランプ済みなので、末尾のタイルでも x の外は
+  // 読まない (load_safe に落とす必要が無い)
+  if (TSRC || rs + TBM <= M) {
     for (int k = 0; k < K_it; k++) {
       threadgroup_barrier(mem_flags::mem_threadgroup);
       loader_x.load_unsafe();
@@ -524,7 +630,12 @@ METAL_FUNC void mlxturbo_seg_tile(
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  mma_op.store_result_safe(yp, N, short2(short(TBN), num_els));
+  if (TEPI) {
+    mlxturbo_seg_store_scatter<T, mma_t>(
+        mma_op, y, N, y_col, row_dst, row_scale, rs, num_els);
+  } else {
+    mma_op.store_result_safe(yp, N, short2(short(TBN), num_els));
+  }
 }
 """
 
@@ -594,25 +705,76 @@ _SEGMENTED_MIXED_SOURCE = _SEGMENTED_HEAD + """
   }
 """ % {"bm16": BM16, "bm": BM}
 
+# P7 第 2 段の 2 つの変種。本文は上の 2 つと同じで、`mlxturbo_seg_tile` の
+# template 定数と末尾の引数だけが違う:
+#
+#   epilogue (TEPI): store を「`row_dst[行]` の位置へ `row_scale[行]` 倍して
+#                    書く」に替える (MoE の combine を down GEMM に畳む)
+#   src      (TSRC): x の行を `row_src[行]` 経由で読む (MoE の x gather を
+#                    gate/up GEMM に畳む)。行数 M は row_src の長さ
+#
+# 素の 2 つ (`_SEGMENTED_SOURCE` / `_SEGMENTED_MIXED_SOURCE`) は 1 文字も
+# 動かさない (既定の経路のコンパイル結果を変えないため)。
+def _seg_variant_source(mixed: bool, epi: bool, src: bool) -> str:
+    tail = ", true" if epi else ", false"
+    tail += ", true" if src else ""
+    args = ",\n      row_dst, row_scale" if epi else ""
+    if src:
+        args = ",\n      " + ("row_dst, row_scale, " if epi else
+                              "nullptr, nullptr, ") + "row_src"
+    body_one = """
+  const int rs = row_start[e] + (t - tile_prefix[e]) * %(bm)s;
+  const int re = min(row_start[e + 1], rs + %(bm)s);
+  mlxturbo_seg_tile<T, %(bm)s, BN, BK, %(wm)s, WN, GROUP_SIZE, BITS,
+                    SKIP_ROWS%(tail)s>(
+      x, w8, scales, biases, y, Xs, Ws, K, N, M, e, rs, re, y_col,
+      simdgroup_index_in_threadgroup, thread_index_in_simdgroup%(args)s);
+"""
+    if not mixed:
+        return _SEGMENTED_HEAD + body_one % {
+            "bm": "TILE_M", "wm": "TILE_WM", "tail": tail, "args": args}
+    head = """
+  const int MIX_THRESHOLD = dims[4];
+  const int rows_e = row_start[e + 1] - row_start[e];
+  if (rows_e < MIX_THRESHOLD) {"""
+    small = body_one % {"bm": str(BM16), "wm": "1", "tail": tail, "args": args}
+    big = body_one % {"bm": str(BM), "wm": "1", "tail": tail, "args": args}
+    return (_SEGMENTED_HEAD + head + small + "  } else {" + big + "  }\n")
 
-def _get_segmented_kernel(mixed: bool = False):
-    key = "segmented_mixed" if mixed else "segmented"
+
+def _get_segmented_kernel(mixed: bool = False, epilogue: bool = False,
+                          src: bool = False):
+    key = "segmented" + ("_epi" if epilogue else "") + ("_src" if src else "") \
+        + ("_mixed" if mixed else "")
     kernel = _KERNELS.get(key)
     if kernel is None:
+        names = [
+            "x",
+            "w",
+            "scales",
+            "biases",
+            "row_start",
+            "tile_prefix",
+            "dims",
+        ]
+        if epilogue:
+            names += ["row_dst", "row_scale"]
+        if src:
+            names += ["row_src"]
+        if epilogue or src:
+            source = _seg_variant_source(mixed, epilogue, src)
+        else:
+            source = _SEGMENTED_MIXED_SOURCE if mixed else _SEGMENTED_SOURCE
+        if epilogue or src:
+            name = "mlxturbo_steel_qmm_" + key
+        else:
+            name = "mlxturbo_steel_qmm_seg_mixed" if mixed else \
+                "mlxturbo_steel_qmm_segmented"
         kernel = mx.fast.metal_kernel(
-            name="mlxturbo_steel_qmm_seg_mixed" if mixed else
-            "mlxturbo_steel_qmm_segmented",
-            input_names=[
-                "x",
-                "w",
-                "scales",
-                "biases",
-                "row_start",
-                "tile_prefix",
-                "dims",
-            ],
+            name=name,
+            input_names=names,
             output_names=["y"],
-            source=_SEGMENTED_MIXED_SOURCE if mixed else _SEGMENTED_SOURCE,
+            source=source,
             header=STEEL_HEADER + _SEGMENTED_HEADER,
             ensure_row_contiguous=True,
         )
@@ -731,6 +893,9 @@ def qmm_segmented(
     mix_threshold: int | None = None,
     group_size: int = GROUP_SIZE,
     bits: int = BITS,
+    row_dst: mx.array | None = None,
+    row_scale: mx.array | None = None,
+    row_src: mx.array | None = None,
 ) -> mx.array:
     """`mx.gather_qmm(..., transpose=True, sorted_indices=True)` の写し。
 
@@ -757,10 +922,23 @@ def qmm_segmented(
     2 種のタイルを混ぜるので threadgroup を 64 スレッドに揃える必要があり、
     WM は必ず 1)。``tables`` を渡すときは同じ ``bm`` /
     ``mix_threshold`` で作った表であること。
+
+    ``row_dst`` / ``row_scale`` (両方セットで渡す、P7 第 2 段の epilogue) を
+    渡すと、行 r の結果を ``row_dst[r]`` の位置へ ``row_scale[r]`` 倍して
+    書く。MoE の combine (unsort + ルータ重み掛け) を down GEMM の store に
+    畳むためのもの。``row_dst`` は uint32 の (M,)、``row_scale`` は float32 の
+    (M,)。**``row_dst`` は [0, M) の置換であること** -- 出力は初期化せずに
+    タイルが書くだけなので、書かれない行があると未初期化のまま残る。
+    掛け算は累算器 (fp32) のまま行い、丸めは store の 1 回だけ。
+
+    ``row_src`` (uint32 の (M,)) を渡すと、GEMM の行 r が読むのは
+    ``x[row_src[r]]`` になる (MoE の x gather を GEMM に畳む)。このとき
+    ``x`` の行数は M と無関係でよく、**M は ``row_src`` の長さ**になる。
     """
 
     _fire.bump("moe_grouped_gemm_segmented")
-    M, K = x.shape
+    K = x.shape[1]
+    M = x.shape[0] if row_src is None else row_src.shape[0]
     E, N = w.shape[0], w.shape[1]
     if num_experts is not None and num_experts != E:
         raise ValueError(f"num_experts={num_experts} が w の {E} と合わない")
@@ -799,7 +977,22 @@ def qmm_segmented(
     dims = mx.array(
         [K, N, M, E, int(mix_threshold or 0)], dtype=mx.int32
     )
-    kernel = _get_segmented_kernel(mixed)
+    epilogue = row_dst is not None or row_scale is not None
+    if epilogue:
+        if row_dst is None or row_scale is None:
+            raise ValueError("row_dst と row_scale は両方セットで渡すこと")
+        if row_dst.shape != (M,) or row_scale.shape != (M,):
+            raise ValueError(
+                f"row_dst/row_scale の形は (M,)={M} のみ"
+                f" (来たのは {row_dst.shape} / {row_scale.shape})")
+        if row_dst.dtype != mx.uint32:
+            row_dst = row_dst.astype(mx.uint32)
+        if row_scale.dtype != mx.float32:
+            row_scale = row_scale.astype(mx.float32)
+    if row_src is not None and row_src.dtype != mx.uint32:
+        row_src = row_src.astype(mx.uint32)
+
+    kernel = _get_segmented_kernel(mixed, epilogue, row_src is not None)
     template = [
         ("T", x.dtype),
         ("GROUP_SIZE", group_size),
@@ -808,8 +1001,13 @@ def qmm_segmented(
     ]
     if not mixed:
         template += [("TILE_M", int(bm)), ("TILE_WM", int(tile_wm))]
+    ins = [x, w, scales, biases, row_start, tile_prefix, dims]
+    if epilogue:
+        ins += [row_dst, row_scale]
+    if row_src is not None:
+        ins += [row_src]
     (out,) = kernel(
-        inputs=[x, w, scales, biases, row_start, tile_prefix, dims],
+        inputs=ins,
         template=template,
         grid=(threads * (N // BN), n_tiles_max(M, E, grid_bm), 1),
         threadgroup=(threads, 1, 1),

@@ -2121,6 +2121,232 @@ def disable_moe_grouped_gemm() -> None:
     _MOE_GEMM_PAD_X = None
 
 
+# --- P7 第 2 段: combine を down GEMM の store に畳む -------------------------
+#
+# prefill 幅の MoE で行列積以外に残っていた費用 (8k、層 20、M=2048、
+# `bench/results/moe-split.json`) のうち、
+#
+#   combine の weight_mul_cast  0.87 ms  ((act * w) の実体化 + bf16 への cast)
+#   combine の unsort_sum       1.07 ms  (`out[inv_order]` の gather + sum)
+#   sort の argsort 2 本目       ~0.17 ms  (`inv_order = argsort(order)`)
+#
+# の 3 つは、down GEMM (自前の segmented カーネル) の store でまとめて畳める:
+#
+#   - ルータ重みは累算器 (fp32) に掛けてから 1 回だけ丸めて書く
+#     -> `act` の実体化 (16384x640 の read + fp32 write + cast) が丸ごと消える
+#   - 行 s の結果を `order[s]` の位置へ直接書く (scatter)
+#     -> `out[inv_order]` の gather (16384x2560 の read+write) が消える。
+#        `result[order[s]] = out[s]` なので使うのは `order` そのもので、
+#        `inv_order` (2 本目の argsort) も要らなくなる
+#
+# 残るのは top_k 軸の和 (`sum(axis=-2)`) だけ。専門家をまたぐ行の和なので
+# タイル内では取れず、atomic を使うと非決定になるので畳まない。
+#
+# 2 つ目 (`MLXTURBO_MOE_GATHER_FOLD` 相当のフラグ): x の gather 0.49 ms も
+# gate/up GEMM の**行の読み方**に畳める (`row_src`)。素は
+# `xx[order // top_k]` で 16384x2560 (84MB) を実体化してから GEMM に渡すが、
+# GEMM が行ごとに `row_src[r]` を見て読めば実体化が要らない (読む先の x は
+# 2048 行 = 10MB で、キャッシュにも乗りやすくなる)。
+#
+# 差し替え口は vendor の `_moe_combine_fold` に置いた 1 個のフック
+# (`_MOE_DOWN_EPILOGUE`)。`QuantizedSwitchLinear.__call__` (P3 の差し替え)
+# 側では受けられない -- あちらは `order` も `w` も `row_src` も見えない。
+# **フックが受け持つのは gate/up -> SwiGLU -> down の 3 本まとめて**で、
+# 素の経路 (フック未設置・不適格) は 1 行も変わらない。
+_MOE_DOWN_EPI_ON = False
+_MOE_GATHER_FOLD_ON = False
+# "combine" (down の後ろを 1 カーネルに畳む) / "epi" (down の store に畳む)
+_MOE_FOLD_MODE = "combine"
+
+
+def _moe_fold_block(switch_mlp, x_rows, row_src, idx_s, order, w_flat):
+    """`_moe_combine_fold` から呼ばれる gate/up -> SwiGLU -> down。
+
+    ``switch_mlp`` 以外は `_moe_combine_fold` が持っている並べ替えの材料:
+
+      ``switch_mlp`` : SwitchGLU (3 射影は QuantizedSwitchLinear)
+      ``x_rows`` : gather **前**の x (rows, 1, K)
+      ``row_src``: 行 s が読む x の行 (M,) = `order // top_k`
+      ``idx_s``  : ソート済みの専門家添字 (M,)
+      ``order``  : 行 s の出力位置 (M,)。`argsort(idx.flatten())` そのもの
+      ``w_flat`` : ルータ重み (M,) fp32、**トークン順** (t*top_k + k の並び。
+                   ソート順ではない -- combine カーネルはこの並びで読む)
+
+    戻り値は **(rows, hidden)** (top_k の和まで取った最終形)。
+    条件が揃わなければ ``None`` を返し、呼び手は素の経路に落ちる。
+    判定は `dispatched` (P3) と同じ内容 -- あちらが素の `mx.gather_qmm` に
+    落ちる形でここだけ自前カーネルに入る、という食い違いを避けるため。
+    """
+    import mlx.core as mx
+
+    from .kernels import moe_grouped_gemm as mgg
+
+    if not _MOE_DOWN_EPI_ON or _MOE_GEMM_MODE != "seg":
+        return None
+    if mx.default_device() != mx.gpu:
+        return None
+    if x_rows.ndim != 3 or x_rows.shape[1] != 1:
+        return None
+    M = order.shape[0]
+    if M < _MOE_GEMM_MIN_ROWS:
+        return None
+    if idx_s.ndim != 1 or idx_s.shape[0] != M:
+        return None
+    if row_src.shape != (M,) or w_flat.shape != (M,):
+        return None
+
+    rows, _, K = x_rows.shape
+    up, gate, down = (switch_mlp.up_proj, switch_mlp.gate_proj,
+                      switch_mlp.down_proj)
+    parts = []
+    for proj in (up, gate, down):
+        if "bias" in proj or getattr(proj, "mode", "affine") != "affine":
+            return None
+        b = proj.get("biases")
+        if b is None:
+            return None
+        parts.append((proj["weight"], proj["scales"], b))
+    (w_up, s_up, b_up), (w_gate, s_gate, b_gate), (w_dn, s_dn, b_dn) = parts
+
+    x2 = x_rows.reshape(rows, K)
+    if not mgg.segmented_eligible(x2, w_up, s_up, b_up,
+                                  up.group_size, up.bits):
+        return None
+    H = w_up.shape[1]
+    # down の適格判定は形と dtype しか見ないので、まだ作っていない SwiGLU
+    # 出力 (M, H) の代わりにダミーの 1 行を渡す (MLX は遅延なので、評価
+    # されないこの配列に GPU の仕事は発生しない)
+    probe = mx.zeros((1, H), dtype=x_rows.dtype)
+    if not mgg.segmented_eligible(probe, w_dn, s_dn, b_dn,
+                                  down.group_size, down.bits):
+        return None
+
+    top_k = M // rows
+    if _MOE_FOLD_MODE == "combine":
+        from .kernels import moe_combine as mc
+
+        # 形の判定だけ先に済ませる (遅延グラフを組んでから捨てない)
+        if rows * top_k != M or w_dn.shape[1] % mc.VEC != 0:
+            return None
+
+    tables = _moe_gemm_tables(idx_s, w_up.shape[0])
+    kw = dict(tables=tables, bm=_MOE_GEMM_BM, wm=_MOE_GEMM_WM,
+              mix_threshold=_MOE_GEMM_MIX, group_size=up.group_size,
+              bits=up.bits)
+    if _MOE_GATHER_FOLD_ON:
+        src = row_src
+    else:
+        src = None
+        x2 = x_rows.reshape(rows, K)[row_src]
+    x_up = mgg.qmm_segmented(x2, w_up, s_up, b_up, None, row_src=src, **kw)
+    x_gate = mgg.qmm_segmented(x2, w_gate, s_gate, b_gate, None,
+                               row_src=src, **kw)
+    act = switch_mlp.activation(x_up, x_gate)
+    kw_dn = dict(kw, group_size=down.group_size, bits=down.bits)
+    if _MOE_FOLD_MODE == "epi":
+        # down の store でルータ重みを掛けて出力位置へ直接書く。残るのは
+        # top_k 軸の和だけ。store は行 s を order[s] へ書くので、重みも
+        # ソート順 (行 s の重み) で渡す
+        scattered = mgg.qmm_segmented(
+            act, w_dn, s_dn, b_dn, None, row_dst=order,
+            row_scale=w_flat[order], **kw_dn)
+        return mx.unflatten(scattered, 0, (rows, top_k)).sum(axis=-2)
+    # combine: down は現行のまま (ソート順に store)、その後ろの
+    # 「unsort + 重み掛け + 和」を 1 カーネルに畳む。カーネルは
+    # (t, k) の並びで読むので、重みは**トークン順**の w_flat をそのまま渡す
+    out_sorted = mgg.qmm_segmented(act, w_dn, s_dn, b_dn, None, **kw_dn)
+    return mc.combine(out_sorted, _inv_perm(order), w_flat, rows, top_k)
+
+
+def _inv_perm(order):
+    """置換 `order` の逆置換。`mx.argsort(order)` と同じ値を scatter で作る
+    (16384 要素で argsort の ~0.17 ms に対して 64KB の書き込み 1 回)。"""
+    import mlx.core as mx
+
+    n = order.shape[0]
+    idx = mx.arange(n, dtype=mx.uint32)
+    return mx.zeros((n,), dtype=mx.uint32).at[order].add(idx)
+
+
+def enable_moe_down_epilogue(model=None, mode: str | None = None,
+                             gather_fold: bool | None = None) -> int:
+    """P7 第 2 段。MoE の combine (unsort + ルータ重み掛け + 和) を畳む。
+
+    ``mode`` は 2 通り (既定は ``"combine"``):
+
+      - ``"combine"``: down は現行のまま (ソート順に store) で、その後ろの
+        「unsort の gather + ルータ重み + top_k の和」を 1 カーネルに畳む
+        (`kernels/moe_combine.py`)。ルータ重みを down の**後**で掛けるので、
+        `(act*w)` の実体化 (126MB 往復) も消える
+      - ``"epi"``: down の segmented GEMM の store でルータ重みを掛けて
+        出力位置へ直接書く (scatter)。top_k の和だけ後に残る
+
+    どちらも `enable_moe_grouped_gemm` (mode="seg") が有効なときだけ発火する
+    (フックが gate/up/down を自前カーネルで通すため)。行数ゲートも P3 と
+    同じ (`MLXTURBO_MOE_GEMM_MIN_ROWS`、既定 1024) なので decode/verify 幅は
+    1 op も変わらない。
+
+    **ビット一致しない。**丸めが 1 回減る (現行は `(act * w)` を bf16 に
+    丸めてから down GEMM、こちらは fp32 の累算器に w を掛けて 1 回だけ
+    丸める) ので、素より exact に近い側にずれる。
+
+    差し替えは vendor の `_moe_combine_fold` が読むフック 1 個だけ
+    (受け持つのは gate/up -> SwiGLU -> down の 3 本)。A/B で交互に測れるよう、
+    `disable_moe_down_epilogue` はフラグだけ下ろす (C1 / P3 と同じ作法)。
+
+    ``gather_fold`` は x の gather も gate/up GEMM の行の読み方に畳むか
+    (`row_src`)。**既定 on** (`MLXTURBO_MOE_GATHER_FOLD=0` で off)。in-model
+    8k では combine だけの -1.7% に対して、これを足すと -3.8%。
+
+    **既定 on** (2026-09-03、8k prefill -3.8%)。`MLXTURBO_MOE_DOWN_EPI` で
+    `combine` (既定) / `epi` / `off` を選ぶ。引数で渡した値のほうが強い
+    (A/B の knob は必ず明示で渡すので、env の設定に影響されない)。
+
+    戻り値は「フックに届きうる MoE 層の数」(``model`` を渡したときだけ。
+    渡さなければ 0)。off のときは必ず 0。
+    """
+    global _MOE_DOWN_EPI_ON, _MOE_GATHER_FOLD_ON, _MOE_FOLD_MODE
+    import os
+
+    if mode is None:
+        mode = (os.environ.get("MLXTURBO_MOE_DOWN_EPI", "combine").strip()
+                .lower() or "combine")
+    if mode in ("off", "0", "none", "false", "no"):
+        disable_moe_down_epilogue()
+        return 0
+    if mode not in ("combine", "epi"):
+        raise ValueError(f"mode={mode!r} は combine / epi / off のどれか")
+    _MOE_FOLD_MODE = mode
+    if gather_fold is None:
+        gather_fold = os.environ.get(
+            "MLXTURBO_MOE_GATHER_FOLD", "1") not in ("0", "")
+
+    # 実際に読み込まれているのは `mlx_lm.models.qwen4_exp` (中身は
+    # `_vendor/qwen4_exp.py`、`_arch_registry` の finder が差している)。
+    # `mlxturbo._vendor.qwen4_exp` として import すると同じファイルの
+    # **別のモジュール実体**になり、フックが本番の側に立たない
+    import mlx_lm.models.qwen4_exp as Q
+
+    Q._MOE_DOWN_EPILOGUE = _moe_fold_block
+    _MOE_DOWN_EPI_ON = True
+    _MOE_GATHER_FOLD_ON = bool(gather_fold)
+    if model is None:
+        return 0
+    # フックは `_moe_combine_fold` の中にあるので、届くのは combine-fold が
+    # 効いている MoE 層だけ (行数ゲートは呼び出し時に見る)
+    return sum(
+        1 for layer in model.model.layers
+        if getattr(getattr(layer, "mlp", None), "_combine_fold_min_s", None)
+        is not None
+    )
+
+
+def disable_moe_down_epilogue() -> None:
+    """`enable_moe_down_epilogue` を打ち消す (フラグを下ろすだけ)。"""
+    global _MOE_DOWN_EPI_ON
+    _MOE_DOWN_EPI_ON = False
+
+
 # --- P10: prefill 幅の dense 射影を BM=64 の自前 qmm へ -------------------
 #
 # MLX の dense qmm_t は BM=32 (quantized.cpp:1058-1065) なので、W タイル 1 枚の
@@ -2364,6 +2590,133 @@ def disable_ple_hoist(model) -> int:
     return 0
 
 
+# --------------------------------------------------------------- 糊 (P11)
+#
+# decode 1 step の Metal trace (2026-09-03 18:45、`docs/research/
+# SESSION-2026-09-02-CATCHUP.md`) で、S=1 の dispatch 4499/step のうち
+# **量子化行列積は 45% (855 本) しかなく、残り ~3644 本が elementwise /
+# copy / sort の「糊」**だと分かった。ここに置くのはその糊だけを減らす
+# 差し替えで、行列積そのものには一切触らない (decode 幅の自前カーネルは
+# 冷 DRAM の並列度不足で 4 回負けている --- CLAUDE.md)。
+#
+# `mx.compile` は MLX 本体の融合なので、その「自前カーネルが負ける」筋には
+# 当たらない。過去に負けた `MLXTURBO_PIPELINE` / `HC_PREFILL_COMPILE` は
+# 別の対象 (前者は decode ループの二重化、後者は prefill 幅の HC)。
+_GLUE_COMPILE_ORIG: dict = {}
+
+
+def enable_glue_compile() -> int:
+    """silu 系の 2〜3 op の連なりを `mx.compile` で 1 カーネルに畳む。既定 off。
+
+    畳む先は 4 か所 (どれも「同じ形の elementwise が 2〜3 本並ぶ」だけの糊):
+
+    - `mlx.nn.silu` = ``x * sigmoid(x)`` (2 dispatch)。vendor の
+      `GatedDeltaNet` が conv 出力に 1 回ずつ (36 層)。
+    - `mlx_lm.models.switch_layers.swiglu` = ``silu(gate) * x`` (3 dispatch)。
+      MoE のエキスパート 48 層ぶん。`SwitchGLU.__call__` は
+      `from .activations import swiglu` で取り込んだ**自分の名前空間の束縛**を
+      呼ぶので、`activations` 側だけ差しても効かない (両方差す)。
+    - `Q.MLP.__call__` の ``silu(gate_proj(x)) * up_proj(x)``。shared expert
+      48 層ぶん。本体は 1 行の写しで、射影 3 本の呼び方は素のまま
+      (行列積には触らない)。
+    - `SparseMoeBlock` の shared expert 合流 ``out + sigmoid(sg) * shared``
+      (sigmoid / 乗算 / 加算 の 3 dispatch)。vendor 側の `_shared_add` を
+      compile 経路に切り替える (`Q._GLUE_COMPILE_ON`)。
+
+    **`mlx.nn.silu` と `mlx_lm` の `swiglu` は上流で既に
+    `@partial(mx.compile, shapeless=True)` が付いている** (MLX 0.32.2 で確認)。
+    つまりこの 2 つを差し替えても本数は変わらず、効くのは後ろの 2 つ
+    (MLP の `* up` を silu と同じカーネルに畳む 48 本、shared 合流の
+    3 -> 1 で 96 本) の合わせて ~144 本 / 4499。前の 2 つを残してあるのは、
+    上流が compile を外したときに黙って本数が戻らないようにするため。
+
+    演算の順序は素とまったく同じなので **出力はビット一致するはず**。
+    崩れたらそれ自体が報告事項。
+    """
+    import mlx.core as mx
+    import mlx.nn as nn
+    import mlx_lm.models.activations as ACT
+    import mlx_lm.models.switch_layers as SL
+    from mlx_lm.models import qwen4_exp as Q
+
+    if _GLUE_COMPILE_ORIG:
+        return 0
+    _GLUE_COMPILE_ORIG["silu"] = nn.silu
+    _GLUE_COMPILE_ORIG["swiglu_act"] = ACT.swiglu
+    _GLUE_COMPILE_ORIG["swiglu_sl"] = SL.swiglu
+    _GLUE_COMPILE_ORIG["mlp"] = Q.MLP.__call__
+
+    silu_c = mx.compile(lambda x: x * mx.sigmoid(x), shapeless=True)
+    swiglu_c = mx.compile(
+        lambda gate, x: (gate * mx.sigmoid(gate)) * x, shapeless=True)
+
+    def mlp_call(self, x):
+        return self.down_proj(swiglu_c(self.gate_proj(x), self.up_proj(x)))
+
+    nn.silu = silu_c
+    ACT.swiglu = swiglu_c
+    SL.swiglu = swiglu_c
+    Q.MLP.__call__ = mlp_call
+    Q._GLUE_COMPILE_ON = True
+    return 1
+
+
+def disable_glue_compile() -> int:
+    """`enable_glue_compile` を打ち消す (A/B で交互に測るために要る)。"""
+    import mlx.nn as nn
+    import mlx_lm.models.activations as ACT
+    import mlx_lm.models.switch_layers as SL
+    from mlx_lm.models import qwen4_exp as Q
+
+    if not _GLUE_COMPILE_ORIG:
+        return 0
+    nn.silu = _GLUE_COMPILE_ORIG.pop("silu")
+    ACT.swiglu = _GLUE_COMPILE_ORIG.pop("swiglu_act")
+    SL.swiglu = _GLUE_COMPILE_ORIG.pop("swiglu_sl")
+    Q.MLP.__call__ = _GLUE_COMPILE_ORIG.pop("mlp")
+    Q._GLUE_COMPILE_ON = False
+    _GLUE_COMPILE_ORIG.clear()
+    return 1
+
+
+def enable_moe_combine_glue(mode: int = 1) -> int:
+    """MoE の top_k 合成 ``(y * w[..., None]).sum(-2)`` の書き方を選ぶ。既定 off。
+
+    素の合成は decode 幅で 3 dispatch 出る: fp32 のルータ重み w (rows, top_k)
+    を (rows, top_k, 2560) に**実体化する** `Broadcast strided` (trace で
+    96 x 10 us = 0.96 ms/round)、その `vv_Multiply`、そして top_k 軸の `Sum`。
+
+    - ``mode=1`` (compile): 素の式をそのまま `mx.compile` に通す。broadcast と
+      乗算が 1 カーネルに畳まれ、fp32 (top_k, 2560) の実体化が消える。
+      **式も順序も素のままなのでビット一致するはず。**
+    - ``mode=2`` (matmul): 中身は長さ top_k=10 の内積そのものなので
+      ``w[..., None, :] @ y`` (M=1, K=10, N=2560) と書く。**ビット一致は
+      しない** (総和の順序と累積が matmul 側に移る) ので、採用するなら
+      KLD を見ること。
+    - ``mode=0``: 素に戻す (`disable_moe_combine_glue` と同じ)。
+
+    `_moe_combine_fold` (prefill 幅、行数 >= 64) の側は触らない --- あちらは
+    down_proj の入力に w を先掛けする別の畳み方で、既に broadcast の幅が
+    4 分の 1 になっている。
+    """
+    from mlx_lm.models import qwen4_exp as Q
+
+    if Q._MOE_COMBINE_MODE == mode:
+        return 0
+    Q._MOE_COMBINE_MODE = int(mode)
+    return 1
+
+
+def disable_moe_combine_glue() -> int:
+    """`enable_moe_combine_glue` を打ち消す (素の書き方に戻す)。"""
+    from mlx_lm.models import qwen4_exp as Q
+
+    if not Q._MOE_COMBINE_MODE:
+        return 0
+    Q._MOE_COMBINE_MODE = 0
+    return 1
+
+
 __all__ = [
     "enable_gather_sort",
     "enable_gdn_blocked_kernel",
@@ -2398,4 +2751,8 @@ __all__ = [
     "disable_sdpa_split",
     "enable_ple_hoist",
     "disable_ple_hoist",
+    "enable_glue_compile",
+    "disable_glue_compile",
+    "enable_moe_combine_glue",
+    "disable_moe_combine_glue",
 ]
