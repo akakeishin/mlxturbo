@@ -2216,7 +2216,7 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - 次の手 (品質と速度の取引、KLD が要る): blocks を 64 に釘付け (冷連鎖 123 → 92 us/層、-0.37 ms/forward、partials 1/4)。再結合順が変わるので teacher の後。
 - **罠 16**: 1 プロセスの A/B で depth 適応の EMA が variant をまたぐ。decode_ab は variant / row の切り替えで DepthController を作り直すこと (未対応、decode_ab の宿題)。
 
-### 2026-09-03 18:45 decode 1 step の Metal trace (`tools/decode_gpu_trace.py`、観測 dylib で dispatch / command buffer / GPU 時間を取る。`bench/results/decode-gpu-trace-*.json`)
+### 2026-09-03 18:10 decode 1 step の Metal trace (`tools/decode_gpu_trace.py`、観測 dylib で dispatch / command buffer / GPU 時間を取る。`bench/results/decode-gpu-trace-*.json`)
 
 | | 壁時計 ms/round | dispatch/round | CB/round | GPU 合計 ms | busy | カーネル平均 | 隙間平均 |
 |---|---|---|---|---|---|---|---|
@@ -2237,7 +2237,7 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
   (c) 層ごとの elementwise の糊 (multiply / sigmoid / broadcast / softmax、~4 ms) を `mx.compile` か 1 カーネルに畳む、(d) lm_head 8bit の 1.75 ms (4bit で候補 → 8bit で上位だけ再採点、品質の確認要)、
   (e) `wide` (射影の連結) を decode 幅で burn-in 付きに再測 (前の負けは位置 1 の段差込みの疑い)。
 
-### 2026-09-03 19:00 本番のパックを lm_head 4bit (`~/models/ddalcu-mlxlm-head4`、真 bf16 から g64 で焼いた 9/2 23:03 のもの) に (ユーザー判断)
+### 2026-09-03 18:20 本番のパックを lm_head 4bit (`~/models/ddalcu-mlxlm-head4`、真 bf16 から g64 で焼いた 9/2 23:03 のもの) に (ユーザー判断)
 
 - 理由: 対戦相手 (mlx-serve / oMLX / rapid-mlx) は一律 4bit で、条件を揃える。decode で lm_head の 1 本 (1.75 ms/forward、7%) が半分になる見込み (+3〜4%)。
 - 代金 (了承済み): KLD 0.01326 → 0.01794 (+0.0047)、top-1 一致 0.966 → 0.962。以後の KLD 基準は 0.01794。
