@@ -67,6 +67,20 @@
 このツールは `build_runner` が返す `FlashSpecEngine`/MTP は使わない
 (生成に要らない) が、出荷経路と同じ融合 (`enable_default_fusions`) を
 model に当てる副作用のためだけに `build_runner` をそのまま再利用する。
+
+## 常駐 worker (`tool` ジョブ)
+
+98GB を読み直さずに済むよう、`run_with_model(argv, bundle)` を持つ
+(規約は `tools/ab_bundle.py` の docstring)。CLI (`main`) と worker は
+同じ `parse_args` → `run` を通るので、**出力も終了コードも変わらない。**
+worker から呼ばれたときだけ、借り物のモデルに残る 3 つ (経路の旗
+`_gather_attn`/`_prefill_attn`/`_gather_attn_tile`、`qsa_tail.MODE`、
+prefill カーネルの差し替え) を終わりに戻す。
+
+`--qsa-tail` は `MLXTURBO_QSA_TAIL` の代わり。**worker は環境変数を
+読み直さない** (`mlxturbo/qsa_tail.py` は import 時に 1 回だけ読む) ので、
+モジュール属性 `qsa_tail.MODE` をその場で書き換える。省略時は今の値の
+まま (CLI では環境変数どおり)。
 """
 
 from __future__ import annotations
@@ -367,8 +381,17 @@ def eval_quote(
 
 TASKS = {"recall": eval_recall, "quote": eval_quote}
 
+# 「worker には載せられない」を表す終了コード。`tools/ab_submit.py` の
+# NOT_ROUTABLE と同じ値で、`tools/biglock.sh` はこれを受けると自分でロックを
+# 取り直して従来どおり別プロセスで流す (worker には 98GB を返させる)。
+NOT_ROUTABLE = 64
 
-def main() -> int:
+
+class ArgError(ValueError):
+    """引数の誤り。1 行印字して終了コード 1 (従来の main と同じ扱い)。"""
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         description="prefill attention 融合カーネル (MLXTURBO_PREFILL_ATTN) の"
         " on/off で、長文脈の課題 (recall/quote) の正答率がどれだけ動くかを測る"
@@ -401,40 +424,57 @@ def main() -> int:
     ap.add_argument(
         "--max-new", type=int, default=64, help="貪欲デコードの最大トークン数"
     )
+    ap.add_argument(
+        "--qsa-tail",
+        choices=("query", "global"),
+        default=None,
+        help="QSA の端数ブロックの可視規則 (mlxturbo/qsa_tail.py の MODE)。"
+        " 省略時は今の値のまま (CLI では環境変数 MLXTURBO_QSA_TAIL どおり)。"
+        " 常駐 worker は環境変数を読み直さないので、切り替えはここで指定する",
+    )
     ap.add_argument("--out", default=str(REPO_ROOT / "bench" / "results" / "longctx-quality.json"))
-    args = ap.parse_args()
+    return ap
+
+
+def parse_args(argv=None):
+    """引数を解釈して ``(args, ctxs)`` を返す。誤りは `ArgError`。
+
+    98GB を読む前に弾けるものはここで全部弾く。CLI (`main`) と常駐 worker
+    (`run_with_model`) の両方がこれを通る。
+    """
+    args = build_parser().parse_args(argv)
 
     ctxs = sorted({int(v) for v in args.ctxs.split(",") if v.strip() != ""})
     if not ctxs:
-        print("--ctxs が空")
-        return 1
+        raise ArgError("--ctxs が空")
     if args.n <= 0:
-        print("--n は正の整数にすること")
-        return 1
+        raise ArgError("--n は正の整数にすること")
     if args.max_new <= 0:
-        print("--max-new は正の整数にすること")
-        return 1
+        raise ArgError("--max-new は正の整数にすること")
     if args.chunk <= 0:
-        print("--chunk は正の整数にすること")
-        return 1
+        raise ArgError("--chunk は正の整数にすること")
+    return args, ctxs
 
-    if args.ngram:
-        # n-gram をディスクに置いた構成。vendored arch は import 時に旗を読む。
-        os.environ.setdefault("FASTMLX_NGRAM_DISK", "1")
 
-    from verify_width_cost import build_runner  # noqa: E402
+def run(model, tok, eos_ids, args, ctxs) -> int:
+    """読み込み済みのモデルで課題を解く本体 (CLI と worker が共有する)。
 
-    eng, model, tok, eos_ids = build_runner(args)
-    del eng  # 生成に FlashSpecEngine/MTP は使わない (build_runner は出荷経路と
-    # 同じ融合を model に当てる副作用のためだけに呼んでいる)。
-
+    `--qsa-tail` の指定はここで `mlxturbo.qsa_tail.MODE` に当てる。
+    **戻すのは呼び出し側** --- CLI はプロセスごと終わるので戻す必要が無く、
+    worker (`run_with_model`) は借り物なので必ず戻す。
+    """
     import prefill_anatomy as PA  # noqa: E402 (pending() を借りる)
+    from mlxturbo import qsa_tail
+
+    if args.qsa_tail is not None:
+        qsa_tail.MODE = args.qsa_tail
 
     rng = random.Random(args.seed)
 
     print(
         f"model={args.model} ngram={args.ngram} ctxs={ctxs} n={args.n}"
-        f" seed={args.seed} chunk={args.chunk} max_new={args.max_new}",
+        f" seed={args.seed} chunk={args.chunk} max_new={args.max_new}"
+        f" qsa_tail={qsa_tail.MODE}",
         flush=True,
     )
 
@@ -446,6 +486,7 @@ def main() -> int:
         "n": args.n,
         "chunk": args.chunk,
         "max_new": args.max_new,
+        "qsa_tail": qsa_tail.MODE,
         "ctxs": ctxs,
         "tasks": {name: {} for name in TASKS},
     }
@@ -520,6 +561,108 @@ def main() -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, ensure_ascii=False, indent=1))
     print(f"\nwrote {out_path}", flush=True)
+    return 0
+
+
+_MISSING = object()
+
+
+def _route_snapshot(model) -> list[tuple]:
+    """`_set_route` が書き換える経路の旗を控える。
+
+    `enable_prefill_attn` / `disable_gather_attn` は層の ``self_attn`` に
+    ``_gather_attn`` / ``_prefill_attn`` / ``_gather_attn_tile`` を直に立てる。
+    この道具は最後の 1 問を必ず kernel 経路で終えるので、**戻さないと次の
+    ジョブが「本番の既定」ではなく「この道具が最後に立てた旗」で走る。**
+    """
+    from mlxturbo.gather_attn import _each_layer
+
+    snap = []
+    for layer in _each_layer(model):
+        sa = getattr(layer, "self_attn", None)
+        if sa is None or not hasattr(sa, "indexer"):
+            continue
+        snap.append((sa, {a: getattr(sa, a, _MISSING)
+                          for a in ("_gather_attn", "_prefill_attn",
+                                    "_gather_attn_tile")}))
+    return snap
+
+
+def _route_restore(snap: list[tuple]) -> None:
+    for sa, attrs in snap:
+        for name, val in attrs.items():
+            if val is _MISSING:
+                try:
+                    delattr(sa, name)
+                except Exception:
+                    pass
+            else:
+                setattr(sa, name, val)
+
+
+def run_with_model(argv, bundle) -> int:
+    """読み込み済みの一式で本体を走らせる (`tool` ジョブの入口)。
+
+    規約は `tools/ab_bundle.py` の docstring。**借り物のモデルに旗を残さない**
+    のがここの仕事で、戻すのは 3 つ:
+
+    - 経路の旗 (`_route_snapshot` の docstring)
+    - `mlxturbo.qsa_tail.MODE` (`--qsa-tail` を指定したとき)
+    - `prefill_attn` の差し替え (`_run_route` が自分の finally で戻すが、
+      例外で抜けた場合の網としてここでも控える)
+
+    worker が抱えているモデルと引数が食い違うときは `NOT_ROUTABLE` (64)。
+    `tools/biglock.sh` はこれを受けると worker に 98GB を返させてから、
+    従来どおり別プロセスで流し直す。
+    """
+    try:
+        args, ctxs = parse_args(argv)
+    except ArgError as e:
+        print(e)
+        return 1
+    except SystemExit as e:  # argparse の --help / 引数エラー
+        return int(e.code or 0)
+
+    bad = bundle.mismatch(model_path=args.model, ngram_path=args.ngram,
+                          mtp_path=args.mtp, mtp_bits=args.mtp_bits)
+    if bad:
+        print(f"常駐 worker には載せられない: {bad}")
+        return NOT_ROUTABLE
+
+    from mlxturbo import qsa_tail
+    from mlxturbo.kernels import prefill_attn as prefill_attn_kernel
+
+    snap = _route_snapshot(bundle.model)
+    saved_mode = qsa_tail.MODE
+    saved_kernel = prefill_attn_kernel.prefill_attn
+    try:
+        return run(bundle.model, bundle.tokenizer, bundle.eos_ids, args, ctxs)
+    finally:
+        prefill_attn_kernel.prefill_attn = saved_kernel
+        qsa_tail.MODE = saved_mode
+        _route_restore(snap)
+
+
+def main() -> int:
+    try:
+        args, ctxs = parse_args()
+    except ArgError as e:
+        print(e)
+        return 1
+
+    if args.ngram:
+        # n-gram をディスクに置いた構成。vendored arch は import 時に旗を読む。
+        os.environ.setdefault("FASTMLX_NGRAM_DISK", "1")
+
+    from verify_width_cost import build_runner  # noqa: E402
+
+    eng, model, tok, eos_ids = build_runner(args)
+    del eng  # 生成に FlashSpecEngine/MTP は使わない (build_runner は出荷経路と
+    # 同じ融合を model に当てる副作用のためだけに呼んでいる)。
+
+    rc = run(model, tok, eos_ids, args, ctxs)
+    if rc:
+        return rc
 
     # 計測ツールなので destructor (スレッドプール等の後始末) に用は無い。
     # interpreter shutdown 待ちでプロセスが Metal のメモリを握ったまま残る

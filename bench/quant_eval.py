@@ -375,19 +375,30 @@ def cmd_sweep(args):
     print(f"wrote {out}")
 
 
-def cmd_compare(args):
-    model, _ = _load(args.model, getattr(args, "ngram", None),
-                     getattr(args, "rebit", None),
-                     fusions=getattr(args, "fusions", False))
-    if getattr(args, "disable_ple", False):
-        # n-gram/PLE を丸ごと切る。埋め込みがゼロなら PLE の出力もゼロになる
-        # ので、層を外すのと等価。「n-gram が無いことの代償」を測るための経路
-        n = 0
-        for layer in model.model.layers:
-            if getattr(layer, "ple", None) is not None:
-                layer.ple = None
-                n += 1
-        print(f"PLE を無効化した ({n} 層)")
+def _disable_ple(model) -> list:
+    """n-gram/PLE を丸ごと切る。戻り値は復元用の ``(layer, ple)`` の一覧。
+
+    埋め込みがゼロなら PLE の出力もゼロになるので、層を外すのと等価。
+    「n-gram が無いことの代償」を測るための経路。**常駐 worker では借り物の
+    モデルを壊すことになる**ので、戻せるように控えを返す (CLI は
+    プロセスごと終わるので捨てて構わない)。
+    """
+    saved = []
+    for layer in model.model.layers:
+        if getattr(layer, "ple", None) is not None:
+            saved.append((layer, layer.ple))
+            layer.ple = None
+    print(f"PLE を無効化した ({len(saved)} 層)")
+    return saved
+
+
+def compare_with_model(model, args) -> None:
+    """読み込み済みモデルを参照ダンプと突き合わせて結果を書く。
+
+    `cmd_compare` (モデルを自分で読む CLI) と `run_with_model` (常駐 worker
+    から読み込み済みの一式を受ける) が共有する本体。**ここはモデルを読まない**
+    のが要件 (`evaluate` と同じ理由)。
+    """
     cont = json.loads(Path(args.continuations).read_text())
     ref = np.load(args.ref_dump)
     per_prompt = evaluate(model, cont, ref)
@@ -407,6 +418,15 @@ def cmd_compare(args):
     out = RESULTS_DIR / f"compare-{args.tag}.json"
     out.write_text(json.dumps(result, indent=1))
     print(f"wrote {out}: kld_mean={result['kld_mean']:.5f} agree={result['top1_agree_mean']:.3f}")
+
+
+def cmd_compare(args):
+    model, _ = _load(args.model, getattr(args, "ngram", None),
+                     getattr(args, "rebit", None),
+                     fusions=getattr(args, "fusions", False))
+    if getattr(args, "disable_ple", False):
+        _disable_ple(model)
+    compare_with_model(model, args)
 
 
 def cmd_speed(args):
@@ -482,7 +502,7 @@ def cmd_report(args):
         )
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -545,7 +565,66 @@ def main():
     p = sub.add_parser("report")
     p.set_defaults(fn=cmd_report)
 
-    args = ap.parse_args()
+    return ap
+
+
+# 「worker には載せられない」を表す終了コード。`tools/ab_submit.py` の
+# NOT_ROUTABLE と同じ値で、`tools/biglock.sh` はこれを受けると worker に
+# 98GB を返させてから、従来どおり別プロセスで流し直す。
+NOT_ROUTABLE = 64
+
+
+def run_with_model(argv, bundle) -> int:
+    """読み込み済みの一式で `compare` を走らせる (`tool` ジョブの入口)。
+
+    規約は `tools/ab_bundle.py` の docstring。**載るのは `compare` だけ**で、
+    それも bundle のモデルがそのまま答えになる場合に限る。他は `NOT_ROUTABLE`
+    (64) を返し、`tools/biglock.sh` が従来どおり別プロセスで流し直す:
+
+    - `compare` 以外のサブコマンド。`continuations` / `dump` / `speed` は
+      **融合を当てない素の `_load`** で測る約束 (`_load` の `fusions=False`)
+      なのに対し、bundle は出荷経路の融合が当たった状態でしか手に入らない。
+      `sweep` は `rebit.apply` でモデルのビットを打ち直す (戻せない)。
+    - `--fusions` 無しの `compare`。上と同じ理由で、bundle から「融合の
+      当たっていないモデル」は作れない。
+    - `--rebit`。読み込み後にビットを打ち直すので、借り物のモデルが壊れる。
+    - `--model` / `--ngram` が worker の抱えているものと違うとき。
+
+    `--disable-ple` は層の `ple` を外すだけなので、控えて戻す。
+    """
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as e:  # argparse の --help / 引数エラー
+        return int(e.code or 0)
+
+    if args.cmd != "compare":
+        print(f"常駐 worker に載るのは compare だけ (指定={args.cmd})")
+        return NOT_ROUTABLE
+    if not getattr(args, "fusions", False):
+        print("--fusions 無しの compare は載せられない"
+              " (bundle は出荷経路の融合が当たった状態でしか手に入らない)")
+        return NOT_ROUTABLE
+    if getattr(args, "rebit", None):
+        print("--rebit は読み込み後にビットを打ち直すので載せられない"
+              " (借り物のモデルを壊す)")
+        return NOT_ROUTABLE
+
+    bad = bundle.mismatch(model_path=args.model, ngram_path=getattr(args, "ngram", None))
+    if bad:
+        print(f"常駐 worker には載せられない: {bad}")
+        return NOT_ROUTABLE
+
+    saved_ple = _disable_ple(bundle.model) if getattr(args, "disable_ple", False) else []
+    try:
+        compare_with_model(bundle.model, args)
+    finally:
+        for layer, ple in saved_ple:
+            layer.ple = ple
+    return 0
+
+
+def main():
+    args = build_parser().parse_args()
     args.fn(args)
 
 

@@ -77,6 +77,19 @@ snapshot/restore が要る。`SparseMoeBlock` はキャッシュを持たない�
     tools/biglock.sh .venv/bin/python tools/moe_split.py \\
         --model ~/models/ddalcu-mlxlm --layer 20 --rows 2048,8192 \\
         --json bench/results/moe-split.json
+
+## 常駐 worker (`tool` ジョブ)
+
+98GB を読み直さずに済むよう `run_with_model(argv, bundle)` を持つ (規約は
+`tools/ab_bundle.py` の docstring)。CLI (`main`) と worker は同じ
+`parse_args` → `run` を通るので、**出力も終了コードも変わらない。**
+捕まえた実引数 `x` は `SparseMoeBlock.__call__` を一時的に包んで取るが、
+それは `capture_x` が自分の finally で戻す (worker から呼ばれたときは
+`run_with_model` が例外経路の網としてもう一枚控える)。
+
+**`--ngram` は worker の構成と一致させること。**PLE の埋め込みが変われば
+層 20 に届く `x` が変わる。食い違えば 64 を返し、`tools/biglock.sh` が
+従来どおり別プロセスで流し直す。
 """
 
 from __future__ import annotations
@@ -325,7 +338,13 @@ def print_row(row: dict) -> None:
     print(flush=True)
 
 
-def main() -> int:
+# 「worker には載せられない」を表す終了コード。`tools/ab_submit.py` の
+# NOT_ROUTABLE と同じ値で、`tools/biglock.sh` はこれを受けると worker に
+# 98GB を返させてから、従来どおり別プロセスで流し直す。
+NOT_ROUTABLE = 64
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="~/models/ddalcu-mlxlm")
     ap.add_argument("--ngram", default=None,
@@ -337,30 +356,26 @@ def main() -> int:
                      help="プロンプトの目安トークン数 (既定: max(rows)+300)")
     ap.add_argument("--reps", type=int, default=5, help="中央値を取るレップ数")
     ap.add_argument("--json", default=str(REPO_ROOT / "bench/results/moe-split.json"))
-    args = ap.parse_args()
+    return ap
 
+
+def parse_args(argv=None):
+    """引数を解釈して ``(args, rows, ctx)`` を返す。
+
+    CLI (`main`) と常駐 worker (`run_with_model`) の両方がこれを通る。
+    """
+    args = build_parser().parse_args(argv)
     rows = [int(r) for r in args.rows.split(",")]
     ctx = args.ctx or (max(rows) + 300)
+    return args, rows, ctx
 
-    if args.ngram:
-        os.environ.setdefault("FASTMLX_NGRAM_DISK", "1")
 
+def run(model, tok, args, rows, ctx) -> int:
+    """読み込み済みのモデルで内訳を測る本体 (CLI と worker が共有する)。"""
     import mlx.core as mx
-    from mlx_lm import load
 
     import mlxturbo  # noqa: F401  -- qwen4_exp を _vendor 版に差し替える
     import mlx_lm.models.qwen4_exp as Q
-    from mlxturbo.runner import enable_default_fusions, set_wired_limit_default
-
-    model, tok = load(os.path.expanduser(args.model))
-    if args.ngram:
-        from mlxturbo.ngram_stream import install
-
-        install(model, os.path.expanduser(args.ngram))
-    enable_default_fusions(model, log_prefix="[moe-split]")
-    # engine を直叩きなので、常駐条件を本番と揃えるためモデル読み込み直後に呼ぶ
-    # (tools/gdn_split.py と同じ理由。mlxturbo/runner.py 参照)。
-    set_wired_limit_default(log_prefix="[moe-split]")
 
     n_layers = len(model.model.layers)
     if not (0 <= args.layer < n_layers):
@@ -402,6 +417,61 @@ def main() -> int:
     with open(out_path, "w") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     print(f"\n書いた: {out_path}", flush=True)
+    return 0
+
+
+def run_with_model(argv, bundle) -> int:
+    """読み込み済みの一式で本体を走らせる (`tool` ジョブの入口)。
+
+    規約は `tools/ab_bundle.py` の docstring。この道具がモデルに触るのは
+    `capture_x` の `SparseMoeBlock.__call__` の包みだけ (あちらの finally で
+    戻る) なので、ここではその 1 点を例外経路の網として控えるだけでよい ---
+    部品の計測はどれも純関数で、キャッシュも層の属性も残さない。
+    """
+    try:
+        args, rows, ctx = parse_args(argv)
+    except SystemExit as e:  # argparse の --help / 引数エラー
+        return int(e.code or 0)
+
+    bad = bundle.mismatch(model_path=args.model, ngram_path=args.ngram)
+    if bad:
+        print(f"常駐 worker には載せられない: {bad}")
+        return NOT_ROUTABLE
+
+    import mlxturbo  # noqa: F401  -- qwen4_exp を _vendor 版に差し替える
+    import mlx_lm.models.qwen4_exp as Q
+
+    saved_call = Q.SparseMoeBlock.__call__
+    try:
+        return run(bundle.model, bundle.tokenizer, args, rows, ctx)
+    finally:
+        Q.SparseMoeBlock.__call__ = saved_call
+
+
+def main() -> int:
+    args, rows, ctx = parse_args()
+
+    if args.ngram:
+        os.environ.setdefault("FASTMLX_NGRAM_DISK", "1")
+
+    from mlx_lm import load
+
+    import mlxturbo  # noqa: F401  -- qwen4_exp を _vendor 版に差し替える
+    from mlxturbo.runner import enable_default_fusions, set_wired_limit_default
+
+    model, tok = load(os.path.expanduser(args.model))
+    if args.ngram:
+        from mlxturbo.ngram_stream import install
+
+        install(model, os.path.expanduser(args.ngram))
+    enable_default_fusions(model, log_prefix="[moe-split]")
+    # engine を直叩きなので、常駐条件を本番と揃えるためモデル読み込み直後に呼ぶ
+    # (tools/gdn_split.py と同じ理由。mlxturbo/runner.py 参照)。
+    set_wired_limit_default(log_prefix="[moe-split]")
+
+    rc = run(model, tok, args, rows, ctx)
+    if rc:
+        return rc
 
     sys.stdout.flush()
     sys.stderr.flush()
