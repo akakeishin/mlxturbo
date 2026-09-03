@@ -706,3 +706,15 @@ mlx_lm の更新で写しが壊れる頻度が月 2 回を超えるなら、写�
 ## 公開パックの lm_head を 4bit に (2026-09-03、ユーザー判断で本番を 4bit 頭に)
 
 ローカルの本番は `~/models/ddalcu-mlxlm-head4` (真 bf16 から焼いた 4bit 頭)。HF に公開しているパックは 8bit 頭のままなので、差し替えて README に KLD の代金 (+0.0047) を書く。
+
+### 追記 (2026-09-03 18:50、ユーザー): 族ごとの対応表ではなく、**モデルを読んで動的に判定する**方向で
+
+全アーキテクチャへの個別対応は無理なので、読み込み時にモデルの構造を歩いて「当てられる最適化」を自動で選ぶ形にしたい。設計の芯:
+1. **構造の探索 (duck typing)**: `model_type` ではなくモジュールの形で判定する。GDN (in_proj_qkv / a / b、A_log、conv1d を持つ再帰層)、attention (q/k/v/o、head_dim、GQA 比、sliding window の cache)、
+   MoE (SwitchGLU / gather_qmm の gate/up/down と router)、dense MLP と射影 (`nn.QuantizedLinear` の形)、lm_head、draft 頭 (族が配るもの) を列挙する。
+2. **契約検査つきの適用**: 汎用カーネル (GDN Metal、head_dim 256 の行タイル / flash attention、BM=64 qmm、MoE の混合タイル GEMM、K2 型の疎 attention) は、それぞれ `eligible()` で形の契約を確かめて当て、
+   起動時に合成入力で素の実装と突き合わせる (ビット一致か許容内)。合わなければその最適化だけ外して素で動く (落ちない)。
+3. **起動時の較正**: タイル幅や WM、行数の閾値は機体とモデルで最適が動く (M3 と NAX、mix48 の閾値 48 など) ので、初回読み込み時に短い micro で選んで、モデル × 機体の鍵でキャッシュする。
+4. **動的にできないもの**: 投機 decode の staged / group prefill の forward は今は族ごとの写し。mlx_lm のモデルが `model.layers` + cache の慣習に沿っている範囲で、写しではなく「層の列を歩く汎用の staged forward」に置き換えられれば、投機も族を問わなくなる
+   (写しが要るのは HC や PLE のような族固有のフックがある場合だけ)。draft 頭は族が配るものだけ (方針)。サイドカー (PLE、QSA) は族固有のまま。
+5. 2 族目 (27B) を載せるときに、対応表を「手で書く表」ではなく上の探索の出力にする。3 族目 (Gemma 4) で探索が当たるかを試す。
