@@ -6398,6 +6398,104 @@ async def _drain_and_exit(server_obj: "uvicorn.Server") -> None:
     server_obj.should_exit = True
 
 
+_WARMUP_TOKENS_ENV = "MLXTURBO_WARMUP_TOKENS"
+_WARMUP_TOKENS_DEFAULT = 0  # 2026-09-03: 16384 で測ったが 17k の冷 TTFT は動かず (+0.6%)、起動 +27 s の代金だけ。knob として残す
+# 空焼きの decode 本数。カーネルを 1 度は通す (draft/verify/rollback の
+# コンパイルとディスパッチ) のが目的で、受理率を測るのが目的ではない。
+_WARMUP_DECODE_TOKENS = 4
+
+
+def _warmup_textpool_path() -> Path:
+    """空焼きの素材にする凍結池。tools/_bench_text.py と同じ場所・同じ環境変数。"""
+    override = os.environ.get("FASTMLX_TEXTPOOL")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent.parent / "bench" / "textpool-frozen.txt"
+
+
+def _warmup_prompt_ids(tokenizer, n: int) -> tuple[list[int], str]:
+    """空焼き用に n トークンちょうどのプロンプトを作る。
+
+    凍結池の**先頭から**切る。ベンチの測定窓と重なるが、空焼きは session を
+    持たない (下の ``_warmup_prefill`` が ``session=None`` で呼ぶ) ので接頭辞
+    キャッシュには何も残らず、後続の「冷 TTFT」は冷えたままになる。池が
+    無い環境 (bench/ を含まない配布物) では乱数トークンに落ちる — 目的は
+    重みと KV を触ることなので、中身が実文である必要はない。
+    """
+    path = _warmup_textpool_path()
+    if path.exists():
+        # 1 トークン 8 文字を上限とみて、必要な分だけ読む (5MB 全部は読まない)
+        with path.open(encoding="utf-8", errors="ignore") as f:
+            text = f.read(n * 8)
+        ids = list(tokenizer.encode(text))
+        if len(ids) >= n:
+            return ids[:n], f"凍結池 {path}"
+    import random
+
+    vocab = getattr(tokenizer, "vocab_size", None) or 32000
+    rng = random.Random(0)  # 大域 RNG を汚さない
+    return [rng.randrange(0, int(vocab)) for _ in range(n)], "乱数トークン"
+
+
+def _warmup_prefill(
+    runner, tokenizer, max_context_tokens: int | None,
+    log_prefix: str = "[mlxturbo-serve]",
+) -> None:
+    """リクエストを受ける前に、長文の prefill を 1 本焼いて捨てる。
+
+    新しいプロセスの最初の長い prefill は定常より **5.5% 遅い** (17k で
+    30.09s、空焼き後 1→4 本目で 28.42s に収束。docs/research/
+    SESSION-2026-09-02-CATCHUP.md の 2026-09-03 20:35)。サーバー固有の費用は
+    無く、正体はこの立ち上がりだった。ここで 1 本焼いておくと、実ユーザーの
+    「起動後の最初の長文リクエスト」がその分速くなる。代金は起動時間だけで、
+    品質には一切触らない。
+
+    トークン数は ``MLXTURBO_WARMUP_TOKENS`` (既定 16384、``0`` で無効)。
+    目標文脈と同じ桁でないと立ち上がりが取れないので、短くしすぎないこと。
+
+    **痕跡を残さない。** ``session=None`` で呼ぶので runner は使い捨ての
+    cache を作って捨て (``FlashSpecRunner.generate`` の ``prompt_cache``)、
+    checkpoints も記録されず (``checkpoints=None`` のまま
+    ``generate_stream`` に渡る)、``STATE.session_pool`` はそもそもこの時点で
+    まだ存在しない。n-gram も読み出し専用で、温まるのはページ常駐だけ。
+    後続の「温 TTFT」は接頭辞キャッシュの当たりだけを測ったままになる。
+
+    失敗しても起動は続ける (空焼きは速度の話で、正しさの話ではない)。
+    """
+    raw = os.environ.get(_WARMUP_TOKENS_ENV)
+    try:
+        n = _WARMUP_TOKENS_DEFAULT if raw is None or raw == "" else int(raw)
+    except ValueError:
+        print(f"{log_prefix} {_WARMUP_TOKENS_ENV}={raw!r} が整数でない。空焼きを飛ばす")
+        return
+    if n <= 0:
+        return
+    if max_context_tokens is not None:
+        n = min(n, max_context_tokens - _WARMUP_DECODE_TOKENS)
+    if n <= 0:
+        return
+    t0 = time.perf_counter()
+    try:
+        ids, source = _warmup_prompt_ids(tokenizer, n)
+        runner.generate(
+            prompt_ids=ids,
+            max_tokens=_WARMUP_DECODE_TOKENS,
+            temp=0.0,
+            eos_ids=(),  # 途中で止めない (4 トークンぶんのラウンドは必ず通す)
+            on_tokens=None,
+            session=None,
+        )
+    except Exception as e:  # noqa: BLE001  空焼きに失敗しても起動は続ける
+        print(f"{log_prefix} 空焼きに失敗した (続行): {e!r}")
+        return
+    finally:
+        mx.clear_cache()
+    print(
+        f"{log_prefix} 空焼き prefill {n} トークン ({source}) "
+        f"+ decode {_WARMUP_DECODE_TOKENS} を {time.perf_counter() - t0:.1f}s で完了"
+    )
+
+
 def _enforce_required_runner(
     runner: Runner, required_kind: str | None, log_prefix: str = "[mlxturbo-serve]"
 ) -> None:
@@ -6836,6 +6934,12 @@ def main() -> None:
             wait_ms=args.batch_spec_wait_ms,
             log_prefix="[mlxturbo-serve]",
         )
+        # 長文の空焼き (MLXTURBO_WARMUP_TOKENS、既定 16384)。この executor
+        # スレッドの中で焼く — MLX のスレッド固定は上の構築物と同じ理由で
+        # ここにも効く。max_context_tokens が決まった後なので、モデルの上限を
+        # 超える空焼きにはならない。
+        _warmup_prefill(runner, tokenizer, max_context_tokens,
+                        log_prefix="[mlxturbo-serve]")
         return (
             runner, tokenizer, max_context_tokens, source, downgrade_runner,
             batch_coordinator, spec_batch_coordinator,

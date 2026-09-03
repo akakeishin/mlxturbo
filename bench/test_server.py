@@ -9227,3 +9227,102 @@ def test_gather_attention_guard_switches_on_context_length():
     assert keeps_gather(16852, 256), "prefill のタイルを弾いている"
     # タイル無しの prefill (2048 行) も同じ理由で通る
     assert keeps_gather(16852, 2048), "タイル無しの prefill を弾いている"
+
+
+# ---------- 起動時の長文空焼き (server.py: _warmup_prefill) ----------
+#
+# _load() 自体は実モデルのロードを伴うので直接は叩かず、その中から呼ばれる
+# _warmup_prefill を単体で見る。合成モデルでは空焼きの中身に意味が無いので、
+# ここでは「何トークン渡ったか」「session を持たないか」だけを確認する。
+
+
+class _WarmupRunner:
+    """generate の呼び出しを記録するだけの runner。"""
+
+    def __init__(self, boom: bool = False):
+        self.calls: list[dict] = []
+        self.boom = boom
+
+    def generate(self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session,
+                 **extra):
+        self.calls.append(
+            dict(n=len(prompt_ids), max_tokens=max_tokens, session=session,
+                 on_tokens=on_tokens, ids=list(prompt_ids))
+        )
+        if self.boom:
+            raise RuntimeError("warmup exploded")
+        return {"tokens": [0] * max_tokens}
+
+
+class _WarmupTok:
+    """1 文字 1 トークンのトークナイザ (池の文字数がそのままトークン数になる)。"""
+
+    vocab_size = 97
+
+    def encode(self, text):
+        return [ord(c) % self.vocab_size for c in text]
+
+
+@pytest.fixture
+def warmup_pool(tmp_path, monkeypatch):
+    pool = tmp_path / "pool.txt"
+    pool.write_text("a" * 400_000, encoding="utf-8")
+    monkeypatch.setenv("FASTMLX_TEXTPOOL", str(pool))
+    return pool
+
+
+def test_warmup_prefill_disabled_by_zero(warmup_pool, monkeypatch):
+    monkeypatch.setenv("MLXTURBO_WARMUP_TOKENS", "0")
+    runner = _WarmupRunner()
+    server._warmup_prefill(runner, _WarmupTok(), None)
+    assert runner.calls == []
+
+
+def test_warmup_prefill_default_is_off(warmup_pool, monkeypatch):
+    # 2026-09-03: 既定 16384 で測ったが 17k の冷 TTFT は動かず (+0.6%)、起動 +27 s の
+    # 代金だけだったので既定 0 (無効)。knob は残す (下のテストで形を見る)。
+    monkeypatch.delenv("MLXTURBO_WARMUP_TOKENS", raising=False)
+    runner = _WarmupRunner()
+    server._warmup_prefill(runner, _WarmupTok(), None)
+    assert runner.calls == []
+
+
+def test_warmup_prefill_16384_is_sessionless(warmup_pool, monkeypatch):
+    monkeypatch.setenv("MLXTURBO_WARMUP_TOKENS", "16384")
+    runner = _WarmupRunner()
+    server._warmup_prefill(runner, _WarmupTok(), None)
+    assert len(runner.calls) == 1
+    call = runner.calls[0]
+    assert call["n"] == 16384
+    # 痕跡を残さないための肝: session を渡さない (接頭辞キャッシュにも
+    # checkpoint にも何も積まれない)
+    assert call["session"] is None
+    assert call["on_tokens"] is None
+    # decode は数トークンだけ
+    assert 0 < call["max_tokens"] <= 8
+
+
+def test_warmup_prefill_clamped_by_max_context(warmup_pool, monkeypatch):
+    monkeypatch.setenv("MLXTURBO_WARMUP_TOKENS", "16384")
+    runner = _WarmupRunner()
+    server._warmup_prefill(runner, _WarmupTok(), 4096)
+    assert runner.calls[0]["n"] == 4096 - server._WARMUP_DECODE_TOKENS
+
+
+def test_warmup_prefill_falls_back_to_random_tokens_without_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv("FASTMLX_TEXTPOOL", str(tmp_path / "missing.txt"))
+    monkeypatch.setenv("MLXTURBO_WARMUP_TOKENS", "64")
+    runner = _WarmupRunner()
+    server._warmup_prefill(runner, _WarmupTok(), None)
+    ids = runner.calls[0]["ids"]
+    assert len(ids) == 64
+    assert all(0 <= i < _WarmupTok.vocab_size for i in ids)
+
+
+def test_warmup_prefill_survives_runner_failure(warmup_pool, monkeypatch, capsys):
+    """空焼きは速度の話。失敗しても起動は続く。"""
+
+    monkeypatch.setenv("MLXTURBO_WARMUP_TOKENS", "64")
+    runner = _WarmupRunner(boom=True)
+    server._warmup_prefill(runner, _WarmupTok(), None)  # 例外を投げない
+    assert "空焼きに失敗した" in capsys.readouterr().out
