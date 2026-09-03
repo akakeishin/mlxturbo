@@ -2254,3 +2254,9 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
   x の gather も gate/up GEMM の行の読み方 (`row_src`) に畳む (micro では負けたが in-model では A > B)。丸めが 1 回減るので素より exact に近い側 (ビット一致はしないが head 一致)。
 - 既定: `MLXTURBO_MOE_DOWN_EPI=combine` + `MLXTURBO_MOE_GATHER_FOLD=1` (runner への配線と 17k の確認は P7 のエージェントが続行)。
 - **oracle-draft の再走は無効**: variant 2 / 6 の tok/round がどちらも 1.067 で draft が受理されていない (ms/round 36.2 / 57.4)。stub の `first=` の扱いか saveout の位置合わせ。差し戻し。
+
+### 2026-09-03 18:31 P9 の見積もり (`prefill-width-8k.json`、チャンク幅 512 / 1024 / 2048、グループ上限を上げて MoE は同じ M=n-1 の 1 回、8k、3 本 × 回文): **畳む**
+
+prefill_s: 2048 幅 12.784 / 1024 幅 12.763 / 512 幅 13.238。非 MoE のメンバー数 4 → 8 で差 -0.2% (誤差)、8 → 16 で +3.6%。
+「メンバー数に比例する固定費」B は 2048 幅では実質ゼロで、P9 (4 → 2 か 1) の取り分は 0。細くすると (512) 1 個あたりが重くなる側に振れるだけ。**チャンク幅 8192 は畳む。**
+(rapid-mlx の「QSA インデックスのバッチ処理 -30%」は、うちでは既に layer-major の MoE 集約と P6 で回収済みの領域と読む。)
