@@ -2242,3 +2242,7 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - 理由: 対戦相手 (mlx-serve / oMLX / rapid-mlx) は一律 4bit で、条件を揃える。decode で lm_head の 1 本 (1.75 ms/forward、7%) が半分になる見込み (+3〜4%)。
 - 代金 (了承済み): KLD 0.01326 → 0.01794 (+0.0047)、top-1 一致 0.966 → 0.962。以後の KLD 基準は 0.01794。
 - 運用: 小ベンチ / フルベンチはこのパックで。decode_ab の A/B は走行中のものは 8bit のまま (相対比較)、新しいものから head4。公開パック (HF) の差し替えは後日 (BACKLOG)。
+
+### 2026-09-03 18:21 K2c 50k (`qsa-decode-kernel-50k.json`、両側 query、512 トークン): ms/round **-4.3%**、ms/tok -5.0%、tok/round +0.8%。既定 on を裏付け
+
+対照 NG (case 0) は想定内: 50k では B 側が `_gather_tile_attn` を通り dense sdpa とビット一致しない (knob の docstring に記載)。A (K2c) は dense 意味論の並びと一致する側。
