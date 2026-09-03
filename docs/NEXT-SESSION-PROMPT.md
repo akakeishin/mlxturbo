@@ -72,6 +72,23 @@ MoE router 融合、union gather (真の union が 6 割)、wide 連結。理由
 
 ## いまの段取り (2026-09-03 08:00 時点。何をやっているか見失ったらここを読む)
 
+
+## push 後の流れ (2026-09-03 17:40 に決めたもの。上から順)
+
+1. **エージェントの計測を判定して既定化** (代金ゼロ方針): GDN レジスタ常駐 scan (in-model 8k / 17k で遅くなければ)、P7 第 2 段 (combine / router / sort の融合、8k -2% 狙い)、
+   D1 draft 同梱 (burn-in 付き再測で遅くなければ)、K2c (天井 13% との差 1.4 ms/round を切り分けてから、50k も確認して既定 on)、天井スタブの再走 (draft の費用、oracle の受理率の天井)。
+2. **decode の本格改修 (Lily の 4)**: decode 1 step の trace (カーネル数、GPU 空き率) を見て決める。
+   空き率が大きければ「カーネル数を減らす融合を帯域最適に書く」(消費の大きい順)、小さければ帯域の壁 (lm_head 8bit、PLE の参照、MoE の専門家読み) を削る。
+   その後 depth 4 の既定化 (K2c で行の費用が下がった後、oracle の天井 tok/round を見て rerank と組む)。判定は短 / 17k / 50k の ms/tok。
+3. **P9 チャンク 8192** (prefill): P7 の後。query 化で可視集合はチャンク割りに依存しない (前提は済)。判定は 8k / 17k / 50k の prefill_s と温 TTFT (checkpoint の粗さ)。
+4. **小ベンチ → フルベンチ (対 mlx-serve)**: 2 と 3 で「decode 短文脈が同着以上、prefill 1.03x 以内」が小ベンチで出たらフルベンチ。出なくてもユーザーが呼べばフルベンチ。
+5. **27B / 35B-A3B (qwen3_5)**: 素の数字 (mlx-lm / mlx-serve / oMLX / うち) → 融合の対応表 (アーキテクチャ追従の投資、BACKLOG) → GDN Metal / sdpa 行タイル / BM=64 qmm (MLP 込み) の移植 → Lily の 5 (GQA packing、固定ブロック attention) → 6 (35B-A3B の AR 対 MTP)。
+   teacher (27B の bf16、54 GB) もここで作る。
+6. Gemma 4 (assistant drafter の KV 共有エンジン、sliding window の prefill)。
+7. 優先度最低: Flash-Next の teacher (bf16、query) の作り直し (SSD)。
+
+各段の commit / push: 既定が増えるごとに commit、小ベンチの記録ごとに push。
+
 **優先度最低 (ユーザー 2026-09-03 17:35)**: KLD の teacher (bf16、query) の作り直し。SSD (`/Volumes/Mobile SSD`) が読めるようになってから `bench/teacher_bf16.py --src <bf16 dir> --continuations bench/results/qe-cont.json --out bench/results/qe-ref-bf16.npz` を `MLXTURBO_QSA_TAIL=query` で (251 GB 読み、約 10 分)。それまで品質の判定は課題の正答率で。
 
 GPU は `tools/biglock.sh` で 1 本ずつ直列。親の連鎖スクリプトは scratchpad
