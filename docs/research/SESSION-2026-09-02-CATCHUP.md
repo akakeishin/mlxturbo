@@ -2164,3 +2164,15 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - 教訓 (CLAUDE.md に追記): mmap の -6〜-7% は同じ機体で続けて測った見かけ。**I/O を含む経路の A/B は、プロセスを分けてもページキャッシュを共有する。**冷やすには別の 100 GB 超のファイルを読んで追い出すか、purge が要る。
   本番 (モデル 98 GB + サイドカー 32 GB > 128 GB) はキャッシュが冷えているのが普通なので、mmap のページフォルトが直列化して 4k prefill 2.1 倍、decode -15%。pread (12 スレッド) は冷えていても並列に読む。
 - 末尾 v2 は切り分けの中で 4k -4.3 s 分 (13.16 → 9.86) を持っていて、サーバー経路でも効いている。
+
+### 2026-09-03 16:35 診断 (chain95、worker): P7 の内訳、prefill の天井スタブ、draft 無しの床。oracle は knob が壊れて失敗
+
+- **P7 MoE の内訳** (`moe-split.json`、層 20、8k プロンプト、5 回、ms/層): M=2048: router 0.82 / topk 0.31 / sort 0.34 / gather 0.49 / **gate_up_qmm 14.98** / swiglu 0.40 / **down_qmm 7.29** / combine 1.95
+  (weight_mul_cast 0.87 + unsort_sum 1.07) / shared 2.06 / other 0.23。部品和 28.9 対 壁時計 27.0 (差 7%)。M=8192: 行列積 74.1 / それ以外 21.8、差 2.2%。
+  **行列積が 82%、行列積以外は 4.7 ms/層 = 48 層で 225 ms/チャンク** (「800 ms/チャンク」は ablate の積算の過大評価だった)。回収できそうなのは combine 1.95 + router 0.82 + sort/topk/gather 1.14 = 3.9 ms/層 = 187 ms/チャンク = 8k の 6%。
+  半分取れて -3%。Lily の「ルーティングを GPU に残す +89%」は CPU 同期がある場合の話で、うちには同期が無い (部品は全部 GPU op)。
+- **prefill の天井スタブ** (8k、`stubs-prefill-8k.json`): GDN scan を 0 にして **-5.4%** (11.23 / 11.87 s)、MoE を 1 専門家にして **-3.3%**。GDN の blockwise scan は 8k の 5.4% で、Lily のレジスタ常駐 scan の +5.6% と整合。
+  半分回収で -2.5%。
+- **draft 無しの床** (`ar-depth0.json`、depth 0、depth 適応 off、512 トークン × 3 本 × 2 長さ): 短 **23.5〜24.4 ms/tok (41〜42.5 tok/s)**、17k 26.4〜27.0 ms/tok (37〜38 tok/s)。
+  MTP の倍率は短 52/42 = **1.24x**、17k 46/37.5 = 1.23x。S=1 forward の実測が 24 ms で確定 (帰属の推定と一致)。
+- decode の天井スタブ (短、`stub-draft` ほか) は JSON が出ていない (ログ確認中)。oracle-draft は knob の stub_chain が engine の `_draft_chain(first=...)` の引数に追従しておらず TypeError。直して再走。
