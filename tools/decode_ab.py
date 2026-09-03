@@ -449,6 +449,50 @@ def _knob_gdn_decode_fused(ctx):
     return apply
 
 
+def _knob_moe_dec_fused(ctx):
+    """decode / verify 幅 (行数 <= 8) の MoE を `fused:1` に差し替える。
+
+    - A = 自前 (`kernels/moe_decode_fused.py`、rmax=1・ソート無し・gate/up 融合。
+      gate/up 1 カーネル + down 1 カーネルの 2 本)
+    - B = 素 (既定。`_gather_sort` + `gather_qmm` x3)
+
+    的 (CATCHUP 2026-09-03 21:10 の decode 帰属): 素の `gather_qmm` は decode 幅で
+    x を top_k 行に複製する `g1_copy` (96 x 15.6 us = 1.49 ms/round) と添字の
+    `arange` (144 x 6 us = 0.86 ms/round) を出す。合わせて 2.35 ms/round は
+    専門家の行列積そのもの (2.22 ms) より大きい。`fused:1` は x を対ごとに
+    カーネル内で `pr / top_k` から引くので複製も添字生成も要らない。
+
+    **rmax は 1 に固定** (`moe_dec_fused` が `rmax=1` を渡す)。重複をまとめる
+    rmax>=2 は PoL で負けている (冷 micro S=1 1.109 / S=3 1.066。
+    `kernels/moe_decode_fused.py` の冒頭)。
+
+    出力は素と一致しない (control_identical=False)。積和を fp32 で通して最後に
+    1 回だけ丸めるので、**素より逆量子化参照に近い** (合成 E=32 で自前 max
+    2.1〜2.3% 対 素 6.6〜6.9%、`scratchpad/moe_dec_fused_correct.py`)。
+    tok/round はテキスト運で動くので判定は ms/round で行う。
+
+    判定線 (親): 短文脈 3 本 x 512 の **ms/round -1% 以上**。
+
+    発火の確認: `mlxturbo.kernels._fire.snapshot()` の `moe_decode_fused`
+    (MoE 層 48 x forward 数)。
+    """
+    import os
+
+    from mlxturbo import fused
+
+    eng = ctx["eng"]
+
+    def apply(variant):
+        fused.disable_moe_decode_fused()
+        if variant == "B":
+            os.environ.pop("MLXTURBO_MOE_DECODE_FUSED", None)
+            return
+        os.environ["MLXTURBO_MOE_DECODE_FUSED"] = "1"
+        fused.enable_moe_decode_fused(eng.model)
+
+    return apply
+
+
 def _knob_gdn_prework(ctx):
     """A = GDN 前処理の融合カーネル on / B = off (既定)。
 
@@ -914,6 +958,51 @@ def _knob_hc_elem(ctx):
             fused.enable_hyper_connection_elem()
         else:
             fused.enable_hyper_connection_kernel()
+
+    return apply
+
+
+def _knob_hc_qmm_wide(ctx):
+    """A = HC の down/up (10240->320 / 320->10240) を prefill 幅で qmm_wide に
+    通す (`fused.enable_hc_qmm_wide`、**2026-09-04 から本番の既定**) /
+    B = 素の `mx.quantized_matmul`。判定は `prefill_s`。
+
+    段 P10 (`--knob qmm-wide`) と同じ BM=64 のタイルを、dense 射影ではなく HC の
+    細長い 2 本に当てる。的の出どころは prefill の内訳
+    (`docs/research/SESSION-2026-09-02-CATCHUP.md` 2026-09-03 21:45): HC 読みは
+    prefill の 10.5〜11.7% を占めるのに行列積の下限に対して 63〜65% しか出て
+    いない。冷の連鎖 micro (M=2048、97 組 367.5 MB 巡回、
+    `tools/hc_prefill_micro.py`) で段ごとに割ると、下限との差は
+    post+inject 577 us > down 346 > up 203 > pre 67 ≈ mid 55。この knob は
+    down + up (549 us ぶん) を狙う。
+
+    **ビット一致する** (`control_identical=True`)。`qmm_wide` の K の縮約順は
+    steel の `BlockMMA::mma` が kFragSize=8 刻みで回るだけでタイル形に依らない。
+
+    **2026-09-04 実測** (`bench/results/hc-prefill-fast-c-{4k,17k}.json` と
+    `hc-prefill-fast-8k.json` の C): prefill_s の中央値で 17k **-0.9%**
+    (3 本とも負)、8k -0.4%、4k +0.1% (+1.9 / -0.5 / -1.1 で揺れの中)。
+    tok/round は同一、decode ms/round ±0。代金ゼロなので取り分が 1% 未満でも
+    既定に入れた (CLAUDE.md)。
+
+    同じ走行で測った「elem 変種を prefill 幅まで通す」変種は **棄却**:
+    8k prefill -1.6% と引き換えに tok/round が 3 本とも落ち (-8.0 / -4.3 /
+    -2.6%、平均 -4.8%)、decode ms/round +0.5%、1 本は head まで変わった
+    (`kernels/hyper_connection.py` の第 4 変種の節)。
+
+    prefill 幅に効くので `DECODE_ONLY_KNOBS` には入れない
+    (`--prefill-once` は使えない)。発火の確認は
+    `mlxturbo.kernels._fire.snapshot()` の `qmm_wide_m64n32k32w2x2r8`
+    (A では B より 2 x 97 x チャンク数ぶん多いこと)。
+    """
+    from mlxturbo import fused
+
+    eng = ctx["eng"]
+
+    def apply(variant):
+        fused.disable_hc_qmm_wide(eng.model)
+        if variant == "A":
+            fused.enable_hc_qmm_wide(eng.model, mode="1")
 
     return apply
 
@@ -1760,8 +1849,8 @@ def _knob_ngram_layout(ctx):
 
 
 def _knob_ngram_prefetch(ctx):
-    """n-gram サイドカーの先読み (`StreamNGram.prefetch`)。A = 有効 (既定) /
-    B = 無効。
+    """n-gram サイドカーの先読み (`StreamNGram.prefetch`)。A = 有効 (2026-09-04
+    からの既定) / B = 無効 (2026-09-03 までの既定)。
 
     prefill はプロンプト全体の n-gram 行 id が最初から全部わかっている。
     呼び出し側 (`mlxturbo/spec_flash.py` の `_prefetch_ngram_span`、
@@ -1797,10 +1886,19 @@ def _knob_ngram_prefetch(ctx):
     同じ扱い)。`--prefill-once` とは併用できない (prefill 自体を先読みごと
     畳んでしまうと A/B の差が消える) ので `DECODE_ONLY_KNOBS` には入れない。
 
-    `StreamNGram.prefetch_enabled` の既定は off (`MLXTURBO_NGRAM_PREFETCH=1`
-    で明示的に有効化しない限り on にならない)。2026-09-02 時点の値 (0%) は
-    上記のとおり旧実装のもので、直し後の値はまだ取っていない --
-    `--knob ngram-prefetch --only long --ctx 8000/17000` で取り直すこと。
+    **2026-09-04 に取り直した (17k、冷 = `FASTMLX_NGRAM_NOCACHE=1`、3 ケース、
+    `bench/results/ngram-prefetch-17k-cold.json`): prefill_s A 27.523 s /
+    B 28.343 s = -3.0%、出力は 3 ケースとも一致。**揃った 2 ケースは -5.0% /
+    -4.6% で、残る 1 ケースの +1.0% は A の 1 本目が「位置 1 の段差」を
+    踏んだもの (A の 2 本が 29.63 / 27.67 と 7% 開いている)。ngram の
+    hit_rate は A で 99.6% (miss は decode 側の行だけ)、fetch_ms は
+    17,016 ms -> 751 ms。
+
+    2026-09-03 まで取り分が出なかった理由は 2 つで、どちらも
+    2026-09-04 に直した: (1) pread backend では `prefetch_enabled` の既定が
+    off で、そもそも 1 行も先読みしていなかった (`prefetch_rows=0`)。
+    (2) group 経路の投入位置が遅すぎた (旧配置 `late` は 9/4 に負けて消した。
+    17k 冷で fetch_ms 1834 対 117 ms)。
     """
     model = ctx["eng"].model
     if not ctx["args"].ngram:
@@ -1823,6 +1921,15 @@ def _knob_ngram_prefetch(ctx):
     def apply(variant):
         for s in streams:
             s.prefetch_enabled = variant == "A"
+            # **行キャッシュを条件の切り替えごとに捨てる。**捨てないと、
+            # A (先読み on) が積んだ 27 万行がそのまま残り、次に来る
+            # B (off) の `_gather_cached` が全部ヒットして pread を 1 回も
+            # 打たない -- B が A の成果で速くなる汚染になる
+            # (`_ensure_cache_gen` は `_cache_gen` が既にあれば
+            # `prefetch_enabled` を見ずに返し、`_cache_put` も書き続ける)。
+            # 回文順 (A,B,B,A) でも 2 本目以降が全部汚れるので、順序では
+            # 相殺できない。これで各本が空のキャッシュから始まる。
+            s._cache_gen = None
 
     return apply
 
@@ -2661,6 +2768,9 @@ KNOBS = {
     # A = 前処理 + 出力 norm (3 本) / C = 前処理だけ / B = 素 (既定)。
     # ビット一致はしない (silu の sigmoid が 1 ulp)。判定は ms/round -5%
     "gdn-decode-fused": (_knob_gdn_decode_fused, ["A", "C", "B"], False, "B"),
+    # A = decode 幅の MoE を fused:1 (2 カーネル) / B = 素 (既定)。積和の丸め
+    # 位置が違うのでビット一致はしない。判定は ms/round -1%
+    "moe-dec-fused": (_knob_moe_dec_fused, ["A", "B"], False, "B"),
     "gdn-blocked": (_knob_gdn_blocked, ["A", "B"], False, "B"),
     "gdn-metal": (_knob_gdn_metal, ["A", "B"], False, "B"),
     "hc-write": (_knob_hc_write, ["A", "C", "B"], True, "B"),
@@ -2675,6 +2785,9 @@ KNOBS = {
     # A = 素の vendor 実装 (MLXTURBO_HC=off) / B = 本番既定。hc-elem の
     # tok/round の切り分け用 (knob 関数の docstring 参照)。判定は親
     "hc-off": (_knob_hc_off, ["A", "B"], False, "B"),
+    # A = HC の down/up を qmm_wide (本番既定) / B = 素。ビット一致するので
+    # control_identical=True。判定は prefill_s
+    "hc-qmm-wide": (_knob_hc_qmm_wide, ["A", "B"], True, "B"),
     "hc-kernel-stage": (_knob_hc_kernel_stage, ["A", "B", "C", "D"], False, "B"),
     "hc-compiled": (_knob_hc_compiled, ["A", "B"], True, "B"),
     "hc-prefill-compile": (_knob_hc_prefill_compile, ["A", "B"], False, "B"),
@@ -3167,6 +3280,10 @@ def run_with_model(argv, bundle) -> int:
         # 1 チャンク 2048 トークンは 98304 行なので必ず素へ落ちる。
         # fused.enable_gdn_decode_fused の _GDN_NORM_MAX_ROWS)。
         "gdn-decode-fused",
+        # moe-dec-fused は `fused.moe_dec_fused` の先頭で行数 (B*S) が
+        # _MOE_DISPATCH_DEC_FUSED_MAX_ROWS (既定 8) を超えたら None を返して
+        # 素へ落ちる。prefill の 1 チャンクは 2048 行なので必ず素の経路。
+        "moe-dec-fused",
         # depth-adapt は _effective_depth 経由でしか呼ばれず、それ自体
         # decode ループの中 (generate/generate_stream の while) でしか
         # 呼ばれない (prefill の forward は素の model(...) 呼び出しで、

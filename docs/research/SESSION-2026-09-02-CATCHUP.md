@@ -2692,3 +2692,53 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - decode は 17k で ms/round +0.2% (ばらつき)、tok/round 完全同一 (先読みは prefill の呼び手からしか呼ばれない)。B 側は移した呼び出し口が no-op なので 9/3 の本番と 1 op も違わない。`bench/test_ngram_stream.py` 23 本 pass、`tools/vendor_fingerprint.py` 一致。
 - **判定: 既定に入れる** (代金ゼロ規則: 4 条件どれでも遅くならない、出力同一、メモリは 1 prefill ぶんの行キャッシュ ≤ 70 MB)。冷 17k の集計 -2.9% は線 (-3%) の上だが、揃ったケースは -5%。
 - 残り: 50k は未測定 (`_NGRAM_LOOKAHEAD_WIDTH` 10240 なので境界ごとに追う形になる)。最初の境界の前景取得 (17k 1.05 s / 4k 0.54 s) は prefill の先頭に重ねる相手が無く残る (on-demand 4 回 1387 ms よりは速い)。`MLXTURBO_PLE_HOIST` は group prefill 経路を通らないので本番では効いていない。`prefill-anatomy-*` の「PLE / n-gram 6%」は取り直しが要る。
+
+### 2026-09-04 02:55 HC の読み側 (prefill 幅): 段別の冷 micro → elem の prefill 幅拡張は落とす (非ビット一致で tok/round -4.8%)、qmm_wide を HC の down/up に当てる (ビット一致、17k -0.9%) は既定に
+
+- 道具 `tools/hc_prefill_micro.py` (M=2048、97 組 367.5 MB 巡回、段ごとに正の側から 97 段連鎖。`sum_check` 0.96〜0.99 / `pair_check` 1.00〜1.10 で検算)。`bench/results/hc-prefill-micro.json`。
+
+| 段 | 素 us | 下限 us | 比 | 差 |
+|---|---|---|---|---|
+| pre (rms + (1+w)) | 285.7 | 210 | 0.76 | 67 |
+| down (10240→320, 4bit) | 1500 | 1198 | 0.78 | 346 |
+| mid (silu(x/hc)) | 18.5〜61 | 6.6 | 0.11〜0.36 | 55 |
+| up (320→10240, 4bit) | 1401 | 1198 | 0.86 | 203 |
+| **post+inject** | **908** | **341** | **0.37** | **577** |
+| combine (書き戻し) | 162 | 236 | 1.45 | -74 |
+| 和 / 壁時計 | 4362 / 4391 | 3190 | 0.73 | 1174 |
+
+- 下限は行列積 11.2 TFLOPS、elementwise 400 GB/s。全体 0.73 は 21:45 の「壁の 63〜65%」と桁が合う。取り分の順は post+inject > down > up > pre ≈ mid。
+- 候補の冷 micro: (c) qmm_wide (`m64n32k32w2x2r8`) を down/up に: down 0.82 ↔ 1.01 (孤立測定は走行間で振れる)、up 0.86、**ビット一致**。(d) elem 変種 (`hc_elem_pre/mid/post`) を prefill 幅で: pre 0.82、post+inject **0.425**、合成 full 0.87〜0.96、(c)+(d) 0.840。**ビット一致しない** (normed 5.8e-6、mixed 1.9e-5)。
+- 数値の切り分け (docs の誤りを訂正): `hyper_connection.py` の「M≥62 で post 段の縮約 (mean) が素と食い違う」は違う。素の `mean(axis=-2)` は M=2048 でも bf16 逐次加算と厳密一致 (fp32 で溜める模型は 33% 外す)。MLX の bf16 sigmoid も bf16 算術で写しは 65533/65536 一致。残る 1 ulp は写した sigmoid か Metal の bf16 積の丸めで、**prefill 幅の elem をビット一致にする道は無い**。
+- in-model (`--knob hc-prefill-fast`、head4、depth 2、prefill_s 中央値、`bench/results/hc-prefill-fast-8k.json`、`hc-prefill-fast-c-{4k,17k}.json`):
+
+| | 4k | 8k | 17k | 数値 | tok/round |
+|---|---|---|---|---|---|
+| A: elem prefill 幅 + wide | — | **-1.6%** (-0.9 / -1.8 / -2.0) | — | 非ビット一致 (case 2 で head が変わる) | **-4.8%** (-8.0 / -4.3 / -2.6、3 本とも負)、decode ms/round +0.5% |
+| C: wide だけ | +0.1% (+1.9 / -0.5 / -1.1) | -0.4% (+0.2 / -0.4 / -1.0) | **-0.9%** (-1.5 / -0.9 / -0.3) | ビット一致 (head 同一) | 同一、decode ±0 |
+
+- **A は落とす**: prefill -1.6% の代金が受理率 -4.8% (品質を売って速度を買わない)。実装も削る (負けた変種は knob で残さない)。
+- **C は既定に** (`MLXTURBO_HC_QMM_WIDE`、auto = `MLXTURBO_QMM_WIDE` と同じ NAX 判定、`=0` で off): 代金ゼロ (ビット一致、メモリ増無し) で、4k は揺れの中 (+0.1%)、8k -0.4%、17k -0.9% (3 本とも負)。「測った文脈のどれでも遅くならない」を満たす。細長 GEMM (10240→320 / 320→10240) の BM=64 タイル化。
+- 残る的: post+inject (下限の 0.37、577 us/層) は elem でしか詰まらず、それがビット一致しない。norm を down の load に / sigmoid+mean を up の store に畳む案は重みレイアウトの並べ替えか写しの増加が要る (代金あり)。HC 読みの取り分はここで一巡。
+
+### 2026-09-04 03:05 fused:1 (MoE decode 幅、gate/up 融合 + down、rmax=1、ソート無し) を既定 auto に: 短 -1.2〜-1.3% × 2 回 / 17k -1.4%、本番重みの参照テストで自前が素より近い、S=1 の Δ KLD +0.00036
+
+- 配線: `fused.enable_moe_decode_fused` (`MLXTURBO_MOE_DECODE_FUSED=auto|1|0`、auto は非 NAX 機で on = `enable_qmm_wide` と同じ判定)、統合ディスパッチ `dispatched()` の先頭分岐、`MLXTURBO_MOE_DECODE_FUSED_MAX_ROWS`=4 (既定の配線は depth 2 で S ≤ 3。`--max-batch-spec` ≥ 2 は rows ≥ 6 で無言で素に落ちる。PoL は S=1 0.929 / S=3 0.979 で S が増えるほど細るので上限は 4)。`--knob moe-dec-fused`。
+- in-model (head4、1 プロセス A,B,B,A、burn-in、depth 2 固定、`bench/results/moe-dec-fused-{short,short2,17k}.json`):
+
+| | ms/round A / B | 差 | prompt 別 | tok/round |
+|---|---|---|---|---|
+| 短 3 本 × 512 (1 回目) | 38.440 / 38.918 | **-1.23%** | -2.46 / +0.18 / -1.40 | 符号ばらけ (テキスト運) |
+| 短 (2 回目) | 35.273 / 35.730 | **-1.28%** | -0.60 / -1.55 / -1.68 | 同上 |
+| 17k × 512 | 38.558 / 39.110 | **-1.43%** | -1.40 / -1.28 / -1.56 (回文の 6 組全部 A が速い) | -2.6 / +2.0 / -1.1 |
+
+  prefill_s は ±0 (行数ゲートが効いている)。発火 12.7k〜13.9k/走行。先頭 24 トークンは 17k で 3 本とも素と同一、短は 2/3 (case 1 は 19 トークン目で分岐)。
+- 品質ゲート (advisor 9/4、decode 幅だけの非ビット一致は初の事例なので 3 条件を規則にした。CLAUDE.md の品質段落):
+  1. **本番重み・本番 routing での逆量子化 fp32 参照テスト** (`tools/moe_decode_fused_ref_model.py`、worker の tool job、実プロンプトの末尾 S トークンで全 48 層の (x, indices) をフック): S=1 / S=3 の 96 呼び出しで **自前/素 の距離比 最小 0.168 / 中央 0.388 / 最大 < 1、反転 0**。対ごとの bf16 丸めを 2 回 (gate, up) 外したぶん真値に近い。S=6 は MAX_ROWS=4 で発火せず (比 1.000、道具の NG 表示はこれ)。
+  2. **S=1 の Δ KLD** (`quant_eval compare --fusions --step 1`、継続部分を 1 トークンずつ cache 付きで流す。新設): 基準 (off) **0.01796** / agree 0.9657 → on **0.01832** / agree 0.9607、**Δ +0.00036** (受け入れ幅 +0.0005 の中)。prompt 別は 15 本悪化 / 16 本改善で、平均を押し上げたのは ja-fact (+0.0095) 1 本。札別: experts +0.0006、attn +0.0014、ngram -0.0005、code -0.0001。
+  3. 読み: 参照 (fp32) には近づくのに teacher (bf16) からは僅かに離れる = **teacher 自身の bf16 丸めの癖に対する一致度**が落ちている。KLD 対 bf16 teacher は「真値への近さ」の物差しではない点に注意。品質の本命は課題の正答率 (長文脈は `tools/longctx_quality.py`)。
+- **判定: 既定 auto に入れる** (速度は 3 走行とも負、遅くなる文脈は無い、参照テスト反転 0、Δ KLD は幅の中)。`MLXTURBO_MOE_DECODE_FUSED=0` が逃げ道。
+- 収穫: 短文脈 decode の糊の融合レーンは「勝ちは GDN (-2.4%) と fused:1 (-1.3%) の 2 本」で閉じる。どちらも「融合先が素より GPU 時間を使わない」型。
+- 追記 (03:10): 上限の幅 S=4 (`--widths 4`) でも参照テストは反転 0 (比 最小 0.205 / 中央 0.342 / 最大 0.689、`bench/results/moe-dec-fused-ref-model-s4.json`)。道具は上限を超える幅を skip と印すよう直した (既定 widths 1,3,4)。
+- 追記 (03:12→03:20 に訂正): `tools/verify_prefill_bitident.py` (group=0 と group=4 の 17k prefill のビット一致ゲート) が FAIL した。fused:1 off でも FAIL。正体は **9/3 15:35 の末尾 v2 で既知の性質** (checkpoints=None の経路は group=0 が末尾 2048 を 1 回、group=4 が 2047+1 に割るので量子化行列積の丸めが動く。サーバーの実構成 checkpoints=[] は両方 2047+1 でビット一致) で、道具が最初の checkpoints=None の比較で exit していて、本命の checkpoints=[] まで届いていなかった。道具を「checkpoints=None は tail-in-group が on なら情報表示、判定は checkpoints=[]」に直して再走。fused:1 を prefill 中に止める案は一度当てたが、サーバー経路では両方の写しが同じ +1 ステップを踏むので要らず、複雑さだけ増えるので戻した。
+- 追記 (03:24): 判定を直したゲートで **OK: group=0/4 bit-identical (n=17000, cache arrays=110)、checkpoints=[] 込みでも bit-identical** (末尾 checkpoint n-1 / n あり)。今日の既定 (n-gram 先読み on、HC qmm_wide auto、fused:1 auto) でサーバー構成の写し 2 つは一致。checkpoints=None の不一致は既知の情報表示。

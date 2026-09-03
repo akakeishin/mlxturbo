@@ -93,10 +93,19 @@
   `MLXTURBO_MOE_GEMM_MIX` (既定 48、`=0` で off) と `MLXTURBO_QMM_WIDE` (既定 auto = 非 NAX で on、`=off`) は 2026-09-03 14:00 に
   8k の in-model (混合タイル -4.3%、BM=64 dense 射影 -2.6%、どちらも素とビット一致) で入れた本番の既定値。NAX 機では
   `MLXTURBO_MOE_GEMM=auto` の判定でどちらも off になる (自前カーネルは NAX 機で auto=off の方針)。
+  `MLXTURBO_MOE_DECODE_FUSED` (既定 auto = 非 NAX 機で on、`=0` で off、行数 B*S ≤ `MLXTURBO_MOE_DECODE_FUSED_MAX_ROWS`=4 だけ) は 2026-09-04 03:05 に入れた本番の既定値:
+  decode / verify 幅の MoE を gate/up 融合 + down の 2 カーネル (rmax=1、ソート無し) に。短 ms/round -1.2〜-1.3% (2 回) / 17k -1.4%。**非ビット一致**で、本番重みの
+  逆量子化 fp32 参照テストでは自前が素より近く (中央 0.39 倍、反転 0/96)、S=1 の Δ KLD は +0.00036 (対 bf16 teacher、幅 +0.0005 の中)。バッチ検証 (rows ≥ 6) は素に落ちる。
+  `MLXTURBO_HC_QMM_WIDE` (既定 auto = `MLXTURBO_QMM_WIDE` と同じ NAX 判定、`=0` で off) は 2026-09-04 02:55 に入れた本番の既定値: HC の細長 GEMM
+  (10240→320 / 320→10240) を BM=64 タイルに (ビット一致、4k ±0 / 8k -0.4% / 17k -0.9%)。elem 変種の prefill 幅拡張は非ビット一致で tok/round -4.8% だったので落とした。
   `MLXTURBO_SDPA_ROWTILE` (既定 256、`=0` で off) も本番の既定値: head_dim 256 の sdpa は MLX の fallback でタイルを飛ばさないので、
   prefill の dense 経路で q を 256 行ずつに割り前方の K/V だけ渡す (4k -1.1% / 8k -1.2% / 17k -1.0%、KLD 差 0.0、2026-09-03)。
 - 品質を売って速度を買わない。fake を実物より緩くしない。KLD の受け入れ幅は
   現行比 +0.0005 (bench/quant_eval.py compare)。
+  **decode 幅 (行数 ≤ 8) にしか発火しない非ビット一致のカーネル**は、prefill 幅で走る通常の compare では数値が 1 度も通らない。既定に入れる条件は 3 つ
+  (2026-09-04、fused:1 で確立): (i) 本番の重み・routing での逆量子化 fp32 参照への距離が素以下 (`tools/moe_decode_fused_ref_model.py` の型、反転する層が 0)、
+  (ii) 変更が丸め回数を減らす方向、(iii) `bench/quant_eval.py compare --fusions --step 1` (S=1 で 1 トークンずつ) の on/off 同一条件の Δ KLD ≤ +0.0005。
+  S=1 の基準は `bench/results/quant-eval/compare-step1-base-0904.json` の 0.01796。
   **本番のパックは lm_head も 4bit (`~/models/ddalcu-mlxlm-head4`、真 bf16 から g64 で焼いたもの) にした** (ユーザー 2026-09-03 18:20。
   相手の一律 4bit と条件を揃える。代金は KLD 0.01326 → 0.01794 (+0.0047)、top-1 一致 0.966 → 0.962 で、これは了承済み)。
   以後の KLD の基準は `compare-head4-baked-0903.json` の 0.01794。8bit 頭のパック (`~/models/ddalcu-mlxlm`) は旧基準の A/B の続きにだけ使う。

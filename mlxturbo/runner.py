@@ -1363,6 +1363,18 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
             print(f"{log_prefix} hyper-connections: elem 融合 (第 4 変種、decode/verify 幅のみ、"
                   "ビット一致。MLXTURBO_HC=kernel|compiled|off で切替)")
         fused.enable_hyper_connection_prefill_compiled(model)
+        # HC の細長い 2 本 (10240->320 / 320->10240) を prefill 幅だけ
+        # qmm_wide に通す (段 P10 の HC 版)。**2026-09-04 に既定 on。**
+        # 素とビット一致、in-model (--knob hc-qmm-wide) は 17k prefill -0.9%
+        # (3 本とも負) / 8k -0.4% / 4k +0.1% (揺れ)、tok/round 同一、decode ±0。
+        # 代金ゼロなので取り分が 1% 未満でも入れる (CLAUDE.md)。
+        # enable_hc_qmm_wide 自身が MLXTURBO_HC_QMM_WIDE (auto|1|0、既定 auto)
+        # を読む。auto は enable_qmm_wide の判定に従うので、NAX 機や
+        # MLXTURBO_QMM_WIDE=off では何も起きない。=0 で切れる。
+        n_hcw = fused.enable_hc_qmm_wide(model)
+        if n_hcw:
+            print(f"{log_prefix} HC の down/up を qmm_wide に ({n_hcw} 射影、"
+                  "prefill 幅のみ、ビット一致。MLXTURBO_HC_QMM_WIDE=0 で off)")
         # 書き戻し側 (DecoderLayer._combine) は読み側と別のゲート。
         # **2026-09-02 に既定 on にした。**in-model A/B (--knob hc-write、
         # 3 変種 A/C/B、下駄を取った後) で短 -0.7% / 長 -0.8%、tok/round は
@@ -1397,6 +1409,15 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         fused.enable_moe_verify_gather()
         if os.environ.get("MLXTURBO_MOE_VERIFY") == "1":
             print(f"{log_prefix} moe_verify_gather カーネル有効 (verify 幅の gate+up 融合 + down)")
+        # enable_moe_decode_fused も同じ作法 (MLXTURBO_MOE_DECODE_FUSED の
+        # auto|1|0 を関数自身が読む。既定 auto = 非 NAX 機で on、2026-09-04)。
+        # 短 ms/round -1.2〜-1.3% / 17k -1.4%、本番重みの fp32 参照テストで
+        # 自前が素より近い、S=1 の Δ KLD +0.00036 (CATCHUP 2026-09-04 03:05)。
+        fused.enable_moe_decode_fused(model)
+        if fused._MOE_DISPATCH_DEC_FUSED_ON:
+            print(f"{log_prefix} moe_decode_fused カーネル有効 (decode 幅 rows <= "
+                  f"{fused._MOE_DISPATCH_DEC_FUSED_MAX_ROWS} の fused:1、rmax=1・ソート無し。"
+                  "MLXTURBO_MOE_DECODE_FUSED=0 で off)")
         # enable_moe_combine_fold 自身が MLXTURBO_MOE_COMBINE_FOLD=0 で
         # 無効化するゲートを持っているので、ここでは呼ぶだけでよい (既定
         # on)。行数 (B×S) が MLXTURBO_MOE_COMBINE_FOLD_MIN_S (既定 64)

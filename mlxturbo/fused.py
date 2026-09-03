@@ -317,6 +317,12 @@ def enable_hyper_connection_elem() -> None:
     長 +0.7% で **速度目的では棄却**。残してあるのは起動回数を減らす筋の
     実測記録として。
 
+    **prefill 幅まで広げる案は 2026-09-04 に棄却済み**
+    (`eligible_elem` の行数上限 8 を外す変種)。冷 micro は HC 読み 0.871 まで
+    落ちるが、in-model は 8k prefill -1.6% と引き換えに tok/round が 3 本とも
+    落ちた (平均 -4.8%)。prefill 幅の down/up を速くするのは
+    `enable_hc_qmm_wide` (ビット一致) の担当。
+
     発火の確認は `mlxturbo.kernels._fire.snapshot()` の `hc_elem`。
     """
 
@@ -1490,6 +1496,11 @@ _MOE_DISPATCH_SORT_MIN: "int | None" = None   # enable_gather_sort が設定
 _MOE_DISPATCH_GLU_ON = False        # enable_moe_glu が設定
 _MOE_DISPATCH_VERIFY_ON = False     # enable_moe_verify_gather が設定
 _MOE_DISPATCH_WIDE_SORT_MIN: "int | None" = None  # インストール時に一度だけ読む
+_MOE_DISPATCH_DEC_FUSED_ON = False  # enable_moe_decode_fused が設定
+_MOE_DISPATCH_DEC_FUSED_MAX_ROWS = 4  # decode / verify 幅の上限 (行数 B*S)。既定の配線は S <= 3 (depth 2)
+# `MLXTURBO_MOE_DECODE_FUSED` の既定。auto = 非 NAX 機で on / NAX 機で off
+# (自前カーネルは NAX 機に当てない方針)。"0" で off。
+_MOE_DEC_FUSED_DEFAULT = "auto"  # 2026-09-04 03:05 から auto (下の enable_moe_decode_fused の docstring)
 
 
 def _ensure_moe_dispatch_installed() -> None:
@@ -1597,6 +1608,44 @@ def _ensure_moe_dispatch_installed() -> None:
         out = self.down_proj(act, indices, sorted_indices=False)
         return out.squeeze(-2)
 
+    def moe_dec_fused(self, x, indices):
+        """enable_moe_decode_fused: decode / verify 幅 (行数 <= 8) を
+        `kernels/moe_decode_fused.py` の `fused:1` 変種に差し替える。
+
+        素の経路は (行 x top_k) の対を `_gather_sort` で並べ替えてから
+        `gather_qmm` を 3 回呼ぶ。`gather_qmm` は decode 幅で x を top_k 行に
+        複製する `g1_copy` (96 x 15.6 us = 1.49 ms/round) と添字の `arange`
+        (144 x 6 us = 0.86 ms/round) を出す (CATCHUP 2026-09-03 21:10)。
+        `fused:1` は重複をまとめず (rmax=1)、ソートもせず、x を対ごとに
+        カーネル内で `pr / top_k` から引くので、複製も添字生成も要らない。
+        gate/up が 1 カーネル、down が 1 カーネル。
+
+        **rmax は 1 に固定する。**重複をまとめる rmax>=2 は PoL で負けた
+        (重複の対が threadgroup を増やして帯域を稼いでいた。冷 micro で
+        S=1 1.109 / S=3 1.066、`kernels/moe_decode_fused.py` の冒頭)。
+
+        適格でなければ None (素通し)。"""
+        from .kernels import _fire
+        from .kernels import moe_decode_fused as mdf
+
+        topk = indices.shape[-1]
+        rows = indices.size // topk
+        if rows > _MOE_DISPATCH_DEC_FUSED_MAX_ROWS:
+            return None
+        gp, up, dp = self.gate_proj, self.up_proj, self.down_proj
+        if not mdf.eligible(x, gp, up, dp):
+            return None
+        K = x.shape[-1]
+        if K % 512 != 0:                     # gate/up カーネルの前提
+            return None
+        idx_flat = indices.reshape(-1)
+        # h: (rows*topk, moe_intermediate) = silu(gate) * up
+        h = mdf.gate_up(x.reshape(-1, K), idx_flat, gp, up, topk, rmax=1)
+        y = mdf.down(h, idx_flat, dp, topk, K, rmax=1)
+        _fire.bump("moe_decode_fused")
+        # 素の経路の out.squeeze(-2) と同じ (…, top_k, hidden)
+        return y.reshape(*indices.shape, K)
+
     def moe_verify(self, x, indices):
         """enable_moe_verify_gather: verify 幅だけ v2 (gate+up 融合 + down)
         へ。適格でなければ None (素通し)。indices.size >= 64 (mlx_lm 自身の
@@ -1636,6 +1685,10 @@ def _ensure_moe_dispatch_installed() -> None:
         return out
 
     def dispatched(self, x, indices):
+        if _MOE_DISPATCH_DEC_FUSED_ON:
+            out = moe_dec_fused(self, x, indices)
+            if out is not None:
+                return out
         if _MOE_DISPATCH_VERIFY_ON:
             out = moe_verify(self, x, indices)
             if out is not None:
@@ -1791,6 +1844,75 @@ def disable_moe_verify_gather() -> None:
     壊れていた)。"""
     global _MOE_DISPATCH_VERIFY_ON
     _MOE_DISPATCH_VERIFY_ON = False
+
+
+def enable_moe_decode_fused(model=None, max_rows: int | None = None,
+                            mode: str | None = None) -> None:
+    """decode / verify 幅の MoE を `kernels/moe_decode_fused.py` の `fused:1`
+    に差し替える (gate/up 1 カーネル + down 1 カーネル、重複もソートも無し)。
+
+    ``mode``: ``"auto"`` (非 NAX 機だけ on) / ``"1"`` / ``"0"``。``None`` なら
+    環境変数 `MLXTURBO_MOE_DECODE_FUSED` を読む (既定は `_MOE_DEC_FUSED_DEFAULT` = auto。
+    2026-09-04 03:05 に既定 on: 短 ms/round -1.2〜-1.3% × 2 回 / 17k -1.4%、本番重みの
+    逆量子化 fp32 参照テストで自前が素より近い (中央 0.39 倍、反転 0/96)、S=1 の
+    Δ KLD +0.00036 (受け入れ幅 +0.0005 の中、対 bf16 teacher)。`=0` で off)。
+    NAX 機の判定は `moe_grouped_gemm.is_nax_device` で `enable_qmm_wide` と同じ
+    もの -- あちらは MLX 側が別カーネルを持っていて A/B 未実施なので、自前
+    カーネルは当てない。ゲートを関数自身の中に持たせるのは
+    `enable_moe_verify_gather` と同じ作法 (呼び出し側が env を忘れても既定が保たれる)。
+
+    行数 (B*S) が `MLXTURBO_MOE_DECODE_FUSED_MAX_ROWS` (既定 4) を超える幅は
+    必ず素の経路に落ちる (無言で切り替わる。既定の配線は depth 2 で S <= 3、
+    `--max-batch-spec` >= 2 のバッチ検証は rows >= 6 で素に落ちる。PoL は
+    S=1 0.929 / S=3 0.979 で S が増えるほど取り分が細るので上限は 4 に留める)。prefill 幅は `enable_moe_grouped_gemm` (段 P3) と
+    `enable_moe_down_epilogue` (段 P7 第 2 段) のまま -- どちらも
+    `QuantizedSwitchLinear.__call__` / `_moe_combine_fold` 側の差し替えで、
+    ここ (`SwitchGLU.__call__` の分岐) とは掛かる場所が違うので共存する。
+    `enable_moe_combine_fold` の行数ゲート (既定 64) より小さい幅しか通らない
+    ので、fold が発火する側と重なることも無い。
+
+    数値: 積和は fp32 で 1 回丸め (素の `gather_qmm` は対ごとに丸める) なので
+    ビット一致はしない。判定線 (親): 短文脈 3 本 x 512 の ms/round -1% 以上、
+    head の不一致が丸め級。
+
+    実体は `_ensure_moe_dispatch_installed` が入れる統合ディスパッチ関数
+    (C1) の一分岐。`model` は受け取るだけで使わない (他の enable_* と
+    呼び口を揃えるため)。
+
+    発火の確認: `mlxturbo.kernels._fire.snapshot()` の `moe_decode_fused`。
+    """
+    global _MOE_DISPATCH_DEC_FUSED_ON, _MOE_DISPATCH_DEC_FUSED_MAX_ROWS
+    import os
+
+    from .kernels import moe_grouped_gemm as mgg
+
+    if mode is None:
+        mode = (os.environ.get("MLXTURBO_MOE_DECODE_FUSED",
+                               _MOE_DEC_FUSED_DEFAULT).strip().lower()
+                or _MOE_DEC_FUSED_DEFAULT)
+    if mode in ("1", "on", "true"):
+        mode = "on"
+    elif mode in ("0", "off", "false"):
+        mode = "off"
+    if mode not in ("auto", "on", "off"):
+        raise ValueError(f"mode={mode!r} は auto / 1 / 0 のどれかにすること")
+    if mode == "off" or (mode == "auto" and mgg.is_nax_device()):
+        _MOE_DISPATCH_DEC_FUSED_ON = False
+        return
+    if max_rows is None:
+        max_rows = int(os.environ.get("MLXTURBO_MOE_DECODE_FUSED_MAX_ROWS", "4"))
+    _MOE_DISPATCH_DEC_FUSED_MAX_ROWS = max_rows
+    if _MOE_DISPATCH_DEC_FUSED_ON:
+        return
+    _MOE_DISPATCH_DEC_FUSED_ON = True
+    _ensure_moe_dispatch_installed()
+
+
+def disable_moe_decode_fused(model=None) -> None:
+    """`enable_moe_decode_fused` を打ち消す (フラグを下ろすだけ)。A/B で
+    交互に測るために要る。"""
+    global _MOE_DISPATCH_DEC_FUSED_ON
+    _MOE_DISPATCH_DEC_FUSED_ON = False
 
 
 def enable_moe_combine_fold(model) -> int:
@@ -2572,6 +2694,118 @@ def enable_qmm_wide(model, mtp=None, mode: str | None = None,
                 n += 1
     _QMM_WIDE_ON = n > 0
     return n
+
+
+# HC (hyper-connection) の読み側の細長い 2 本。`_QMM_WIDE_TARGETS` と別に
+# 持つのは、あちらが「本番の既定に入っている dense 射影」の集合で、こちらは
+# 2026-09-04 に prefill の内訳から出てきた別の的だから (`enable_hc_qmm_wide`)。
+_HC_QMM_WIDE_HOLDERS = ("attn_hyper_connection", "mlp_hyper_connection")
+_HC_QMM_WIDE_NAMES = ("input_mix_weight_down", "input_mix_weight_up")
+
+
+def _hc_gated_residuals(model, mtp=None):
+    """`GatedResidual` を 97 個 (48 層 x 2 + mixer) 全部たどる。"""
+    holders = list(_HC_QMM_WIDE_HOLDERS)
+    layers = list(model.model.layers)
+    if mtp is not None:
+        layers += list(mtp.layers)
+    for layer in layers:
+        for holder in holders:
+            mod = getattr(layer, holder, None)
+            if mod is not None:
+                yield mod
+    mixer = getattr(model.model, "hyper_connection_mixer", None)
+    if mixer is not None:
+        yield mixer
+
+
+def enable_hc_qmm_wide(model, mtp=None, mode: str | None = None,
+                       tile_name: str = "m64n32k32w2x2r8") -> int:
+    """HC の `input_mix_weight_down` / `_up` を prefill 幅で qmm_wide に通す。
+
+    **2026-09-04 から既定 on。**`enable_qmm_wide` (段 P10) と同じ差し替え
+    (`nn.QuantizedLinear.__call__`) と同じ行数ゲート (`_QMM_WIDE_MIN_ROWS`、
+    既定 1024) に相乗りし、印を付ける射影を HC の細長い 2 本
+    (10240->320 と 320->10240、4bit/gs64) に広げるだけ。
+
+    ``mode``: ``"auto"`` (既定、`enable_qmm_wide` の判定に従う = `_QMM_WIDE_ON`
+    が立っているときだけ効く。NAX 機や `MLXTURBO_QMM_WIDE=off` では何も起きない)
+    / ``"1"`` (印を付ける) / ``"0"`` (何もしない)。``None`` なら環境変数
+    `MLXTURBO_HC_QMM_WIDE` を読む。**`=0` が逃げ道。**
+
+    数値は素とビット一致する (`qmm_wide` の K の縮約順はタイル形に依らない)。
+    冷の連鎖 micro (M=2048、97 組 367.5 MB 巡回、
+    `bench/results/hc-prefill-micro.json`) で down 0.820 / up 0.865、
+    in-model (`--knob hc-qmm-wide`、`bench/results/hc-prefill-fast-c-*.json`)
+    は 17k prefill -0.9% (3 本とも負) / 8k -0.4% / 4k +0.1% (揺れの中)、
+    tok/round 同一、decode ±0 -- 代金ゼロなので取り分が小さくても既定に入れた
+    (CLAUDE.md の「代金ゼロの改善は 1% 未満でも既定に入れる」)。
+
+    戻り値は印を付けた射影の数 (本番のパックなら 97 x 2 = 194)。
+    """
+    import os
+
+    import mlx.core as mx
+    import mlx.nn as nn
+
+    from .kernels import qmm_wide as qw
+
+    global _QMM_WIDE_STOCK
+
+    if mode is None:
+        mode = os.environ.get("MLXTURBO_HC_QMM_WIDE", "auto").strip().lower()
+    mode = mode or "auto"
+    if mode in ("0", "off", "false"):
+        return 0
+    if mode not in ("auto", "1", "on", "true"):
+        raise ValueError(f"mode={mode!r} は auto / 1 / 0 のどれかにすること")
+    if mx.default_device() != mx.gpu:
+        return 0
+    if mode == "auto":
+        # `enable_qmm_wide` とまったく同じ門を自前で通す。あちらは runner の
+        # 後ろで呼ばれるので `_QMM_WIDE_ON` をここでは当てにできない
+        from .kernels import moe_grouped_gemm as mgg
+
+        wide_mode = (os.environ.get("MLXTURBO_QMM_WIDE", "auto").strip().lower()
+                     or "auto")
+        if wide_mode == "off" or (wide_mode == "auto" and mgg.is_nax_device()):
+            return 0
+    tile = qw.TILES.get(tile_name)
+    if tile is None:
+        raise ValueError(f"tile={tile_name!r} は qmm_wide.TILES に無い")
+    if _QMM_WIDE_STOCK is None:
+        _QMM_WIDE_STOCK = nn.QuantizedLinear.__call__
+        nn.QuantizedLinear.__call__ = _qmm_wide_dispatch
+
+    n = 0
+    for gr in _hc_gated_residuals(model, mtp):
+        for name in _HC_QMM_WIDE_NAMES:
+            lin = getattr(gr, name, None)
+            if lin is None or not isinstance(lin, nn.QuantizedLinear):
+                continue
+            if "bias" in lin or getattr(lin, "mode", "affine") != "affine":
+                continue
+            w, scales = lin["weight"], lin["scales"]
+            biases = lin.get("biases")
+            if biases is None:
+                continue
+            x_probe = mx.zeros(
+                (1, w.shape[1] * 32 // lin.bits), dtype=scales.dtype)
+            if not qw.eligible(x_probe, w, scales, biases, tile,
+                               lin.group_size, lin.bits):
+                continue
+            lin._qmm_wide = tile
+            n += 1
+    return n
+
+
+def disable_hc_qmm_wide(model, mtp=None) -> None:
+    """`enable_hc_qmm_wide` の印だけを外す (dense 射影の印は触らない)。"""
+    for gr in _hc_gated_residuals(model, mtp):
+        for name in _HC_QMM_WIDE_NAMES:
+            lin = getattr(gr, name, None)
+            if lin is not None:
+                lin._qmm_wide = None
 
 
 def disable_qmm_wide() -> None:

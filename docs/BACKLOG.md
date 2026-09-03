@@ -750,3 +750,10 @@ mlx_lm の更新で写しが壊れる頻度が月 2 回を超えるなら、写�
 `_moe_combine_fold` の `mx.argsort(idx_flat)` は 20480 要素 (80 KB、値は 0..511) の並べ替えに **0.224 ms/層**、`row_src` / `_inv_perm` / 表まで入れて 0.26〜0.33 ms/層 かかる。MLX の汎用ソートの多段起動ぶんで、GPU の実働ではない。
 ブロック局所ヒストグラム (threadgroup 内で数える) → `cumsum` → ブロック内順位 (原子操作なしで決定的) の 2 カーネル + 小 op 数本にすれば 0.05〜0.08 ms/層 に落ちる見込み = **-0.25 ms/層 = 8k prefill の -0.4%**。
 専門家内の行順は結果に影響しない (行ごとの GEMM は位置に依らず、`combine` は k の固定順で足す) ので**出力はビット一致**。P7 第 3 段で残った唯一の的 (router は床、swiglu と topk は合わせて -0.15 ms/層で揺れの中、`docs/research/SESSION-2026-09-02-CATCHUP.md` の 2026-09-03 20:55)。
+
+## `qmm_wide` は M < 1024 で HC の down (10240→320) が素と食い違う (2026-09-04 03:10、HC エージェントの副産物、未調査)
+
+`tools/hc_prefill_micro.py` で本番の行数ゲート `fused._QMM_WIDE_MIN_ROWS` (=1024) より小さい幅を測ると、down (K=10240, N=320) が
+M=256 で相対 0.53 (max_abs 2.0)、M=512 で 0.373、M ≥ 2048 で 0.0。up (K=320, N=10240) は全幅で一致。本番は prefill のチャンクが 2048 で
+ゲートが 1024、C の in-model も 4k / 8k / 17k でビット一致なので届いていないが、**`MLXTURBO_QMM_WIDE_MIN_ROWS` を下げる前にここを潰す**こと
+(N=320 の細長形で M が小さいときのタイル端の扱いを疑う)。micro の numerics に `below_prod_min_rows` / `prod_min_rows` を出してある。

@@ -1035,18 +1035,19 @@ def fused_gated_residual(
 #   2048   7.0e-6      4.0e-4          2.5e-4         0
 #
 # - M<=6 (decode/verify 幅) は全段ビット一致。
-# - M>=62 で post 段だけ崩れる。normed と up の入力が完全一致しているので、
-#   原因は post カーネルの中 — `mean(axis=-2)` を bf16 逐次加算で模した式
-#   (`_post_source` から引き継いだ、S=1 で確かめられたモデル) が M の大きい
-#   col-reduce では合っていないか、写した sigmoid が全 bf16 パターン中 1 個だけ
-#   外す (65535/65536) のどちらか。切り分けは未了。
-# - M=2048 では `mx.fast.rms_norm` 側も縮約の形が変わるらしく normed も崩れる。
-#
-# **この差は in-model に出る。**`--knob hc-elem` / `hc-off` の 3 者比較
-# (2026-09-03、`bench/results/hc-elem-off-*.json`) で、出力トークン列の先頭 24 は
-# elem / 素 / 既定カーネルの 3 者で一致するのに tok/round は食い違った。prefill
-# (M=62〜17k) がこの経路を通るため。**素とのビット一致が要るなら
-# `eligible_elem` に行数の上限 (decode/verify 幅だけ通す) を足すこと。**
+# - **縮約の模型は正しい** (2026-09-04 に切り分け済み、`tools/hc_prefill_micro.py`
+#   の `mixed_model_vs_plain`): 素の `mean(axis=-2)` は M=2048 でも bf16 逐次加算と
+#   厳密に一致する (fp32 で溜める模型は素を 8.3% 外す)。同じ入力から組んだ模型と
+#   カーネルだけが 1.9e-5 食い違う (`mixed_model_vs_elem`) ので、**残る差は
+#   カーネルの中** — 写した sigmoid (全 bf16 パターン中 65533/65536 一致) か
+#   Metal の bf16 積の丸め。M が増えるほど当たる要素が増えるだけで、M そのものが
+#   縮約の形を変えているわけではない。
+# - normed 側の差は `mx.fast.rms_norm` と自前の縮約順の違い (M=2048 で 6e-6)。
+# - **prefill 幅まで通す道は塞がっている。**行数ゲートを外した in-model
+#   (2026-09-04、`bench/results/hc-prefill-fast-8k.json` の variant A)
+#   は 8k prefill -1.6% と引き換えに tok/round が 3 本とも落ち (-8.0 / -4.3 / -2.6%、
+#   平均 -4.8%)、decode ms/round +0.5%、1 本は head まで変わった。**棄却。**
+#   `eligible_elem` の行数上限 8 は動かさないこと。
 
 _KERNELS_ELEM: dict[tuple, Any] = {}
 
@@ -1161,7 +1162,8 @@ def _elem_post_source(cfg: dict) -> str:
 
     if (j < {d}) {{
         // 参照の mean(axis=-2) は **bf16 で逐次加算**する (fp32 で溜めて最後に
-        // 丸める形ではない。_post_source の同じ注記を参照)
+        // 丸める形ではない)。M=2048 でも素と厳密一致することを実測済み
+        // (2026-09-04。fp32 で溜める模型は素を 8.3% 外す)
         float total = 0.0f;
         for (int l = 0; l < {hc}; l++) {{
             size_t idx = (size_t)m * {hcd} + (size_t)l * {d} + (size_t)j;
@@ -1220,6 +1222,11 @@ def _elem_qmm(x: mx.array, w: tuple):
     ここは MLX の qmv/gemv をそのまま呼ぶ -- 第 4 変種の要点は「GEMV を
     自前カーネルに取り込まない」ことなので、この関数の中身を融合カーネルに
     差し替えると変種の意味が消える。
+
+    この経路は decode / verify 幅 (行数 <= 8) しか通らない (`eligible_elem`)。
+    prefill 幅の down/up を `qmm_wide` に通すのは `nn.QuantizedLinear.__call__`
+    側の差し替え (`fused.enable_hc_qmm_wide`) の担当で、そちらは素の
+    `GatedResidual.__call__` に当たる。
     """
     if len(w) == 1:
         return x @ w[0].T
@@ -1251,9 +1258,11 @@ def eligible_elem(
         return False
     if norm_weight.shape != (hc * d,):
         return False
-    # decode / verify 幅だけ (行数 <= 8)。M >= 62 では post 段の縮約 (mean の bf16
-    # 逐次加算の模倣) が素と食い違い軌道が分かれる (2026-09-03 14:55 の切り分け)。
-    # decode 幅では全段ビット一致。
+    # decode / verify 幅だけ (行数 <= 8)。M >= 62 では mixed / normed が 1e-5 級の
+    # 割合で素と 1 ulp 食い違い、軌道が分かれる (2026-09-03 14:55 の切り分け)。
+    # decode 幅では全段ビット一致。**prefill 幅まで上げるのは 2026-09-04 の
+    # in-model で棄却済み** (8k -1.6% と引き換えに tok/round が 3 本とも落ちて
+    # 平均 -4.8%、head も変わる)。
     rows = 1
     for n in hyper.shape[:-1]:
         rows *= int(n)
