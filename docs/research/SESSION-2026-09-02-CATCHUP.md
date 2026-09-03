@@ -2236,3 +2236,9 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - **次の的 (decode の本格改修)**: (a) S ≤ 8 の MoE ルーティングを sort 無しに (短で 2.3 ms = 6%)、(b) copy 133 本の出所 (transpose / 非連続) を潰す (1.8 ms)、
   (c) 層ごとの elementwise の糊 (multiply / sigmoid / broadcast / softmax、~4 ms) を `mx.compile` か 1 カーネルに畳む、(d) lm_head 8bit の 1.75 ms (4bit で候補 → 8bit で上位だけ再採点、品質の確認要)、
   (e) `wide` (射影の連結) を decode 幅で burn-in 付きに再測 (前の負けは位置 1 の段差込みの疑い)。
+
+### 2026-09-03 19:00 本番のパックを lm_head 4bit (`~/models/ddalcu-mlxlm-head4`、真 bf16 から g64 で焼いた 9/2 23:03 のもの) に (ユーザー判断)
+
+- 理由: 対戦相手 (mlx-serve / oMLX / rapid-mlx) は一律 4bit で、条件を揃える。decode で lm_head の 1 本 (1.75 ms/forward、7%) が半分になる見込み (+3〜4%)。
+- 代金 (了承済み): KLD 0.01326 → 0.01794 (+0.0047)、top-1 一致 0.966 → 0.962。以後の KLD 基準は 0.01794。
+- 運用: 小ベンチ / フルベンチはこのパックで。decode_ab の A/B は走行中のものは 8bit のまま (相対比較)、新しいものから head4。公開パック (HF) の差し替えは後日 (BACKLOG)。

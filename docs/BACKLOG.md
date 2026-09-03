@@ -702,3 +702,7 @@ mlx_lm の更新で写しが壊れる頻度が月 2 回を超えるなら、写�
 - **vision / 音声も追従の対象に含める** (BACKLOG 1 節「マルチモーダル対応」と同じ話)。Gemma 4 と Qwen の VL 系は mlx_lm 側が VLM ラッパ (`gemma4.py` + `gemma4_text.py` の形) なので、
   8〜9 割の追従はまず text 側の経路で取り、vision / 音声の encoder は別の adapter として足す。投機 decode 側で要るのは「画像 / 音声トークンを含む prefix の prefill と、
   その KV を持ったままの draft / verify」で、text だけの前提を置いている箇所 (prime 窓、n-gram の文脈、checkpoint の位置) を洗うのが先。
+
+## 公開パックの lm_head を 4bit に (2026-09-03、ユーザー判断で本番を 4bit 頭に)
+
+ローカルの本番は `~/models/ddalcu-mlxlm-head4` (真 bf16 から焼いた 4bit 頭)。HF に公開しているパックは 8bit 頭のままなので、差し替えて README に KLD の代金 (+0.0047) を書く。
