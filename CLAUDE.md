@@ -67,8 +67,8 @@
   on にした。
   `MLXTURBO_DEPTH_ADAPT` (既定 on、`=0` で off) も本番の既定値で、2048 超の文脈で受理率 EMA から
   draft 深さを選ぶ (17k で ms/tok -3〜-6%、2026-09-03)。2048 以下は静的 depth 2 のまま。
-  `MLXTURBO_PREFILL_ATTN` (既定 on、`=0` で off) は T=1 gather の prefill attention カーネルで、kv ≥ 12288
-  (`MLXTURBO_PREFILL_ATTN_MIN_KV`) だけ発火する (50k prefill -21%、2026-09-03)。長文脈の KLD (自前の dense
+  `MLXTURBO_PREFILL_ATTN` (既定 on、`=0` で off) は T=1 gather の prefill attention カーネルで、kv ≥ 8192
+  (`MLXTURBO_PREFILL_ATTN_MIN_KV`、2026-09-03 17:20 に 12288 から下げた。交差点 8.1k、10k -0.8%、品質同一) だけ発火する (50k prefill -23%、17k -3.7%、2026-09-03)。長文脈の KLD (自前の dense
   比) 0.040 は、既に受理している GDN Metal の同じ物差しでの 0.111 より小さい。長文脈の品質は
   bf16 参照が無いので、この物差しではなく課題の正答率で見ること (CATCHUP 2026-09-03 07:40)。
   `MLXTURBO_MOE_COMBINE_FOLD` (既定 on、行数 ≥ 64 の prefill 幅だけ、`=0` で off) と `MLXTURBO_PRIME_WINDOW`
@@ -86,6 +86,8 @@
   prefill の dense 経路で q を 256 行ずつに割り前方の K/V だけ渡す (4k -1.1% / 8k -1.2% / 17k -1.0%、KLD 差 0.0、2026-09-03)。
 - 品質を売って速度を買わない。fake を実物より緩くしない。KLD の受け入れ幅は
   現行比 +0.0005 (bench/quant_eval.py compare)。
+- **代金ゼロ (品質・メモリ・複雑さの増分が無い) の改善は、取り分が 1% 未満でも既定に入れる** (ユーザー 2026-09-03 17:20)。
+  条件は「測った文脈のどれでも遅くならない」こと。効果が薄いだけを理由に畳まない。畳むのは代金がある (品質、メモリ、遅くなる文脈がある、写しが増える) とき。
 
 ## 分業
 

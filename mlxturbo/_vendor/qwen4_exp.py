@@ -1178,7 +1178,8 @@ class Attention(nn.Module):
         # カーネルは kv が小さいと dense より遅く (kv=8192 で 1.43 倍遅い)、
         # kv≈11k を境に有利になる (kv=16896 で 1.50 倍速い)。そこで
         # `_prefill_attn` が立っているときは比のガードの代わりに kv_len の
-        # しきい値だけで判定する (既定 12288、`MLXTURBO_PREFILL_ATTN_MIN_KV`)。
+        # しきい値だけで判定する (既定 8192、`MLXTURBO_PREFILL_ATTN_MIN_KV`。2026-09-03 17:20 に 12288 から下げた:
+        # 交差点 8.1k、10k で -0.8%、17k -0.3%、品質同一)。
         #
         # **フォールバックの注記**: この分岐に入ると、以降でカーネルが
         # (形/dtype/cache 種別で) 不適格と判った場合は比のガード無しで
@@ -1221,7 +1222,7 @@ class Attention(nn.Module):
 
         if prefill_attn_on:
             min_kv = int(
-                os.environ.get("MLXTURBO_PREFILL_ATTN_MIN_KV", "12288")
+                os.environ.get("MLXTURBO_PREFILL_ATTN_MIN_KV", "8192")
             )
             if kv_len < min_kv:
                 return None
@@ -1658,6 +1659,13 @@ _MOE_COMBINE_SORT_MIN_RAW = int(os.environ.get("MLXTURBO_SORT_MIN", "16"))
 # と同じ読み方をここでも独立に行う -- fused.py への逆依存を避けるため)。
 _MOE_COMBINE_SORT_MIN = _MOE_COMBINE_SORT_MIN_RAW if _MOE_COMBINE_SORT_MIN_RAW else 64
 
+# mlxturbo: P7 第 2 段のフック (`mlxturbo.fused.enable_moe_down_epilogue` が
+# 関数を差す。既定 None = 素の経路)。差された関数は gate/up -> SwiGLU ->
+# down の 3 本を自前カーネルで通し、**(rows, hidden)** (top_k の和まで
+# 取った形) を返す (発火しなければ None)。これが返ると `(act * w)` の
+# 実体化・`out[inv_order]` の gather・top_k の和がまとめて畳まれる。
+_MOE_DOWN_EPILOGUE = None
+
 
 def _moe_combine_fold(switch_mlp: SwitchGLU, x: mx.array, idx: mx.array,
                        w: mx.array) -> mx.array:
@@ -1672,10 +1680,21 @@ def _moe_combine_fold(switch_mlp: SwitchGLU, x: mx.array, idx: mx.array,
     if do_sort:
         idx_flat = idx.flatten()
         order = mx.argsort(idx_flat)
-        inv_order = mx.argsort(order)
         idx_s = idx_flat[order]
-        xx = xx.flatten(0, -3)[order // top_k]
-        w_s = w.flatten()[order][:, None, None]
+        row_src = order // top_k
+        w_ord = w.flatten()[order]
+        # mlxturbo: P7 第 2 段。フックが立っていて発火すれば、gate/up ->
+        # SwiGLU -> down の 3 本を自前カーネルで通し、ルータ重み掛け・
+        # 並べ替え戻し・その添字作り (と gather) が GEMM に畳まれる
+        ep = _MOE_DOWN_EPILOGUE
+        if ep is not None:
+            folded = ep(switch_mlp, xx.flatten(0, -3), row_src, idx_s,
+                        order, w_ord)
+            if folded is not None:
+                # (rows, hidden) -> (B, S, hidden)
+                return mx.unflatten(folded, 0, idx.shape[:-1])
+        xx = xx.flatten(0, -3)[row_src]
+        w_s = w_ord[:, None, None]
     else:
         idx_s = idx
         w_s = w[..., None, None]
@@ -1688,7 +1707,7 @@ def _moe_combine_fold(switch_mlp: SwitchGLU, x: mx.array, idx: mx.array,
     act = (switch_mlp.activation(x_up, x_gate) * w_s).astype(x.dtype)
     out = switch_mlp.down_proj(act, idx_s, sorted_indices=do_sort)
     if do_sort:
-        out = out[inv_order]
+        out = out[mx.argsort(order)]
         out = mx.unflatten(out, 0, idx.shape)
     return out.squeeze(-2).sum(axis=-2)
 
