@@ -16,43 +16,58 @@ set -e
 LOCK="${TMPDIR:-/tmp}/mlxturbo-bigmodel.lock"
 WAITED=0
 
-# ---- 優先レーン ------------------------------------------------------------
+# ---- レーン (3 段) ---------------------------------------------------------
 #
-# モデルを読まない数分の micro が、モデルを読む 20 分の A/B の後ろで 40 分待つ
-# のは無駄 (エージェントがその間止まる)。micro は札 (ticket) を出し、札が
-# 生きている間は普通の待ち手がロックを取らない。micro どうしは先着順。
-# 自動判定: コマンドに _micro.py / kernel_chain_cost.py / micro_kernel_latency.py /
-# verify_*.py / smoke_*.py が含まれれば優先。BIGLOCK_PRIO=1/0 で明示できる。
+# 方針: 親の A/B (run_chainNN.sh から流す長い列) が 1 本終わったら、エージェントの
+# GPU 待ちを全部先に流してから次の A/B に進む。エージェントどうしでは、モデルを
+# 読まない数分の micro を、モデルを読む A/B より先に通す。
+#
+#   2 = micro  : コマンドに _micro.py / kernel_chain_cost.py / micro_kernel_latency.py /
+#                verify_*.py / smoke_*.py が含まれる (自動)
+#   1 = normal : それ以外 (既定。エージェントの in-model A/B など)
+#   0 = bg     : 祖先に run_chain*.sh がいる親の列 (自動)
+#
+# BIGLOCK_PRIO=0/1/2 で明示できる。各待ち手は札 (PRIO_DIR/<pid>、中身が段) を出し、
+# 自分より高い段の札が生きている間はロックを取らない。同じ段は先着順。
 PRIO_DIR="${TMPDIR:-/tmp}/mlxturbo-biglock-prio"
 mkdir -p "$PRIO_DIR"
-PRIO="${BIGLOCK_PRIO:-}"
-if [ -z "$PRIO" ]; then
-  case "$*" in
-    *_micro.py*|*kernel_chain_cost.py*|*micro_kernel_latency.py*|*/verify_*.py*|*/smoke_*.py*|*[[:space:]]verify_*.py*|*[[:space:]]smoke_*.py*) PRIO=1 ;;
-    *) PRIO=0 ;;
-  esac
-fi
-TICKET="$PRIO_DIR/$$"
-if [ "$PRIO" = 1 ]; then
-  echo $$ > "$TICKET"
-  POLL=3
-else
-  POLL=15
-fi
-trap 'rm -f "$TICKET"' EXIT INT TERM
-# 生きている優先札 (自分以外) があるか。死んだ札は掃除する
-live_prio() {
-  local t o
-  for t in "$PRIO_DIR"/*(N); do
-    o=$(basename "$t")
-    [ "$o" = "$$" ] && continue
-    if kill -0 "$o" 2>/dev/null; then return 0; else rm -f "$t"; fi
+in_chain() {
+  local p=$$ c
+  while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+    c=$(ps -o command= -p "$p" 2>/dev/null)
+    case "$c" in
+      *zsh\ /*/run_chain*.sh*|*zsh\ run_chain*.sh*|*zsh\ ./run_chain*.sh*) return 0 ;;
+    esac
+    p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
   done
   return 1
 }
-
-# ロックを取るまで回る。取得は noclobber で不可分にする。`[ -f ]` で見てから
-# 書く形だと、同時に待っていた 2 本が両方通って両方 98GB を読みに行く
+PRIO="${BIGLOCK_PRIO:-}"
+if [ -z "$PRIO" ]; then
+  case "$*" in
+    *_micro.py*|*kernel_chain_cost.py*|*micro_kernel_latency.py*|*/verify_*.py*|*/smoke_*.py*|*[[:space:]]verify_*.py*|*[[:space:]]smoke_*.py*) PRIO=2 ;;
+    *) if in_chain; then PRIO=0; else PRIO=1; fi ;;
+  esac
+fi
+TICKET="$PRIO_DIR/$$"
+echo "$PRIO" > "$TICKET"
+case "$PRIO" in 2) POLL=3 ;; 1) POLL=5 ;; *) POLL=15 ;; esac
+trap 'rm -f "$TICKET"' EXIT INT TERM
+# 自分より高い段の札 (自分以外) が生きているか。死んだ札は掃除する
+live_higher() {
+  local t o lv
+  for t in "$PRIO_DIR"/*(N); do
+    o=$(basename "$t")
+    [ "$o" = "$$" ] && continue
+    if kill -0 "$o" 2>/dev/null; then
+      lv=$(cat "$t" 2>/dev/null); [ -z "$lv" ] && lv=1
+      [ "$lv" -gt "$PRIO" ] && return 0
+    else
+      rm -f "$t"
+    fi
+  done
+  return 1
+}
 while true; do
   # 1. 既存のロックが生きているか。死んでいれば掃除する
   if [ -f "$LOCK" ]; then
@@ -88,9 +103,9 @@ while true; do
     sleep 15; WAITED=$((WAITED + 15)); continue
   fi
 
-  # 3. 優先札が生きていれば、普通の待ち手は譲る
-  if [ "$PRIO" != 1 ] && live_prio; then
-    [ "$WAITED" -eq 0 ] && echo "biglock: 優先の micro が待っている。先に通す" >&2
+  # 3. 自分より高い段の待ち手がいれば譲る
+  if live_higher; then
+    [ "$WAITED" -eq 0 ] && echo "biglock: 段 $PRIO。上の段の待ち手を先に通す" >&2
     sleep $POLL; WAITED=$((WAITED + POLL)); continue
   fi
 
