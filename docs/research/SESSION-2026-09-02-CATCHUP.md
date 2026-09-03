@@ -1889,3 +1889,6 @@ decode 側 mmap 確認 (chain85 B1、pread): 短 3 本 ms/round 37.44 (null A/B 
 代償: 末尾で BPE 境界の checkpoint (n-1) を積めない。**作り直しの形**: 最終メンバーを「末尾チャンクから最後の 1 トークンを除いた部分」にし、
 最後の 1 トークンだけ chunk 主導で流す → MoE は 3999 行 1 回、checkpoint 復活、mixer/lm_head の追加コードも不要 (上位互換)。追加費用は T=1 の forward 1 回。
 ハーネスの罠: 対照検査を (kind, ctx) でまとめると、長さが同じ別プロンプト同士を突き合わせて偽の NG が出る (3 本中 2 本が 3873 トークン)。case 単位に直す。
+
+P6 の品質ゲート (11:19、`tools/longctx_quality.py`、17k、n=8、seed 0): recall は dense 8/8、kernel 8/8、agree 1.0 で、発火下限 12288 (48 発火/問) と 8192 (72 発火/問) の両方で同じ。
+下限を 8192 に下げても課題正答率は落ちない (quote 課題の値はエージェントの報告で確認)。
