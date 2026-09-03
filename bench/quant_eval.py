@@ -120,6 +120,28 @@ def _teacher_logits(model, full_ids):
     return logits[0]
 
 
+def _step_logits(model, full_ids, start):
+    """decode 幅 (S=1) の数値で logits を取る。
+
+    `_teacher_logits` は列全体を prefill 幅 (1 回の forward) で流すので、
+    decode / verify 幅 (行数 <= 8) にしか発火しないカーネルの数値は 1 度も
+    通らない。ここでは prompt (`full[:start]`) を prefill 幅で 1 回流して
+    cache を作り、`full[start:-1]` を 1 トークンずつ cache 付きで流す (本番の
+    decode と同じ幅)。返り値は `_teacher_logits(model, full)[start:-1]` と
+    同じ位置・同じ行数。"""
+    import mlx.core as mx
+
+    cache = model.make_cache()
+    if start > 0:
+        mx.eval(model(mx.array(full_ids[:start])[None], cache=cache))
+    outs = []
+    for t in range(start, len(full_ids) - 1):
+        lg = model(mx.array(full_ids[t : t + 1])[None], cache=cache)
+        mx.eval(lg)
+        outs.append(lg[0, -1])
+    return mx.stack(outs, axis=0)
+
+
 def cmd_continuations(args):
     import mlx.core as mx
 
@@ -184,7 +206,7 @@ def cmd_dump(args):
     print(f"wrote {args.out}")
 
 
-def evaluate(model, cont: dict, ref, quiet: bool = False) -> dict:
+def evaluate(model, cont: dict, ref, quiet: bool = False, step: int = 0) -> dict:
     """読み込み済みモデルを参照ダンプと突き合わせ、プロンプト別の指標を返す。
 
     cmd_compare と cmd_sweep で共有する。sweep はモデルを 1 回しか読まずに
@@ -197,7 +219,8 @@ def evaluate(model, cont: dict, ref, quiet: bool = False) -> dict:
     for key, entry in cont["prompts"].items():
         full = entry["prompt_ids"] + entry["continuation_ids"]
         start = len(entry["prompt_ids"]) - 1
-        logits = _teacher_logits(model, full)[start:-1].astype(mx.float32)
+        logits = (_step_logits(model, full, start) if step == 1
+              else _teacher_logits(model, full)[start:-1]).astype(mx.float32)
         logq_all = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         idx = mx.array(ref[f"{key}.idx"])
         logq = mx.take_along_axis(logq_all, idx, axis=-1)
@@ -401,10 +424,12 @@ def compare_with_model(model, args) -> None:
     """
     cont = json.loads(Path(args.continuations).read_text())
     ref = np.load(args.ref_dump)
-    per_prompt = evaluate(model, cont, ref)
+    step = int(getattr(args, "step", 0) or 0)
+    per_prompt = evaluate(model, cont, ref, step=step)
     result = {
         "kind": "compare",
         "tag": args.tag,
+        "step": step,
         "fusions": bool(getattr(args, "fusions", False)),
         "mlxturbo_env": _mlxturbo_env_snapshot(),
         "model": args.model,
@@ -535,6 +560,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="出荷経路と同じ融合 knob (runner.enable_default_fusions) "
                         "を有効にする。MLXTURBO_GDN_METAL 等の環境変数がここで"
                         "初めて効くようになる")
+    p.add_argument("--step", type=int, default=0, choices=(0, 1),
+                   help="1 なら継続部分を 1 トークンずつ cache 付きで流す "
+                        "(decode 幅 S=1 の数値。decode 幅にしか発火しない "
+                        "カーネルの KLD はこれでしか測れない)。既定 0 = 列全体を "
+                        "prefill 幅で 1 回")
     p.set_defaults(fn=cmd_compare)
 
     p = sub.add_parser("sweep", help="1 回のロードでビット構成を積み上げて測る")
