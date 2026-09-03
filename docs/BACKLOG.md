@@ -799,3 +799,11 @@ M=256 で相対 0.53、M=512 で 0.373、M ≥ 2048 で 0.0。調査 (`tools/qmm
   `omlx serve --model-dir <親>` で発見、`qwen3_5_mtp` を drafter として識別 (ペア付けは model_settings の `vlm_mtp_draft_model`、CLI 無し)。**MTPLX 2.9.2** は `tools/compare/mtplx-venv/`。
   **mlx-serve** は `ddalcu/Qwen3.8-27B-MLX-Serve-4bit` (18.2 GB、draft head baked in) が推奨でローカルに無い。sidecar 探索は同一ディレクトリ直下の `mtp.safetensors` 等。rapid-mlx は無し。
   HTTP harness は `bench/vs_mlx_serve.py` の `stream_once` (エンジン非依存)、`self_snapshot.py` は mlxturbo / mlx-serve の argv 直書き。池は 27B でも同じ (vocab 完全一致)。
+
+## 後でやる: draft の学習 (小さい draft model の蒸留、uzu 型) — ユーザー 2026-09-04 08:10「速度のためにはやるべき。いずれやる気はするが、特化すると汎用性能として使いづらいので、あえて手を出していない。アイデアとして残す」
+
+Mirai / uzu (`docs/research/EXTERNAL-MIRAI-UZU-2026-09.md`) の 105 tok/s の半分は「<50 MB の学習した draft」で、MTP 1 層 (2 倍) の上に 1.5〜2 倍。
+ただし uzu は族ごと・用途ごとに学習していて、一般チャット (MT-Bench) では 84 に落ちる = 特化の代金。うちで採るなら条件は「汎用性能を落とさない」:
+(1) 学習データは特定領域に寄せない (teacher の rollout を広い池から)、(2) 受理率が落ちる入力でも素の decode より遅くならない設計 (depth 適応は既にある)、
+(3) 品質は draft に依らない (検証は本体なので出力は同じ。速度だけの話)。MTP 頭の学習 (方針で無し) とは別物で、本体を触らない小モデルの学習。
+着手時期はユーザーの判断。先に 27B レーンの基準測定。
