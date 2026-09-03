@@ -290,8 +290,6 @@ def from_biglock(cmd: list[str], prio: int) -> int:
     (そのとき biglock は worker に「降りろ」を伝えてから走る)。
     """
     rec = daemon_record()
-    if rec is None:
-        return NOT_ROUTABLE  # worker が居ないなら従来どおり
     spec = classify(cmd)
     if spec is None:
         return NOT_ROUTABLE
@@ -304,8 +302,19 @@ def from_biglock(cmd: list[str], prio: int) -> int:
             return int(e.code or 2)
         if AD.job_reject_reason(job_args, knob_names):
             return NOT_ROUTABLE
-        if _model_mismatch(rec, job_args):
+        if rec is None:
+            # worker が居ない (tier 0/1 の非 routable なジョブが降ろした後など)。
+            # モデルを読むジョブなので、ここで起こして乗せる (2026-09-03: 13:39 以降
+            # 一度も worker が使われず、毎回 3 分の読み直しになっていた)
+            rec = start_daemon(model=job_args.model, ngram=job_args.ngram,
+                               mtp=job_args.mtp, mtp_bits=job_args.mtp_bits)
+            if rec is None:
+                return NOT_ROUTABLE
+        elif _model_mismatch(rec, job_args):
             return NOT_ROUTABLE
+    elif rec is None:
+        # tool / exec は worker が居ないなら従来どおり (exec は起こす価値が無い)
+        return NOT_ROUTABLE
     elif spec["type"] == "tool" and AD.tool_reject_reason(spec["path"]):
         # 道具側が `run_with_model` をまだ持っていない。従来の別プロセスへ。
         return NOT_ROUTABLE
