@@ -16,6 +16,41 @@ set -e
 LOCK="${TMPDIR:-/tmp}/mlxturbo-bigmodel.lock"
 WAITED=0
 
+# ---- 優先レーン ------------------------------------------------------------
+#
+# モデルを読まない数分の micro が、モデルを読む 20 分の A/B の後ろで 40 分待つ
+# のは無駄 (エージェントがその間止まる)。micro は札 (ticket) を出し、札が
+# 生きている間は普通の待ち手がロックを取らない。micro どうしは先着順。
+# 自動判定: コマンドに _micro.py / kernel_chain_cost.py / micro_kernel_latency.py /
+# verify_*.py / smoke_*.py が含まれれば優先。BIGLOCK_PRIO=1/0 で明示できる。
+PRIO_DIR="${TMPDIR:-/tmp}/mlxturbo-biglock-prio"
+mkdir -p "$PRIO_DIR"
+PRIO="${BIGLOCK_PRIO:-}"
+if [ -z "$PRIO" ]; then
+  case "$*" in
+    *_micro.py*|*kernel_chain_cost.py*|*micro_kernel_latency.py*|*/verify_*.py*|*/smoke_*.py*|*[[:space:]]verify_*.py*|*[[:space:]]smoke_*.py*) PRIO=1 ;;
+    *) PRIO=0 ;;
+  esac
+fi
+TICKET="$PRIO_DIR/$$"
+if [ "$PRIO" = 1 ]; then
+  echo $$ > "$TICKET"
+  POLL=3
+else
+  POLL=15
+fi
+trap 'rm -f "$TICKET"' EXIT INT TERM
+# 生きている優先札 (自分以外) があるか。死んだ札は掃除する
+live_prio() {
+  local t o
+  for t in "$PRIO_DIR"/*(N); do
+    o=$(basename "$t")
+    [ "$o" = "$$" ] && continue
+    if kill -0 "$o" 2>/dev/null; then return 0; else rm -f "$t"; fi
+  done
+  return 1
+}
+
 # ロックを取るまで回る。取得は noclobber で不可分にする。`[ -f ]` で見てから
 # 書く形だと、同時に待っていた 2 本が両方通って両方 98GB を読みに行く
 while true; do
@@ -28,7 +63,7 @@ while true; do
     else
       [ "$WAITED" -eq 0 ] && \
         echo "biglock: pid=$OWNER が 98GB を抱えている。空くまで待つ" >&2
-      sleep 15; WAITED=$((WAITED + 15)); continue
+      sleep $POLL; WAITED=$((WAITED + POLL)); continue
     fi
   fi
 
@@ -53,8 +88,15 @@ while true; do
     sleep 15; WAITED=$((WAITED + 15)); continue
   fi
 
-  # 3. 取得。既に誰かが作っていれば失敗するので、その場合は待ちに戻る
+  # 3. 優先札が生きていれば、普通の待ち手は譲る
+  if [ "$PRIO" != 1 ] && live_prio; then
+    [ "$WAITED" -eq 0 ] && echo "biglock: 優先の micro が待っている。先に通す" >&2
+    sleep $POLL; WAITED=$((WAITED + POLL)); continue
+  fi
+
+  # 4. 取得。既に誰かが作っていれば失敗するので、その場合は待ちに戻る
   if (set -o noclobber; echo $$ > "$LOCK") 2>/dev/null; then
+    rm -f "$TICKET"
     break
   fi
   sleep 5; WAITED=$((WAITED + 5))
@@ -93,6 +135,6 @@ if [ "$MEM_WAITED" -ge 600 ]; then
 elif [ "$MEM_WAITED" -gt 0 ]; then
   echo "biglock: メモリ待ち ${MEM_WAITED}s (回収可能 ${FREE_GB}GB)。開始する" >&2
 fi
-trap 'rm -f "$LOCK"' EXIT INT TERM
+trap 'rm -f "$LOCK" "$TICKET"' EXIT INT TERM
 
 "$@"
