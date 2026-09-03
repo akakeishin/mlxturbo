@@ -2196,3 +2196,13 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 ### 2026-09-03 17:51 D1 (draft 同梱) の burn-in 付き再測 (`draft-presync-burnin.json`、短長 3 本 × 512、worker): ms/tok 短 +1.0% / 長 +0.4% → 畳んだまま
 
 起動直後の段差を除いても A (同梱) が遅い (ms/round 短 +2.0% / 長 +1.5%、tok/round +0.9% / +1.0%、出力一致)。代金ゼロではない (遅い) ので既定に入れない。
+
+### 2026-09-03 18:05 GDN レジスタ常駐 scan の PoL (`mlxturbo/kernels/gdn_scan_reg.py`、`MLXTURBO_GDN_SCAN=reg`、既定 blocked)
+
+- **現行の kernel S は既にレジスタ常駐だった**: 状態の断片をレジスタに 1 回載せて T 全体を回し、行内縮約は simd_shuffle、書き戻しは最後だけ。Lily の +5.6% の比較相手 (2K で 1 層 256 MiB を動かす blockwise) は
+  チャンク分解を行列積に作り替える版で、うちの `gated_delta_blocked.py` (逐次の 1.68 倍で棄却済み) に当たる。**その取り分は 9/2 に kernel S を既定にした時点で回収済み。**
+- 冷の連鎖 micro (36 層 1.5 GB の活性を巡回、72 歩、ABBA×3): blocked 2882〜2900 us/チャンク、**reg lanes=4 db=32 2512〜2522 (0.871〜0.875)**、lanes=8 1.045、lanes=16 / 32 1.50 / 2.35、lanes=2 2.12。
+  取れた 13% は staging ではなく割り当て (1 スレッド 16 → 32 個の d、shuffle 3 段 → 2 段)。独立累算器 (0.90〜0.96)、q 先読み (5.2 倍、溢れ) は全部悪化。
+- 数値: mlx_lm 逐次基準の相対誤差 RMS は kernel S 0.7〜1.8e-5、reg 0.4〜2.3e-5 (同級)。lanes=8 は kernel S とビット一致 (差はメモリの持ち方だけ)。
+- 契約: `_vendor/qwen4_exp.py:1580` の `_gdn_metal` シーム → `gated_delta_update_blocked_metal` の中で切替 (8 行)。rollback 側 (`capture()` は `gated_delta_update_with_states`) は無関係。
+- 判定線 0.70 には未達 (0.875 = prefill -0.7% 相当) だが、**代金ゼロ方針で in-model 4k / 8k / 17k を回して、遅くならなければ既定 reg** (エージェントに戻した)。

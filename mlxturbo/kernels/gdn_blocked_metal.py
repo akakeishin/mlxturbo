@@ -390,5 +390,14 @@ def gated_delta_update_blocked_metal(
     """
     beta = mx.sigmoid(b)
     g = compute_g(A_log, a, dt_bias)
+    # MLXTURBO_GDN_SCAN=reg (既定 blocked) のときは、同じ再帰を threadgroup
+    # メモリ無しのレジスタ常駐 scan で解く (mlxturbo/kernels/gdn_scan_reg.py)。
+    # 契約 (入出力・状態の形・dtype) は kernel S と同じで、適格条件も揃えて
+    # あるので、ここで差し替えても呼び手 (qwen4_exp / spec_flash) は変わらない。
+    from . import gdn_scan_reg as _gsr
+
+    if _gsr.active() and _gsr.eligible(q, k, v, state, None):
+        _fire.bump("gdn_scan_reg")
+        return _gsr.gated_delta_scan_reg(q, k, v, g, beta, state)
     _fire.bump("gdn_metal")
     return gated_delta_blocked_seq(q, k, v, g, beta, state, block_t)
