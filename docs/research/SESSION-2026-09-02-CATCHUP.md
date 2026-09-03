@@ -2266,3 +2266,12 @@ prefill_s: 2048 幅 12.784 / 1024 幅 12.763 / 512 幅 13.238。非 MoE のメ�
 ### 2026-09-03 18:51 oracle-draft の再走 (17k、`--save-out` 付き): まだ受理されない (tok/round 1.05 / 1.06)。副産物: 行の追加費用は 17k で **4.9 ms/行** (S=2 34.65 → S=6 54.32 ms/round、K2c on)
 
 受理率の天井はこの knob では取れていない (真の次トークンの位置合わせが崩れている疑い、担当が調査中)。行費用 4.9 ms (以前の見積もり 7 ms) は K2c 後の値。
+
+### 2026-09-03 19:10 oracle の顛末と 2 つの発見 (天井スタブのエージェント)
+
+- `first=` の追従は済 (stub-draft は有効: 短で draft 3.1 ms = 8.2%)。oracle が当たらなかった原因は 2 つ:
+  1. **ベンチのプロンプト池はリポジトリ自身** (`tools/_bench_text.py:text_pool()` = docs/**/*.md + README + .py)。セッション中に docs を編集すると、同じトークン位置の窓の中身が変わる。
+     saveout と oracle の間に NEXT-SESSION-PROMPT.md を編集したので case 1 / 2 の prompt が別物になった。**罠 17: 走行をまたぐ比較 (別プロセスの A/B、小ベンチどうし) は、docs の編集で prompt が変わる。**池を凍結したファイルに置き換えるべき。
+  2. **生成トークンが verify 幅 S に依存する**: 同じ prompt で depth 2 (S=3) の参照と S=2 / S=6 の oracle が出力 index 3 で分岐 (case 1)。K2c (qsa_decode_kernel) が既定になった時点と一致し、それ以前は S=2 / S=6 とも oracle が完全に当たっていた (= S 非依存だった)。
+     同じ S での K2c on/off は head 一致 (17k の A/B) なので、K2c は「S ごとに参照 (MLX の sdpa) の並びを写している」= MLX 側の S 依存を持ち込んだのか、K2b の S ごとの経路差か。**確認要 (品質側)**: K2c on / off × S∈{1, 3, 6} で同一 prompt の greedy 出力を比べる。
+- 綺麗な 1 点 (K2c 前、case 0): 現行 tok/round 1.896 / 43.87 ms、oracle S=2 2.000 / 34.31、S=6 5.953 / 57.28 (S=6 / S=2 = 1.67 倍)。
