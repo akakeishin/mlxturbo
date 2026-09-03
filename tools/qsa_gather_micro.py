@@ -135,7 +135,7 @@ def build_case(kv_len: int, S: int, seed: int = 0):
 def run(variants, kvs, S, reps, out_path):
     results = []
     PA2 = None
-    if "c" in variants:
+    if "c" in variants or "d" in variants:
         from mlxturbo.kernels import prefill_attn_v2 as PA2  # noqa: N806
 
     for kv_len in kvs:
@@ -153,6 +153,12 @@ def run(variants, kvs, S, reps, out_path):
             )
         if "c" in variants:
             fns["c_new"] = lambda c=case: PA2.prefill_attn_v2(
+                c["q"], c["k"], c["v"], c["keep_block"], c["cache"],
+                cr=c["cr"], kv_len=c["kv_len"], n_blocks=c["n_blocks"],
+                block_topk=c["block_topk"], offset=c["offset"], scale=c["scale"],
+            )
+        if "d" in variants:
+            fns["d_u4"] = lambda c=case: PA2.prefill_attn_v2_u4(
                 c["q"], c["k"], c["v"], c["keep_block"], c["cache"],
                 cr=c["cr"], kv_len=c["kv_len"], n_blocks=c["n_blocks"],
                 block_topk=c["block_topk"], offset=c["offset"], scale=c["scale"],
@@ -188,6 +194,14 @@ def run(variants, kvs, S, reps, out_path):
             row["b_over_a"] = row["b_current"] / row["a_dense"]
         if "a_dense" in row and "c_new" in row:
             row["c_over_a"] = row["c_new"] / row["a_dense"]
+        if "a_dense" in row and "d_u4" in row:
+            row["d_over_a"] = row["d_u4"] / row["a_dense"]
+        if "b_current" in row and "d_u4" in row:
+            row["d_over_b"] = row["d_u4"] / row["b_current"]
+            # uint4 版は演算順が現行と同一なのでビット一致するはず
+            row["d_bitident_b"] = bool(
+                mx.array_equal(outs["d_u4"], outs["b_current"]).item()
+            )
 
         err_str = "  ".join(
             f"{k}={v:.2e}" for k, v in row.items() if k.endswith("err")
@@ -195,7 +209,11 @@ def run(variants, kvs, S, reps, out_path):
         print(
             f"kv={kv_len:6d} S={S}  "
             + "  ".join(f"{n}={row[n]:.2f}ms" for n in names)
-            + ("  " + err_str if err_str else ""),
+            + ("  " + err_str if err_str else "")
+            + (
+                f"  bitident(d==b)={row['d_bitident_b']}"
+                if "d_bitident_b" in row else ""
+            ),
             flush=True,
         )
         results.append(row)
@@ -211,24 +229,37 @@ def run(variants, kvs, S, reps, out_path):
     return results
 
 
-def run_stage_breakdown(kvs, S, reps, out_path):
-    """現行カーネルの 3 パス (compact / load / full) の内訳を測る。"""
+def run_stage_breakdown(kvs, S, reps, out_path, stages=None):
+    """カーネルの 3 パス (compact / load / score+softmax) の内訳を測る。
+
+    ``stages`` に ``"compact_load_u4"`` / ``"full_u4"`` を混ぜると、P6 の
+    uint4 化した段階 load の版も同じプロセス内で交互 (ABAB) に測る。
+    load 単体は ``compact_load - compact`` (scalar) と
+    ``compact_load_u4 - compact`` (uint4) の差で出す。
+    """
     from mlxturbo.kernels import prefill_attn_v2 as PA2
+
+    if stages is None:
+        stages = ["compact", "compact_load", "full"]
+
+    def call(name, c):
+        base = name[:-3] if name.endswith("_u4") else name
+        return PA2.prefill_attn_stage(
+            base, c["q"], c["k"], c["v"], c["keep_block"], c["cache"],
+            cr=c["cr"], kv_len=c["kv_len"], n_blocks=c["n_blocks"],
+            block_topk=c["block_topk"], offset=c["offset"], scale=c["scale"],
+            vec=name.endswith("_u4"),
+        )
 
     results = []
     for kv_len in kvs:
         case = build_case(kv_len, S)
-        stages = ["compact", "compact_load", "full"]
-        fns = {
-            st: (lambda c=case, s=st: PA2.prefill_attn_stage(
-                s, c["q"], c["k"], c["v"], c["keep_block"], c["cache"],
-                cr=c["cr"], kv_len=c["kv_len"], n_blocks=c["n_blocks"],
-                block_topk=c["block_topk"], offset=c["offset"], scale=c["scale"],
-            ))
-            for st in stages
-        }
+        fns = {st: (lambda c=case, s=st: call(s, c)) for st in stages}
+        outs = {}
         for st in stages:
-            mx.eval(fns[st]())
+            o = fns[st]()
+            mx.eval(o)
+            outs[st] = o
         samples = {st: [] for st in stages}
         for r in range(reps):
             order = stages if r % 2 == 0 else stages[::-1]
@@ -239,18 +270,35 @@ def run_stage_breakdown(kvs, S, reps, out_path):
         row = {"kv": kv_len, "S": S}
         for st in stages:
             row[st] = statistics.median(samples[st])
-        row["compact_ms"] = row["compact"]
-        row["load_ms"] = row["compact_load"] - row["compact"]
-        row["score_softmax_ms"] = row["full"] - row["compact_load"]
-        print(
-            f"kv={kv_len:6d}  compact={row['compact_ms']:.2f}ms  "
-            f"load={row['load_ms']:.2f}ms  "
-            f"score+softmax={row['score_softmax_ms']:.2f}ms  "
-            f"full={row['full']:.2f}ms",
-            flush=True,
-        )
+        parts = []
+        if "compact" in row:
+            row["compact_ms"] = row["compact"]
+            parts.append(f"compact={row['compact_ms']:.2f}ms")
+            for st in ("compact_load", "compact_load_u4"):
+                if st in row:
+                    row[f"load_ms{st[len('compact_load'):]}"] = row[st] - row["compact"]
+            if "load_ms" in row:
+                parts.append(f"load={row['load_ms']:.2f}ms")
+            if "load_ms_u4" in row:
+                parts.append(f"load_u4={row['load_ms_u4']:.2f}ms")
+        for full, cl in (("full", "compact_load"), ("full_u4", "compact_load_u4")):
+            if full in row and cl in row:
+                key = "score_softmax_ms" + full[len("full"):]
+                row[key] = row[full] - row[cl]
+                parts.append(f"{key.replace('_ms','')}={row[key]:.2f}ms")
+        for full in ("full", "full_u4"):
+            if full in row:
+                parts.append(f"{full}={row[full]:.2f}ms")
+        # 段階の出力そのものも一致を見る (compact_load 系は load した値の和)
+        for a_, b_ in (("compact_load", "compact_load_u4"), ("full", "full_u4")):
+            if a_ in outs and b_ in outs:
+                row[f"bitident_{b_}"] = bool(
+                    mx.array_equal(outs[a_], outs[b_]).item()
+                )
+                parts.append(f"bitident({b_})={row[f'bitident_{b_}']}")
+        print(f"kv={kv_len:6d}  " + "  ".join(parts), flush=True)
         results.append(row)
-        del case, fns
+        del case, fns, outs
 
     if out_path:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -266,9 +314,16 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--kvs", default="8192,16896")
     ap.add_argument("--S", type=int, default=2048)
-    ap.add_argument("--variants", default="a,b,c", help="a=dense基準 b=現行カーネル c=新カーネル")
+    ap.add_argument(
+        "--variants", default="a,b,c",
+        help="a=dense基準 b=現行カーネル c=新カーネル d=uint4 load 版 (P6)",
+    )
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--stage-breakdown", action="store_true", help="現行カーネルの3パス内訳を測る")
+    ap.add_argument(
+        "--stages", default="compact,compact_load,full",
+        help="--stage-breakdown で測る段階 (compact_load_u4 / full_u4 を含められる)",
+    )
     ap.add_argument("--out", default="bench/results/qsa-gather-micro.json")
     a = ap.parse_args()
     if not mx.metal.is_available():
@@ -278,7 +333,9 @@ def main() -> None:
     kvs = [int(x) for x in a.kvs.split(",")]
     if a.stage_breakdown:
         out = a.out if a.out != "bench/results/qsa-gather-micro.json" else "bench/results/qsa-gather-micro-breakdown.json"
-        run_stage_breakdown(kvs, a.S, a.reps, out)
+        run_stage_breakdown(
+            kvs, a.S, a.reps, out, [s for s in a.stages.split(",") if s]
+        )
     else:
         variants = set(a.variants.split(","))
         run(variants, kvs, a.S, a.reps, a.out)

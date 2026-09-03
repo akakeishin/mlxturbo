@@ -81,12 +81,94 @@ def _tile_blocks_target(
     return bb
 
 
-def _source(head_dim, gqa, cr, bb, kmax, scale, stage: str, sw: int | None = None) -> str:
+def _vec_elems(itemsize: int) -> int:
+    """1 つの ``uint4`` (16 バイト) に入る要素数。bf16 なら 8。"""
+    assert 16 % itemsize == 0, f"itemsize={itemsize} は 16 バイトを割り切らない"
+    return 16 // itemsize
+
+
+def _tg_decl(bk: int, d: int, vec: bool, ve: int) -> str:
+    """K/V タイルの threadgroup 宣言。
+
+    ``vec`` のときは ``uint4`` 配列として確保して 16 バイト整列を保証し、
+    スコア側は ``T*`` に読み替える (barrier を挟むので順序は保たれる)。
+    """
+    if not vec:
+        return f"""
+    threadgroup T tg_k[{bk} * {d}];
+    threadgroup T tg_v[{bk} * {d}];
+"""
+    return f"""
+    threadgroup uint4 tg_k4[{bk} * {d} / {ve}];
+    threadgroup uint4 tg_v4[{bk} * {d} / {ve}];
+    threadgroup T* tg_k = (threadgroup T*)tg_k4;
+    threadgroup T* tg_v = (threadgroup T*)tg_v4;
+"""
+
+
+def _load_loop(d, cr, nsg, nth, vec: bool, ve: int) -> str:
+    """1 タイル分の K/V を threadgroup へ載せるループ。
+
+    scalar 版 (現行本番と同じ) は 1 スレッド 1 要素 (bf16 = 2 バイト) で、
+    要素ごとに ``e/d``・``e%d``・``cc%cr``・``tg_sel[]`` を払う。
+    ``vec`` 版は 1 スレッド 1 ``uint4`` (16 バイト = bf16 8 個) に変え、
+    **1 列 = 1 simdgroup** に割り当てる。列の添字計算と ``tg_sel[]`` 参照は
+    列あたり 1 回になり、32 レーン x 16 バイト = 512 バイト (= 1 行ちょうど、
+    head_dim=256/bf16) の連続読みになる。
+    """
+    if not vec:
+        return f"""
+        for (int e = (int)tid; e < ncol * {d}; e += {nth}) {{
+            const int cc = e / {d};
+            const int dd = e - cc * {d};
+            const int col = is_tail
+                ? (tail_base + tb + cc)
+                : (tg_sel[t0 + cc / {cr}] * {cr} + (cc % {cr}));
+            tg_k[e] = kbase[(size_t)col * {d} + dd];
+            tg_v[e] = vbase[(size_t)col * {d} + dd];
+        }}
+"""
+    vpc = d // ve  # 1 列あたりの uint4 個数 (head_dim=256/bf16 なら 32)
+    if vpc == 32:
+        inner = """
+            tg_k4[cc * 32 + (int)lane] = ksrc[lane];
+            tg_v4[cc * 32 + (int)lane] = vsrc[lane];
+"""
+    else:
+        inner = f"""
+            for (int dv = (int)lane; dv < {vpc}; dv += 32) {{
+                tg_k4[cc * {vpc} + dv] = ksrc[dv];
+                tg_v4[cc * {vpc} + dv] = vsrc[dv];
+            }}
+"""
+    return f"""
+        for (int cc = (int)sg; cc < ncol; cc += {nsg}) {{
+            const int col = is_tail
+                ? (tail_base + tb + cc)
+                : (tg_sel[t0 + cc / {cr}] * {cr} + (cc % {cr}));
+            const device uint4* ksrc =
+                (const device uint4*)(kbase + (size_t)col * {d});
+            const device uint4* vsrc =
+                (const device uint4*)(vbase + (size_t)col * {d});
+{inner}        }}
+"""
+
+
+def _source(
+    head_dim, gqa, cr, bb, kmax, scale, stage: str, sw: int | None = None,
+    vec: bool = False, itemsize: int = 2,
+) -> str:
     d = head_dim
     dpl = (d + 31) // 32
     bk = bb * cr
     nsg = gqa
     nth = nsg * 32
+    ve = _vec_elems(itemsize)
+    if vec:
+        assert d % ve == 0, f"head_dim={d} が {ve} で割り切れない (uint4 化不可)"
+        assert (bk * d) % ve == 0
+    tgd = _tg_decl(bk, d, vec, ve)
+    ld = _load_loop(d, cr, nsg, nth, vec, ve)
     # 候補: load タイル幅 (bk) と score/softmax の register チャンク幅 (sw) を
     # 分離する。breakdown 実測 (2026-09-03) で bk を広げると load は速くなるが
     # score+softmax は `sc[bk]` の register 圧で遅くなった (bb=4: 17.12ms,
@@ -175,10 +257,7 @@ def _source(head_dim, gqa, cr, bb, kmax, scale, stage: str, sw: int | None = Non
         return body
 
     if stage == "compact_load":
-        body = header + tail_calc + f"""
-    threadgroup T tg_k[{bk} * {d}];
-    threadgroup T tg_v[{bk} * {d}];
-
+        body = header + tail_calc + tgd + f"""
     const device T* kbase = k + ((size_t)b * NKV + kvh) * (size_t)CAP * {d};
     const device T* vbase = v + ((size_t)b * NKV + kvh) * (size_t)CAP * {d};
 
@@ -196,16 +275,7 @@ def _source(head_dim, gqa, cr, bb, kmax, scale, stage: str, sw: int | None = Non
                                  : min({bb}, total - t0) * {cr};
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int e = (int)tid; e < ncol * {d}; e += {nth}) {{
-            const int cc = e / {d};
-            const int dd = e - cc * {d};
-            const int col = is_tail
-                ? (tail_base + tb + cc)
-                : (tg_sel[t0 + cc / {cr}] * {cr} + (cc % {cr}));
-            tg_k[e] = kbase[(size_t)col * {d} + dd];
-            tg_v[e] = vbase[(size_t)col * {d} + dd];
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+{ld}        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // score は計算しない --- load した値の単純和だけ (DCE 防止、
         // かつ score/softmax の費用を含めないための代用)
@@ -240,10 +310,7 @@ def _source(head_dim, gqa, cr, bb, kmax, scale, stage: str, sw: int | None = Non
     }}
     float m = -INFINITY;
     float l = 0.0f;
-
-    threadgroup T tg_k[{bk} * {d}];
-    threadgroup T tg_v[{bk} * {d}];
-
+{tgd}
     const device T* kbase = k + ((size_t)b * NKV + kvh) * (size_t)CAP * {d};
     const device T* vbase = v + ((size_t)b * NKV + kvh) * (size_t)CAP * {d};
 
@@ -258,16 +325,7 @@ def _source(head_dim, gqa, cr, bb, kmax, scale, stage: str, sw: int | None = Non
                                  : min({bb}, total - t0) * {cr};
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int e = (int)tid; e < ncol * {d}; e += {nth}) {{
-            const int cc = e / {d};
-            const int dd = e - cc * {d};
-            const int col = is_tail
-                ? (tail_base + tb + cc)
-                : (tg_sel[t0 + cc / {cr}] * {cr} + (cc % {cr}));
-            tg_k[e] = kbase[(size_t)col * {d} + dd];
-            tg_v[e] = vbase[(size_t)col * {d} + dd];
-        }}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+{ld}        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // load タイル (幅 {bk}) の中を score チャンク幅 {sw} でさらに分割する
         // (候補: load/score の register 幅を分離、barrier は増やさない --- 直上の
@@ -536,15 +594,24 @@ def prefill_attn_direct(
     return out
 
 
-def _get_kernel(head_dim, gqa, cr, bb, kmax, scale, stage: str, sw: int | None = None):
-    key = (head_dim, gqa, cr, bb, kmax, scale, stage, sw)
+def _get_kernel(
+    head_dim, gqa, cr, bb, kmax, scale, stage: str, sw: int | None = None,
+    vec: bool = False, itemsize: int = 2,
+):
+    key = (head_dim, gqa, cr, bb, kmax, scale, stage, sw, vec, itemsize)
     kern = _KERNELS.get(key)
     if kern is None:
+        suffix = "_u4" if vec else ""
         kern = mx.fast.metal_kernel(
-            name=f"prefill_attn_v2_{stage}_{head_dim}_{gqa}_{cr}_{bb}_{kmax}_{sw or bb*cr}",
+            name=(
+                f"prefill_attn_v2_{stage}{suffix}_{head_dim}_{gqa}_{cr}_{bb}"
+                f"_{kmax}_{sw or bb*cr}"
+            ),
             input_names=["q", "k", "v", "keep", "params"],
             output_names=["out"],
-            source=_source(head_dim, gqa, cr, bb, kmax, scale, stage, sw),
+            source=_source(
+                head_dim, gqa, cr, bb, kmax, scale, stage, sw, vec, itemsize
+            ),
         )
         _KERNELS[key] = kern
     return kern
@@ -575,8 +642,12 @@ def prefill_attn_stage(
     scale: float,
     target_cols: int | None = None,
     score_chunk: int | None = None,
+    vec: bool = False,
 ) -> mx.array:
-    """内訳計測用の入口。``stage`` は "compact" / "compact_load" / "full"。"""
+    """内訳計測用の入口。``stage`` は "compact" / "compact_load" / "full"。
+
+    ``vec=True`` で段階 load を ``uint4`` (16 バイト) 化した版になる (P6)。
+    """
     B, n_heads, S, head_dim = q.shape
     n_kv = k.shape[1]
     gqa = n_heads // n_kv
@@ -587,12 +658,25 @@ def prefill_attn_stage(
 
     keys, values, cap = PA._kv_buffers(cache, k, v, kv_len)
 
+    if vec:
+        # uint4 (16 バイト) 読み書きの前提。K/V の 1 行は head_dim*itemsize
+        # バイトで、行頭が 16 バイト整列していなければならない。
+        row_bytes = head_dim * itemsize
+        assert row_bytes % 16 == 0, (
+            f"1 行 {row_bytes} バイトが 16 の倍数でない (uint4 化不可)"
+        )
+        # kbase の起点も (b*NKV+kvh)*CAP*head_dim 要素ずれるだけなので、
+        # CAP*head_dim*itemsize が 16 の倍数なら整列は保たれる。
+        assert (cap * row_bytes) % 16 == 0, (
+            f"KV バッファの head ごとの刻み {cap * row_bytes} バイトが 16 の倍数でない"
+        )
+
     q_bshd = q.transpose(0, 2, 1, 3)
     params = mx.array([S, n_blocks, kv_len, cap, offset, n_kv], dtype=mx.int32)
 
     kernel = _get_kernel(
         head_dim, gqa, cr, bb, block_topk, float(scale), stage,
-        sw if stage == "full" else None,
+        sw if stage == "full" else None, vec, itemsize,
     )
     (out,) = kernel(
         inputs=[q_bshd, keys, values, keep_block, params],
@@ -637,7 +721,34 @@ def prefill_attn_v2(
     )
 
 
+def prefill_attn_v2_u4(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    keep_block: mx.array,
+    cache,
+    *,
+    cr: int,
+    kv_len: int,
+    n_blocks: int,
+    block_topk: int,
+    offset: int,
+    scale: float,
+) -> mx.array:
+    """P6: 段階 load を ``uint4`` 化したフルカーネル。
+
+    演算の順序は現行 (`prefill_attn.prefill_attn`) と同一 (タイル幅も同じ
+    bb=6 / 24 列) なので、**出力はビット一致するはず**。変わるのは
+    threadgroup へ載せる担当の割り振りと 1 命令あたりのバイト数だけ。
+    """
+    return prefill_attn_stage(
+        "full", q, k, v, keep_block, cache,
+        cr=cr, kv_len=kv_len, n_blocks=n_blocks, block_topk=block_topk,
+        offset=offset, scale=scale, vec=True,
+    )
+
+
 __all__ = [
-    "prefill_attn_stage", "prefill_attn_v2", "prefill_attn_direct",
-    "build_row_idx", "TARGET_COLS", "MODE",
+    "prefill_attn_stage", "prefill_attn_v2", "prefill_attn_v2_u4",
+    "prefill_attn_direct", "build_row_idx", "TARGET_COLS", "MODE",
 ]

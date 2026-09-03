@@ -792,6 +792,20 @@ _DRAFT_TRACE = os.environ.get("MLXTURBO_DRAFT_TRACE") == "1"
 # path 文字列なので "1" ではなく素の環境変数の有無で判定する。
 _DEPTH_TRACE_PATH = os.environ.get("MLXTURBO_DEPTH_TRACE") or None
 
+# MLXTURBO_DRAFT_PRESYNC=1 (既定 off、案 D1): 次ラウンドの draft の 1 段目を
+# 検証フォワードと同じ eval に同梱する。ラウンドの `mx.eval(lg, nxt_all, dv)`
+# の前に、`nxt_all` の S 行 (S = 検証幅) を入力とした MTP 1 段を因果ブロック
+# として組み、同じ同期に載せる。同期後は受理数 hit が分かるので、行 hit まで
+# を残して余りを trim し、2 段目以降だけを `_draft_chain` で組む
+# (`FlashSpecEngine._presync_step0` の docstring)。
+#
+# これで `_prime_accepted_gap` の hit 回の逐次 MTP 呼び出しと `_draft_chain`
+# の step 0 が、S 行 1 回に吸収される。棄却済みの `MLXTURBO_PIPELINE` と違い
+# **捨てるグラフは無い** --- 行 <= hit は必ず使い、余るのは行 hit+1..S-1 の
+# MTP 計算 (1〜2 行) だけ。off のときは既存のフラグ読み出しのみで生成コスト
+# ゼロ (経路は 1 ビットも変わらない)。
+_DRAFT_PRESYNC = os.environ.get("MLXTURBO_DRAFT_PRESYNC") == "1"
+
 
 class _PrefillTracer:
     """_PREFILL_TRACE=1 のときだけ prefill の区間を ms で刻んで 1 行ずつ print する。
@@ -1339,12 +1353,20 @@ class FlashSpecEngine:
         top2 = mx.take_along_axis(top, mx.take_along_axis(part, order, axis=-1), axis=-1)
         return (tok, top2, margin) if want_margin else (tok, top2)
 
-    def _draft_argmax_rows(self, row, lm, cw, cs, cb) -> mx.array:
+    def _draft_argmax_rows(self, row, lm, cw, cs, cb, want_margin: bool = False):
         """`_draft_argmax` の rerank 経路の B 行版 (バッチ x 投機で使う)。
 
         単一行の側をそのまま一般化しない理由: あちらは `row @ rows.T` の
         2 階行列積で、行を足すとバッチ行列積になる。数学的には同じでも
         加算順が変わりうるので、**実測が乗っている B=1 の経路には触らない**。
+
+        ``want_margin`` (既定 False): True なら ``(tok, margin)`` を返す。
+        ``margin`` は行ごとの再採点後 top-1/top-2 スコア差 (B,)。``tok`` は
+        ``want_margin`` の有無で変わらない (既に計算済みの ``scores`` から
+        2 位を追加で読むだけで、行列積も dequantize も増えない) ---
+        `_draft_argmax` の ``want_margin`` と同じ規約。**既定 False では
+        戻り値は従来どおり素の ``mx.array``** なので、既存の呼び手
+        (`_draft_argmax` の rerank + バッチ行分岐) は 1 ビットも変わらない。
         """
         top = mx.argpartition(-mx.quantized_matmul(
             row, cw, scales=cs, biases=cb, transpose=True,
@@ -1356,7 +1378,88 @@ class FlashSpecEngine:
         scores = mx.matmul(
             row[:, None, :].astype(rows.dtype), rows.transpose(0, 2, 1))[:, 0]
         best = mx.argmax(scores, axis=-1, keepdims=True)
-        return mx.take_along_axis(top, best, axis=-1)
+        tok = mx.take_along_axis(top, best, axis=-1)
+        if not want_margin:
+            return tok
+        part = mx.argpartition(-scores, 1, axis=-1)[..., :2]
+        vals = mx.take_along_axis(scores, part, axis=-1)
+        return tok, mx.abs(vals[..., 0] - vals[..., 1])
+
+    def _draft_argmax_block(self, out, want_margin: bool = False):
+        """`_draft_argmax` の「全行」版 (案 D1 の同梱グラフ専用)。
+
+        `_draft_argmax` は ``out[:, -1]`` で末尾 1 行しか見ないが、こちらは
+        ``(1, S, d)`` の **S 行すべて**について draft トークンを出す
+        (``(1, S)``)。同期の前に組むので、どの行 (= 受理数 hit) を使うかは
+        まだ分からない --- 全部組んでおいて、同期後に 1 行選ぶ。
+
+        rerank ありの経路はトークンの計算を既存の `_draft_argmax_rows`
+        (バッチ行版) にそのまま委ねるので、写しは増えない。rerank 無しは
+        `_draft_argmax` の非 rerank 分岐から ``[:, -1]`` を外しただけ。
+
+        ``want_margin`` (既定 False): True なら ``(toks, margin)`` の
+        ``margin`` に行ごとの top-1/top-2 差 ``(S,)`` を入れる (False なら
+        None)。案 D2b (マージンで 2 段目を組むか決める) はここを読む口で、
+        **同梱グラフの中で作るので追加の同期は要らない**。
+        """
+        if self._rerank is None:
+            logits = self._head(out)                    # (1, S, V)
+            toks = mx.argmax(logits, axis=-1)           # (1, S)
+            if not want_margin:
+                return toks, None
+            part = mx.argpartition(-logits, 1, axis=-1)[..., :2]
+            vals = mx.take_along_axis(logits, part, axis=-1)
+            return toks, mx.abs(vals[..., 0] - vals[..., 1])[0]
+        cw, cs, cb = self._rerank
+        row = out[0]                                    # (S, d)
+        res = self._draft_argmax_rows(
+            row, self.model.lm_head, cw, cs, cb, want_margin=want_margin)
+        if not want_margin:
+            return res.reshape(1, -1), None
+        tok, margin = res
+        return tok.reshape(1, -1), margin
+
+    def _presync_step0(self, nxt_all, hyper_all, cache, S: int,
+                       want_margin: bool = False):
+        """検証と同じ eval に載せる「次ラウンドの draft の 1 段目」(案 D1)。
+
+        行 j の入力は ``(embed(nxt_all[:, j]), hyper_all[:, j])``。これは
+        `_prime_accepted_gap` が逐次に流す ``(embed(toks[j]), hypers[j])``
+        と同じ対であり (``_verify`` は ``toks[j] = nxt_all[:, j:j+1]``、
+        ``hypers[j] = cap.hyper[:, j:j+1]`` を返す)、行 ``hit`` については
+        `_draft_chain` の step 0 の ``(embed(cur), hyper_prev)`` そのもの。
+        つまり行 0..hit を 1 回の因果ブロックで前進させると、現行の
+        「hit 回の逐次 MTP + step 0 の MTP」と同じ集合を計算したことになる。
+
+        **グラフを組むだけで eval しない。**呼び手が検証フォワードと同じ
+        ``mx.eval`` に載せること。同期後に受理数が確定するので、呼び手は
+        ``trim_attn_cache(cache, keep + len(toks))`` で行 ``len(toks)`` 以降
+        (使わなかった行) の列を落とし、行 ``len(toks)-1`` の ``(tok, x)``
+        から 2 段目以降を `_draft_chain(..., first=...)` で組む。
+
+        戻り値 ``(keep, toks, x, margin)``:
+
+        - ``keep``   -- 呼び出し前のキャッシュ列数 (trim の基準)
+        - ``toks``   -- (1, S) の行ごとの draft トークン
+        - ``x``      -- (1, S, hc*d) の mixer 前 hyper (2 段目の入力)
+        - ``margin`` -- ``want_margin`` のときだけ (S,)、他は None
+
+        **キャッシュの不変条件が一時的に破れる区間がある。**``_draft_chain``
+        の「投機的な列を持ち越さない」不変条件は、この関数が S 列を押し込ん
+        でから呼び手が trim するまでの間だけ成立しない。この間に MTP
+        キャッシュを読む他の経路は無い (同じラウンドの中で閉じている)。
+        """
+        Q = _arch()
+        keep = cache.size()   # 層呼び出しの**前**に取る (呼び出しが S 進める)
+        emb = self.model.model.embed_tokens(nxt_all[:, :S])
+        mask = Q.create_attention_mask(emb, None)
+        x = self.mtp.combine(emb, hyper_all[:, :S])
+        x = self.mtp.layers[0](
+            x, self.rope, mask, None, cache, cache.indexer, None, None
+        )
+        out = self.mtp.hyper_connection_mixer(x)
+        toks, margin = self._draft_argmax_block(out, want_margin=want_margin)
+        return keep, toks, x, margin
 
     def _effective_depth(self, pos: int) -> int:
         """この位置で引くドラフト数。長い文脈では 1 に落とす
@@ -1378,7 +1481,8 @@ class FlashSpecEngine:
             return m
         return choose_depth(pos, self.depth, self.depth_ctx_limit)
 
-    def _draft_chain(self, cur, hyper_prev, cache, depth: int, trace_top2: bool = False):
+    def _draft_chain(self, cur, hyper_prev, cache, depth: int,
+                     trace_top2: bool = False, first=None):
         """``self.depth`` トークンをまとめて引く。
 
         ヘッドは (embed(t), hyper) を受けて、mixer で潰す前に **hyper 形状の
@@ -1405,15 +1509,39 @@ class FlashSpecEngine:
         確信度) を全位置ぶん見るための読み出し専用の追加で、``_trace_top2``
         と全く同じ「set/consume が対で1回ずつ」の規約 (呼び出し側は
         ``generate_stream._trace_depth_round`` で消費する)。
+
+        ``first`` (既定 None、`MLXTURBO_DRAFT_PRESYNC` = 案 D1 専用):
+        ``(tok, x, margin)`` --- 1 段目 (step 0) を呼び手が既に計算・同期
+        済みのときに渡す。``tok`` はその段の draft トークン ``(1, 1)``、
+        ``x`` は次段へ渡す mixer 前の hyper ``(1, 1, hc*d)``、``margin`` は
+        float か None。渡すと **step 0 の MTP 呼び出しをまるごと飛ばし**、
+        ``cur``/``hyper_prev`` は使わない (`_presync_step0` が既に同じ対を
+        キャッシュへ書いてある前提なので、``keep`` も 1 足さない)。
+
+        ``first`` を渡した場合、``MLXTURBO_DRAFT_TRACE`` の ``_trace_top2``
+        は**置かれない** (置く担当だった step 0 がここに無いため)。
+        ``_trace_draft_hit`` は None を黙って読み飛ばすので、D1 有効時は
+        木化ドラフトの trace が数えられなくなるだけで壊れはしない。
+        ``MLXTURBO_DEPTH_TRACE`` のマージンは ``first[2]`` が 1 段目ぶんに
+        なるので、こちらは D1 有効時もそのまま全段そろう。
         """
         Q = _arch()
-        keep = cache.size() + 1  # 物理列数 (trim_attn_cache の注記参照)
+        # 物理列数 (trim_attn_cache の注記参照)。`first` があるときは
+        # `_presync_step0` が cur の 1 列を既に書いた後なので +1 しない
+        keep = cache.size() + (0 if first is not None else 1)
         drafts = []
         tok, hyper = cur, hyper_prev
         want_top2 = trace_top2 and _DRAFT_TRACE
         want_margin = trace_top2 and _DEPTH_TRACE_PATH is not None
         margins: list | None = [] if want_margin else None
-        for step in range(depth):
+        start = 0
+        if first is not None:
+            tok, hyper, margin0 = first
+            drafts.append(tok)
+            if want_margin:
+                margins.append(margin0)
+            start = 1
+        for step in range(start, depth):
             emb = self.model.model.embed_tokens(tok)
             mask = Q.create_attention_mask(emb, None)
             x = self.mtp.combine(emb, hyper)
@@ -2279,10 +2407,25 @@ class FlashSpecEngine:
             # sampler ありなら temp<=0 でも sampler 側に入り precomputed は
             # 無視される (独立レビュー A-6)。揃えないと argmax/concat を
             # 評価してから丸ごと捨てるだけの無駄になる。
+            presync = None
             if temp <= 0 and sampler is None and drafts:
                 nxt_all = mx.argmax(lg, axis=-1)
                 dv = mx.concatenate(drafts, axis=1)
-                mx.eval(lg, nxt_all, dv)
+                if _DRAFT_PRESYNC and _MTP_CACHE_APPEND and pipeline == 0:
+                    # 案 D1: 次ラウンドの draft の 1 段目 (と、受理済み中間
+                    # トークンの MTP キャッシュへの追いつき) を、この検証と
+                    # 同じグラフ・同じ同期に載せる。同期後に hit が分かって
+                    # から行を選ぶので、捨てるグラフは無い
+                    # (`_presync_step0` の docstring)。
+                    presync = self._presync_step0(
+                        nxt_all, cap.hyper, mtp_cache, total,
+                        want_margin=_DEPTH_TRACE_PATH is not None)
+                    extra = [presync[1], presync[2]]
+                    if presync[3] is not None:
+                        extra.append(presync[3])
+                    mx.eval(lg, nxt_all, dv, *extra)
+                else:
+                    mx.eval(lg, nxt_all, dv)
             else:
                 nxt_all = dv = None
                 mx.eval(lg)
@@ -2330,7 +2473,14 @@ class FlashSpecEngine:
                     pending = next_pending
                 else:
                     _pipeline_restore(model, caches, mtp_cache, next_pending[6])
-            if _MTP_CACHE_APPEND and not (full_accept and pipeline == 1):
+            if presync is not None:
+                # 案 D1: 独立レビュー A-1 の追いつき (下の分岐) と、次ラウンド
+                # の `_draft_chain` の step 0 は、既に S 行まとめて積んである。
+                # 確定した len(toks) 行 (= 中間トークン len(toks)-1 個 + 次の
+                # cur 1 個) だけ残して、使わなかった行を落とす。**残る列数は
+                # 素の経路の「keep + (len(toks)-1) + 1」と同じ。**
+                trim_attn_cache(mtp_cache, presync[0] + len(toks))
+            elif _MTP_CACHE_APPEND and not (full_accept and pipeline == 1):
                 # 独立レビュー A-1: このラウンドで確定した中間トークンを MTP
                 # キャッシュへ積み直す。pipeline (既定 off) の先組みが採用され
                 # た (pending が立った) ときは、その先組み自身が古い hyper 連鎖
@@ -2349,11 +2499,32 @@ class FlashSpecEngine:
             next_drafts = None
             if (pending is None and cut is None
                     and len(out) + len(vals) < max_tokens):
+                # `first` (プロンプト直後の 1 トークン目) と紛らわしいので
+                # 別名にする -- こちらは _draft_chain の 1 段目のこと
+                _step0 = None
+                if presync is not None:
+                    # 行 len(toks)-1 = cur の行。ここまでは同期済みなので、
+                    # 1 段目は「もう出来ている値を渡すだけ」になる
+                    m = len(toks) - 1
+                    _pmargin = presync[3]
+                    # `.tolist()` を (S,) 全体に 1 回。上の mx.eval で評価済み
+                    # の配列なのでホスト側の読み出しだけで済む。`_pmargin[m]`
+                    # と切ってから `.item()` を打つと、評価済み配列に対する
+                    # 新しいスライス演算 (遅延ノード) を毎ラウンド作ることに
+                    # なり、そのぶん dispatch + 同期が増える (`_verify` の
+                    # docstring が同じ理由で vals を int で返している)。
+                    # **D2b (マージンで depth を決める) の読み口もここ** ---
+                    # 全行ぶんのマージンが既にこの 1 回の読み出しで手に入る。
+                    _step0 = (
+                        presync[1][:, m:m + 1], presync[2][:, m:m + 1],
+                        None if _pmargin is None else _pmargin.tolist()[m],
+                    )
                 next_drafts = self._draft_chain(
                     cur, hyper_prev, mtp_cache,
                     self._effective_depth(base_pos + n + len(out) + len(vals)),
                     trace_top2=True,  # pending が None のときだけここに来る
                     # ので、これが次ラウンドの _verify にそのまま渡る draft
+                    first=_step0,
                 )
                 mx.async_eval(next_drafts)
             if _ROUND_TRACE:

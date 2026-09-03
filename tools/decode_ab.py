@@ -19,6 +19,11 @@ A = 新しい側、B = 比較対象 (多くは修正前 / 既定 off)。knob ご
   `resume` をそのまま使い、控えたキャッシュから decode だけを流す。
   各条件がまったく同じ状態から始まるので**制御はむしろ強くなる**。
   prefill に効く knob (`prefill-group` / `stage-every`) では使えない (弾く)。
+- **複数の knob をまとめて回すなら `--knobs a,b,c`** (`--knob` の代わり)。
+  98GB のモデル読み込みが 1 回で済み、`--prefill-once` のときは prefill
+  キャッシュも knob 間で共有する。各 knob は今までどおり回文順で測り、
+  終わりに対照 (baseline) を貼り直してから次に渡す。要約と JSON は knob
+  ごとに出る (`--out` の basename に `-<knob>` が付く)。
 
 ## knob
 
@@ -1156,6 +1161,37 @@ def _knob_sdpa_split(ctx):
     return apply
 
 
+def _knob_sdpa_rowtile(ctx):
+    """A = dense sdpa の行タイル分割 (段 P5、R=256) / B = 単発呼び出し (既定)。
+
+    `Attention.__call__` の dense 分岐 (S>=64、量子化 cache でない --
+    MLX 0.32.2 の sdpa は head_dim=256・S>8 で常に fallback (matmul->where->
+    softmax->matmul) に落ち、タイルを 1 つも飛ばさない) を、q 行 R=256 ごとの
+    タイルに割り、各タイルは前方 K/V `[0, offset+(t+1)R)` だけを見て呼ぶ
+    (`mlxturbo/fused.py:enable_sdpa_rowtile`、`_vendor/qwen4_exp.py` は
+    触らずモジュール直下の `scaled_dot_product_attention` 参照を差し替える)。
+    可視集合は不変 (近似無し、`docs/research/IDEAS-2026-09-03.md` の P5)。
+
+    出力一致は要求しない -- PV の縮約がタイルごとに切れて和の順序が変わる
+    (`control_identical=False`)。合格条件は **17k の prefill 壁時計
+    (prefill_s)** と tok/round の悪化なし。
+
+    発火の確認: `mlxturbo.kernels._fire.snapshot()` の `sdpa_rowtile`
+    (要 `MLXTURBO_SDPA_ROWTILE_TRACE=1`)。
+    """
+    from mlxturbo import fused
+
+    model = ctx["eng"].model
+
+    def apply(variant):
+        if variant == "A":
+            fused.enable_sdpa_rowtile(model, rows=256)
+        else:
+            fused.disable_sdpa_rowtile()
+
+    return apply
+
+
 def _knob_gather_attn(ctx):
     """A = gather 経路 (段 3(b)) / B = 現行の加算マスク。
 
@@ -1274,6 +1310,42 @@ def _knob_mtp_append(ctx):
 
     def apply(variant):
         SF._MTP_CACHE_APPEND = variant == "A"
+
+    return apply
+
+
+def _knob_draft_presync(ctx):
+    """案 D1 (`docs/research/IDEAS-2026-09-03.md`)。A = 次ラウンドの draft の
+    1 段目を検証と同じグラフに同梱 (`MLXTURBO_DRAFT_PRESYNC`) / B = 現行
+    (`_prime_accepted_gap` の hit 回の逐次 MTP + `_draft_chain` の step 0)。
+
+    A では `mx.eval(lg, nxt_all, dv)` の前に、`nxt_all` の S 行 (S = 検証幅)
+    を入力とした MTP 1 段を因果ブロックで組んで同じ同期に載せる。同期後は
+    受理数が分かるので、確定した行だけ残して trim し、2 段目以降を
+    `_draft_chain(..., first=...)` で組む。狙いは `[round]` trace の
+    eval_done -> drafts_submitted の 2.4 ms (GPU に何も無い区間) を潰すこと。
+
+    **出力トークン列は一致するはず (`control_identical=True`)。**draft が
+    何であれ、出るトークンはトランク自身の logits の受理済み接頭辞からしか
+    作られない (`_verify`: 位置 j <= hit の logits は確定済みの接頭辞にしか
+    条件付いていない) ので、draft の値が丸めで動いても出力は動かない。
+    **一致しなければそれ自体が第一の報告事項** --- ブロック幅の違い
+    (S=3 は sdpa の分割経路、S=1 はベクトル経路) が draft の値を変え、
+    受理率が動くところまでは想定内だが、出力が変わるならそれは受理判定か
+    巻き戻しのどこかが壊れている。
+
+    合格条件は **ms/round** (見込み -3〜-5%)。tok/round は不変が想定
+    (受理率を動かす経路ではない。draft の最下位ビットが動く可能性はあるので
+    厳密な不変は要求しない)。`--round-trace` を付けて eval_done ->
+    drafts_submitted の区間も併せて見ること。
+
+    `spec_flash._DRAFT_PRESYNC` を直接差し替える (env は import 時にしか
+    読まれないので、`mtp-append` などと同じ扱い)。
+    """
+    import mlxturbo.spec_flash as SF
+
+    def apply(variant):
+        SF._DRAFT_PRESYNC = variant == "A"
 
     return apply
 
@@ -1556,6 +1628,70 @@ def _knob_moe_combine(ctx):
         else:
             os.environ["MLXTURBO_MOE_COMBINE_FOLD"] = "0"  # off 側のゲートを閉じる
             fused.disable_moe_combine_fold(eng.model)
+
+    return apply
+
+
+def _knob_moe_grouped_gemm(ctx):
+    """prefill 幅の MoE 行列積 (`mx.gather_qmm(sorted_indices=True)`) の 3 者比較。
+
+    A = 自前の grouped GEMM (`mlxturbo/kernels/moe_grouped_gemm.qmm_segmented`、
+        タイルを専門家境界で切る。BM=32 / 128 スレッド) /
+    B = 既製 `mx.gather_qmm` (現行既定) /
+    C = 既製 `mx.gather_qmm` のまま、専門家セグメントを 16 行の倍数に
+        ダミー行で揃えて straddle を無くす (pad16)
+
+    動機: この機 (非 NAX) の gather 経路は BM=16 固定 (`quantized.cpp:1652`)
+    で、タイルが専門家境界をまたぐとセグメントごとにフル BM x BN x K を
+    やり直す (`quantized.h:2517`)。行列積だけを測った micro
+    (`tools/moe_grouped_gemm_micro.py --stage segmented`、
+    `tools/gather_qmm_pad_micro.py`) の取り分:
+
+      - A (segmented): r=160 で dense 比 1.098 (素 1.167) = -5.2%、
+        r=40 で 1.398 (素 1.458) = -4.1%
+      - C (pad16): r=160 で 81.99 -> 79.06 ms = -3.6% (行数 +4.3%)、
+        r=40 で 25.51 -> 22.61 ms = -11% (行数 +18%)
+
+    どちらも**行列積の呼び 1 本だけ**の数字で、in-model にはそれ以外が乗る:
+
+      - A: `counts` -> `row_start`/`tile_prefix` の小 op 列 (48 層 x チャンク)。
+        host 同期は無い
+      - C: 水増し後の x を作る gather (M_pad x K) と、出力から元の行を
+        取り戻す gather (M x N) が**別途**掛かる。さらに水増し後の行数
+        `M_pad` を確定するのに **host 同期が 1 回 (MoE 層あたり 1 回)** 要る
+        -- MLX の配列は形が静的なので `Σ_e ceil(c_e/16)*16` を Python の
+        int にしないと配列を作れない。静的上限 (`M + 16*E`) で張れば同期は
+        消えるが、r=40 で行数 +40% (実際は +18%) になって micro の勝ちが
+        消えるので採っていない
+
+    3 者を同じ A/B に入れてあるのは、micro -> in-model の換算率を A と C で
+    同時に出すため (どちらも同じ行列積を置き換えるので、乗る「外側」の差が
+    そのまま出る)。
+
+    A と C はどちらも素とビット一致するはず (A は micro の 10 ケースで確認済み、
+    C はダミー行が他の行の結果に影響しないため) なので
+    `control_identical=True`。**一致しなければそれ自体が報告事項。**
+
+    判定は **prefill_s**。prefill にしか効かない (decode/verify 幅は行数
+    ゲート `MLXTURBO_MOE_GEMM_MIN_ROWS`=1024 で必ず素に落ちる) が、
+    `--prefill-once` で prefill を畳むと差が消えるので
+    `DECODE_ONLY_KNOBS` には入れない。
+
+    発火の確認: `mlxturbo.kernels._fire.snapshot()` の
+    `moe_grouped_gemm_segmented` / `moe_grouped_gemm_pad16`。
+    `MLXTURBO_MOE_GEMM_TRACE=1` を立てると初出の形ごとに stderr へ 1 行出る。
+    """
+    from mlxturbo import fused
+
+    eng = ctx["eng"]
+
+    def apply(variant):
+        if variant == "A":
+            fused.enable_moe_grouped_gemm(eng.model, mode="seg")
+        elif variant == "C":
+            fused.enable_moe_grouped_gemm(eng.model, mode="pad16")
+        else:
+            fused.disable_moe_grouped_gemm()
 
     return apply
 
@@ -1959,6 +2095,7 @@ KNOBS = {
     "qsa": (_knob_qsa, ["A", "B"], False, "A"),
     "bool-mask": (_knob_bool_mask, ["A", "B"], False, "B"),
     "sdpa-split": (_knob_sdpa_split, ["A", "B"], False, "B"),
+    "sdpa-rowtile": (_knob_sdpa_rowtile, ["A", "B"], False, "B"),
     "gather-attn": (_knob_gather_attn, ["A", "B"], False, "B"),
     # -1 は gather 自体を切る (現行既定)。0 はタイルなしの gather
     "gather-tile": (_knob_gather_tile, ["-1", "0", "256"], False, "-1"),
@@ -1969,6 +2106,9 @@ KNOBS = {
     "depth-adapt": (_knob_depth_adapt, ["A", "B"], False, "B"),
     "draft-rerank": (_knob_draft_rerank, ["A", "B"], False, "B"),
     "mtp-append": (_knob_mtp_append, ["A", "B"], False, "B"),
+    # 案 D1。A = draft 1 段目を verify のグラフに同梱 / B = 現行 (既定)。
+    # 出力は一致するはず (control_identical=True)。判定は ms/round
+    "draft-presync": (_knob_draft_presync, ["A", "B"], True, "B"),
     # A = interleaved (本番既定) を基準に、B = separate (RAM 常駐) と比べる
     "ngram-layout": (_knob_ngram_layout, ["A", "B"], True, "A"),
     # A = 先読み有効 (既定) / B = 無効。判定は prefill_s
@@ -1977,6 +2117,9 @@ KNOBS = {
     "ngram-batch": (_knob_ngram_batch, ["A", "B"], True, "A"),
     "prime-window": (_knob_prime_window, ["2048", "512"], False, "2048"),
     "moe-combine": (_knob_moe_combine, ["A", "B"], False, "B"),
+    # A = 自前 grouped GEMM / B = 既製 gather_qmm (既定) / C = 16 行揃え + 既製。
+    # どちらもビット一致のはず (control_identical=True)。判定は prefill_s
+    "moe-grouped-gemm": (_knob_moe_grouped_gemm, ["A", "B", "C"], True, "B"),
     # 天井スタブ 5 種 (docs 参照は各 knob 関数の docstring)。出力の正しさは
     # 問わないので control_identical は全部 False
     "stub-draft": (_knob_stub_draft, ["A", "B"], False, "B"),
@@ -2107,7 +2250,14 @@ def _ngram_stream_instance(model):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--knob", required=True, choices=sorted(KNOBS))
+    ap.add_argument("--knob", default=None, choices=sorted(KNOBS))
+    ap.add_argument("--knobs", default=None,
+                    help="knob をカンマ区切りで複数指定し、1 プロセスで順に "
+                         "回す (98GB のモデル読み込みが 1 回で済む)。各 knob は"
+                         " 今までどおり回文順で測り、knob ごとに要約と JSON を"
+                         " 出す (--out の basename に -<knob> が付く)。"
+                         "--knob との併用は不可。--variants は 1 knob 用なので"
+                         "こちらとは併用しない")
     ap.add_argument("--model", required=True)
     ap.add_argument("--ngram", default=None)
     ap.add_argument("--ngram-b", default="~/models/ddalcu-ngram-sep",
@@ -2191,6 +2341,24 @@ def main() -> int:
                          "の docstring 参照)。他の knob では無視される。")
     args = ap.parse_args()
 
+    # --knob / --knobs はどちらか片方。モデル読み込み (98GB) の前に弾く
+    if bool(args.knob) == bool(args.knobs):
+        ap.error("--knob か --knobs のどちらか一方を指定すること")
+    if args.knobs:
+        knob_names = [s.strip() for s in args.knobs.split(",") if s.strip()]
+        if not knob_names:
+            ap.error("--knobs が空")
+        for k in knob_names:
+            if k not in KNOBS:
+                ap.error(f"--knobs の {k!r} は knob ではない"
+                         f" (候補: {', '.join(sorted(KNOBS))})")
+        if len(set(knob_names)) != len(knob_names):
+            ap.error("--knobs に同じ knob が 2 回入っている")
+        if args.variants:
+            ap.error("--variants は 1 knob 用なので --knobs とは併用しない")
+    else:
+        knob_names = [args.knob]
+
     if args.ngram:
         os.environ.setdefault("FASTMLX_NGRAM_DISK", "1")
     if args.round_trace:
@@ -2263,36 +2431,47 @@ def main() -> int:
     if args.only in ("both", "long"):
         cases += [("long", to_ids(p)) for p in longs]
 
-    setup, variants, control_identical, baseline = KNOBS[args.knob]
-    if args.variants:
-        variants = [v.strip() for v in args.variants.split(",")]
-        if baseline not in variants:
-            baseline = variants[0]
-    set_variant = setup({"eng": eng, "args": args})
-    order = variants + variants[::-1]
+    # ---- knob ごとの状態 ---------------------------------------------
+    #
+    # `--knobs` で複数並べたときは、この dict を knob ごとに 1 組持って順に
+    # 回す。共有するのはモデル読み込みと (decode 専用 knob のときだけ)
+    # prefill キャッシュで、それ以外は 1 knob だけ走らせたときと同じ手順を
+    # 踏む -- 温めも、回文順 (A,B,B,A) も、`_fire.reset()` も knob ごと。
+    #
+    # `setup()` は遅延で呼ぶ。knob によっては setup 自体が重い準備 (別の
+    # n-gram を RAM に載せる等) をするので、その knob の番が来る前に走らせない
+    knob_state: dict = {}
 
-    # ngram-prefetch / ngram-batch: 発火が実際にあるか (キャッシュ hit 率、
-    # バッチ pread の分岐) を数字で見る。StreamNGram.stats を run ごとに
-    # reset_stats() してから拾う
-    ngram_stream = (
-        _ngram_stream_instance(eng.model) if args.knob in NGRAM_STATS_KNOBS else None
-    )
+    def knob_setup(name):
+        st = knob_state.get(name)
+        if st is not None:
+            return st
+        setup, variants, control_identical, baseline = KNOBS[name]
+        if args.variants:
+            variants = [v.strip() for v in args.variants.split(",")]
+            if baseline not in variants:
+                baseline = variants[0]
+        st = dict(
+            name=name,
+            set_variant=setup({"eng": eng, "args": args}),
+            variants=variants,
+            order=variants + variants[::-1],
+            control_identical=control_identical,
+            baseline=baseline,
+            # ngram-prefetch / ngram-batch: 発火が実際にあるか (キャッシュ
+            # hit 率、バッチ pread の分岐) を数字で見る。StreamNGram.stats を
+            # run ごとに reset_stats() してから拾う
+            ngram_stream=(_ngram_stream_instance(eng.model)
+                          if name in NGRAM_STATS_KNOBS else None),
+            rows=[],
+        )
+        knob_state[name] = st
+        return st
 
-    print(f"knob={args.knob}  判定基準はモジュール docstring のとおり"
-          " (測る前に宣言済み)。")
+    print(f"knob={','.join(knob_names)}  判定基準はモジュール docstring の"
+          "とおり (測る前に宣言済み)。")
     print(f"生成長 {args.tokens} トークンで全条件そろえる。"
           " 最初の 1 本は温めなので捨てる。\n")
-
-    # 温め: 最初の 1 本は必ず遅いので、計測に混ぜず先に捨てる。短文脈だけ
-    # 温めても長文脈の初回は重みのページインで 2 倍かかる (73s vs 35s の実測)
-    # ので、長い方も 1 本捨てる
-    set_variant(variants[0])
-    for want in ("short", "long"):
-        for kind, ids in cases:
-            if kind == want:
-                eng.depth_trace_prompt_id = f"warmup:{kind}"
-                run_once(eng, ids, 32, eos_ids, temp=args.temp)
-                break
 
     # **ホワイトリストにすること。**`--prefill-once` は共有 prefill を
     # `variants[0]` で 1 回だけ組み、他の変種はそこから decode を再開する。
@@ -2331,6 +2510,12 @@ def main() -> int:
         # (spec_flash._prime_accepted_gap の呼び出し口)。_prime_draft_cache
         # (prefill 側の priming) は触らない。
         "mtp-append",
+        # draft-presync (案 D1、`spec_flash._DRAFT_PRESYNC`) は
+        # generate_stream の decode ループ内、検証フォワードの mx.eval の
+        # 手前でしか読まれない (`_presync_step0` の呼び出し口はそこ 1 箇所)。
+        # prefill 側の priming (`_prime_draft_cache`) も、チャンクループの
+        # 素の model(...) 呼び出しも、このフラグを一度も見ない。
+        "draft-presync",
         # sdpa-split は `1 < S <= 8` のときしか分岐に入らない。prefill の
         # チャンク幅 (既定 2048、`mlxturbo/spec.py` の PREFILL_STEP_SIZE)
         # は常にこれを大きく越えるので、prefill 幅では発火しない。
@@ -2363,13 +2548,33 @@ def main() -> int:
         # 済むよう、ここに入れておく (knob 自身の docstring 参照)。
         "oracle-draft",
     }
-    if args.prefill_once and args.knob not in DECODE_ONLY_KNOBS:
-        print(f"knob={args.knob} は prefill に影響しうるので --prefill-once は"
-              f"使えない (decode 専用と確認済みなのは"
-              f" {sorted(DECODE_ONLY_KNOBS)})")
-        return 1
+    if args.prefill_once:
+        bad = [k for k in knob_names if k not in DECODE_ONLY_KNOBS]
+        if bad:
+            print(f"knob={','.join(bad)} は prefill に影響しうるので "
+                  f"--prefill-once は使えない (decode 専用と確認済みなのは"
+                  f" {sorted(DECODE_ONLY_KNOBS)})")
+            return 1
 
-    rows = []
+    # 温め: 最初の 1 本は必ず遅いので、計測に混ぜず先に捨てる。短文脈だけ
+    # 温めても長文脈の初回は重みのページインで 2 倍かかる (73s vs 35s の実測)
+    # ので、長い方も 1 本捨てる。
+    #
+    # **knob ごとに variants[0] で 1 本ずつ捨てる。**`mx.fast.metal_kernel`
+    # は初回発火で JIT コンパイルするので、A 側 (回文順の先頭) のカーネルを
+    # ここで一度焼いておかないと、その knob の 1 本目だけコンパイル時間を
+    # 抱えて計測に混ざる
+    for name in knob_names:
+        st = knob_setup(name)
+        st["set_variant"](st["variants"][0])
+        for want in ("short", "long"):
+            for kind, ids in cases:
+                if kind == want:
+                    eng.depth_trace_prompt_id = f"warmup:{name}:{kind}"
+                    run_once(eng, ids, 32, eos_ids, temp=args.temp)
+                    break
+        st["set_variant"](st["baseline"])
+
     for case_idx, (kind, ids) in enumerate(cases):
         n = ids.shape[1]
         print(f"--- {kind} ctx={n} ---", flush=True)
@@ -2390,149 +2595,176 @@ def main() -> int:
         # 判明した。実際の並びは 13.90 / 12.58 / 12.64 / 12.6x で、1 本目だけ
         # 段差になっている。**この日の長文脈の A/B は全部 A 側に約 5% の
         # 下駄を履かせていた。**
-        set_variant(baseline)
-        eng.depth_trace_prompt_id = f"warmup:{kind}:{case_idx}"
-        if shared is None:
-            run_once(eng, ids, 32, eos_ids, temp=args.temp)
-        else:
-            run_resumed(eng, *shared, base_pos=n, n_tokens=32, eos_ids=eos_ids,
-                        temp=args.temp)
-        for v in order:
-            set_variant(v)
-            # カーネルの発火回数を条件ごとに数え直す。適格判定は条件を外すと
-            # 黙って False を返すので、「効果ゼロ」が遅いのか届いていないのかを
-            # 区別する手が要る (2026-09-01 に GDN 前処理で実際に空振りした)。
-            _fire.reset()
-            if ngram_stream is not None:
-                ngram_stream.reset_stats()
-            # MLXTURBO_DEPTH_TRACE の prompt_id フィールド用 (未設定 = トレース
-            # 無効時は engine 側で読まれないだけなので、常に立てて害はない)。
-            eng.depth_trace_prompt_id = f"{kind}:{case_idx}"
+        # knob ごとにこのケースを回す (`--knobs`)。1 knob だけなら
+        # ループは 1 周で、以前と同じ手順・同じ並びになる
+        for _name in knob_names:
+            _st = knob_setup(_name)
+            set_variant = _st["set_variant"]
+            order = _st["order"]
+            baseline = _st["baseline"]
+            ngram_stream = _st["ngram_stream"]
+            rows = _st["rows"]
+            if len(knob_names) > 1:
+                print(f"  [knob {_name}]", flush=True)
+            set_variant(baseline)
+            eng.depth_trace_prompt_id = f"warmup:{kind}:{case_idx}"
             if shared is None:
-                out, tp, td, acc, rounds = run_once(
-                    eng, ids, args.tokens, eos_ids, temp=args.temp)
+                run_once(eng, ids, 32, eos_ids, temp=args.temp)
             else:
-                out, tp, td, acc, rounds = run_resumed(
-                    eng, *shared, base_pos=n, n_tokens=args.tokens,
-                    eos_ids=eos_ids, temp=args.temp)
-            ms = td / max(len(out), 1) * 1000
-            tpr = len(out) / max(rounds, 1)
-            # ms/token は ms/round と tok/round の比なので、**費用と受理が
-            # 混ざる**。出力が変わりうる knob では ms/round を見ないと、
-            # テキスト運による受理の増減を実装の速さと取り違える
-            rows.append(dict(kind=kind, ctx=n, variant=v, n_out=len(out),
-                             prefill_s=tp, decode_s=td, ms_per_tok=ms,
-                             ms_per_round=td / max(rounds, 1) * 1000,
-                             accepted=acc, rounds=rounds, tok_per_round=tpr,
-                             head=out[:24]))
-            if args.save_out:
-                # 既定 (off) の JSON は上の rows.append(...) までで変わらない。
-                # --save-out のときだけ、生成トークン id の全列と (長文脈だと
-                # 17k 個規模になる) プロンプトのトークン id 列を追加で持たせる。
-                rows[-1]["out"] = out
-                rows[-1]["prompt_ids"] = ids[0].tolist()
-            fired = _fire.snapshot()
-            rows[-1]["fired"] = fired
-            fired_s = ("  発火 " + " ".join(f"{k}={n}" for k, n in
-                                            sorted(fired.items()))) if fired else ""
-            ngram_s = ""
-            if ngram_stream is not None:
-                rows[-1]["ngram"] = dict(ngram_stream.stats)
-                ngram_s = "  " + ngram_stream.stats_line()
-            peak_s = ""
-            if args.round_trace:
-                trace = list(getattr(eng, "last_round_trace", None) or [])
-                rows[-1]["peak_delta_mb"] = trace
-                if trace:
-                    rows[-1]["peak_delta_mb_median"] = statistics.median(trace)
-                    rows[-1]["peak_delta_mb_max"] = max(trace)
-                    # --prefill-once のとき、run_resumed の _restore が
-                    # caches の keys/values を直接掴んだ snap を毎 variant
-                    # の頭で挿し戻す (このファイルの _snapshot/_restore の
-                    # docstring 参照)。そのため 1 ラウンド目だけ
-                    # update_and_fetch が donation できずコピーになるのは
-                    # ハーネス自身のアーティファクトで、本番の継続 decode
-                    # には無い。2 ラウンド目以降だけの値も別に残す。
-                    rest = trace[1:]
-                    if rest:
-                        rows[-1]["peak_delta_mb_median_wo_r1"] = statistics.median(rest)
-                        rows[-1]["peak_delta_mb_max_wo_r1"] = max(rest)
-                    peak_s = (f"  peak_delta_mb median={rows[-1]['peak_delta_mb_median']:.1f}"
-                              f" max={rows[-1]['peak_delta_mb_max']:.1f}"
-                              f" (r1={trace[0]:.1f})")
-            print(f"  {v}: prefill {tp:6.2f}s  decode {td:6.2f}s  "
-                  f"{ms:6.2f} ms/tok  tok/round {tpr:.3f}  "
-                  f"({acc}/{rounds}){fired_s}{ngram_s}{peak_s}", flush=True)
-    set_variant(baseline)
+                run_resumed(eng, *shared, base_pos=n, n_tokens=32, eos_ids=eos_ids,
+                            temp=args.temp)
+            for v in order:
+                set_variant(v)
+                # カーネルの発火回数を条件ごとに数え直す。適格判定は条件を外すと
+                # 黙って False を返すので、「効果ゼロ」が遅いのか届いていないのかを
+                # 区別する手が要る (2026-09-01 に GDN 前処理で実際に空振りした)。
+                _fire.reset()
+                if ngram_stream is not None:
+                    ngram_stream.reset_stats()
+                # MLXTURBO_DEPTH_TRACE の prompt_id フィールド用 (未設定 = トレース
+                # 無効時は engine 側で読まれないだけなので、常に立てて害はない)。
+                eng.depth_trace_prompt_id = f"{kind}:{case_idx}"
+                if shared is None:
+                    out, tp, td, acc, rounds = run_once(
+                        eng, ids, args.tokens, eos_ids, temp=args.temp)
+                else:
+                    out, tp, td, acc, rounds = run_resumed(
+                        eng, *shared, base_pos=n, n_tokens=args.tokens,
+                        eos_ids=eos_ids, temp=args.temp)
+                ms = td / max(len(out), 1) * 1000
+                tpr = len(out) / max(rounds, 1)
+                # ms/token は ms/round と tok/round の比なので、**費用と受理が
+                # 混ざる**。出力が変わりうる knob では ms/round を見ないと、
+                # テキスト運による受理の増減を実装の速さと取り違える
+                rows.append(dict(kind=kind, ctx=n, variant=v, n_out=len(out),
+                                 prefill_s=tp, decode_s=td, ms_per_tok=ms,
+                                 ms_per_round=td / max(rounds, 1) * 1000,
+                                 accepted=acc, rounds=rounds, tok_per_round=tpr,
+                                 head=out[:24]))
+                if args.save_out:
+                    # 既定 (off) の JSON は上の rows.append(...) までで変わらない。
+                    # --save-out のときだけ、生成トークン id の全列と (長文脈だと
+                    # 17k 個規模になる) プロンプトのトークン id 列を追加で持たせる。
+                    rows[-1]["out"] = out
+                    rows[-1]["prompt_ids"] = ids[0].tolist()
+                fired = _fire.snapshot()
+                rows[-1]["fired"] = fired
+                fired_s = ("  発火 " + " ".join(f"{k}={n}" for k, n in
+                                                sorted(fired.items()))) if fired else ""
+                ngram_s = ""
+                if ngram_stream is not None:
+                    rows[-1]["ngram"] = dict(ngram_stream.stats)
+                    ngram_s = "  " + ngram_stream.stats_line()
+                peak_s = ""
+                if args.round_trace:
+                    trace = list(getattr(eng, "last_round_trace", None) or [])
+                    rows[-1]["peak_delta_mb"] = trace
+                    if trace:
+                        rows[-1]["peak_delta_mb_median"] = statistics.median(trace)
+                        rows[-1]["peak_delta_mb_max"] = max(trace)
+                        # --prefill-once のとき、run_resumed の _restore が
+                        # caches の keys/values を直接掴んだ snap を毎 variant
+                        # の頭で挿し戻す (このファイルの _snapshot/_restore の
+                        # docstring 参照)。そのため 1 ラウンド目だけ
+                        # update_and_fetch が donation できずコピーになるのは
+                        # ハーネス自身のアーティファクトで、本番の継続 decode
+                        # には無い。2 ラウンド目以降だけの値も別に残す。
+                        rest = trace[1:]
+                        if rest:
+                            rows[-1]["peak_delta_mb_median_wo_r1"] = statistics.median(rest)
+                            rows[-1]["peak_delta_mb_max_wo_r1"] = max(rest)
+                        peak_s = (f"  peak_delta_mb median={rows[-1]['peak_delta_mb_median']:.1f}"
+                                  f" max={rows[-1]['peak_delta_mb_max']:.1f}"
+                                  f" (r1={trace[0]:.1f})")
+                print(f"  {v}: prefill {tp:6.2f}s  decode {td:6.2f}s  "
+                      f"{ms:6.2f} ms/tok  tok/round {tpr:.3f}  "
+                      f"({acc}/{rounds}){fired_s}{ngram_s}{peak_s}", flush=True)
+            # knob 間で状態が漏れないよう、各 knob の終わりに対照
+            # (baseline) を貼り直してから次の knob に渡す
+            set_variant(baseline)
 
-    # ---- まとめ -------------------------------------------------------
-    print("\n=== まとめ ===")
-    ok = True
-    for kind in ("short", "long"):
-        sub = [r for r in rows if r["kind"] == kind]
-        if not sub:
-            continue
-        for metric in ("ms_per_tok", "ms_per_round", "tok_per_round",
-                       "prefill_s"):
-            means = {}
-            for v in variants:
-                vals = [r[metric] for r in sub if r["variant"] == v]
-                means[v] = sum(vals) / len(vals)
-            base = means[baseline]
-            if base == 0:
-                # --prefill-once のとき prefill_s は全条件 0 になる (prefill は
-                # 1 回しか流していない)。比を取る意味が無いので飛ばす
-                continue
-            cells = "  ".join(
-                f"{v}={means[v]:8.3f}({(means[v] - base) / base * 100:+5.1f}%)"
-                for v in variants
-            )
-            print(f"  {kind:5s} {metric:14s} {cells}   [基準 {baseline}]")
-            if kind == "long" and metric == "tok_per_round":
-                worst = min((means[v] - base) / base * 100 for v in variants)
-                if worst < -5:
-                    print("    ** tok/round が 5% 超落ちた条件がある **")
-
-    # ngram-prefetch / ngram-batch: StreamNGram.stats の合計 (発火の確認)。
-    # hit/miss は「先読みが実際に効いているか」、sync_ms/fetch_ms は
-    # 「バッチ化自体の取り分」を切り分けるためのもの
-    if ngram_stream is not None:
+    # ---- まとめ (knob ごとに 1 組) -----------------------------------
+    for _name in knob_names:
+        _st = knob_state[_name]
+        rows = _st["rows"]
+        variants = _st["variants"]
+        baseline = _st["baseline"]
+        control_identical = _st["control_identical"]
+        ngram_stream = _st["ngram_stream"]
+        if len(knob_names) > 1:
+            print(f"\n########## knob {_name} ##########")
+        print("\n=== まとめ ===")
+        ok = True
         for kind in ("short", "long"):
-            sub = [r for r in rows if r["kind"] == kind and "ngram" in r]
+            sub = [r for r in rows if r["kind"] == kind]
             if not sub:
                 continue
-            for metric in ("hits", "misses", "sync_ms", "fetch_ms"):
-                totals = {}
+            for metric in ("ms_per_tok", "ms_per_round", "tok_per_round",
+                           "prefill_s"):
+                means = {}
                 for v in variants:
-                    vals = [r["ngram"][metric] for r in sub if r["variant"] == v]
-                    totals[v] = sum(vals)
-                base = totals[baseline]
+                    vals = [r[metric] for r in sub if r["variant"] == v]
+                    means[v] = sum(vals) / len(vals)
+                base = means[baseline]
                 if base == 0:
-                    cells = "  ".join(f"{v}={totals[v]:10.2f}" for v in variants)
-                    print(f"  {kind:5s} ngram_{metric:9s} {cells}"
-                          f"   [基準 {baseline} が 0 なので比は無し]")
+                    # --prefill-once のとき prefill_s は全条件 0 になる (prefill は
+                    # 1 回しか流していない)。比を取る意味が無いので飛ばす
                     continue
                 cells = "  ".join(
-                    f"{v}={totals[v]:10.2f}"
-                    f"({(totals[v] - base) / base * 100:+5.1f}%)"
+                    f"{v}={means[v]:8.3f}({(means[v] - base) / base * 100:+5.1f}%)"
                     for v in variants
                 )
-                print(f"  {kind:5s} ngram_{metric:9s} {cells}   [基準 {baseline}]")
+                print(f"  {kind:5s} {metric:14s} {cells}   [基準 {baseline}]")
+                if kind == "long" and metric == "tok_per_round":
+                    worst = min((means[v] - base) / base * 100 for v in variants)
+                    if worst < -5:
+                        print("    ** tok/round が 5% 超落ちた条件がある **")
 
-    if control_identical:
-        # 対照: 短文脈は A と B で出力が完全一致するはず
-        for c in sorted({r["ctx"] for r in rows if r["kind"] == "short"}):
-            sub = [r for r in rows if r["ctx"] == c]
-            if len({tuple(r["head"]) for r in sub}) != 1:
-                ok = False
-                print(f"  対照 NG: ctx={c} で条件間の出力が食い違う"
-                      " (一致するはずの領域。測定は無効)")
-        if ok:
-            print("  対照 OK: 短文脈は条件間で出力が一致")
+        # ngram-prefetch / ngram-batch: StreamNGram.stats の合計 (発火の確認)。
+        # hit/miss は「先読みが実際に効いているか」、sync_ms/fetch_ms は
+        # 「バッチ化自体の取り分」を切り分けるためのもの
+        if ngram_stream is not None:
+            for kind in ("short", "long"):
+                sub = [r for r in rows if r["kind"] == kind and "ngram" in r]
+                if not sub:
+                    continue
+                for metric in ("hits", "misses", "sync_ms", "fetch_ms"):
+                    totals = {}
+                    for v in variants:
+                        vals = [r["ngram"][metric] for r in sub if r["variant"] == v]
+                        totals[v] = sum(vals)
+                    base = totals[baseline]
+                    if base == 0:
+                        cells = "  ".join(f"{v}={totals[v]:10.2f}" for v in variants)
+                        print(f"  {kind:5s} ngram_{metric:9s} {cells}"
+                              f"   [基準 {baseline} が 0 なので比は無し]")
+                        continue
+                    cells = "  ".join(
+                        f"{v}={totals[v]:10.2f}"
+                        f"({(totals[v] - base) / base * 100:+5.1f}%)"
+                        for v in variants
+                    )
+                    print(f"  {kind:5s} ngram_{metric:9s} {cells}   [基準 {baseline}]")
 
-    if args.out:
-        Path(args.out).write_text(json.dumps(rows, ensure_ascii=False, indent=1))
-        print(f"\n書き出し: {args.out}")
+        if control_identical:
+            # 対照: 短文脈は A と B で出力が完全一致するはず
+            for c in sorted({r["ctx"] for r in rows if r["kind"] == "short"}):
+                sub = [r for r in rows if r["ctx"] == c]
+                if len({tuple(r["head"]) for r in sub}) != 1:
+                    ok = False
+                    print(f"  対照 NG: ctx={c} で条件間の出力が食い違う"
+                          " (一致するはずの領域。測定は無効)")
+            if ok:
+                print("  対照 OK: 短文脈は条件間で出力が一致")
+
+        if args.out:
+            # --knobs で複数回したときは basename に -<knob> を足す
+            # (1 knob だけなら --out そのまま = 従来と同じファイル名)
+            _p = Path(args.out)
+            if len(knob_names) > 1:
+                _p = _p.with_name(f"{_p.stem}-{_name}{_p.suffix}")
+            _p.write_text(json.dumps(rows, ensure_ascii=False, indent=1))
+            print(f"\n書き出し: {_p}")
     # 計測ツールなので destructor (スレッドプール等の後始末) に用は無い。
     # interpreter shutdown 待ちでプロセスが Metal のメモリを握ったまま
     # 1 時間以上残った実測があるので、結果を書き終えたら即 _exit で落とす

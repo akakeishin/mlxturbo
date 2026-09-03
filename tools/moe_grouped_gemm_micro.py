@@ -38,12 +38,25 @@
     c = t(flat20) / t(flat32)。flat160 はフルタイルだけの対照
     (1 タイルあたりの時間が flat32 と揃うことを見る)
 
+## 第 3 段の付帯費用 (`--stage tables`)
+
+行列積そのものではなく、**in-model で行列積の外側に乗るもの**を測る。
+
+  - `seg`: `counts_from_sorted_ids` -> `segment_tables` (scatter-add 1 +
+    cumsum 2 + concat 2)。host 同期なし、MoE 層 1 つにつき 1 回
+  - `pad16`: 16 行揃えの `(src, idx_pad, keep)`。水増し後の行数を Python の
+    int にする **host 同期が 1 回**入る (MLX の配列は形が静的なので、
+    これを避けるには静的上限で張るしかなく、そうすると r=40 で行数 +40%
+    になって勝ちが消える)
+
 ## 使い方 (GPU。必ず lock 経由で)
 
     tools/biglock.sh .venv/bin/python tools/moe_grouped_gemm_micro.py \
         --stage dense --json bench/results/moe-grouped-gemm-dense.json
     tools/biglock.sh .venv/bin/python tools/moe_grouped_gemm_micro.py \
         --stage segmented --json bench/results/moe-grouped-gemm-segmented.json
+    tools/biglock.sh .venv/bin/python tools/moe_grouped_gemm_micro.py \
+        --stage tables --json bench/results/moe-grouped-gemm-tables.json
 """
 
 from __future__ import annotations
@@ -62,6 +75,7 @@ from mlxturbo.kernels.moe_grouped_gemm import (
     BM,
     ENV_KNOB,
     GROUP_SIZE,
+    counts_from_sorted_ids,
     dense_eligible,
     enabled,
     is_nax_device,
@@ -533,9 +547,110 @@ def _report_partial_cost(results: list[dict]) -> None:
             f"(比 {per_full_32 / per_full_160:5.3f})"
         )
 
+# ---------------------------------------------------------------------------
+# 第 3 段の付帯費用 (--stage tables)
+# ---------------------------------------------------------------------------
+
+# 本番の MoE 層数 (qwen4_exp、Flash-Next)
+N_LAYERS = 48
+
+
+def run_tables(rounds: int, warmup: int, seed: int) -> list[dict]:
+    """テーブル構築の小 op 列だけを 48 層ぶん測る。
+
+    in-model では行列積そのものの取り分に**これが乗る**。2 種類:
+
+      - ``seg``  : `counts_from_sorted_ids` -> `segment_tables`
+                   (scatter-add 1 + cumsum 2 + concat 2)。host 同期なし。
+                   MoE 層 1 つにつき 1 回 (gate/up/down で使い回す)
+      - ``pad16``: 16 行揃えの `(src, idx_pad, keep)`。**host 同期が 1 回**
+                   入る (水増し後の行数を Python の int にしないと配列が
+                   作れない)。同じく MoE 層 1 つにつき 1 回
+
+    ``seg`` は同期が無いので 48 本まとめて 1 回の `mx.eval` で測る
+    (in-model でもレイヤー間に他の仕事が挟まるので、これが上限ではなく
+    「投げ切るのに要る時間」の目安)。``pad16`` は同期が構造上入るので
+    48 回逐次で測る。
+    """
+
+    E = NUM_EXPERTS
+    from mlxturbo import fused
+
+    cases = [
+        ("2048tok(r=40)", skew_counts(E, 20480, 67, 20.0, 90.0)),
+        ("8192tok(r=160)", skew_counts(E, 81920, 67, 80.0, 360.0)),
+    ]
+    rng = np.random.default_rng(seed)
+    results = []
+    for name, counts in cases:
+        counts = counts.copy()
+        rng.shuffle(counts)
+        M = int(counts.sum())
+        ids = mx.array(np.repeat(np.arange(E, dtype=np.uint32), counts))
+        mx.eval(ids)
+
+        def build_seg() -> float:
+            t0 = time.perf_counter()
+            outs = []
+            for _ in range(N_LAYERS):
+                rs, tp = segment_tables(counts_from_sorted_ids(ids, E))
+                outs.append(rs)
+                outs.append(tp)
+            mx.eval(*outs)
+            return (time.perf_counter() - t0) * 1e3
+
+        def build_pad() -> float:
+            t0 = time.perf_counter()
+            for _ in range(N_LAYERS):
+                fused._MOE_GEMM_PAD_TABLES = None  # キャッシュを外して毎回作らせる
+                tabs = fused._moe_gemm_pad_tables(ids, E)
+                mx.eval(*tabs)
+            fused._MOE_GEMM_PAD_TABLES = None
+            return (time.perf_counter() - t0) * 1e3
+
+        for _ in range(warmup):
+            build_seg()
+            build_pad()
+        seg_ms = []
+        pad_ms = []
+        for _ in range(rounds):
+            seg_ms.append(build_seg())
+            pad_ms.append(build_pad())
+            pad_ms.append(build_pad())
+            seg_ms.append(build_seg())
+
+        seg_med = statistics.median(seg_ms)
+        pad_med = statistics.median(pad_ms)
+        # 水増し後の行数 (host 側で同じ式を回して確かめる)
+        m_pad = int((np.ceil(counts / 16) * 16).sum())
+        entry = {
+            "case": name,
+            "M": M,
+            "M_pad16": m_pad,
+            "pad_row_inflation": m_pad / M,
+            "layers": N_LAYERS,
+            "seg_tables_ms_48": seg_med,
+            "seg_tables_us_per_layer": seg_med / N_LAYERS * 1e3,
+            "pad16_tables_ms_48": pad_med,
+            "pad16_tables_us_per_layer": pad_med / N_LAYERS * 1e3,
+            "samples": len(seg_ms),
+        }
+        results.append(entry)
+        print(
+            f"{name:16s} M={M:6d}  seg テーブル {seg_med:7.3f} ms/48 層 "
+            f"({seg_med / N_LAYERS * 1e3:6.1f} us/層)  |  "
+            f"pad16 テーブル {pad_med:7.3f} ms/48 層 "
+            f"({pad_med / N_LAYERS * 1e3:6.1f} us/層、host 同期込み)  |  "
+            f"水増し後 {m_pad} 行 ({m_pad / M:5.3f} 倍)"
+        )
+        del ids
+    return results
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--stage", choices=["dense", "segmented"], default="dense")
+    ap.add_argument("--stage", choices=["dense", "segmented", "tables"],
+                    default="dense")
     ap.add_argument("--rounds", type=int, default=10, help="ABBA の回数 (A/B 各 20 本)")
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--seed", type=int, default=0)
@@ -552,6 +667,8 @@ def main() -> None:
 
     if args.stage == "dense":
         results = run_dense(args.rounds, args.warmup, args.seed)
+    elif args.stage == "tables":
+        results = run_tables(args.rounds, args.warmup, args.seed)
     else:
         results = run_segmented(args.rounds, args.warmup, args.seed)
 

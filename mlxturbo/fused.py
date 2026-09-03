@@ -819,6 +819,147 @@ def disable_sdpa_split() -> None:
     Q.Attention._sdpa_split_width = False
 
 
+_ORIG_SDPA_ROWTILE = None
+_SDPA_ROWTILE_ROWS = 0
+_SDPA_ROWTILE_TRACE = False
+_SDPA_ROWTILE_MIN_S = 64
+
+
+def _sdpa_rowtile_call(orig, q, k, v, cache, scale, mask, sinks, rows):
+    """行タイルの本体 (段 P5)。q を `rows` 行ずつに割り、タイル t は K/V を
+    前方 `[0, offset+(t+1)*rows)` だけに絞って `orig` (素の
+    `scaled_dot_product_attention`) を呼び、`concatenate(axis=2)` で戻す。
+
+    QSA の可視集合は `block_end <= q_col` / tail `col <= q_col` なので、
+    各行タイルの可視 key は元から `[0, offset+(t+1)*rows)` の中に全部入る
+    (近似無し --- 切り捨てるのは、そのタイルのどの行からも見えないと
+    証明済みの列だけ)。`mask=="causal"` はタイルごとにそのまま "causal" を
+    渡す -- fallback (`mlx/fast.cpp`) は `offset = kL - qL` で対角を出すので、
+    K/V を `[0, kv_end)` に切ってあれば各タイルの対角は自動的に
+    `offset+t0` (= このタイルの先頭クエリの絶対位置) になり、正しい。
+    """
+    import mlx.core as mx
+
+    S = q.shape[2]
+    kv_len = k.shape[2]
+    offset = kv_len - S
+    outs = []
+    t0 = 0
+    while t0 < S:
+        t1 = min(t0 + rows, S)
+        kv_end = offset + t1
+        k_t = k[:, :, :kv_end, :]
+        v_t = v[:, :, :kv_end, :]
+        q_t = q[:, :, t0:t1, :]
+        m_t = mask if isinstance(mask, str) else mask[..., t0:t1, :kv_end]
+        outs.append(orig(q_t, k_t, v_t, cache=cache, scale=scale, mask=m_t, sinks=sinks))
+        t0 = t1
+    return mx.concatenate(outs, axis=2)
+
+
+def _sdpa_rowtile_dispatch(queries, keys, values, cache=None, scale=1.0, mask=None, sinks=None):
+    """`mlx_lm.models.qwen4_exp.scaled_dot_product_attention` の身代わり (段 P5)。
+
+    `_vendor/qwen4_exp.py` はモジュール直下に `scaled_dot_product_attention`
+    という名前を import している (`from .base import ... scaled_dot_product_attention`、
+    `_arch_registry.py` の meta_path フックでこのモジュールは
+    `mlx_lm.models.qwen4_exp` として読み込まれる)。その名前をこの関数に
+    差し替えることで、vendor ファイルを 1 行も触らずに `Attention.__call__`
+    の dense 分岐 (S>=64、量子化 cache でない) だけを行タイルに割る
+    (`docs/research/IDEAS-2026-09-03.md` の P5)。`Attention` クラス自体には
+    触らないので、既存の 2 枠 (`_positions`/`_final_mask`、batch.py/
+    batch_spec.py) は増えない。
+
+    **`_gather_tile_attn` (段 3(b)、`MLXTURBO_GATHER_ATTN`/`MLXTURBO_PREFILL_ATTN`
+    -- 既定 on -- が立てる) の else 節も同じ名前を呼ぶ。**そちらの k/v は
+    union で `take_along_axis` して集めた列で、位置順ではない。この関数の
+    「前方 `[0, kv_end)` だけ見れば残りは因果的に不可視」という前提は
+    位置順の K/V でしか成り立たないので、誤ってそちらを行タイル化すると
+    shape は揃ったまま**サイレントに違う値を返しうる**。呼び出し元フレームの
+    関数名とモジュール名で区別する (`Attention.__call__` だけ通す、
+    `_gather_tile_attn` は素通しさせる --- この名前を呼ぶのはこの 2 か所だけ、
+    2026-09 時点で grep 済み)。
+    """
+    rows = _SDPA_ROWTILE_ROWS
+    orig = _ORIG_SDPA_ROWTILE
+    if (
+        rows > 0
+        and sinks is None
+        and not (cache is not None and hasattr(cache, "bits"))
+    ):
+        mask_ok = (mask == "causal") if isinstance(mask, str) else (mask is not None)
+        if (
+            mask_ok
+            and queries.shape[2] >= _SDPA_ROWTILE_MIN_S
+            and queries.shape[2] > rows
+        ):
+            import sys
+
+            frame = sys._getframe(1)
+            if (
+                frame.f_code.co_name == "__call__"
+                and frame.f_globals.get("__name__") == "mlx_lm.models.qwen4_exp"
+            ):
+                if _SDPA_ROWTILE_TRACE:
+                    from mlxturbo.kernels import _fire
+
+                    _fire.bump("sdpa_rowtile")
+                return _sdpa_rowtile_call(
+                    orig, queries, keys, values, cache, scale, mask, sinks, rows
+                )
+    return orig(queries, keys, values, cache=cache, scale=scale, mask=mask, sinks=sinks)
+
+
+def enable_sdpa_rowtile(model=None, rows: int = 256) -> None:
+    """P5: `Attention.__call__` の dense sdpa (S>=64、量子化 cache でない) を
+    q 行 `rows` 行ずつのタイルに割り、各タイルは前方 K/V だけを見て呼ぶ
+    (`docs/research/IDEAS-2026-09-03.md` の P5)。MLX 0.32.2 の sdpa は
+    head_dim=256・S>8 では常に fallback (matmul->where->softmax->matmul) で
+    タイルを飛ばさないので、現チャンクの上三角ぶんを毎回無駄に計算している
+    --- 可視集合はタイル分割の前後で不変 (近似無し) だが、PV の縮約が
+    タイルごとに切れて和の順序が変わるので出力はビット一致しない
+    (`tools/decode_ab.py --knob sdpa-rowtile` は `control_identical=False`、
+    KLD で確認する)。
+
+    `_vendor/qwen4_exp.py` は触らない --- モジュール直下の
+    `scaled_dot_product_attention` という名前 (`from .base import ...` で
+    import された参照) を `_sdpa_rowtile_dispatch` に差し替えるだけ。
+    `model` 引数は他の `enable_*(model, ...)` と呼び方を揃えるためだけで
+    実際には使わない (パッチはモジュール直下の 1 関数だけで、layer ごとの
+    属性は要らない)。
+
+    既定 off。環境変数 `MLXTURBO_SDPA_ROWTILE=<R>` でも上書きできる (未設定/0
+    なら off)。`MLXTURBO_SDPA_ROWTILE_TRACE=1` で発火するたびに
+    `mlxturbo.kernels._fire.bump("sdpa_rowtile")` が乗る
+    (`mlxturbo.kernels._fire.snapshot()` で回数を見る)。
+
+    proof-of-life は `tools/sdpa_rowtile_micro.py` (モデル無し)。判定は
+    `tools/decode_ab.py --knob sdpa-rowtile` の prefill_s と tok/round
+    (悪化しないこと)。
+    """
+    global _ORIG_SDPA_ROWTILE, _SDPA_ROWTILE_ROWS, _SDPA_ROWTILE_TRACE
+    import os
+
+    import mlx_lm.models.qwen4_exp as Q
+
+    env = os.environ.get("MLXTURBO_SDPA_ROWTILE")
+    r = int(env) if env else int(rows)
+    _SDPA_ROWTILE_TRACE = os.environ.get("MLXTURBO_SDPA_ROWTILE_TRACE") == "1"
+    if r <= 0:
+        _SDPA_ROWTILE_ROWS = 0
+        return
+    if _ORIG_SDPA_ROWTILE is None:
+        _ORIG_SDPA_ROWTILE = Q.scaled_dot_product_attention
+        Q.scaled_dot_product_attention = _sdpa_rowtile_dispatch
+    _SDPA_ROWTILE_ROWS = r
+
+
+def disable_sdpa_rowtile() -> None:
+    global _SDPA_ROWTILE_ROWS
+
+    _SDPA_ROWTILE_ROWS = 0
+
+
 def disable_hyper_connection() -> None:
     global _ORIG_HC
     if _ORIG_HC is None:
@@ -1555,6 +1696,297 @@ def disable_moe_combine_fold(model) -> int:
             mlp._combine_fold_min_s = None
             n += 1
     return n
+
+
+# --- MoE grouped GEMM (P3、kernels/moe_grouped_gemm.py の第 3 段) -------------
+#
+# 差し替え先を `SparseMoeBlock.__call__` ではなく
+# `mlx_lm.models.switch_layers.QuantizedSwitchLinear.__call__` にしてある。
+# 理由は 2 つ:
+#
+#  - 置き換えたいのは `mx.gather_qmm(..., sorted_indices=True)` 1 本だけで、
+#    それはこのクラスの `__call__` にしか無い。SparseMoeBlock 側で受けると
+#    `_moe_combine_fold` (vendor) のソート・並べ替え・SwiGLU まで写す羽目に
+#    なり、「写しを増やさない」規則 (CLAUDE.md) に反する。
+#  - 本番の prefill は既定 on の `MLXTURBO_MOE_COMBINE_FOLD` 経路を通るので
+#    `SwitchGLU.__call__` (統合ディスパッチ C1) を経由しない。gate/up/down は
+#    そこから `QuantizedSwitchLinear` を直接呼ぶので、ここに置けば fold 経路と
+#    素の SwitchGLU 経路の両方を 1 か所で拾える。
+#
+# 差し替えは `QuantizedSwitchLinear` に対してこれ 1 個だけ (SwitchGLU 側の
+# 統合ディスパッチとは別クラス)。C1 と同じく「インストールは 1 回、経路の
+# 選択は呼び出し時にモジュール変数で」の作法に合わせてあるので、A/B で
+# 交互に切り替えても掛け順が壊れない。
+_MOE_GEMM_STOCK = None        # 素の SL.QuantizedSwitchLinear.__call__
+# "off" (素通し) / "seg" (自前カーネル) / "pad16" (16 行揃え + 既製 gather_qmm)
+_MOE_GEMM_MODE = "off"
+_MOE_GEMM_MIN_ROWS = 1024     # インストール時に 1 回だけ読む (ホットパスで getenv しない)
+_MOE_GEMM_TRACE = False
+# (indices, num_experts, tables) の 1 段キャッシュ。`_moe_combine_fold` も
+# `gather_sort` も gate/up/down の 3 本に**同じ添字オブジェクト**を渡すので、
+# 同一性 (`is`) で引けばテーブル構築は 3 回に 1 回で済む。参照を持っている
+# 間は id が再利用されないので、同一性判定は安全。
+_MOE_GEMM_TABLES = None
+_MOE_GEMM_PAD_TABLES = None   # pad16 用 (indices, num_experts, (src, idx_pad, keep))
+_MOE_GEMM_PAD_X = None        # pad16 の x_pad を gate/up で使い回す 1 段キャッシュ
+_MOE_GEMM_TRACE_SEEN: set = set()
+
+# pad16 の揃え幅。素の `affine_gather_qmm_rhs` のタイル (quantized.cpp:1652 の
+# bm=16) に合わせてある。ここを 32 にすると水増しが倍になる
+_MOE_GEMM_PAD = 16
+
+
+def _moe_gemm_tables(indices, num_experts):
+    """`indices` (専門家順にソート済み、(M,)) から `(row_start, tile_prefix)`。
+
+    host 同期は入らない (`counts_from_sorted_ids` も `segment_tables` も
+    mx op だけ)。同じ添字での 2 回目以降はキャッシュを返す。
+    """
+    global _MOE_GEMM_TABLES
+
+    from .kernels import moe_grouped_gemm as mgg
+
+    cached = _MOE_GEMM_TABLES
+    if cached is not None and cached[0] is indices and cached[1] == num_experts:
+        return cached[2]
+    tables = mgg.segment_tables(mgg.counts_from_sorted_ids(indices, num_experts))
+    _MOE_GEMM_TABLES = (indices, num_experts, tables)
+    return tables
+
+
+def _moe_gemm_pad_tables(indices, num_experts):
+    """pad16 (variant C) の 3 本を作る。戻り値は `(src, idx_pad, keep)`。
+
+      - ``src`` (M_pad,)     : 水増し後の行 -> 元の x の行。端数のダミー行は
+                               その専門家の**最後の実在行**を指す (0 行でも
+                               よいが、行が全部同じ専門家に属していたほうが
+                               読みが局所的になる)
+      - ``idx_pad`` (M_pad,) : 水増し後の行の専門家 id (`rhs_indices` 用)
+      - ``keep`` (M,)        : 元の行 -> 水増し後の行 (出力の取り戻し)
+
+    **ここだけ host 同期が 1 回入る** (`M_pad` の確定)。MLX の配列は形が
+    静的なので、`Σ_e ceil(c_e / 16) * 16` を Python の int にしないと
+    水増し後の配列を作れない。静的上限 (`M + 16*E`) で張る手もあるが、
+    r=40 で行数 +40% (実際の +18% に対して) になって micro の勝ちが消える
+    ので採らない。同期は添字 1 つにつき 1 回 (= MoE 層 1 つにつき 1 回。
+    gate/up/down の 3 本はキャッシュを共有する)。
+    """
+    global _MOE_GEMM_PAD_TABLES
+
+    import mlx.core as mx
+
+    from .kernels import moe_grouped_gemm as mgg
+
+    cached = _MOE_GEMM_PAD_TABLES
+    if cached is not None and cached[0] is indices and cached[1] == num_experts:
+        return cached[2]
+
+    E = num_experts
+    pad = _MOE_GEMM_PAD
+    counts = mgg.counts_from_sorted_ids(indices, E)          # (E,)
+    padded = ((counts + (pad - 1)) // pad) * pad             # (E,)
+    zero = mx.zeros((1,), dtype=mx.int32)
+    start = mx.concatenate([zero, mx.cumsum(counts)])        # (E+1,)
+    pstart = mx.concatenate([zero, mx.cumsum(padded)])       # (E+1,)
+    m_pad = int(pstart[E].item())                            # ← 唯一の host 同期
+
+    # 水増し後の行 -> 専門家。境界に 1 を撒いて累積和を取るだけ (探索不要)。
+    # 行を持たない専門家は境界が重なるので、そこで id が 2 以上飛ぶ。
+    # 長さを M_pad+1 にしてあるのは pstart[e] == M_pad (末尾の空専門家) が
+    # 範囲外にならないようにするため
+    bumps = mx.zeros((m_pad + 1,), dtype=mx.int32)
+    bumps = bumps.at[pstart[1:E]].add(mx.ones((E - 1,), dtype=mx.int32))
+    seg = mx.cumsum(bumps)[:m_pad]                           # (M_pad,)
+    off = mx.arange(m_pad, dtype=mx.int32) - pstart[seg]
+    src = start[seg] + mx.minimum(off, counts[seg] - 1)      # (M_pad,)
+    idx_pad = seg.astype(indices.dtype)
+
+    idx_i = indices.astype(mx.int32)
+    m = indices.shape[0]
+    keep = pstart[idx_i] + (mx.arange(m, dtype=mx.int32) - start[idx_i])
+
+    tables = (src, idx_pad, keep)
+    _MOE_GEMM_PAD_TABLES = (indices, num_experts, tables)
+    return tables
+
+
+def _moe_gemm_trace(rows: int, n_out: int) -> None:
+    """`MLXTURBO_MOE_GEMM_TRACE=1` のときだけ、初出の形ごとに 1 行 stderr へ。
+
+    終了時に累計 (`_fire` の `moe_grouped_gemm_segmented` /
+    `moe_grouped_gemm_pad16`) も 1 行出す。
+    """
+    import atexit
+    import sys
+
+    from .kernels import _fire
+
+    key = (rows, n_out, _MOE_GEMM_MODE)
+    if key in _MOE_GEMM_TRACE_SEEN:
+        return
+    if not _MOE_GEMM_TRACE_SEEN:
+        atexit.register(
+            lambda: print(
+                "[mlxturbo] moe_grouped_gemm 発火合計:"
+                f" seg {_fire.snapshot().get('moe_grouped_gemm_segmented', 0)} 回"
+                f" / pad16 {_fire.snapshot().get('moe_grouped_gemm_pad16', 0)} 回",
+                file=sys.stderr,
+            )
+        )
+    _MOE_GEMM_TRACE_SEEN.add(key)
+    print(
+        f"[mlxturbo] moe_grouped_gemm 発火 ({_MOE_GEMM_MODE}):"
+        f" rows={rows} N={n_out}",
+        file=sys.stderr,
+    )
+
+
+def enable_moe_grouped_gemm(model=None, mode: str = "seg") -> None:
+    """prefill 幅の `mx.gather_qmm(sorted_indices=True)` を差し替える。
+
+    ``mode`` は 2 通り:
+
+      - ``"seg"`` (既定): 自前の grouped GEMM
+        (`kernels/moe_grouped_gemm.qmm_segmented`) に置き換える
+      - ``"pad16"``: 既製の `mx.gather_qmm` のまま、**専門家セグメントを
+        16 行の倍数にダミー行で揃えて** straddle を物理的に無くす
+        (`tools/gather_qmm_pad_micro.py` の (b) を in-model に持ち込んだ形)。
+        micro では r=40 で -11%、r=160 で -3.6%。ただし in-model では
+        水増しの gather (x_pad) と出力の取り戻しが**別途**乗る --
+        micro の数字は gather_qmm の呼び 1 本だけを測ったもの
+
+    素は BM=16 のタイルを行の並びだけで切るので、専門家境界をまたいだタイルは
+    セグメントごとにフル BM x BN x K をやり直す (`quantized.h:2517`)。
+    こちらはタイル 1 枚が必ず 1 専門家に収まり、形も dense と同じ
+    BM=32 / 128 スレッドになる。**素とビット一致する** (micro の 10 ケースで
+    確認済み、`bench/results/moe-grouped-gemm-segmented.json`)。
+
+    発火条件 (どれか外れたら素の `mx.gather_qmm` に落ちる):
+
+      - `sorted_indices=True` で呼ばれている (prefill 幅の gather_sort 経路)
+      - 行数が `MLXTURBO_MOE_GEMM_MIN_ROWS` (既定 1024) 以上。decode/verify 幅
+        (数十行) は素のまま -- あちらは `gather_qmv` で経路自体が別
+      - `MLXTURBO_MOE_GEMM` (auto|on|off) が on を解く。`auto` は非 NAX 機だけ
+        on (NAX 機は MLX 側が別カーネルを持っていて A/B 未実施。
+        `moe_grouped_gemm.is_nax_device`)
+      - 形が `segmented_eligible` を満たす (4bit/gs64、N が 32 の倍数、
+        K が 32 と 64 の倍数、bias 無し、affine)。pad16 も同じ判定を使う
+        (既製カーネルに投げるだけなので条件はもっと緩いが、A と C を同じ
+        母集団で比べるために揃えてある)
+      - GPU が既定デバイス (`mx.fast.metal_kernel` なので CPU では使えない)
+
+    **`runner.enable_default_fusions` には配線していない。**in-model A/B
+    (`tools/decode_ab.py --knob moe-grouped-gemm`) で prefill が勝ってから
+    配線する。micro (行列積だけ) の取り分は r=160 で -5.2%、r=40 で -4.1%。
+    """
+    global _MOE_GEMM_STOCK, _MOE_GEMM_MODE, _MOE_GEMM_MIN_ROWS, _MOE_GEMM_TRACE
+    import os
+
+    import mlx.core as mx
+    import mlx_lm.models.switch_layers as SL
+
+    from .kernels import _fire
+    from .kernels import moe_grouped_gemm as mgg
+
+    if mode not in ("seg", "pad16"):
+        raise ValueError(f"mode={mode!r} は seg / pad16 のどちらかにすること")
+    _MOE_GEMM_MODE = mode if (mode == "pad16" or mgg.enabled()) else "off"
+    if _MOE_GEMM_STOCK is not None:
+        return
+    _MOE_GEMM_MIN_ROWS = int(os.environ.get("MLXTURBO_MOE_GEMM_MIN_ROWS", "1024"))
+    _MOE_GEMM_TRACE = os.environ.get("MLXTURBO_MOE_GEMM_TRACE") == "1"
+    _MOE_GEMM_STOCK = SL.QuantizedSwitchLinear.__call__
+    stock = _MOE_GEMM_STOCK
+
+    def pad16(self, x_key, x2, indices, w, scales, biases, K):
+        """16 行揃え + 既製 `mx.gather_qmm`。x_pad は gate/up で使い回す。
+
+        キャッシュの鍵は**呼び出し側が渡した `x` そのもの** (`x_key`)。
+        `x2` は `reshape` の戻りで毎回別オブジェクトになるので鍵にならない。
+        gate と up は同じ `x` を受け取る (`_moe_combine_fold` / `gather_sort`
+        のどちらも同じ配列を 2 回渡す) ので、水増しの gather は 1 回で済む。
+        down は別の配列 (SwiGLU 出力) なのでもう 1 回走る。
+        """
+        global _MOE_GEMM_PAD_X
+
+        src, idx_pad, keep = _moe_gemm_pad_tables(indices, w.shape[0])
+        cached = _MOE_GEMM_PAD_X
+        if cached is not None and cached[0] is x_key:
+            x_pad = cached[1]
+        else:
+            x_pad = x2[src]
+            _MOE_GEMM_PAD_X = (x_key, x_pad)
+        y = mx.gather_qmm(
+            x_pad.reshape(-1, 1, K),
+            w,
+            scales,
+            biases,
+            rhs_indices=idx_pad,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+            sorted_indices=True,
+        )
+        _fire.bump("moe_grouped_gemm_pad16")
+        return y[keep]
+
+    def dispatched(self, x, indices, sorted_indices=False):
+        # 素通しの判定を先に済ませる (decode 幅はここで全部落ちる)
+        if (
+            _MOE_GEMM_MODE != "off"
+            and sorted_indices
+            and x.ndim == 3
+            and x.shape[1] == 1
+            and x.shape[0] >= _MOE_GEMM_MIN_ROWS
+            and indices.ndim == 1
+            and indices.shape[0] == x.shape[0]
+            and "bias" not in self
+            and getattr(self, "mode", "affine") == "affine"
+            and mx.default_device() == mx.gpu
+        ):
+            w = self["weight"]
+            scales = self["scales"]
+            biases = self.get("biases")
+            rows, _, K = x.shape
+            x2 = x.reshape(rows, K)
+            if biases is not None and mgg.segmented_eligible(
+                x2, w, scales, biases, self.group_size, self.bits
+            ):
+                if _MOE_GEMM_TRACE:
+                    _moe_gemm_trace(rows, w.shape[1])
+                if _MOE_GEMM_MODE == "pad16":
+                    # 出力は (M, 1, N) のまま返る (keep が行を選ぶだけ)
+                    return pad16(self, x, x2, indices, w, scales, biases, K)
+                out = mgg.qmm_segmented(
+                    x2,
+                    w,
+                    scales,
+                    biases,
+                    None,
+                    tables=_moe_gemm_tables(indices, w.shape[0]),
+                    group_size=self.group_size,
+                    bits=self.bits,
+                )
+                # 素の gather_qmm は (M, 1, N) を返す。呼び手 (SwitchGLU /
+                # _moe_combine_fold) はこの中間次元を前提にしているので戻す
+                return out.reshape(rows, 1, w.shape[1])
+        return stock(self, x, indices, sorted_indices)
+
+    SL.QuantizedSwitchLinear.__call__ = dispatched
+
+
+def disable_moe_grouped_gemm() -> None:
+    """`enable_moe_grouped_gemm` を打ち消す (フラグを下ろすだけ)。
+
+    差し替え自体は残るが `dispatched` が素通しに固定される。A/B で交互に
+    測るためにこの形にしてある (統合ディスパッチ C1 と同じ理屈)。
+    """
+    global _MOE_GEMM_MODE, _MOE_GEMM_TABLES, _MOE_GEMM_PAD_TABLES, _MOE_GEMM_PAD_X
+    _MOE_GEMM_MODE = "off"
+    _MOE_GEMM_TABLES = None
+    _MOE_GEMM_PAD_TABLES = None
+    _MOE_GEMM_PAD_X = None
 
 
 def enable_fast_rope(model) -> int:
