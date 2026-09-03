@@ -290,24 +290,40 @@ def test_non_metal_and_non_bf16_paths_call_stock_exactly_once():
 
 
 def test_eligible_path_builds_once_and_launches_e120_geometry():
+    # `qmm_skinny_mma()` の既定は v5 (M=6..16、split-K、xsums 無し) に移った
+    # ので、e120 の形 (M=2..9、xsums + table) を見るこの節は backend を明示
+    # して呼ぶ。e120_v4 は診断用に選択可能なまま残っている
+    # (qmm_skinny_mma の docstring)。既定の v5 経路は GPU ゲート
+    # (bench/test_qmm_skinny_mma.py) が既定のまま M_MIN..M_MAX を回して見る。
     fake_mx = _FakeMX(gpu_available=True)
     old_loader = qmv_module._load_mx
     qmv_module._load_mx = lambda: fake_mx
-    qmv_module._KERNEL = None
-    qmv_module._TABLE_KERNEL = None
-    qmv_module._XSUMS_KERNEL = None
+    # 実在するキャッシュ名で退避する。以前の _KERNEL / _TABLE_KERNEL /
+    # _XSUMS_KERNEL への代入は別名の属性を作るだけで、本物の e120 キャッシュ
+    # は残っていた (kernel_builds == 3 が実行順に依存していた)。
+    qmv_module._E120_KERNEL = None
+    qmv_module._E120_TABLE_KERNEL = None
+    qmv_module._E120_XSUMS_KERNEL = None
     try:
         outputs = []
         arrays_by_m = {}
         for m in (2, 8, 9):
             x, w, scales, biases = _arrays(fake_mx, m=m)
             arrays_by_m[m] = (x, w, scales, biases)
-            outputs.append(qmv_module.qmm_skinny_mma(x, w, scales, biases))
+            outputs.append(
+                qmv_module.qmm_skinny_mma(
+                    x,
+                    w,
+                    scales,
+                    biases,
+                    implementation=qmv_module.E120_V4_IMPLEMENTATION,
+                )
+            )
     finally:
         qmv_module._load_mx = old_loader
-        qmv_module._KERNEL = None
-        qmv_module._TABLE_KERNEL = None
-        qmv_module._XSUMS_KERNEL = None
+        qmv_module._E120_KERNEL = None
+        qmv_module._E120_TABLE_KERNEL = None
+        qmv_module._E120_XSUMS_KERNEL = None
 
     assert outputs == ["y-output", "y-output", "y-output"]
     assert not fake_mx.fallback_calls

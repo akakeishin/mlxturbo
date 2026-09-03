@@ -4959,11 +4959,21 @@ def test_flash_spec_checkpoint_reuse_matches_full_rebuild_with_tail_mismatch(mon
     )
     # チャンク主導なら 3,6,9,12 に立つが、layer-major prefill
     # (MLXTURBO_PREFILL_GROUP=4) は前方チャンクをまとめて流すので、境界は
-    # グループの出口 (9) だけになる。**グループ内で刻むのは構造的に不可能** --
+    # グループの出口にしか立たない。**グループ内で刻むのは構造的に不可能** --
     # レイヤー主導では「チャンク k を全層通した状態」がどの瞬間にも存在しない
-    # (docs/research/IMPROVEMENT-QUEUE.md B2)。末尾側は従来経路なので、
-    # BPE 末尾分割の 11 と全体の 12 が続く。
-    assert [pos for pos, _ in session.checkpoints] == [9, 11, 12]
+    # (docs/research/IMPROVEMENT-QUEUE.md B2)。
+    #
+    # そのグループの出口は 2026-09-03 に 9 から 11 へ移った:
+    # MLXTURBO_PREFILL_TAIL_IN_GROUP が既定 on になり、末尾チャンクの
+    # 「最後の 1 トークンを除いた部分」(9..11) が同じグループの最終メンバー
+    # として流れるため。BPE 末尾分割の n-1 (11) は、このグループが積む境界
+    # checkpoint そのものになる (spec_flash.py の _PREFILL_TAIL_IN_GROUP の
+    # コメント)。最後の 1 トークンだけが従来の chunk 主導で流れて 12 が続く。
+    # グループの内側に入った中間 checkpoint (9) が消えるのは、この既定を
+    # 入れたときに測って受け入れた代償
+    # (docs/research/SESSION-2026-09-02-CATCHUP.md の 2026-09-03 12:55
+    # 「残る性質」)。MLXTURBO_PREFILL_TAIL_IN_GROUP=0 なら [9, 11, 12]。
+    assert [pos for pos, _ in session.checkpoints] == [11, 12]
 
     # FlashSpecRunner の不変条件 (6a0cd27): 最後の cur はまだ cache に
     # feed されていないので、publish されるのは tokens[:-1] まで。
@@ -4979,7 +4989,9 @@ def test_flash_spec_checkpoint_reuse_matches_full_rebuild_with_tail_mismatch(mon
     while lcp < n and session.processed[lcp] == turn2_prompt[lcp]:
         lcp += 1
     assert lcp == len(fed_history) - 2  # 末尾だけ食い違っている想定どおり
-    assert lcp not in (3, 6, 9, 12)  # チェックポイント境界そのものではない
+    # チャンク境界 (3, 6, 9, 12) にも、実際に立った checkpoint (11, 12) にも
+    # 一致しない位置で食い違っていること
+    assert lcp not in (3, 6, 9, 11, 12)
 
     cp_pos = server._try_checkpoint_restore_session_cache(session, lcp)
     assert cp_pos == 12  # 生成部分にはチェックポイントが無いので prefill の
