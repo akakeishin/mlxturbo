@@ -2215,3 +2215,24 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - 発火は 12/round (本体の attention 12 層)。**MTP の draft 層 (`FlashMTPModule` の DecoderLayer) には当たっていない**: `enable_default_fusions` (runner 1885) が MTP 読み込み (1954) より前。gather_attn / prefill_attn も同じ穴。冷連鎖で ~0.12 ms/round。
 - 次の手 (品質と速度の取引、KLD が要る): blocks を 64 に釘付け (冷連鎖 123 → 92 us/層、-0.37 ms/forward、partials 1/4)。再結合順が変わるので teacher の後。
 - **罠 16**: 1 プロセスの A/B で depth 適応の EMA が variant をまたぐ。decode_ab は variant / row の切り替えで DepthController を作り直すこと (未対応、decode_ab の宿題)。
+
+### 2026-09-03 18:45 decode 1 step の Metal trace (`tools/decode_gpu_trace.py`、観測 dylib で dispatch / command buffer / GPU 時間を取る。`bench/results/decode-gpu-trace-*.json`)
+
+| | 壁時計 ms/round | dispatch/round | CB/round | GPU 合計 ms | busy | カーネル平均 | 隙間平均 |
+|---|---|---|---|---|---|---|---|
+| 短 (S=3) | 36.9 | 5136 | 327〜358 | 34.6 | **93%** | 6.7 us | 0.5 us |
+| 17k | 35.7 / 42.8 (depth 差) | 5737 / 6083 | 315〜329 | 33.2 / 40.2 | 93〜94% | 6.6 us | 0.4 us |
+| depth 0 (S=1) | 23.6 | **4499** | 223〜237 | 22.0 | 88〜93% | 5.0 us | 0.7 us |
+
+- decode_ab との整合 ±1%。ioreg (0.1 s) の稼働率 92〜94% と独立に一致。**GPU は空いていない。起動の隙間は 0.4〜0.7 us/dispatch (1 CB に 15〜19 dispatch が詰まる) で、8/31 の「round 間の 7.3 ms の泡」は無い。**
+- **dispatch は S=1 で 4499 (Lily の 795 の 5.7 倍、48 層で 94/層)。**`--split-cb` の帰属: 量子化行列積が depth 0 で 10.0 / 22.3 ms (45%、855 dispatch)、短で 18.8 / 34.6 (54%、964)。残り ~3644 dispatch (elementwise、copy、sigmoid、sort、broadcast、softmax) が 55%。
+  行列積は active 重み 1.7〜2 GB に対し 170〜200 GB/s = 帯域の半分。
+- **壁 (5 ms) からの 5 倍の分解: 1.07 (空き) × 2.2 (糊のカーネル) × 2.0 (行列積が帯域の半分)。融合の的は行列積ではなく ~3600 本の糊。**
+- depth 0 の上位 (回数 × us = ms/round): `affine_qmv_fast_b4` 422 × 10.9 = 4.60、`g1_copy` **133 × 13.4 = 1.79**、`affine_qmv_fast_b8` (lm_head 8bit) **1 × 1745 = 1.75 (7%)**、`affine_gather_qmv_fast` 96 × 17.9 = 1.72、
+  `vv_Multiply` 257 × 5.3 = 1.36、`vs_Multiply` 264 × 4.5 = 1.20、`v_Sigmoid` 289 × 3.8 = 1.09、`Broadcast strided` 96 × 10 = 0.96、`affine_gather_qmv` 48 × 19.9 = 0.95、`block_softmax` 48 × 19.9 = 0.95。
+  短 (S=3): `affine_qmv_wide` 566 × 12.7 = 7.20、`affine_gather_qmv_fast` 100 × **64.2** = 6.42、**`carg_block_sort` 96 × 24.2 = 2.32** (3 行のルーティングに sort)。
+- 道具の限界: 既定モードの per-kernel は CB 内で按分 (帰属には `--split-cb`、壁が 2.5 倍)、busy は CB 単位 (中の空きは見えない = 上限)、直列段の長さは見えない、ioreg は走行を 3〜13% 遅くする (opt-in)。
+  `xctrace` は MLX の compute を落とし、`mx.metal.start_capture` は常駐 98 GB を全部書くので、どちらも使えなかった。
+- **次の的 (decode の本格改修)**: (a) S ≤ 8 の MoE ルーティングを sort 無しに (短で 2.3 ms = 6%)、(b) copy 133 本の出所 (transpose / 非連続) を潰す (1.8 ms)、
+  (c) 層ごとの elementwise の糊 (multiply / sigmoid / broadcast / softmax、~4 ms) を `mx.compile` か 1 カーネルに畳む、(d) lm_head 8bit の 1.75 ms (4bit で候補 → 8bit で上位だけ再採点、品質の確認要)、
+  (e) `wide` (射影の連結) を decode 幅で burn-in 付きに再測 (前の負けは位置 1 の段差込みの疑い)。
