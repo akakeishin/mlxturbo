@@ -10,6 +10,15 @@ CLAUDE.md の「温キャッシュのマイクロを信じない」は帯域 (�
 使ってよいが、採否は必ず in-model A/B で決めること (micro で勝って in-model で
 負けた前例が複数ある: moe_glu、moe_route、HC prefill 融合)。
 
+`run_hc_kernel` の連鎖はさらに一枚落とし穴があった: 重み 1 組 (norm_weight
+/down/up/inject、約 7 MB) を 200 回読み回す**温キャッシュ**で、並列度の低い
+自前カーネルが冷の DRAM レイテンシを隠せない負けを覆い隠していた
+(`docs/research/SESSION-2026-09-02-CATCHUP.md` の「2026-09-03 12:00 custom
+kernel が decode の in-model で負ける理由」節)。そのため既定を **`--weight-sets`
+で重みを層数ぶん (既定 97) 巡回させる冷キャッシュ**に変えてある。
+`--weight-sets 1` で旧来の温キャッシュの挙動に戻せる。判定ゲートは
+「重みを 100 MB 超巡回させた冷の連鎖で素の op 列より速いこと」。
+
     uv run python tools/micro_kernel_latency.py --out bench/results/micro-kernel-latency.json
 
 モデルはロードしない (合成テンソルのみ)。最後に os._exit(0) で落ちる。
@@ -56,8 +65,70 @@ N_LM_HEAD = 100
 
 OP_CHAIN_SHAPES = [(1, HIDDEN), (1, CONV_DIM), (1, N_V, DK)]
 
+# 連鎖 (chain) が巡回する重みの組数の既定値 (層数)。attention 12 / GDN 36 /
+# MoE 48 (+ HC は 48 層 x 2 + mixer = 97、docs/research/SESSION-2026-09-02-CATCHUP.md
+# の「2026-09-03 12:00 custom kernel が decode の in-model で負ける理由」節)。
+# "moe" は本ファイル・tools/kernel_chain_cost.py のどちらにも対応する連鎖項目が
+# 無いが、kind の対応を揃えるために定義だけ残す。
+WEIGHT_SET_DEFAULTS = {"hc": 97, "gdn": 36, "moe": 48}
+
 
 # --------------------------------------------------------------------- 補助
+
+
+def _weight_bytes(x) -> int:
+    """`x` (mx.array、または量子化タプル (wq, sc, bi, group_size, bits) のように
+    mx.array と非配列が混じった tuple/list) の中の mx.array 分の nbytes を
+    再帰的に合算する。group_size/bits のような非配列要素は 0 として無視。
+    `--weight-sets` で作った重み 1 組の総バイト数を出すのに使う。
+    """
+    import mlx.core as mx
+
+    if isinstance(x, mx.array):
+        return x.nbytes
+    if isinstance(x, (tuple, list)):
+        return sum(_weight_bytes(v) for v in x)
+    return 0
+
+
+def _cycle_index(n_sets: int):
+    """0, 1, ..., n_sets-1, 0, 1, ... と無限に回すジェネレータ。連鎖の
+    ステップ i が `weights[i % n_sets]` を選ぶのに使う (n_sets=1 なら常に 0
+    = 旧来通り重み 1 組を使い回す温キャッシュ)。"""
+    i = 0
+    while True:
+        yield i % n_sets
+        i += 1
+
+
+def _report_weight_sets(label: str, per_set_bytes: int, n_sets: int) -> dict:
+    """`--weight-sets` の巡回設定を起動時に 1 行 print し、JSON 出力用の
+    dict (`{n_sets, weight_bytes_per_set, weight_total_mb, mode}`) を返す。
+
+    温キャッシュ (`n_sets<=1`) と冷キャッシュ (`n_sets>1`) のどちらかを
+    明記し、冷キャッシュなのに総量が 100 MB に届かない場合は警告する
+    (CATCHUP の判定ゲート「重みを 100 MB 超巡回させた冷の連鎖」に届いて
+    いない、という意味の警告。GDN 系は元々の重みが小さいので、既定の
+    層数を渡しても届かないのが正しい結果になりうる)。
+    """
+    total_mb = per_set_bytes * n_sets / 1e6
+    mode = "warm" if n_sets <= 1 else "cold"
+    mode_ja = (
+        "温 (重み 1 組を使い回す)" if mode == "warm" else f"冷 (重み {n_sets} 組を巡回)"
+    )
+    print(f"  [weight-sets] {label}: 重み総量 {total_mb:.3f} MB / {mode_ja}")
+    if mode == "cold" and total_mb < 100:
+        print(
+            f"    警告: {label} の重み総量が 100 MB 未満 ({total_mb:.3f} MB) -- "
+            "冷キャッシュを再現できていない可能性がある (この項目自体の重みが"
+            "小さいため。--weight-sets を増やしても大きくは変わらない)"
+        )
+    return {
+        "n_sets": n_sets,
+        "weight_bytes_per_set": int(per_set_bytes),
+        "weight_total_mb": round(total_mb, 3),
+        "mode": mode,
+    }
 
 
 def _qmm_linear(x, w):
@@ -299,25 +370,53 @@ def run_op_chain():
     return out
 
 
-def run_hc_kernel():
-    """2) HC 融合カーネル (fused_gated_residual) vs 素の GatedResidual 相当。"""
+def run_hc_kernel(n_sets: int | None = None):
+    """2) HC 融合カーネル (fused_gated_residual) vs 素の GatedResidual 相当。
+
+    `n_sets` 組の重み (norm_weight/down/up/inject、各組別々の乱数) を起動時に
+    まとめて作り、連鎖の呼び出しごとに `weights[i % n_sets]` を巡回する
+    (fused/plain は独立カウンタ)。既定は `WEIGHT_SET_DEFAULTS["hc"]` (97、HC の
+    発火回数)。`n_sets=1` を渡すと旧来通り重み 1 組を使い回す温キャッシュに戻る。
+
+    背景: この関数がまさに温キャッシュだった当人 (重み 1 組・約 7 MB を
+    200 回読み回す、`docs/research/SESSION-2026-09-02-CATCHUP.md` の
+    「2026-09-03 12:00 custom kernel が decode の in-model で負ける理由」節)。
+    重みを 48 組 (157 MB) 巡回させると融合カーネルだけ 81 -> 140.8 us/回
+    (+74%) に悪化し、in-model の負けを説明した。
+    """
     import mlx.core as mx
 
     from mlxturbo.kernels.hyper_connection import fused_gated_residual
 
+    n_sets = n_sets or WEIGHT_SET_DEFAULTS["hc"]
     dtype = mx.bfloat16
-    norm_weight = mx.zeros(HC * HIDDEN, dtype=dtype)
-    down = _quant_linear(HC_LOWRANK, HC * HIDDEN, dtype)
-    up = _quant_linear(HC * HIDDEN, HC_LOWRANK, dtype)
-    inject = _quant_linear(HC, HC * HIDDEN, dtype)
+
+    weight_sets = []
+    for _ in range(n_sets):
+        norm_weight = mx.zeros(HC * HIDDEN, dtype=dtype)
+        down = _quant_linear(HC_LOWRANK, HC * HIDDEN, dtype)
+        up = _quant_linear(HC * HIDDEN, HC_LOWRANK, dtype)
+        inject = _quant_linear(HC, HC * HIDDEN, dtype)
+        mx.eval(norm_weight, down, up, inject)
+        weight_sets.append((norm_weight, down, up, inject))
+
     init_hyper = mx.random.normal((1, HC * HIDDEN)).astype(dtype)
-    mx.eval(norm_weight, down, up, inject, init_hyper)
+    mx.eval(init_hyper)
 
-    def fused_step(hyper):
-        return fused_gated_residual(hyper, norm_weight, RMS_EPS, HC, HIDDEN, down, up, inject)
+    per_set_bytes = sum(_weight_bytes(t) for t in weight_sets[0])
+    weight_meta = _report_weight_sets("hc_kernel", per_set_bytes, n_sets)
 
-    def plain_step(hyper):
-        return plain_gated_residual(hyper, norm_weight, RMS_EPS, HC, HIDDEN, down, up, inject)
+    def _make_step(fn):
+        idx = _cycle_index(n_sets)
+
+        def step(hyper):
+            norm_weight, down, up, inject = weight_sets[next(idx)]
+            return fn(hyper, norm_weight, RMS_EPS, HC, HIDDEN, down, up, inject)
+
+        return step
+
+    fused_step = _make_step(fused_gated_residual)
+    plain_step = _make_step(plain_gated_residual)
 
     fused_samples, plain_samples = _bench_chained_hc_ab(fused_step, plain_step, init_hyper, N_HC // 2)
     fused = _summarize(fused_samples, WARMUP)
@@ -326,6 +425,7 @@ def run_hc_kernel():
         "fused": fused,
         "plain": plain,
         "ratio_fused_over_plain": round(fused["median_us"] / plain["median_us"], 4),
+        "weight_sets": weight_meta,
     }
 
 
@@ -450,7 +550,23 @@ def main():
         help="lm_head の量子化ビット数 (既定 8。v-fast6 レシピを見たいときは 6)。"
              " HC の down/up/inject は対象外 (常に 8bit のまま)。",
     )
+    ap.add_argument(
+        "--weight-sets", type=int, default=None,
+        help=(
+            "hc_kernel の連鎖 (run_hc_kernel) が巡回する重みの組数。既定は "
+            f"WEIGHT_SET_DEFAULTS['hc']={WEIGHT_SET_DEFAULTS['hc']} (HC の発火回数、"
+            "冷キャッシュ)。1 を指定すると旧来の温キャッシュ (重み 1 組を使い回す) "
+            "に戻る。gdn_prework/gdn_recurrent/lm_head は連鎖ではない (毎回 eval "
+            "する固定入力の繰り返し、lm_head は単体の重みが元々 100 MB を超える) "
+            "のでこのフラグの対象外。"
+        ),
+    )
     args = ap.parse_args()
+
+    print(
+        f"--weight-sets={args.weight_sets if args.weight_sets is not None else '(既定、項目ごと)'}"
+        f"  (既定値: {WEIGHT_SET_DEFAULTS})\n"
+    )
 
     result = {
         "meta": {
@@ -464,9 +580,10 @@ def main():
                 "lm_head_bits": args.lm_head_bits,
             },
             "warmup_discarded": WARMUP,
+            "weight_set_defaults": WEIGHT_SET_DEFAULTS,
         },
         "op_chain": run_op_chain(),
-        "hc_kernel": run_hc_kernel(),
+        "hc_kernel": run_hc_kernel(args.weight_sets),
         "gdn_prework": run_gdn_prework(),
         "gdn_recurrent": run_gdn_recurrent(),
         "lm_head": run_lm_head(args.lm_head_bits),

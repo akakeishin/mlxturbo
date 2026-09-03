@@ -32,6 +32,18 @@ fused/plain は CLAUDE.md の作法通り 1 プロセス内で ABBA 交互に測
      単独の us/call として出す): mx.fast.rms_norm 単体、`y + 1.0` の
      elementwise 単体、`mx.fast.metal_kernel` で書いた 2560 要素の加算。
 
+**重みは既定で `--weight-sets` 組 (項目ごとの層数、hc=97/gdn=36) を巡回する
+冷キャッシュ**で読む (各ステップ i が `weights[i % N]` を使う、各組別々の乱数)。
+もともとは重み 1 組 (HC は down/up/inject 約 7 MB) を N=200 回読み回す温キャッシュ
+だったため、並列度の低い自前カーネルが冷の DRAM レイテンシを隠せない負けが
+見えていなかった (HC 融合: 温 +13 us -> 冷 +78 us/回 x 97 層 = +7.6 ms/forward、
+docs/research/SESSION-2026-09-02-CATCHUP.md の「2026-09-03 12:00 custom kernel が
+decode の in-model で負ける理由」節)。**判定ゲートは「重みを 100 MB 超巡回させた
+冷の連鎖で素の op 列より速いこと」**に移した。`--weight-sets 1` で旧来の温キャッシュ
+に戻せる。GDN 系の重み (A_log/dt_bias/conv1d.weight) は元々小さく既定の組数でも
+100 MB に届かないため、起動時にその旨の警告が出る (HC のような量子化重み行列を
+持たないという正しい結果)。
+
 モデルは読まない (重みは乱数の量子化重みで代用)。`--count-forward` だけ例外で、
 実モデル (既定 ~/models/ddalcu-mlxlm) を読んで S=1 decode forward を 1 回走らせ、
 `mx.fast.metal_kernel` が返す呼び出し可能オブジェクトを薄いカウンタで包んで、
@@ -76,8 +88,12 @@ from micro_kernel_latency import (  # noqa: E402
     N_V,
     RMS_EPS,
     VALUE_DIM,
+    WEIGHT_SET_DEFAULTS,
     _combine,
+    _cycle_index,
     _quant_linear,
+    _report_weight_sets,
+    _weight_bytes,
     plain_gated_residual,
     plain_gdn_prework,
 )
@@ -209,25 +225,47 @@ def _bench_floor_items(items: dict, n_chain: int, n_pairs: int, warmup: int) -> 
 # --------------------------------------------------------------- 各項目の構築
 
 
-def build_hc_items():
+def build_hc_items(n_sets: int | None = None):
     """1) HC (hyper-connections)。連鎖は「出力 hyper を次の入力 hyper にする」形
     (micro_kernel_latency._bench_chained_hc_ab と同じ組み方)。mixed と inject の
     両方を _combine が直接消費するので、余計な extra_leaves は要らない。
+
+    `n_sets` 組の重み (norm_weight/down/up/inject、各組別々の乱数) を起動時に
+    まとめて作り、連鎖のステップ i が `weights[i % n_sets]` を巡回する
+    (fused/plain は独立カウンタ)。既定は `WEIGHT_SET_DEFAULTS["hc"]` (97、HC の
+    発火回数、docs/research/SESSION-2026-09-02-CATCHUP.md の「2026-09-03 12:00」
+    節)。`n_sets=1` で旧来通り重み 1 組 (約 7 MB) を 200 回使い回す温キャッシュに
+    戻る -- この温キャッシュこそが、並列度の低い自前カーネルが冷の DRAM
+    レイテンシを隠せない負けを見えなくしていた当人 (HC 融合: 温 +13 us -> 冷
+    +78 us/回)。判定ゲートは「重みを 100 MB 超巡回させた冷の連鎖」。
     """
     import mlx.core as mx
 
     from mlxturbo.kernels.hyper_connection import fused_gated_residual
 
+    n_sets = n_sets or WEIGHT_SET_DEFAULTS["hc"]
     dtype = mx.bfloat16
-    norm_weight = mx.zeros(HC * HIDDEN, dtype=dtype)
-    down = _quant_linear(HC_LOWRANK, HC * HIDDEN, dtype)
-    up = _quant_linear(HC * HIDDEN, HC_LOWRANK, dtype)
-    inject = _quant_linear(HC, HC * HIDDEN, dtype)
+
+    weight_sets = []
+    for _ in range(n_sets):
+        norm_weight = mx.zeros(HC * HIDDEN, dtype=dtype)
+        down = _quant_linear(HC_LOWRANK, HC * HIDDEN, dtype)
+        up = _quant_linear(HC * HIDDEN, HC_LOWRANK, dtype)
+        inject = _quant_linear(HC, HC * HIDDEN, dtype)
+        mx.eval(norm_weight, down, up, inject)
+        weight_sets.append((norm_weight, down, up, inject))
+
     init_hyper = mx.random.normal((1, HC * HIDDEN)).astype(dtype)
-    mx.eval(norm_weight, down, up, inject, init_hyper)
+    mx.eval(init_hyper)
+
+    per_set_bytes = sum(_weight_bytes(t) for t in weight_sets[0])
+    meta = _report_weight_sets("hc_gated_residual", per_set_bytes, n_sets)
 
     def _make_step(fn):
+        idx = _cycle_index(n_sets)
+
         def step(hyper):
+            norm_weight, down, up, inject = weight_sets[next(idx)]
             mixed, inj = fn(hyper, norm_weight, RMS_EPS, HC, HIDDEN, down, up, inject)
             return _combine(hyper, mixed, inj), []
 
@@ -235,47 +273,73 @@ def build_hc_items():
 
     fused_step = _make_step(fused_gated_residual)
     plain_step = _make_step(plain_gated_residual)
-    return fused_step, plain_step, (lambda: init_hyper)
+    return fused_step, plain_step, (lambda: init_hyper), meta
 
 
-def build_gdn_recurrent_items():
+def build_gdn_recurrent_items(n_sets: int | None = None):
     """2) GDN recurrent step (S=1)。連鎖は状態 (state, fp32) だけを次段へ渡す。
     q/k/v/a/b は固定 (HC の重みや floor 項目の weight と同じ「据え置き入力」
     扱い)。どちらの実装も 1 回の Metal 起動で y と state を一緒に出すので、
     y を使わなくても kernel の起動そのものは省略されない (extra_leaves 不要)。
+
+    `n_sets` 組の A_log/dt_bias (実体は per-layer 学習パラメータ、「重み」に
+    相当) を巡回する (fused/plain は独立カウンタ)。q/k/v/a/b は本物の decode
+    でも毎トークン計算し直す活性化であって重みではないので、従来通り固定入力
+    のまま (巡回しない)。既定は `WEIGHT_SET_DEFAULTS["gdn"]` (36、GDN 層数)。
+    A_log/dt_bias は 1 組あたり数百バイトしかないので、既定の組数を渡しても
+    100 MB には遠く届かず起動時に警告が出る -- それ自体が「GDN recurrent には
+    HC のような大きい重み (量子化行列) を読む冷キャッシュ問題が無い」という
+    正しい結果 (CATCHUP の敗因整理でも GDN recurrent は custom kernel 同士の
+    比較で、HC のような custom-vs-plain の負けの対象に含まれていない)。
     """
     import mlx.core as mx
 
     from mlx_lm.models.gated_delta import gated_delta_update
     from mlxturbo.kernels.gated_delta_states import gated_delta_update_with_states
 
+    n_sets = n_sets or WEIGHT_SET_DEFAULTS["gdn"]
     dtype = mx.bfloat16
     q = mx.random.normal((1, 1, N_K, DK)).astype(dtype)
     k = mx.random.normal((1, 1, N_K, DK)).astype(dtype)
     v = mx.random.normal((1, 1, N_V, DV)).astype(dtype)
     a = mx.random.normal((1, 1, N_V)).astype(dtype)
     b = mx.random.normal((1, 1, N_V)).astype(dtype)
-    A_log = mx.zeros(N_V, dtype=mx.float32)
-    dt_bias = mx.ones(N_V, dtype=mx.float32)
+    mx.eval(q, k, v, a, b)
+
+    weight_sets = []
+    for _ in range(n_sets):
+        A_log = mx.random.normal((N_V,)).astype(mx.float32)
+        dt_bias = mx.random.normal((N_V,)).astype(mx.float32)
+        mx.eval(A_log, dt_bias)
+        weight_sets.append((A_log, dt_bias))
+
     init_state = mx.random.normal((1, N_V, DV, DK)).astype(mx.float32)
-    mx.eval(q, k, v, a, b, A_log, dt_bias, init_state)
+    mx.eval(init_state)
+
+    per_set_bytes = sum(_weight_bytes(t) for t in weight_sets[0])
+    meta = _report_weight_sets("gdn_recurrent", per_set_bytes, n_sets)
+
+    idx_fused = _cycle_index(n_sets)
+    idx_plain = _cycle_index(n_sets)
 
     def fused_step(state):
+        A_log, dt_bias = weight_sets[next(idx_fused)]
         _out, states_all = gated_delta_update_with_states(
             q, k, v, a, b, A_log, dt_bias, state, None
         )
         return states_all[:, -1], []
 
     def plain_step(state):
+        A_log, dt_bias = weight_sets[next(idx_plain)]
         _out, state_out = gated_delta_update(
             q, k, v, a, b, A_log, dt_bias, state, None, use_kernel=True
         )
         return state_out, []
 
-    return fused_step, plain_step, (lambda: init_state)
+    return fused_step, plain_step, (lambda: init_state), meta
 
 
-def build_gdn_prework_items():
+def build_gdn_prework_items(n_sets: int | None = None):
     """3) GDN 前処理。連鎖は (mixed_qkv, conv_state) の 2 つを次段へ渡す。
 
     plain_gdn_prework は「conv1d -> silu -> rms_norm」の枝と「concat + slice
@@ -289,25 +353,41 @@ def build_gdn_prework_items():
     g/beta はどちらの chain 変数にも乗らないので extra_leaves で明示的に
     毎回 eval 対象へ入れる (fused は 1 dispatch なのでどのみち計算されるが、
     plain は g/beta が完全に独立した op 列なので、入れないと一度も実行されない)。
+
+    `n_sets` 組の conv1d.weight (CONV_DIM x CONV_KERNEL、per-layer 学習
+    パラメータ) と A_log/dt_bias を巡回する (fused/plain は独立カウンタ)。
+    mixed_qkv/conv_state は chain の carry (前段の出力)、a/b は毎トークンの
+    活性化なのでどちらも巡回しない。既定は `WEIGHT_SET_DEFAULTS["gdn"]`
+    (36、GDN 層数)。conv1d 重みは 1 組 ~80 KB しかないので、既定の組数を
+    渡しても 100 MB には遠く届かず起動時に警告が出る -- build_gdn_recurrent_items
+    と同じ理由 (HC のような大きい量子化重みが無い) で正しい結果。
     """
     import mlx.core as mx
     import mlx.nn as nn
 
     from mlxturbo.kernels.gdn_prework import fused_gdn_prework
 
+    n_sets = n_sets or WEIGHT_SET_DEFAULTS["gdn"]
     dtype = mx.bfloat16
     a = mx.random.normal((1, 1, N_V)).astype(dtype)
     b = mx.random.normal((1, 1, N_V)).astype(dtype)
-    A_log = mx.zeros(N_V, dtype=mx.float32)
-    dt_bias = mx.ones(N_V, dtype=mx.float32)
+    mx.eval(a, b)
 
-    conv1d = nn.Conv1d(CONV_DIM, CONV_DIM, kernel_size=CONV_KERNEL, groups=CONV_DIM, bias=False)
-    conv1d.weight = mx.random.normal((CONV_DIM, CONV_KERNEL, 1)).astype(dtype)
-    conv_w = conv1d.weight
+    weight_sets = []
+    for _ in range(n_sets):
+        conv1d = nn.Conv1d(CONV_DIM, CONV_DIM, kernel_size=CONV_KERNEL, groups=CONV_DIM, bias=False)
+        conv1d.weight = mx.random.normal((CONV_DIM, CONV_KERNEL, 1)).astype(dtype)
+        A_log = mx.random.normal((N_V,)).astype(mx.float32)
+        dt_bias = mx.random.normal((N_V,)).astype(mx.float32)
+        mx.eval(conv1d.weight, A_log, dt_bias)
+        weight_sets.append((conv1d, conv1d.weight, A_log, dt_bias))
 
     init_mixed_qkv = mx.random.normal((1, 1, CONV_DIM)).astype(dtype)
     init_conv_state = mx.random.normal((1, CONV_KERNEL - 1, CONV_DIM)).astype(dtype)
-    mx.eval(a, b, A_log, dt_bias, conv1d.weight, init_mixed_qkv, init_conv_state)
+    mx.eval(init_mixed_qkv, init_conv_state)
+
+    per_set_bytes = sum(_weight_bytes(t) for t in weight_sets[0][1:])  # conv1d モジュール自体は数えない
+    meta = _report_weight_sets("gdn_prework", per_set_bytes, n_sets)
 
     def _repack_qkv(q, k, v):
         return mx.concatenate(
@@ -315,8 +395,12 @@ def build_gdn_prework_items():
             axis=-1,
         )
 
+    idx_fused = _cycle_index(n_sets)
+    idx_plain = _cycle_index(n_sets)
+
     def fused_step(carry):
         mixed_qkv, conv_state = carry
+        _conv1d, conv_w, A_log, dt_bias = weight_sets[next(idx_fused)]
         q, k, v, g, beta, conv_state_out = fused_gdn_prework(
             mixed_qkv, conv_state, conv_w, a, b, A_log, dt_bias,
             N_K, N_V, DK, DV, KEY_DIM, VALUE_DIM, RMS_EPS,
@@ -325,6 +409,7 @@ def build_gdn_prework_items():
 
     def plain_step(carry):
         mixed_qkv, conv_state = carry
+        conv1d, _conv_w, A_log, dt_bias = weight_sets[next(idx_plain)]
         q, k, v, g, beta, conv_state_out = plain_gdn_prework(
             mixed_qkv, conv_state, conv1d, a, b, A_log, dt_bias,
             N_K, N_V, DK, DV, KEY_DIM, VALUE_DIM,
@@ -332,7 +417,7 @@ def build_gdn_prework_items():
         return (_repack_qkv(q, k, v), conv_state_out), [g, beta]
 
     init = lambda: (init_mixed_qkv, init_conv_state)  # noqa: E731
-    return fused_step, plain_step, init
+    return fused_step, plain_step, init, meta
 
 
 def _plain_rms_norm_gated(x, weight, gate, eps):
@@ -346,27 +431,49 @@ def _plain_rms_norm_gated(x, weight, gate, eps):
     return (g * out.astype(mx.float32)).astype(x.dtype)
 
 
-def build_rms_norm_gated_items():
+def build_rms_norm_gated_items(n_sets: int | None = None):
     """4) RMSNormGated。GDN の実寸 (48 head x 128) で、rms_norm_gated.py の
     docstring 通り x=(B,S,n_v,dv)。連鎖は出力を次の x にする (gate は固定の
-    据え置き入力)。"""
+    据え置き入力)。
+
+    `n_sets` 組の weight ((DV,)、per-layer 学習パラメータ) を巡回する
+    (fused/plain は独立カウンタ)。gate は毎トークンの活性化なので巡回しない。
+    既定は `WEIGHT_SET_DEFAULTS["gdn"]` (36、GDN 層数)。weight は 1 組 256 B
+    しかないので、既定の組数を渡しても 100 MB には遠く届かず起動時に警告が
+    出る -- build_gdn_recurrent_items と同じ理由で正しい結果。
+    """
     import mlx.core as mx
 
     from mlxturbo.kernels.rms_norm_gated import rms_norm_gated
 
+    n_sets = n_sets or WEIGHT_SET_DEFAULTS["gdn"]
     dtype = mx.bfloat16
-    weight = mx.random.normal((DV,)).astype(dtype)
+
+    weight_sets = []
+    for _ in range(n_sets):
+        w = mx.random.normal((DV,)).astype(dtype)
+        mx.eval(w)
+        weight_sets.append(w)
+
     gate = mx.random.normal((1, 1, N_V, DV)).astype(dtype)
     init_x = mx.random.normal((1, 1, N_V, DV)).astype(dtype)
-    mx.eval(weight, gate, init_x)
+    mx.eval(gate, init_x)
+
+    per_set_bytes = _weight_bytes(weight_sets[0])
+    meta = _report_weight_sets("rms_norm_gated", per_set_bytes, n_sets)
+
+    idx_fused = _cycle_index(n_sets)
+    idx_plain = _cycle_index(n_sets)
 
     def fused_step(x):
+        weight = weight_sets[next(idx_fused)]
         return rms_norm_gated(x, weight, gate, RMS_EPS, "sigmoid"), []
 
     def plain_step(x):
+        weight = weight_sets[next(idx_plain)]
         return _plain_rms_norm_gated(x, weight, gate, RMS_EPS), []
 
-    return fused_step, plain_step, (lambda: init_x)
+    return fused_step, plain_step, (lambda: init_x), meta
 
 
 def build_rms_norm_floor_item():
@@ -552,6 +659,18 @@ def main():
     ap.add_argument("--ngram", default=None, help="--count-forward 用 (既定 未使用)")
     ap.add_argument("--mtp", default=None, help="--count-forward 用 (既定はモデルディレクトリ内の mtp.safetensors)")
     ap.add_argument("--mtp-bits", type=int, default=4, help="--count-forward 用")
+    ap.add_argument(
+        "--weight-sets", type=int, default=None,
+        help=(
+            "kernels (hc_gated_residual/gdn_recurrent/gdn_prework/rms_norm_gated) の"
+            "連鎖が巡回する重みの組数。既定は項目ごとの層数 "
+            f"(hc={WEIGHT_SET_DEFAULTS['hc']} / gdn={WEIGHT_SET_DEFAULTS['gdn']}、"
+            "冷キャッシュ)。1 を指定すると旧来の温キャッシュ (重み 1 組を使い回す) "
+            "に戻る。floor 項目 (rms_norm_alone/elementwise_add/"
+            "metal_kernel_add_2560) は対象外 (重み自体を持たない/無視できるほど"
+            "小さい起動費の床の参照値なので巡回しても意味がない)。"
+        ),
+    )
     args = ap.parse_args()
 
     n_chain, n_pairs, warmup = args.n_chain, args.n_pairs, args.warmup
@@ -559,6 +678,8 @@ def main():
     print(
         f"N_CHAIN={n_chain}  N_PAIRS={n_pairs} (ABBA x n_pairs = 側ごと {2 * n_pairs} 試行)"
         f"  WARMUP={warmup}\n"
+        f"--weight-sets={args.weight_sets if args.weight_sets is not None else '(既定、項目ごと)'}"
+        f"  (既定値: {WEIGHT_SET_DEFAULTS})\n"
     )
 
     result: dict = {
@@ -568,11 +689,14 @@ def main():
                 "eval 時間 / N を 1 回あたりの費用とする。tools/micro_kernel_latency.py "
                 "は毎回 eval するため同期 (~200us) が混ざって 1 回の費用が読めない、その補い。"
                 "絶対値は熱・キャッシュ状態に依存する目安 (CLAUDE.md の計測の作法参照)。"
-                "採否は必ず in-model A/B で決めること。"
+                "採否は必ず in-model A/B で決めること。既定は --weight-sets で重みを"
+                "層数ぶん巡回させる冷キャッシュ (判定ゲート: 重み 100 MB 超巡回の冷の"
+                "連鎖で素の op 列より速いこと)。--weight-sets 1 で旧来の温キャッシュに戻る。"
             ),
             "n_chain": n_chain,
             "n_pairs": n_pairs,
             "warmup": warmup,
+            "weight_set_defaults": WEIGHT_SET_DEFAULTS,
             "dims": {
                 "hidden": HIDDEN, "hc": HC, "hc_lowrank": HC_LOWRANK,
                 "n_k": N_K, "n_v": N_V, "dk": DK, "dv": DV,
@@ -583,13 +707,16 @@ def main():
         "kernels": {},
         "floor": {},
     }
+    weight_meta: dict = {}
 
-    fused_step, plain_step, init = build_hc_items()
+    fused_step, plain_step, init, wm = build_hc_items(args.weight_sets)
+    weight_meta["hc_gated_residual"] = wm
     hc = _bench_pair("fused", fused_step, init, "plain", plain_step, init, n_chain, n_pairs, warmup)
     result["kernels"]["hc_gated_residual"] = hc
     _print_pair_row("hc_gated_residual (fused_gated_residual, pre+post 2 kernel)", hc)
 
-    fused_step, plain_step, init = build_gdn_recurrent_items()
+    fused_step, plain_step, init, wm = build_gdn_recurrent_items(args.weight_sets)
+    weight_meta["gdn_recurrent"] = wm
     gdn_rec = _bench_pair(
         "gated_delta_update_with_states", fused_step, init,
         "mlx_lm_gated_delta_update", plain_step, init, n_chain, n_pairs, warmup,
@@ -600,16 +727,23 @@ def main():
         "gated_delta_update_with_states", "mlx_lm_gated_delta_update",
     )
 
-    fused_step, plain_step, init = build_gdn_prework_items()
+    fused_step, plain_step, init, wm = build_gdn_prework_items(args.weight_sets)
+    weight_meta["gdn_prework"] = wm
     gdn_pre = _bench_pair("fused", fused_step, init, "plain", plain_step, init, n_chain, n_pairs, warmup)
     result["kernels"]["gdn_prework"] = gdn_pre
     _print_pair_row("gdn_prework (fused_gdn_prework)", gdn_pre)
 
-    fused_step, plain_step, init = build_rms_norm_gated_items()
+    fused_step, plain_step, init, wm = build_rms_norm_gated_items(args.weight_sets)
+    weight_meta["rms_norm_gated"] = wm
     rmsg = _bench_pair("fused", fused_step, init, "plain", plain_step, init, n_chain, n_pairs, warmup)
     result["kernels"]["rms_norm_gated"] = rmsg
     _print_pair_row("rms_norm_gated", rmsg)
 
+    result["meta"]["weight_sets"] = weight_meta
+
+    # 床の 3 項目は --weight-sets の対象外 (rms_norm_alone の weight は HIDDEN 分
+    # ~5KB、他 2 つは重みを持たない。起動費そのものの床であって weight-sets が
+    # 検証したい「量子化重み行列の DRAM 読み出し」とは無関係)。
     rms_step, rms_init = build_rms_norm_floor_item()
     add_step, add_init = build_elementwise_floor_item()
     mk_step, mk_init = build_metal_kernel_floor_item()
