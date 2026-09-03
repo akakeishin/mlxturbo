@@ -286,3 +286,6 @@ Flash-Next のフルベンチは後回し (ユーザーの指示があるまで�
 - **Mirai / uzu (07:55、`docs/research/EXTERNAL-MIRAI-UZU-2026-09.md`)**: Qwen3.6 27B を M5 Max で 105 tok/s (specdec、<50 MB の学習した draft、蒸留した独自 4bit)。同じ機体なら MTPLX 55 / MLX 26。物理の差ではなく機体 + draft の学習 + 独自量子化。27B の比較には MTPLX (`tools/compare/mtplx-venv/`) も入れる。uzu は別重みなので参考点。
 - **方針 (ユーザー 08:30)**: フルベンチは回さない。**汎用的に動かせる移植 (動的に部品を当てる) と高速化を先に。**27B の 5 者比較の本番パスは script だけ用意して後回し (煙試験の数字は COMPARE-QUEUE)。
   走行中: GDN 部品の qwen3_5 移植、sdpa 行タイル + MLP qmm_wide の移植、qwen3_5 用の 1 プロセス A/B 道具 (`tools/decode_ab_generic.py`)。次の段は decode 経路 (SpecEngine + staged) の段階投入と糊の融合を 27B に。
+- **27B 移植の現在地 (08:58、commit 3788945)**: GDN 部品 (48 層)、sdpa 行タイル (16 層)、qmm_wide (368 射影、MLP 込み) が契約で当たる。KLD は既定 0.00027 (参照 = 素の 4bit、全部 GDN Metal)。
+  速度 A/B は走行中 (GDN Metal 4k/17k、GDN decode 融合 短 ×2、行タイル 4k/17k、qmm_wide 17k)。qmm_wide は 4k で取り分なし (+0.4%)。
+  **最大の的は decode 経路**: 27B の round は 82〜112 ms (重み読みの下限 35 ms) で、mlx-serve は同じ MTP 頭で 4k 43 tok/s 対 27。round の内訳を測定中 → 設計 (spec_flash の仕組みを族 adapter で汎用化するか) を advisor と決める。
