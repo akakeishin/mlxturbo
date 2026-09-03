@@ -2206,3 +2206,12 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - 数値: mlx_lm 逐次基準の相対誤差 RMS は kernel S 0.7〜1.8e-5、reg 0.4〜2.3e-5 (同級)。lanes=8 は kernel S とビット一致 (差はメモリの持ち方だけ)。
 - 契約: `_vendor/qwen4_exp.py:1580` の `_gdn_metal` シーム → `gated_delta_update_blocked_metal` の中で切替 (8 行)。rollback 側 (`capture()` は `gated_delta_update_with_states`) は無関係。
 - 判定線 0.70 には未達 (0.875 = prefill -0.7% 相当) だが、**代金ゼロ方針で in-model 4k / 8k / 17k を回して、遅くならなければ既定 reg** (エージェントに戻した)。
+
+### 2026-09-03 18:15 K2c の再測 (burn-in 付き、両側 query、17k、`qsa-decode-kernel-17k-v2.json`): **ms/round -4.1%、ms/tok -4.5%、head 一致 → 既定 on**
+
+- -0.7% は 2 つの汚れが A 側に乗っていた: (1) burn-in 無しの位置 1 の段差 (+2.5 ms/round)、(2) **depth 適応の EMA が variant をまたいで持ち越される** (case 0 の A が 270 round 全部 depth 2、B は 71 → 10 に減衰)。
+  clean な 10 行で -1.48 ms/round = 冷連鎖の見込み (12 × 142 us) と一致。
+- host 側の固定費を削った: `arch_char()` が `mirror_blocks` ごとに `mx.device_info()` (nanobind が dict を作り直す) → モジュールで 1 回。params / blocks / visible_counts の小さい `mx.array` 24 個/forward → 1 エントリの memo。同期 (`mx.eval` / `.item()`) は無し。
+- 発火は 12/round (本体の attention 12 層)。**MTP の draft 層 (`FlashMTPModule` の DecoderLayer) には当たっていない**: `enable_default_fusions` (runner 1885) が MTP 読み込み (1954) より前。gather_attn / prefill_attn も同じ穴。冷連鎖で ~0.12 ms/round。
+- 次の手 (品質と速度の取引、KLD が要る): blocks を 64 に釘付け (冷連鎖 123 → 92 us/層、-0.37 ms/forward、partials 1/4)。再結合順が変わるので teacher の後。
+- **罠 16**: 1 プロセスの A/B で depth 適応の EMA が variant をまたぐ。decode_ab は variant / row の切り替えで DepthController を作り直すこと (未対応、decode_ab の宿題)。

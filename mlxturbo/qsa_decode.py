@@ -16,9 +16,10 @@ argpartition (GPU では全ソート) とマスク組みで 25〜40 本、sdpa �
 「全キーの mask バイトを 1 個ずつ待つ」直列ループが候補判定だけになる。
 冷たい 12 層連鎖では 17k S=2 で 281→139 us/層、50k S=6 で 1278→481 us/層。
 
-**``MLXTURBO_QSA_TAIL=query`` が要る。**K2b が写した参照は HF と同じ
-per-query tail 1 本だけで、global tail (現在の既定) は実装していない
-(`mlxturbo/qsa_tail.py`)。global のまま有効化しても
+**``MLXTURBO_QSA_TAIL=query`` が要る** (2026-09-03 の commit 11790ee で
+**これが既定になった**ので、通常は何もしなくてよい)。K2b が写した参照は HF と
+同じ per-query tail 1 本だけで、旧既定の global tail は実装していない
+(`mlxturbo/qsa_tail.py`)。global に戻して有効化しても
 `Attention._decode_qsa_forward` が発火せず、`qsa_attn_decode` が理由を
 1 行表示して素の経路に落ちる。
 
@@ -26,8 +27,10 @@ per-query tail 1 本だけで、global tail (現在の既定) は実装してい
     qsa_decode.enable_qsa_decode_kernel(model)    # A 側
     qsa_decode.disable_qsa_decode_kernel(model)   # B 側 (既定)
 
-既定 off。in-model A/B は `tools/decode_ab.py --knob qsa-decode-kernel`
-(両側を `MLXTURBO_QSA_TAIL=query` にして走らせる)。発火は
+既定 off。in-model A/B は `tools/decode_ab.py --knob qsa-decode-kernel`。
+17k の実測 (2026-09-03、`bench/results/qsa-decode-kernel-17k-v2.json`、
+depth 混合がそろった 10 行): ms/round -4.1%、ms/tok -4.5%、出力はビット一致。
+発火は
 `mlxturbo.kernels._fire.snapshot()` の ``qsa_decode_kernel``
 (選択側は ``qsa_select``、attention 側は ``qsa_attn_decode``)。
 """
@@ -75,13 +78,13 @@ def disable_qsa_decode_kernel(model, mtp=None) -> int:
 def enable_qsa_decode_kernel_default(model, mtp=None, log_prefix: str = "") -> int:
     """`mlxturbo/runner.py` の `enable_default_fusions` から無条件に呼ばれる
     自己ゲート版 (`enable_indexer_lean_default` と同じ作法)。環境変数
-    ``MLXTURBO_QSA_DECODE_KERNEL=1`` が立っているときだけ有効化する。
+    **既定 on** (2026-09-03 18:15、17k ms/round -4.1%、ビット一致)。``MLXTURBO_QSA_DECODE_KERNEL=0`` で off。
 
     ``MLXTURBO_QSA_TAIL`` が ``query`` でないときも属性は立てるが、その場合は
     `Attention._decode_qsa_forward` が毎回退く (理由は 1 度だけ表示される)。
     ここで警告しておくのは「有効にしたのに発火 0」を取り違えないため。
     """
-    if os.environ.get("MLXTURBO_QSA_DECODE_KERNEL") != "1":
+    if os.environ.get("MLXTURBO_QSA_DECODE_KERNEL", "1") == "0":
         return 0
     n = enable_qsa_decode_kernel(model, mtp)
     if log_prefix:

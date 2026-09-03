@@ -373,18 +373,33 @@ def visible_counts(q_col: mx.array, compress_ratio: int, n_blocks: int) -> mx.ar
     return mx.minimum(n, n_blocks).astype(mx.int32)
 
 
+# 1 個メモ。decode の 1 フォワードでは 12 層すべてが同じ
+# (offset, S, cr, n_blocks) を渡すので、`mx.array` の構築が 12 回から 1 回に
+# なる。**鍵が値を完全に決める**ので、当たれば必ず同じ中身になる
+# (スレッドが混ざっても外れるだけで、間違った配列は返らない)。
+_NVIS_MEMO: tuple[tuple, mx.array] | None = None
+
+
 def visible_counts_host(
     offset: int, s_len: int, compress_ratio: int, n_blocks: int
 ) -> mx.array:
     """`visible_counts` と同じものを、GPU の op を使わずに作る。
 
     ``q_col = mx.arange(offset, offset + S)`` の値は Python 側で分かるので、
-    ホストで数えて配列にするだけで済む (`_pooled_and_top` の配線はこちら)。
+    ホストで数えて配列にするだけで済む (`QSAIndexer.select_bits` の配線は
+    こちら)。
     """
-    return mx.array(
+    global _NVIS_MEMO
+    key = (offset, s_len, compress_ratio, n_blocks)
+    memo = _NVIS_MEMO
+    if memo is not None and memo[0] == key:
+        return memo[1]
+    arr = mx.array(
         [min(n_blocks, (offset + s + 1) // compress_ratio) for s in range(s_len)],
         dtype=mx.int32,
     )
+    _NVIS_MEMO = (key, arr)
+    return arr
 
 
 def eligible(raw: mx.array, n_vis: mx.array, k: int) -> bool:

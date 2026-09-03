@@ -1682,14 +1682,15 @@ def _moe_combine_fold(switch_mlp: SwitchGLU, x: mx.array, idx: mx.array,
         order = mx.argsort(idx_flat)
         idx_s = idx_flat[order]
         row_src = order // top_k
-        w_ord = w.flatten()[order]
+        w_flat = w.flatten()
+        w_ord = w_flat[order]
         # mlxturbo: P7 第 2 段。フックが立っていて発火すれば、gate/up ->
         # SwiGLU -> down の 3 本を自前カーネルで通し、ルータ重み掛け・
-        # 並べ替え戻し・その添字作り (と gather) が GEMM に畳まれる
+        # 並べ替え戻し・top_k の和 (と gather) がカーネルに畳まれる
         ep = _MOE_DOWN_EPILOGUE
         if ep is not None:
             folded = ep(switch_mlp, xx.flatten(0, -3), row_src, idx_s,
-                        order, w_ord)
+                        order, w_flat)
             if folded is not None:
                 # (rows, hidden) -> (B, S, hidden)
                 return mx.unflatten(folded, 0, idx.shape[:-1])

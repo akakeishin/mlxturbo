@@ -102,6 +102,19 @@ _KERNELS: dict[tuple, Any] = {}
 _SCALES: dict[float, mx.array] = {}
 _warned: set = set()
 
+# GPU アーキテクチャ名は 1 プロセスで変わらないのに、`mx.device_info()` は
+# 呼ぶたびに C++ の map を Python の dict へ作り直す。`mirror_blocks` は
+# 層ごと (S>=3 なら分割ごと) に呼ばれるので、decode の 1 フォワードで
+# 12〜24 回ぶん積み上がる。1 度だけ引いて覚える。
+_ARCH_CHAR: str | None = None
+
+# 小さい入力配列 (params / blocks) の 1 個メモ。1 フォワードの 12 層は
+# offset も kv_len も同じなので、鍵が一致する限り 12 回の `mx.array` 構築が
+# 1 回になる。**鍵が値を完全に決める**ので、当たれば必ず同じ中身
+# (スレッドが混ざっても外れるだけで、間違った配列は返らない)。
+_P1_MEMO: tuple[tuple, mx.array] | None = None
+_P2_MEMO: dict[int, mx.array] = {}
+
 
 def _warn_once(key: str, msg: str) -> None:
     if key in _warned:
@@ -114,13 +127,24 @@ def _warn_once(key: str, msg: str) -> None:
 # ``blocks`` の表 (本家 `scaled_dot_product_attention.cpp:487-522` の写し)
 # --------------------------------------------------------------------------
 def arch_char() -> str:
-    """GPU アーキテクチャ名の末尾 1 文字 (本家の ``devc``)。"""
-    try:
-        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
-    except Exception:
-        return ""
-    arch = str(info.get("architecture", ""))
-    return arch[-1] if arch else ""
+    """GPU アーキテクチャ名の末尾 1 文字 (本家の ``devc``)。
+
+    1 プロセスで変わらないので覚える (`_ARCH_CHAR`)。`mirror_blocks` が
+    decode の 1 フォワードで 12〜24 回呼ばれる口なので、`mx.device_info()`
+    の dict 変換をそのつど払うと無視できない。
+    """
+    global _ARCH_CHAR
+    if _ARCH_CHAR is None:
+        try:
+            info = (
+                mx.device_info() if hasattr(mx, "device_info")
+                else mx.metal.device_info()
+            )
+            arch = str(info.get("architecture", ""))
+        except Exception:
+            arch = ""
+        _ARCH_CHAR = arch[-1] if arch else ""
+    return _ARCH_CHAR
 
 
 def sdpa_blocks(n_kv: int, n_simds: int, devc: str | None = None) -> int:
@@ -454,6 +478,26 @@ def _get_kernels(d: int, gqa: int, cr: int, blocks: int, bc: int):
     return p1, p2
 
 
+def _params1(*vals: int) -> mx.array:
+    """pass 1 の params。1 フォワードぶん (12 層) を 1 個メモで畳む。"""
+    global _P1_MEMO
+    memo = _P1_MEMO
+    if memo is not None and memo[0] == vals:
+        return memo[1]
+    arr = mx.array(list(vals), dtype=mx.int32)
+    _P1_MEMO = (vals, arr)
+    return arr
+
+
+def _params2(blocks: int) -> mx.array:
+    """pass 2 の params (``blocks`` だけ)。取る値は数種類しかない。"""
+    arr = _P2_MEMO.get(blocks)
+    if arr is None:
+        arr = mx.array([blocks], dtype=mx.int32)
+        _P2_MEMO[blocks] = arr
+    return arr
+
+
 def _scale_arr(scale: float) -> mx.array:
     arr = _SCALES.get(scale)
     if arr is None:
@@ -576,9 +620,7 @@ def qsa_attn_decode(
     nw = bits.shape[-1]
 
     p1, p2 = _get_kernels(d, gqa, cr, blocks, stage_cols(d, q_bshd.dtype.size))
-    params1 = mx.array(
-        [n_kv, kv_len, cap, n_blocks, nw, offset, S], dtype=mx.int32
-    )
+    params1 = _params1(n_kv, kv_len, cap, n_blocks, nw, offset, S)
     partials, sums, maxs = p1(
         inputs=[
             q_bshd,
@@ -595,7 +637,7 @@ def qsa_attn_decode(
         output_dtypes=[q_bshd.dtype, mx.float32, mx.float32],
     )
     (out,) = p2(
-        inputs=[partials, sums, maxs, mx.array([blocks], dtype=mx.int32)],
+        inputs=[partials, sums, maxs, _params2(blocks)],
         template=[("T", q_bshd.dtype)],
         grid=(1024 * B * hq, S, 1),
         threadgroup=(1024, 1, 1),

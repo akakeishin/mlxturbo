@@ -1552,7 +1552,8 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         # (選択 = qsa_select、attention = qsa_attn_decode) に置き換える。
         # **既定 off。**出力はビット一致する写しだが、参照が HF と同じ
         # per-query tail 1 本だけなので `MLXTURBO_QSA_TAIL=query` が要る
-        # (現在の既定は global)。enable_qsa_decode_kernel_default 自身が
+        # (2026-09-03 の commit 11790ee でこれが既定になった)。
+        # enable_qsa_decode_kernel_default 自身が
         # MLXTURBO_QSA_DECODE_KERNEL=1 をゲートに持っているので、ここでは
         # 呼ぶだけで安全。採否は tools/decode_ab.py --knob qsa-decode-kernel。
         from . import qsa_decode
