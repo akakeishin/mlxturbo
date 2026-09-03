@@ -2311,3 +2311,13 @@ prefill_s: 2048 幅 12.784 / 1024 幅 12.763 / 512 幅 13.238。非 MoE のメ�
   `Broadcast strided` 96 本 = ルータ重みの実体化 48 + shared gate の sigmoid 48。消しても速くならなかった。
 - 訂正: moe-combine-glue の行は knob 関数名の衝突 (`_knob_moe_combine` が既存と同名) で既存の fold knob を呼んでいた。「compile 版でビット一致が崩れた」は fold の既知の負け方の再現で、compile 版は未計測。残る 3 つの判定は有効。
 - 4 knob のコードは取り除く (方針: 効かない変種を二重に持たない)。`decode_copy_probe.py` は残す。
+
+### 2026-09-03 20:00 読み直し: decode の壁は「dispatch あたりの床 ≈ 5 us × 4499 本」
+
+- depth 0 の round 22〜25 ms ÷ 4499 dispatch = **4.9〜5.6 us/dispatch**。Lily は 5.4 ms ÷ 795 = 6.8 us/dispatch。**1 本あたりの費用は同じで、本数が 5.7 倍違う。**
+- 行列積そのものは遅くない: 1 トークンの dense 射影 ≈ 1.3 GB (GDN 36 層の in_proj / out_proj が 1 GB、attention 12 層 0.28 GB) + MoE 0.25 GB + lm_head 0.3 GB (4bit) ≈ 1.9 GB を 10 ms = 190〜220 GB/s。
+  qmv の大物は 300 GB/s 級 (ピークの 7 割)。ここを削る手は重みのビット数だけで、それは品質の取引 (lm_head は 4bit にした)。
+- 19:35 の「糊は壁ではない」は言い過ぎ。あの 4 knob は本数を **4〜5%** しか減らしておらず、置き換えたカーネルの副作用 (compile 版が素より遅い、sort 無しの gather が遅い) の中に埋もれた。
+  **必要なのは 2〜3 倍の削減** (94 本/層 → 30 本/層)。それには層の塊ごとの大きい融合 (MoE のルーティング〜combine、GDN の前処理〜再帰〜norm、HC の pre/post) を、MLX の qmv と同じ並列度で書くこと。Lily はそれをやった。
+- 手の順: (1) MoE decode の融合 (PoL 走行中: ルーティング + gather + gate/up + SwiGLU + down + combine を 3 本程度に、行間で専門家を共有)、(2) GDN の層まるごと (prework は前に負けたが、並列度を直して再挑戦)、(3) HC の pre/post (elem 変種は decode 幅ならビット一致)。
+  それぞれ「本数を 1/3 に」を目安に、in-model の ms/round で判定。
