@@ -79,6 +79,16 @@ MoE router 融合、union gather (真の union が 6 割)、wide 連結。理由
 decode 51.7 / 47.5 / 47.5 / 44.8 / 47.0 tok/s (相手比 -7 / -3 / -22 / -5 / +2%)、温 TTFT 0.14〜0.80 s (相手の 4〜20 倍速)。
 走行中: decode の糊 4 つ (sort 無しルーティング、copy、elementwise の compile、wide 再測)、K2c の S 依存確認 (品質側)、プロンプト池の凍結、サーバー経路と decode_ab の 17k prefill の差 (+15%) の切り分け。
 
+## 数日の集中 (ユーザー 2026-09-03 20:05): decode の tok/s
+
+短文脈の tok/s に数日集中する。壁は dispatch の床 (5 us × 4499 本/step、Lily は 795 本) なので、**層の塊ごとの大きい融合で本数を 1/3 に**:
+1. MoE decode (ルーティング + gather + gate/up + SwiGLU + down + combine を 3 本程度、行間で専門家を共有、並列度は MLX の qmv 以上) — PoL 走行中。
+2. GDN の層まるごと (前処理 + 再帰 + norm。prework の負けは並列度不足だったので直して再挑戦)。
+3. HC の pre / post (decode 幅ならビット一致の elem 変種を土台に)。
+4. その後: 受理率 (draft の top-k 命中率 → rerank / depth 4)、MTP の draft 層に K2c 等を当てる (enable の順序)。
+判定は 1 プロセス ABBA (burn-in、depth 固定) の短 / 17k の ms/round、head の一致。冷連鎖 micro は重みを 100 MB 超巡回。「本数が減ったのに遅い」ときはカーネルの並列度を疑う。
+prefill 側はサーバー経路の +15% の切り分けだけ並行。27B / 動的判定はその後。
+
 ## push 後の流れ (2026-09-03 17:40 に決めたもの。上から順)
 
 1. **エージェントの計測を判定して既定化** (代金ゼロ方針): GDN レジスタ常駐 scan (in-model 8k / 17k で遅くなければ)、P7 第 2 段 (combine / router / sort の融合、8k -2% 狙い)、
