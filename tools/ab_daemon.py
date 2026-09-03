@@ -43,7 +43,7 @@
   `${TMPDIR}/mlxturbo-biglock-prio/` に札を出して上の段に譲る。ジョブと
   ジョブの間はロックを放すので、別プロセスの micro が割り込める。
   **ジョブ実行時にメモリ待ちはしない** (モデルは既に載っている)。起動時の
-  読み込みだけは 100GB の空きを待つ (98GB を 2 本載せると必ず落ちる)。
+  読み込みだけは 95GB の空きを待つ (`MEM_NEED_GB`、biglock と同じ値)。
 - **モデルを読む段 0/1 が来たら降りる。**worker が居座ると、worker を通れ
   ない仕事 (self_snapshot、mlx-serve など) が biglock のメモリ待ち 10 分を
   空振りしたうえでスラッシングする。biglock はロックを取った直後に
@@ -103,6 +103,12 @@ STOP_FILE = PID_FILE.with_suffix(".stop")
 # biglock.sh と同じ場所・同じ規約 (あちらの zsh と読み書きし合う)
 LOCK_FILE = TMP / "mlxturbo-bigmodel.lock"
 PRIO_DIR = TMP / "mlxturbo-biglock-prio"
+# 起動時の読み込みで待つ「回収可能メモリ」。**`tools/biglock.sh` の段 0/1 と
+# 同じ 95GB** (あちらの `MEM_NEED_GB`)。同じ 91GB を読むのに daemon だけ 100 を
+# 要求していたので、前の worker が降りた直後 (ページの回収が追い付かず 62〜72GB)
+# に閾値の手前で待っていた (2026-09-04 の観察)。**「98GB を 2 本載せる」事故を
+# 防いでいるのは閾値ではなくロックのほう**で、こちらはスラッシング避け。
+MEM_NEED_GB = 95
 
 # ---- daemon に載せられないもの -------------------------------------------
 #
@@ -132,6 +138,24 @@ ENV_IGNORE = {
     "MLXTURBO_AB_QUEUE", "MLXTURBO_AB_PID", "MLXTURBO_AB_DAEMON_LOG",
     "MLXTURBO_MIN_FREE_GB",
 }
+# **worker が読み込みの途中で自分で立てるキー。**突き合わせの両側から外す。
+# `tools/ab_bundle.py` の `load_bundle` は `--ngram` があれば
+# `FASTMLX_NGRAM_DISK=1` を立てる (`_vendor/qwen4_exp.py` の import 時に
+# 読まれるので、読み込みより前でないと効かない)。`launch_env` を読み込みの
+# 前に取るだけでは足りない --- 読み込み後の `os.environ` を引き継ぐ経路が
+# 2 つある: (1) コードの鮮度で自分を作り直す `os.execv`、(2)
+# `ab_submit.start_daemon` の Popen (env を渡さないので投入側を継承する)。
+# どちらかを通った worker の起動時 env にはこのキーが入っているので、素の
+# シェルから投げたジョブとは永久に一致せず、**ジョブごとに 98GB を読み直す**
+# (2026-09-04 02:20 の観察、`docs/BACKLOG.md`)。n-gram をディスクで持つかは
+# `--ngram` の有無で決まり、そちらは `bundle.mismatch` が別に見ている。
+# 代金: ジョブが `FASTMLX_NGRAM_DISK=0` を明示しても worker は無視する
+# (n-gram を RAM に持つ構成は 32GB を足すので、`ngram-layout` と同じく
+# そもそも worker に載らない)。
+SELF_SET_ENV = {"FASTMLX_NGRAM_DISK"}
+# 突き合わせにも上書きにも使わないキー。**上書きから外れる**ので、ここの
+# キーは execve / subprocess の子に現在の `os.environ` の値がそのまま渡る。
+ENV_SKIP = ENV_IGNORE | SELF_SET_ENV
 # **実行中に切り替えられると確かめた変数だけ**をここに置く。ここに無いものは
 # 全部「読み込み時に効く」扱いで作り直す --- 判断を誤ったときの代金が
 # 非対称だから (作り直しは 3 分、取りこぼしは *嘘の数字*)。
@@ -314,7 +338,7 @@ def biglock_acquire(prio: int, mem_need_gb: int = 0, log=print) -> None:
     """`tools/biglock.sh` と同じ手順でロックを取る。
 
     ``mem_need_gb`` が 0 ならメモリ待ちをしない (ジョブ実行時。モデルは
-    既に載っている)。起動時の読み込みだけ 100 を渡す。
+    既に載っている)。起動時の読み込みだけ `MEM_NEED_GB` を渡す。
 
     待っている最中に停止の合図が来たら `StopRequested` を投げる。
     """
@@ -681,16 +705,23 @@ def call_tool(rel: str, argv: list[str], bundle) -> int:
 
 
 def ab_env(environ=None) -> dict:
-    """突き合わせの対象になる環境変数だけを抜き出す。"""
+    """突き合わせの対象になる環境変数だけを抜き出す。
+
+    `ENV_PREFIXES` で始まるもののうち、worker 自身の配管 (`ENV_IGNORE`) と
+    worker が読み込みで自分に立てるもの (`SELF_SET_ENV`) を落とす。**投入側
+    (`ab_submit.enqueue`) と worker の起動時 env が同じ関数を通る**ので、
+    落としたキーはどちらの向きにも「違い」として現れない。
+    """
     src = os.environ if environ is None else environ
     return {k: v for k, v in src.items()
-            if k.startswith(ENV_PREFIXES) and k not in ENV_IGNORE}
+            if k.startswith(ENV_PREFIXES) and k not in ENV_SKIP}
 
 
 def env_delta(job_env: dict, launch_env: dict) -> tuple[set, set]:
     """(違うキー全部, そのうち作り直しが要るキー) を返す。
 
-    判定はキー集合と値の一致だけ。片方にしか無いキーも「違う」。
+    判定はキー集合と値の一致だけ。片方にしか無いキーも「違う」。**両側とも
+    `ab_env` を通っている前提**なので、`SELF_SET_ENV` はここに届かない。
     """
     diff = {k for k in set(job_env) | set(launch_env)
             if job_env.get(k) != launch_env.get(k)}
@@ -802,6 +833,8 @@ def main() -> int:
     # **読み込みの前に**控えること。`ab_bundle.load_bundle` が
     # `FASTMLX_NGRAM_DISK=1` を立てるので、読み込み後の env と投入側の env は
     # 必ず食い違い、毎ジョブ読み直しの無限ループになる。
+    # ただしそれだけでは足りない (この起動が `os.execv` や `start_daemon` の
+    # 継承で来ていると、読み込みの前から入っている)。`SELF_SET_ENV` を見ること。
     launch_env = ab_env()
     PID_FILE.write_text(json.dumps({
         "pid": os.getpid(),
@@ -819,13 +852,20 @@ def main() -> int:
     def log(msg):
         print(f"[ab_daemon {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
+    # `SELF_SET_ENV` は突き合わせから外してあるぶん、**worker 自身が自分の
+    # 引数に合わせる。**`--ngram` が無いのに継承した `FASTMLX_NGRAM_DISK=1` を
+    # 残すと、`_vendor/qwen4_exp.py` が n-gram の重みを読み飛ばしたまま
+    # `ngram_stream.install` も走らない (中身の無い n-gram で測ることになる)。
+    if not daemon_args.ngram:
+        os.environ.pop("FASTMLX_NGRAM_DISK", None)
+
     # 読み込みの間だけは 98GB を 2 本載せないための排他が要る (ジョブの
     # 実行時と違い、ここは本当に 91GB を SSD から読む)。
     log(f"モデルを読む: {daemon_args.model}")
     t0 = time.perf_counter()
     try:
         biglock_acquire(int(os.environ.get("BIGLOCK_PRIO", "1")),
-                        mem_need_gb=100, log=log)
+                        mem_need_gb=MEM_NEED_GB, log=log)
         try:
             bundle = decode_ab.load_bundle(load_args)
             if not daemon_args.no_burn_in:
@@ -935,7 +975,7 @@ def main() -> int:
             # **その env で自分を作り直してから**測る (3 分は払う価値がある)。
             job_env = {str(k): str(v) for k, v in (spec.get("env") or {}).items()
                        if str(k).startswith(ENV_PREFIXES)
-                       and str(k) not in ENV_IGNORE}
+                       and str(k) not in ENV_SKIP}
             diff, need_reload = env_delta(job_env, launch_env)
             if kind == "exec":
                 # 別プロセスなので env はそのまま渡せばよい。**読み直しは要らない**
@@ -957,7 +997,7 @@ def main() -> int:
                 refresh_pid("restarting", {"job": path.name})
                 new_env = {k: v for k, v in os.environ.items()
                            if not (k.startswith(ENV_PREFIXES)
-                                   and k not in ENV_IGNORE)}
+                                   and k not in ENV_SKIP)}
                 new_env.update(job_env)
                 new_env[ENV_JOB_MARK] = path.name
                 biglock_release()
@@ -986,7 +1026,7 @@ def main() -> int:
                     # 別プロセスなので bundle は触られず、状態も戻さなくてよい。
                     child_env = {k: v for k, v in os.environ.items()
                                  if not (k.startswith(ENV_PREFIXES)
-                                         and k not in ENV_IGNORE)}
+                                         and k not in ENV_SKIP)}
                     child_env.update(job_env)
                     child_env.pop(ENV_JOB_MARK, None)
                     code = subprocess.call(

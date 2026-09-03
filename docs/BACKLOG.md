@@ -745,6 +745,8 @@ mlx_lm の更新で写しが壊れる頻度が月 2 回を超えるなら、写�
   (biglock の MEM_NEED と同じ) に揃えるか、待ちの上限を短くする。
 - コードの鮮度検査は他エージェントの編集 (`hyper_connection.py` / `ngram_stream.py` / `spec_flash.py`) でも作り直しを起こす。4 本が並ぶ夜は読み直しが数回/時になった。
 
+直した (2026-09-04 03:53): 上の 2 つ。`ab_daemon.SELF_SET_ENV` (= `FASTMLX_NGRAM_DISK`) を `ab_env` の両側から落として突き合わせループを閉じ (launch_env は元から読み込み前に取っていたが、`os.execv` と `ab_submit.start_daemon` の Popen が読み込み後の env を継承するので足りなかった)、`--ngram` 無しの起動では worker が自分でこのキーを消すようにした。メモリ待ちの閾値は 100 → `MEM_NEED_GB = 95` (biglock の段 0/1 と同じ)。単体テストは `bench/test_ab_daemon_env.py`。
+
 ## MoE の行のソートを計数ソートにする (2026-09-03、着手は親の判断)
 
 `_moe_combine_fold` の `mx.argsort(idx_flat)` は 20480 要素 (80 KB、値は 0..511) の並べ替えに **0.224 ms/層**、`row_src` / `_inv_perm` / 表まで入れて 0.26〜0.33 ms/層 かかる。MLX の汎用ソートの多段起動ぶんで、GPU の実働ではない。
