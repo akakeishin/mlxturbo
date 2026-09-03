@@ -1913,3 +1913,11 @@ qmm はこの形で 11.5〜11.7 TFLOPS (見込みの 10.3〜11.3 より上)、bf
 pread B1 37.44 / B2 37.44 ms/round、mmap A2 37.03 ms/round (mmap A1 は連鎖の組み替えで消えた)。tok/round は 2.144 で同一。
 mmap の 16 行取得は decode を遅くしない (むしろ -1%、揺れの幅)。**mmap 既定は decode 側も問題なし**。
 P7 の `tools/moe_split.py` は n-gram サイドカー無しでモデルを読んで shard 重みの欠落で落ちた (--ngram の経路が無い)。直して再投入。
+
+### 2026-09-03 11:50 K2a: 厳密 top-k select カーネル (`mlxturbo/kernels/qsa_select.py`、`tools/verify_qsa_select.py`)
+
+S ∈ {1,2,3,4,6} × kv ∈ {4k, 8.5k, 17k, 25k, 50k} × 意地悪 9 種 (全同点、閾値 0、-0.0、結合順、可視 < k) = 875 通り 2800 行で **argpartition の集合と 100% 一致**。
+MLX の `sum(axis=-1)` は 0.0 起点の逐次和 (木状ではない)、argpartition の同点は添字昇順、をどちらも実測で確認。
+時間 (us/呼び出し、まとめ eval の GPU 実働 / 1 本ずつの露出レイテンシ): 17k S=2 13.4 / 31.5 (argpartition 73.2 / 127.6)、S=6 14.0 / 30.8、50k S=2 14.7 / 51.6 (常駐上限 6400 ブロック超でキー再読み)。
+判定線 (17k S=2 ≤ 30 us) 通過。**K2b (2-pass vector の写し + 常駐ビットマップ + per-query tail) に進む。**
+配線の口: `_pooled_and_top` を einsum (466 行) と `mx.maximum` (467 行) の間で `_block_scores` / `_select` に割り、`select_kernel` を別メソッドで足す。`n_vis` は `visible_counts_host` (Python だけ) で作る。
