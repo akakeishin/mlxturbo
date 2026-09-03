@@ -276,3 +276,11 @@ ANE は見送り (INT8 の重みコピーでメモリが増える)。最終ゴ�
   decode 53.6 / 58.5 / 47.4 / 52.5 / 49.9 / 44.8 tok/s (1 回 × 256 なので ±10% の運)、温 TTFT 0.15〜0.31 s。次の節目はフルベンチ (反復 2、同冷却) で相手と同時刻に取り直すこと。
 - **K1 arm A (04:10)**: 畳んだ (冷 micro 2.3x 遅い、天井側でも完全な融合で 4k -1.2% が上限)。**小 kv の attention は閉じた。**prefill の残りの的は MoE 行ソートの計数ソート化 (BACKLOG、-0.4%、ビット一致) だけで、その後は 27B レーン。
 - **計数ソート (04:51)**: 未配線の記録に (取り分 0.04%、見込みは単発 eval の往復を測った誤り)。**Flash-Next の prefill / decode の的はこれで全部一巡。**残りはユーザーの指示待ち: フルベンチ (反復 2、同冷却、相手と同時刻) → 27B レーン (最初の直しは MTP サイドカーの読み込み、BACKLOG)。
+
+## 27B レーン開始 (ユーザー 2026-09-04 07:50「とりあえず 27B やろうか。oMLX や mlx-lm とも比較できる」)
+
+Flash-Next の的は一巡 (単独レイテンシは方針の中では 55〜60 tok/s が天井。抜ける道は永続カーネル / 低ビット / 並列のどれかで、判断はユーザー)。
+27B (`~/models/qwen38-27b-4bit` + MTP `~/models/qwen38-27b-mtp`) を、部品の置き換え方式で速くし、mlx-lm / mlx-serve / oMLX (可能なら rapid-mlx) と比べる。
+段取り: (1) MTP サイドカーの読み込み修正 (mtp.py の quantize の順) → (2) 相手の起動方法と harness の下調べ (scout) → (3) 基準測定 (同じ冷却、同じ池、4 者) → (4) 27B の内訳 (prefill / decode の部品) → (5) 契約が合う部品から当てる (GDN Metal、sdpa 行タイル、BM=64 qmm の MLP 込み)。
+Flash-Next のフルベンチは後回し (ユーザーの指示があるまで回さない)。
+- **Mirai / uzu (07:55、`docs/research/EXTERNAL-MIRAI-UZU-2026-09.md`)**: Qwen3.6 27B を M5 Max で 105 tok/s (specdec、<50 MB の学習した draft、蒸留した独自 4bit)。同じ機体なら MTPLX 55 / MLX 26。物理の差ではなく機体 + draft の学習 + 独自量子化。27B の比較には MTPLX (`tools/compare/mtplx-venv/`) も入れる。uzu は別重みなので参考点。
