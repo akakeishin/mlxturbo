@@ -2003,3 +2003,14 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
   判定線: elem = off がビット一致で、kernel 既定の tok/round が両方の長さで 2% 以上低ければ、HC=kernel を既定から降ろす (品質を売って速度を買わない)。
 - ゲートのバグ: `tools/micro_kernel_latency.py` / `kernel_chain_cost.py` の `_quant_linear` は QBITS=8 既定。実モデルの HC は 4bit/gs64、inject は bf16。8bit だと
   素 205 / kernel 48 / elem 198 と符号が反転する (committed の kernel_chain_cost も fused 46 / plain 200)。**HC 項目を 4bit/gs64 + bf16 inject に直す (修正中)。**
+
+### 2026-09-03 12:55 末尾チャンクのグループ化 v2 (末尾 1 トークンを外に出し、n-1 の checkpoint を残す): 4k -4.9%、8k -3.4%、サーバー経路はビット一致 (`bench/results/tail-in-group-v2-{4000,8000}.json`)
+
+- 1 プロセス A,B,B,A、3 プロンプト × 2 レップ、8 トークン。4k A 6.001 / B 6.312 s (**-4.9%**、ケース別 -4.5 / -5.2 / -5.1)、8k 12.337 / 12.771 s (**-3.4%**、-3.5 / -3.3 / -3.4)。
+  v1 (末尾を丸ごとグループへ) の -4.6% / -4.1% と同水準。判定線 (4k -3%) 通過。
+- 実モデル 17k のビット一致ゲート (`tools/verify_prefill_bitident.py`、sep n-gram): `checkpoints=[]` (サーバーの実構成) で group=0 と group=4 + tail-in-group が**ビット一致**、
+  末尾に n-1 と n の checkpoint がある。`checkpoints=None` (generate() / ベンチ / 検証プローブ) だけ FAIL = 末尾を 2047+1 に割るので量子化行列積の丸めが動く
+  (4k case0 の A/B 出力が 6 トークン目で分岐したのはこれ。計算は正しい、`docs/research/PREFILL-CHUNKING-DETERMINISM.md`)。
+- 合成モデル 4 形で on/off の出力一致、`bench/test_server.py` + `test_depth_controller.py` 435 passed、fingerprint exit 0。
+- 残る性質: グループ内部の中間 checkpoint が消える (末尾の n-1 / n は残る)。LCP が末尾 2048 の内側かつ n-1 以外に落ちるターンでは復元点が 1 グループ手前まで下がる (グループ prefill が元から持つ性質を最後の 1 境界ぶん広げる)。
+- **判定: 17k を測り直してから既定 on にする** (v1 は 17k -1.3%。17k で遅くならなければ `MLXTURBO_PREFILL_TAIL_IN_GROUP=1` を既定に)。checkpoints=None 経路の丸めの違いは、本番 (サーバー) に影響しないので許容する。17k は投入済み (`tail-in-group-v2-17000.json`)。
