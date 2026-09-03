@@ -2636,7 +2636,7 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - 壁 (11.2 TFLOPS の dense 上限比): MoE GEMM 79〜82%、GDN の射影 80〜83%、attention の射影 95〜97% → 張り付き。**HC 読みだけ 63〜65%** (細長 GEMM 10240→320 / 320→10240 と elementwise)。sdpa は kv=4096 で 7.5 TFLOPS (遅くはない、減らす的)。
 - **次の的 3 つ**: (1) attention の kv < 8192 の dense 帯 (8k で 8.3%): budget 2048 の疎性を小 kv でも使える専用カーネルが要る (現行の gather カーネルは kv=8192 で dense の 1.43 倍遅く交差点 11k)。8k で -5%、4k で -2%。
   (2) HC 読み: 下限との差 4.3 / 3.8 / 3.6 点。norm を down の load に、sigmoid と mean を up の store に畳む、細長 GEMM に BM=64 タイル。相手が融合している場所 (9/2 の分析) と同じ。
-  (3) **n-gram の行取得 6%**: `_prefetch_ngram_span` は走っている (段の ngram_lookahead 0 ms) のに費用が PLE に残る = **先読みが実際には重なっていない**。RAM 常駐の separate (32 GB) だと 0.9%。先読みを本当に重ねれば 32 GB を払わずに -5%。
+  (3) **n-gram の行取得 6%**: `_prefetch_ngram_span` は走っている (段の ngram_lookahead 0 ms) のに費用が PLE に残る = **先読みが実際には重なっていない**。 **(訂正 9/4 02:25: 走っていなかった。pread では `prefetch_enabled` の既定が off で、各 PLE 層で即 return していた。0 ms は何もしていなかったから。下の 02:25 の項)**RAM 常駐の separate (32 GB) だと 0.9%。先読みを本当に重ねれば 32 GB を払わずに -5%。
 - 死んだ的: グループ境界 0.1%、末尾チャンク 0.1〜0.6% (末尾 v2 が畳んだ)、MoE それ以外 2.5〜3.2%、GDN scan 3.5〜3.8%。
 - 相手との差の推測: 4k の +0.25 s は HC 読みの非効率 (0.25 s) と MoE 非行列積 (0.19 s) で桁が合う。17k はばらつき (±5〜7%) の中。
 
@@ -2665,3 +2665,30 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - 8192 より上でも死んでいる: 17k で現行カーネル (load 41.6 / score 17.1 ms) を比で動かすと T=4 で 0.87x が最良だが、P6 の uint4 (load 25 ms) と重ねると 43.7 対 42.1 ms で**上乗せゼロ**。P6 のままでよい。
 - 注意: 模型は 8〜12k 帯で現行 MIN_KV=8192 の in-model (10k -0.8%) と符号が合わない (dense 側が模型より高い費用を払っている疑い: `_final_mask` の bool 組み立て、fallback のスコア実体化)。今回の判定 (4k/6k 帯) は dense 側が高い方向の誤差なので動かないが、8〜12k の絶対値は信用しない。
 - **残る筋は疎性ではなく「スコアを実体化しない融合」(K1 の arm A、見込み 4k -1.3〜-2.0%)。**21:45 の見立て「8k -5% / 4k -2%」のうち疎性で取れる分はゼロと確定。
+
+### 2026-09-04 02:25 n-gram の先読みは走っていなかった。既定 on + 投入位置を forward の前に → 既定に入れる (17k 冷 -2.9% / 4k 冷 -1.0% / 17k 温 -1.8% / 4k 温 -0.4%、出力一致)
+
+- 診断 (`tools/ngram_prefill_diag.py`、17k、`FASTMLX_NGRAM_NOCACHE=1` = 冷): `prefill-anatomy-0903-17k.json` の `ngram_stats` に `prefetch_rows=0 / prefetch_done=0 / hits=0` が既に記録されていた。`StreamNGram.__init__` の `_pf_default` が pread では "0" で、`_prefetch_ngram_span` は各 PLE 層で即 return。21:45 の「走っている」は誤読。
+- 6% の本体は「同期」でも「プール競合」でもない: `sync_ms` は 17k 全体で 18 ms、GIL の取り合いは 1.00x (`tools/ngram_fetch_micro.py`: 1 チャンク 32,768 行の pread 328 ms、F_NOCACHE 340 ms、再読み 151 ms、ヒット経路 7.2 ms)。
+- 旧配置 (境界を組み終えて `mx.eval` の直前) では、PLE 層が layer 1 (先頭付近) なので次の境界の行は構築のほぼ最初に要求され、隠せる窓が直前境界の eval 1.4 s しか無い → 1 境界ぶんの pread (約 1 s) を隠しきれず、on にしても最初のチャンクで 23,437 miss (580 ms)。
+
+| mode | 先読み | call の hit/miss | sync_ms | fetch_ms | wall |
+|---|---|---|---|---|---|
+| off (9/3 の本番) | 無し | 0 / 269,856 | 18 | 2849 | 32.4 s |
+| late (旧配置を on に) | 背景 985 ms | 136,691 / 133,165 | 18 | 1834 | 30.3 s |
+| **early (新)** | 前景 1.06 s + 背景 1 s | **269,856 / 0** | 14 | **117** | **29.3 s** |
+
+- 直したもの: `_prefetch_ngram_span` を `_group_prefill_forward` の**前**で呼ぶ (`MLXTURBO_NGRAM_PREFETCH_AT`、既定 early)。最初の境界だけ自分のぶんを前景で読み切る (`wait=True`、`start < ctx_len` は本家と同じ EOS 埋めで gid ビット一致、合成テストで固定)。`StreamNGram.prefetch(ids, wait=)`、既定 on (`MLXTURBO_NGRAM_PREFETCH`、`=0` で off)、行キャッシュは prefill の開始で世代を捨てる (上限 1 prefill ぶん、17k で約 70 MB。捨てないと辞書 639 MB + バッファ 400 MB まで育つ)。`FASTMLX_NGRAM_NOCACHE=1` は計測専用 (`F_NOCACHE`)。
+- **`--knob ngram-prefetch` の汚染を修正**: 条件切り替えごとに `_cache_gen = None`。これまでは A が積んだ 27 万行が残って次の B が全ヒットしていた (回文順でも相殺できない)。**9/3 までのこの knob の数字 (-0.9% 等) はこの汚染込み。**
+- in-model (`--knob ngram-prefetch --only long --tokens 64`、A,B,B,A × 3 ケース、prefill_s、`bench/results/ngram-prefetch-*.json`):
+
+| 条件 | A (on, early) | B (off) | 差 | fetch_ms A/B | 出力 |
+|---|---|---|---|---|---|
+| 17k 冷 (F_NOCACHE) | 27.523 | 28.343 | **-2.9%** (ケース別 -5.0 / -4.6 / +1.0、最後は A の位置 1 の段差) | 751 / 17,016 | 3 ケース一致 |
+| 4k 冷 | 6.034 | 6.095 | **-1.0%** | 229 / 4,030 | 一致 |
+| 17k 温 | 26.799 | 27.297 | **-1.8%** (-2.7 / -1.4 / -1.4) | 705 / 10,270 | 一致 |
+| 4k 温 | 5.793 | 5.819 | **-0.4%** | 185 / 1,697 | 一致 |
+
+- decode は 17k で ms/round +0.2% (ばらつき)、tok/round 完全同一 (先読みは prefill の呼び手からしか呼ばれない)。B 側は移した呼び出し口が no-op なので 9/3 の本番と 1 op も違わない。`bench/test_ngram_stream.py` 23 本 pass、`tools/vendor_fingerprint.py` 一致。
+- **判定: 既定に入れる** (代金ゼロ規則: 4 条件どれでも遅くならない、出力同一、メモリは 1 prefill ぶんの行キャッシュ ≤ 70 MB)。冷 17k の集計 -2.9% は線 (-3%) の上だが、揃ったケースは -5%。
+- 残り: 50k は未測定 (`_NGRAM_LOOKAHEAD_WIDTH` 10240 なので境界ごとに追う形になる)。最初の境界の前景取得 (17k 1.05 s / 4k 0.54 s) は prefill の先頭に重ねる相手が無く残る (on-demand 4 回 1387 ms よりは速い)。`MLXTURBO_PLE_HOIST` は group prefill 経路を通らないので本番では効いていない。`prefill-anatomy-*` の「PLE / n-gram 6%」は取り直しが要る。

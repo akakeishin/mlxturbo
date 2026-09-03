@@ -327,6 +327,22 @@ class StreamNGram:
             # the point of parallelizing
             self._pool = ThreadPoolExecutor(max_workers=self.n_threads)
             self._fd = os.open(str(rows_bin), os.O_RDONLY)
+            # `FASTMLX_NGRAM_NOCACHE=1`: この fd の読みをページキャッシュに
+            # 乗せない (macOS の `F_NOCACHE`)。**計測専用の knob。**
+            # サイドカーの行 id はハッシュでほぼ一様なので、32GB の rows.bin
+            # に対して本番の読みは元から実質冷えている (micro: 通常 fd で
+            # 328 ms/チャンク、F_NOCACHE で 340 ms とほぼ同じ)。ところが
+            # A/B は同じプロンプトを何度も流すので、2 回目以降だけ同じ行が
+            # 温まって (151 ms/チャンク) 冷えた本番と違う条件になる。
+            # `sudo purge` が使えないので、A/B の両側をこれで揃える。
+            if os.environ.get("FASTMLX_NGRAM_NOCACHE") == "1":
+                import fcntl
+
+                _F_NOCACHE = 48  # <sys/fcntl.h> (macOS)
+                try:
+                    fcntl.fcntl(self._fd, _F_NOCACHE, 1)
+                except OSError:
+                    pass  # 非 macOS では黙って従来どおり
             # `_gather_pread` の読み方 (os.preadv/os.pread の選択)。クラス
             # docstring 参照。preadv が無い環境では自動的に旧経路
             self._use_preadv = hasattr(os, "preadv") and (
@@ -372,10 +388,20 @@ class StreamNGram:
             self._mmap_prefetch_threads: list[threading.Thread] = []
             self._mmap_prefetch_lock = threading.Lock()
 
-        # mmap は既定 on (背景の madvise が冷 pread 257 ms/チャンクを隠す、2026-09-03)、
-        # pread は既定 off (行キャッシュ 419 MB を確保する割に -0.4〜-0.9% で差が無い、B-7)。
+        # **既定 on (2026-09-04)。**pread も 2026-09-03 までは既定 off だった
+        # (行キャッシュ 419 MB を確保する割に -0.4〜-0.9% で差が無かった) が、
+        # それは先読みの**投入位置**が悪かったため。PLE 層は 48 層のほぼ先頭
+        # (`ple_layer_ids=[2]` -> layer index 1) なので、境界の n-gram 行は
+        # その境界の graph 構築のほぼ最初に要求される。旧配置 (境界を組み終えて
+        # `mx.eval` を投入する直前) だと先読みに残る窓が直前境界の eval だけで、
+        # 1 境界ぶんの pread を隠しきれていなかった。`mlxturbo/spec_flash.py` の
+        # `_NGRAM_PREFETCH_AT` を early (境界を組み始める前) にした上で測り直すと、
+        # 17k の冷 (F_NOCACHE) in-model A/B で **prefill -3.0%** (揃った 2 ケースは
+        # -5.0% / -4.6%、出力は 3 ケースとも一致、`bench/results/ngram-prefetch-17k-cold.json`)。
+        # 行キャッシュは prefill ごとに捨てる (`prefetch(..., wait=True)`) ので
+        # 1 回の prefill ぶん (17k で 27 万行 = 約 70 MB) で頭打ち。
         # `MLXTURBO_NGRAM_PREFETCH=0/1` で明示できる。
-        _pf_default = "1" if self.backend == "mmap" else "0"
+        _pf_default = "1"
         self.prefetch_enabled = os.environ.get("MLXTURBO_NGRAM_PREFETCH", _pf_default) == "1"
         self.reset_stats()
 
@@ -458,6 +484,11 @@ class StreamNGram:
         self.stats: dict[str, float] = dict(
             calls=0, rows=0, hits=0, misses=0, prefetch_rows=0,
             prefetch_done=0, sync_ms=0.0, fetch_ms=0.0,
+            # 先読みスレッドが実際に読みに使った時間 (壁時計の和)。GPU 実行に
+            # 重なっていれば壁時計には乗らないので、`fetch_ms` (乗る) と
+            # 区別して数える。`prefetch_wait_ms` は wait=True の前景取得ぶん
+            # (これは壁時計に乗る)。
+            prefetch_bg_ms=0.0, prefetch_wait_ms=0.0,
         )
 
     def stats_line(self) -> str:
@@ -469,7 +500,9 @@ class StreamNGram:
             f"ngram calls={s['calls']} rows={s['rows']} hits={s['hits']} "
             f"misses={s['misses']} hit_rate={hit_rate:.1f}% "
             f"prefetch_rows={s['prefetch_rows']} prefetch_done={s['prefetch_done']} "
-            f"sync_ms={s['sync_ms']:.2f} fetch_ms={s['fetch_ms']:.2f}"
+            f"sync_ms={s['sync_ms']:.2f} fetch_ms={s['fetch_ms']:.2f} "
+            f"prefetch_bg_ms={s['prefetch_bg_ms']:.2f} "
+            f"prefetch_wait_ms={s['prefetch_wait_ms']:.2f}"
         )
 
     def _gather_pread(self, flat: np.ndarray) -> np.ndarray:
@@ -701,9 +734,20 @@ class StreamNGram:
         for s, e in zip(seg_starts.tolist(), seg_ends.tolist()):
             self._madvise_fn(mmap.MADV_WILLNEED, s, e - s)
 
-    def prefetch(self, flat_ids: np.ndarray) -> None:
+    def prefetch(self, flat_ids: np.ndarray, wait: bool = False) -> None:
         """未キャッシュ (mmap backend では未先読み) の行を先読みする。
         呼び出しは即時に返る。`prefetch_enabled=False` のときは何もしない。
+
+        `wait=True` のときだけ背景スレッドを立てずにその場で読み切って返る
+        (前景取得)。使うのは **prefill の最初の境界** だけ: そこには重ねる
+        相手の GPU 実行がまだ無いので背景に回す意味が無く、それどころか
+        「最初の境界自身の on-demand 取得」と「次の境界の背景先読み」が
+        同じ `self._pool` と同じ SSD を取り合う (この競合が 2026-09-02 の
+        A/B で先読みの取り分を 0% にした原因、クラス docstring 参照)。
+        最初の境界ぶんを先に前景で読み切ってしまえば、以降の
+        `__call__` は全部キャッシュヒットになり競合が構造的に消える。
+        費用は on-demand で読むのと同じ (どちらも GPU が止まったまま CPU で
+        消える) なので、前倒ししても損はしない。
 
         backend=pread: バックグラウンドスレッドが `_gather_pread` して
         行キャッシュ (`_NGramCacheGen`) に積む (従来どおり)。
@@ -725,6 +769,25 @@ class StreamNGram:
         if ids64.size == 0:
             return
         self.stats["prefetch_rows"] += ids64.size
+        if wait:
+            # `wait=True` が来るのは prefill の最初の境界だけなので、これは
+            # 「新しい prefill が始まった」の合図そのもの。ここで行キャッシュの
+            # 世代を捨てる。**捨てないと満杯 (既定 4M 行) まで積み上がり、
+            # 実測で辞書 639MB + バッファ 400MB = 約 1GB になる** (行 id は
+            # 位置ごとのハッシュなので、前のリクエストの行が次で当たることは
+            # まず無く、持ち続けても得は無い)。捨てれば 1 回の prefill ぶん
+            # (17k で 27 万行 = 約 70MB、50k で 80 万行 = 約 200MB) で頭打ちになる。
+            # 前の prefill の背景先読みがまだ走っていても、そちらは
+            # `_cache_put` の中で世代を読み直すので壊れない (新しい世代へ
+            # 余分な行がいくつか入るだけ)。
+            t0 = time.perf_counter()
+            if self.backend == "mmap":
+                self._madvise_prefetch_worker(ids64)  # mmap に行キャッシュは無い
+            else:
+                self._cache_gen = None
+                self._prefetch_worker(ids64)
+            self.stats["prefetch_wait_ms"] += (time.perf_counter() - t0) * 1000.0
+            return
         if self.backend == "mmap":
             t = threading.Thread(
                 target=self._madvise_prefetch_worker, args=(ids64,), daemon=True
@@ -736,7 +799,9 @@ class StreamNGram:
             self._prefetch_thread = t  # pread backend と同じ慣習: 直近の 1 本
             t.start()
             return
-        t = threading.Thread(target=self._prefetch_worker, args=(ids64,), daemon=True)
+        t = threading.Thread(
+            target=self._prefetch_worker_bg, args=(ids64,), daemon=True
+        )
         self._prefetch_thread = t
         t.start()
 
@@ -767,6 +832,16 @@ class StreamNGram:
         got = self._gather_pread(miss_arr)
         self._cache_put(miss_arr, got)
         self.stats["prefetch_done"] += 1
+
+    def _prefetch_worker_bg(self, ids64: np.ndarray) -> None:
+        """`_prefetch_worker` を背景スレッドで走らせるラッパー。かかった時間を
+        `prefetch_bg_ms` に足す (前景の `wait=True` はここを通らないので、
+        `prefetch_wait_ms` と二重に数えることはない)。"""
+        t0 = time.perf_counter()
+        try:
+            self._prefetch_worker(ids64)
+        finally:
+            self.stats["prefetch_bg_ms"] += (time.perf_counter() - t0) * 1000.0
 
     def __call__(self, gid):
         import mlx.core as mx

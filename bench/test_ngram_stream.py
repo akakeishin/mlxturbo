@@ -158,7 +158,7 @@ def test_call_matches_reference_after_prefetch_completes(tmp_path):
     sidecar, _ = _build_synthetic_sidecar(tmp_path)
     ref = _RefStreamNGram(sidecar)
     new = StreamNGram(sidecar, backend="pread", n_threads=4)
-    new.prefetch_enabled = True  # 既定 off (2026-09-02)。ここは先読み自体を確認する
+    new.prefetch_enabled = True  # 2026-09-04 から既定 on。既定に依らずここで明示する
     rng = np.random.default_rng(3)
     ids = rng.integers(0, ROWS, size=3000).astype(np.int64)
     new.prefetch(ids)
@@ -174,7 +174,7 @@ def test_call_matches_reference_during_concurrent_prefetch(tmp_path):
     sidecar, _ = _build_synthetic_sidecar(tmp_path)
     ref = _RefStreamNGram(sidecar)
     new = StreamNGram(sidecar, backend="pread", n_threads=4)
-    new.prefetch_enabled = True  # 既定 off (2026-09-02)。ここは先読み自体を確認する
+    new.prefetch_enabled = True  # 2026-09-04 から既定 on。既定に依らずここで明示する
     rng = np.random.default_rng(4)
 
     all_ids = rng.integers(0, ROWS, size=20000).astype(np.int64)
@@ -217,8 +217,8 @@ def test_prefetch_disabled_is_noop(tmp_path):
     # prefetch が無効なら行キャッシュ (既定 4M 行 = 419MB) は一度も確保しない
     # (B-7)。以前は空の生成物 (n==0) を無条件に確保していた。
     assert new._cache_gen is None
-    # backend=mmap も同じ環境変数 (MLXTURBO_NGRAM_PREFETCH) で決まるが、
-    # 既定は mmap で on / pread で off (2026-09-03)。有効化した場合の挙動は
+    # backend=mmap も同じ環境変数 (MLXTURBO_NGRAM_PREFETCH) で決まる。
+    # 2026-09-04 から両 backend とも既定 on。mmap 側の挙動は
     # test_mmap_prefetch_* 系で確認する
     mmap_stream = StreamNGram(sidecar, backend="mmap")
     assert mmap_stream.prefetch_enabled is True
@@ -236,9 +236,9 @@ def test_cache_full_clears_and_stays_correct(tmp_path):
     sidecar, _ = _build_synthetic_sidecar(tmp_path)
     ref = _RefStreamNGram(sidecar)
     new = StreamNGram(sidecar, backend="pread", n_threads=4, cache_rows=50)
-    new.prefetch_enabled = True  # 既定 off (B-7 以降、行キャッシュは prefetch
-    # が有効なときだけ育つ)。ここは「満杯 -> 全消し」の世代差し替えそのものを
-    # 確認したいので、通常の __call__ でもキャッシュへ書き込ませる
+    new.prefetch_enabled = True  # 行キャッシュは prefetch が有効なときだけ
+    # 育つ (B-7)。ここは「満杯 -> 全消し」の世代差し替えそのものを確認したい
+    # ので、既定に依らず明示して通常の __call__ でもキャッシュへ書き込ませる
     rng = np.random.default_rng(6)
     for _ in range(30):
         ids = rng.integers(0, ROWS, size=200).astype(np.int64)  # cap の 4 倍
@@ -253,12 +253,13 @@ def test_stats_counters(tmp_path):
     確認する。ngram-prefetch / ngram-batch A/B の「発火してるか」の土台。"""
     sidecar, _ = _build_synthetic_sidecar(tmp_path)
     new = StreamNGram(sidecar, backend="pread", n_threads=4)
-    new.prefetch_enabled = True  # 既定 off (2026-09-02)。ここは prefetch カウンタを確認する
+    new.prefetch_enabled = True  # 2026-09-04 から既定 on。既定に依らずここで明示する
 
     # 初期状態は全部 0
     s0 = new.stats
     assert s0 == dict(calls=0, rows=0, hits=0, misses=0, prefetch_rows=0,
-                      prefetch_done=0, sync_ms=0.0, fetch_ms=0.0)
+                      prefetch_done=0, sync_ms=0.0, fetch_ms=0.0,
+                      prefetch_bg_ms=0.0, prefetch_wait_ms=0.0)
     assert "hits=0" in new.stats_line() and "misses=0" in new.stats_line()
 
     rng = np.random.default_rng(7)
@@ -294,7 +295,8 @@ def test_stats_counters(tmp_path):
 
     new.reset_stats()
     assert new.stats == dict(calls=0, rows=0, hits=0, misses=0, prefetch_rows=0,
-                             prefetch_done=0, sync_ms=0.0, fetch_ms=0.0)
+                             prefetch_done=0, sync_ms=0.0, fetch_ms=0.0,
+                             prefetch_bg_ms=0.0, prefetch_wait_ms=0.0)
 
 
 def test_batch_min_rows_default_and_override(tmp_path):
@@ -401,7 +403,7 @@ def test_prefetch_ngram_span_matches_real_forward(tmp_path, monkeypatch):
     NS.install(model, sidecar)
     stream = ple_emb.ngram_embedding
     assert isinstance(stream, NS.StreamNGram)
-    stream.prefetch_enabled = True  # pread は既定 off。ここは先読み自体を確認する
+    stream.prefetch_enabled = True  # 2026-09-04 から既定 on。既定に依らずここで明示する
 
     ctx_len = ple_emb.context_len  # TINY: ngram_size=3 -> 2
     start, length, total_len = 5, 4, 12
@@ -428,9 +430,10 @@ def test_prefetch_ngram_span_matches_real_forward(tmp_path, monkeypatch):
     captured: dict = {}
     orig_prefetch = stream.prefetch
 
-    def capture_prefetch(flat_ids: np.ndarray) -> None:
+    def capture_prefetch(flat_ids: np.ndarray, wait: bool = False) -> None:
         captured["flat"] = np.array(flat_ids, copy=True)
-        orig_prefetch(flat_ids)
+        captured["wait"] = wait
+        orig_prefetch(flat_ids, wait=wait)
 
     stream.prefetch = capture_prefetch
     try:
@@ -450,6 +453,107 @@ def test_prefetch_ngram_span_matches_real_forward(tmp_path, monkeypatch):
     assert stream.stats["hits"] == expected_flat.size
     assert stream.stats["misses"] == 0
     mx.eval(got)
+
+
+def test_prefetch_ngram_span_start0_matches_real_forward(tmp_path, monkeypatch):
+    """`_prefetch_ngram_span(..., start=0, wait=True)` (prefill の最初の境界を
+    前景で温める経路) が計算する行 id が、実フォワードが同じ区間で要求する
+    行 id とビット一致することを確認する。
+
+    最初の境界には左文脈が無いので、本家は EOS 埋めの `prev_ctx`
+    (`_group_prefill_forward` の `prev_ctxs[0]` / `_prelude`) を前置して
+    gid を作る。`_prefetch_ngram_span` は `start < context_len` のとき同じ
+    EOS 埋めを自前で作る -- ここがずれると先頭 `context_len` トークンぶんの
+    行が毎回 miss になり、「最初の境界を前景で読み切ってから組み始める」
+    という前提 (背景先読みと on-demand を競合させない) が崩れる。
+    """
+    import mlxturbo.ngram_stream as NS
+    import mlxturbo.spec_flash as SF
+    from verify_batch_cache import TINY, build
+
+    model = build(8)
+    ple_layer_idx = model.model.ple_layers[0]
+    ple_emb = model.model.layers[ple_layer_idx].ple.ple_embedding
+    dim = ple_emb.ngram_embedding.dim
+    sidecar, _ = _build_synthetic_sidecar(
+        tmp_path, rows=200_000, dim=dim, bits=4, group_size=dim
+    )
+    monkeypatch.setenv("FASTMLX_NGRAM_BACKEND", "pread")
+    NS.install(model, sidecar)
+    stream = ple_emb.ngram_embedding
+    stream.prefetch_enabled = True
+
+    length = 6
+    rng = np.random.default_rng(13)
+    ids = mx.array(rng.integers(0, TINY["vocab_size"], size=length).astype(np.int64)[None])
+
+    # 基準: 空のキャッシュから実フォワードを流し、そのとき要求された gid を拾う
+    cache = model.make_cache()
+    seen: list = []
+    orig_call = NS.StreamNGram.__call__
+
+    # `stream(gid)` は型の `__call__` を見るので、インスタンス属性に差しても
+    # 効かない。クラス側を差し替える (monkeypatch が後片付けする)
+    def spy(self, gid):
+        seen.append(np.array(gid.reshape(-1), copy=False).astype(np.int64))
+        return orig_call(self, gid)
+
+    monkeypatch.setattr(NS.StreamNGram, "__call__", spy)
+    model.model(ids, cache=cache)
+    monkeypatch.setattr(NS.StreamNGram, "__call__", orig_call)
+    assert len(seen) == 1, seen
+    expected_flat = seen[0]
+
+    # _prefetch_ngram_span の前景経路が同じ行 id を渡すこと
+    captured: dict = {}
+    orig_prefetch = stream.prefetch
+
+    def capture_prefetch(flat_ids: np.ndarray, wait: bool = False) -> None:
+        captured["flat"] = np.array(flat_ids, copy=True)
+        captured["wait"] = wait
+        orig_prefetch(flat_ids, wait=wait)
+
+    stream.prefetch = capture_prefetch
+    try:
+        SF._prefetch_ngram_span(model, ids, 0, length, wait=True)
+    finally:
+        stream.prefetch = orig_prefetch
+
+    assert captured.get("wait") is True
+    assert np.array_equal(captured["flat"], expected_flat)
+    # wait=True なので戻った時点で読み終わっている -- 次の __call__ は全ヒット
+    stream.reset_stats()
+    got = stream(mx.array(expected_flat.reshape(1, -1)))
+    assert stream.stats["hits"] == expected_flat.size
+    assert stream.stats["misses"] == 0
+    assert stream.stats["prefetch_wait_ms"] == 0.0  # reset 後なので 0
+    mx.eval(got)
+
+
+def test_prefetch_ngram_span_start0_without_wait_is_noop(tmp_path, monkeypatch):
+    """`start == 0` かつ `wait=False` は何もしない (背景先読みには重ねる相手の
+    GPU 実行がまだ無いので、投入すると最初の境界の on-demand 取得と
+    `self._pool` / SSD を取り合うだけ)。"""
+    import mlxturbo.ngram_stream as NS
+    import mlxturbo.spec_flash as SF
+    from verify_batch_cache import TINY, build
+
+    model = build(8)
+    ple_emb = model.model.layers[model.model.ple_layers[0]].ple.ple_embedding
+    dim = ple_emb.ngram_embedding.dim
+    sidecar, _ = _build_synthetic_sidecar(
+        tmp_path, rows=200_000, dim=dim, bits=4, group_size=dim
+    )
+    monkeypatch.setenv("FASTMLX_NGRAM_BACKEND", "pread")
+    NS.install(model, sidecar)
+    stream = ple_emb.ngram_embedding
+    stream.prefetch_enabled = True
+    stream.reset_stats()
+
+    rng = np.random.default_rng(17)
+    ids = mx.array(rng.integers(0, TINY["vocab_size"], size=6).astype(np.int64)[None])
+    SF._prefetch_ngram_span(model, ids, 0, 6)
+    assert stream.stats["prefetch_rows"] == 0
 
 
 # --------------------------------------------------------- backend=mmap
