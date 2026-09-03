@@ -2176,3 +2176,13 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - **draft 無しの床** (`ar-depth0.json`、depth 0、depth 適応 off、512 トークン × 3 本 × 2 長さ): 短 **23.5〜24.4 ms/tok (41〜42.5 tok/s)**、17k 26.4〜27.0 ms/tok (37〜38 tok/s)。
   MTP の倍率は短 52/42 = **1.24x**、17k 46/37.5 = 1.23x。S=1 forward の実測が 24 ms で確定 (帰属の推定と一致)。
 - decode の天井スタブ (短、`stub-draft` ほか) は JSON が出ていない (ログ確認中)。oracle-draft は knob の stub_chain が engine の `_draft_chain(first=...)` の引数に追従しておらず TypeError。直して再走。
+
+### 2026-09-03 17:15 天井スタブ (decode 側) と GDN scan の冷 micro、正答率 12 問 (query)
+
+- **draft の費用 (短、`stubs-decode-short-*.json`)**: stub-draft で ms/round 37.6 → 34.5 (**-8.2% = 3.1 ms/round**)。tok/round は 1.0 に落ちる (draft が無いので当然)。
+  stub-indexer-topk / stub-qsa-attn は短文脈では ±0 (疎化しないので発火しない、想定どおり)。
+- **K2 の天井 (17k、query、`stubs-qsa-17k.json`)**: stub-indexer-topk で ms/round **-4.3%**、stub-qsa-attn で **-8.9%** (合わせて約 13% = 4.7 ms/round)。
+  K2c の実測 -0.7% は天井の 1/18 で、配線か K2b の in-model 費用に 1.4 ms/round 以上が消えている。**K2 は畳まず、K2c の差の切り分けへ** (K2c のエージェントに戻した)。
+- **GDN レジスタ常駐 scan の冷 micro** (`gdn-scan-micro.json`、2048 行 × 36 層の活性 1.5 GB を巡回、us/チャンク): blocked 2900、最良の reg (l4-db32) **2529 (0.87 倍)**。判定線 0.70 に届かない。
+  8k の 5.4% × 13% = prefill -0.7% 相当。他の変種 (l2-db128 7.1 倍、l32-db8 2.4 倍) は大負け。報告待ち。
+- **正答率 17k、12 問 (seed 1)**: query は recall dense 12/12 / kernel 12/12、quote dense 7/12 / kernel 8/12。global は走行中。
