@@ -99,8 +99,11 @@ A/B は `--knobs a,b,c` で 1 プロセスにまとめ、プロセス内 ABBA �
    **最優先 (品質)**: QSA の tail の意味論が HF と違う (HF はクエリごとに自分の未完成ブロックを可視、うちは global tail)。`MLXTURBO_QSA_TAIL=query` を
    実装中 (Opus)。通ったら既定にし、teacher (bf16) を作り直して KLD を取り直す。verify の受理率にも効く可能性。
    decode 側: 天井スタブ (chain89、`--knobs`) → K2 (radix select K2a を実装中、K2b は 2-pass vector の写し)。
-   prefill 側: P5 行タイル (4k -1.1% / 8k -1.2%、17k と発火確認待ち → 既定化)、P6 (uint4 load、micro 待ち) → gather カーネル作り直し、
+   prefill 側: P5 行タイルは **既定 on で確定** (17k -1.0%、KLD 差 0.0、`MLXTURBO_SDPA_ROWTILE`)。P6 (uint4 load) は micro 通過
+   (56.4 → 40.8 ms/層、ビット一致、交差点 8.1k) → 本番カーネルへ移植 + 17k / 50k in-model + 下限 8192 の品質ゲート (Opus 実施中)、
    `tail-in-group` (末尾チャンクをグループに、4k -3〜5% 見込み、A/B 待ち)、BM=16 の segmented (micro 待ち)。K1 の mask arm は後回し。
+   **custom kernel が in-model で負ける理由の調査** (ユーザー依頼、Opus 実施中): 仮説 5 つ (per-call CPU 費用 / command buffer 分断 / 段階投入との相性 /
+   非連続入力のコピー / 出力割り当て) を micro と in-model の 2×2 (HC 変種 × STAGE_EVERY 2/0) で切り分ける。
 4. P3: MoE の grouped GEMM。in-model は 4k ±0 / 8k -1.4% / 17k -0.6% (換算率は 8k で予測どおり。MoE 行列積は prefill の 3 割)。既定には入れない。
    第 3 段 (fused.py のフック + knob `moe-grouped-gemm` の A=segmented / B=既製 / C=pad16+既製、4k/8k/17k) を Opus が実施中。
    判定線: 17k -2% 未満かつ 4k -4% 未満なら BM=16 経路 (専門家ごとに BM を選ぶ) を足してから再 A/B。KLD はビット一致なので出力一致で代替。
