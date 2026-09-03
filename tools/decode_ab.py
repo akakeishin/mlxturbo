@@ -1923,6 +1923,66 @@ def _knob_stub_moe_single_expert(ctx):
     return apply
 
 
+def _knob_stub_qsa_attn(ctx):
+    """天井スタブ (K2)。A = decode/verify 幅 (S<=8) の `Attention.__call__`
+    (`_vendor/qwen4_exp.py:1048`) 丸ごとを、QSA の indexer top-k 選択
+    (`self.indexer(...)` --- `QSAIndexer._pooled_and_top` 370〜481 行)・
+    マスク構築 (`_final_mask`)・sdpa 幅分割 (`_sdpa_split_width`、
+    `mlxturbo/fused.py:enable_sdpa_split`) を一切通さず、**末尾 2048 列だけの
+    causal な sdpa 1 回**に差し替える / B = 素 (既定)。**prefill 幅 (S>8) は
+    `orig` にそのまま逃がす** (`stub-indexer-topk` と同じ「入口で S を見て
+    丸ごと逃がす」形)。
+
+    `__call__` は QSA の indexer 呼び出しからマスク組み・sdpa 分割まで 1
+    メソッドにまとまっていて、`_pooled_and_top` のように 1 op だけを差し替
+    えるフックが無い (indexer top-k・マスク構築・sdpa 分割の 3 つを同時に
+    0 費用にしたいので、部分差し替えの積み上げでは済まない)。そのため
+    `stub-indexer-topk` とは違い、**メソッド全体**を差し替える。
+
+    stub は `self._qkv(...)` (q/k/v 射影・rope・KV キャッシュ更新) だけ素の
+    まま呼び、`self.indexer(...)` は一度も呼ばない (idx_cache は decode 中
+    進まない --- 天井狙いなので許容、`--tokens` を伸ばした後段の数値が壊れる
+    のは織り込み済み)。kv 長が 2048 以下ならスライスなし (dense ゲート内の
+    元の経路と実質同じ形に収まる)、2048 を超えたら K/V の末尾 2048 列だけを
+    取り、`mask="causal"` で `mlx_lm.models.base.scaled_dot_product_attention`
+    を 1 回呼ぶ (`cache=None` --- 量子化 cache の分岐に入れないため。q は
+    末尾 S 行なので右揃えの causal 文字列マスクで整合する)。gqa による
+    sdpa 幅分割 (`1 < S <= 8` かつ `S*gqa > 32` で発火する分割ループ) も
+    通らない --- vector 経路の sdpa 呼び出しは常に 1 回。`_gather_attn`
+    (段 3(b)、kv 大で `_gather_forward` に分岐する経路) もこの stub の
+    中では一度も判定しない --- S<=8 なら丸ごと迂回する。
+
+    出力は正しくなくてよい (`control_identical=False`)。目的は「indexer の
+    top-k 選択 + マスク構築 + sdpa (幅分割込み) を 0 費用にしたら 1 ラウンド
+    がいくら減るか」の上限 (K2)。**判定は ms/round だけ**。判定線: 1.5
+    ms/round 未満の短縮なら K2 は畳む。
+    """
+    import mlx.core as mx
+    import mlx_lm.models.qwen4_exp as Q
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    orig = Q.Attention.__call__
+
+    def stub(self, x, rope, mask, cache, idx_cache):
+        B, S, _ = x.shape
+        if S > 8:
+            return orig(self, x, rope, mask, cache, idx_cache)
+        offset, positions = self._positions(cache, S)
+        q, k, v, gate = self._qkv(x, positions, rope, cache)
+        if k.shape[2] > 2048:
+            k = k[:, :, -2048:]
+            v = v[:, :, -2048:]
+        out = scaled_dot_product_attention(
+            q, k, v, None, scale=self.scale, mask="causal")
+        out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+        return self.o_proj(out * mx.sigmoid(gate))
+
+    def apply(variant):
+        Q.Attention.__call__ = stub if variant == "A" else orig
+
+    return apply
+
+
 def _knob_oracle_draft(ctx):
     """D3 の損益 (仮説裏取り、天井スタブではない)。`--oracle-out <json>`
     (decode_ab の `--save-out` 出力、`rows[].out`/`rows[].prompt_ids`) を
@@ -2127,6 +2187,7 @@ KNOBS = {
     "stub-gdn-scan": (_knob_stub_gdn_scan, ["A", "B"], False, "B"),
     "stub-moe-single-expert": (
         _knob_stub_moe_single_expert, ["A", "B"], False, "B"),
+    "stub-qsa-attn": (_knob_stub_qsa_attn, ["A", "B"], False, "B"),
     "oracle-draft": (_knob_oracle_draft, ["6", "2"], False, "2"),
 }
 
@@ -2543,6 +2604,10 @@ def main() -> int:
         # 分岐する (S>=64 の prefill 幅は orig にそのまま逃がす、knob 自身の
         # docstring 参照)。prefill 幅は 1 op も変わらない。
         "stub-indexer-topk",
+        # stub-qsa-attn は `Attention.__call__` に入った時点で S<=8 を見て
+        # 分岐する (S>8 の prefill 幅は orig にそのまま逃がす、knob 自身の
+        # docstring 参照)。prefill 幅は 1 op も変わらない。
+        "stub-qsa-attn",
         # oracle-draft (`_draft_chain` の差し替え) も decode ループの中でしか
         # 呼ばれない。17k の prefill を variants=["6","2"] の回文 4 回払わず
         # 済むよう、ここに入れておく (knob 自身の docstring 参照)。
