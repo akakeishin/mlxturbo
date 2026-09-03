@@ -807,7 +807,15 @@ def _knob_hc_off(ctx):
 
     判定は親が行う。見るのは短・長それぞれの tok/round (第一) と ms/round。
     出力一致は要求しない (`control_identical=False`) -- A と B は旧カーネルの
-    1 ulp 差ぶん食い違いうる。**一致するかどうかそのものが報告事項。**
+    1 ulp 差ぶん食い違いうる。
+
+    **2026-09-03 実測** (`bench/results/hc-elem-off-hc-off.json`):
+    tok/round は A(素)=2.140 / B(既定)=2.144 (短)、1.699 / 1.697 (長) で
+    **差は 0.2% 以内**。旧カーネルは受理率を売っていない。一方 ms/round は
+    A が短 +2.7% / 長 +0.2%、ms/tok は短 +2.8% / 長 +0.0% で、**既定
+    (`MLXTURBO_HC=kernel`) の方が速い。**`hc-elem` の A で tok/round が
+    高く出たのは、elem が prefill 幅でビット一致を外して別の軌道に乗って
+    いるだけで、品質の証拠ではない (`hc-elem` の docstring を参照)。
     """
     from mlxturbo import fused
 
@@ -838,9 +846,20 @@ def _knob_hc_elem(ctx):
     つまり実質は「素 + mixer 1 層だけ融合」で、そこが比較の相手になる。
 
     合格条件: **ms/round が -4% 以上、tok/round は不変**。出力一致は
-    `control_identical=False` で扱う -- A は素とビット一致を狙って組んである
-    (sigmoid は MLX 本体の式の写し) が、B 側の 1 層が旧カーネルを通るので
-    A/B のビット一致は構造的に保証されない。**一致すればそれ自体が報告事項。**
+    `control_identical=False` で扱う。
+
+    **2026-09-03 実測で棄却済み** (`bench/results/hc-elem.json`、
+    `bench/results/hc-elem-off-hc-elem.json`): ms/round は短 +2.4% / 長 +0.7%
+    で改善しない。素の elementwise 11 op はもともと 25 us/call しかなく
+    (冷の連鎖で 4bit/gs64、素 61.9 us/call のうち GEMV が 36.9)、3 本に畳んでも
+    取り分が 9 us/call しか出ない。しかも S=1 では自前カーネルの threadgroup 数
+    が少ない (pre 4 / mid 2 / post 10) ので、その取り分も壁時計に出ない。
+
+    A は decode 幅 (M<=6) では素とビット一致するが、**M>=62 では post 段が
+    1e-5〜2.5e-4 の割合でずれる** (`kernels/hyper_connection.py` の第 4 変種の
+    節の表)。prefill がその幅を通るので in-model の軌道は素と分かれる --
+    `hc-off` との突き合わせで head (先頭 24) は一致するのに tok/round が
+    食い違ったのはこれが理由。
 
     prefill 幅にも効く (`eligible_elem` は行数を見ない) ので
     `DECODE_ONLY_KNOBS` には入れない -- `--prefill-once` は使えない

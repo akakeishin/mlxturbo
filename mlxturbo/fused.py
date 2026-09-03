@@ -307,6 +307,16 @@ def enable_hyper_connection_elem() -> None:
     `Q.GatedResidual.__call__` を取り合うので同時に使わない。切り替えるときは
     先に相手の disable を呼ぶこと。
 
+    **素とビット一致するのは decode 幅 (M<=6) だけ。**M>=62 では post 段が
+    1e-5〜2.5e-4 の割合で 1 ulp ずれる (`kernels/hyper_connection.py` の
+    第 4 変種の節に実測表がある)。`eligible_elem` は行数を見ないので prefill
+    幅の呼び出しもこの経路を通り、in-model の軌道は素と分かれる。ビット一致が
+    要る用途なら先に行数の上限を足すこと。
+
+    2026-09-03 の in-model A/B (`--knob hc-elem`) では ms/round が短 +2.4% /
+    長 +0.7% で **速度目的では棄却**。残してあるのは起動回数を減らす筋の
+    実測記録として。
+
     発火の確認は `mlxturbo.kernels._fire.snapshot()` の `hc_elem`。
     """
 

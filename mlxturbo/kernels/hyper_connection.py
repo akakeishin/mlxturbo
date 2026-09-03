@@ -1023,8 +1023,30 @@ def fused_gated_residual(
 # 本体は `exp(+abs(x))` で組み立てていて、丸め位置が違う。bf16 の全ビットパターン
 # (65536 個、非有限を 0 に置換) で mx.sigmoid と突き合わせると、写しは 65535/65536
 # 一致、`exp(-abs(x))` 変形は 63747/65536 (97.3%) しか一致しない (2026-09-03 実測)。
-# その結果、この変種の mixed / inject は素の実装と**ビット一致**する
-# (S=1 と S=6、量子化 inject と bf16 inject の 4 通りで確認)。
+# その結果、この変種の mixed / inject は **decode 幅では**素の実装とビット一致する。
+#
+# ただし **行数 M が増えると一致は崩れる** (2026-09-03 実測、4bit/gs64・bf16 inject、
+# 素との不一致要素の割合):
+#
+#   M      normed      silu(down/hc)   mixed          inject
+#   1/2/6  0           0               0              0
+#   62     0           0               3.2e-5         0
+#   512    0           0               1.3e-5         0
+#   2048   7.0e-6      4.0e-4          2.5e-4         0
+#
+# - M<=6 (decode/verify 幅) は全段ビット一致。
+# - M>=62 で post 段だけ崩れる。normed と up の入力が完全一致しているので、
+#   原因は post カーネルの中 — `mean(axis=-2)` を bf16 逐次加算で模した式
+#   (`_post_source` から引き継いだ、S=1 で確かめられたモデル) が M の大きい
+#   col-reduce では合っていないか、写した sigmoid が全 bf16 パターン中 1 個だけ
+#   外す (65535/65536) のどちらか。切り分けは未了。
+# - M=2048 では `mx.fast.rms_norm` 側も縮約の形が変わるらしく normed も崩れる。
+#
+# **この差は in-model に出る。**`--knob hc-elem` / `hc-off` の 3 者比較
+# (2026-09-03、`bench/results/hc-elem-off-*.json`) で、出力トークン列の先頭 24 は
+# elem / 素 / 既定カーネルの 3 者で一致するのに tok/round は食い違った。prefill
+# (M=62〜17k) がこの経路を通るため。**素とのビット一致が要るなら
+# `eligible_elem` に行数の上限 (decode/verify 幅だけ通す) を足すこと。**
 
 _KERNELS_ELEM: dict[tuple, Any] = {}
 

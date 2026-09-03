@@ -34,7 +34,7 @@ fused/plain は CLAUDE.md の作法通り 1 プロセス内で ABBA 交互に測
 
 **重みは既定で `--weight-sets` 組 (項目ごとの層数、hc=97/gdn=36) を巡回する
 冷キャッシュ**で読む (各ステップ i が `weights[i % N]` を使う、各組別々の乱数)。
-もともとは重み 1 組 (HC は down/up/inject 約 7 MB) を N=200 回読み回す温キャッシュ
+もともとは重み 1 組 (HC は down/up/inject 約 3.8 MB) を N=200 回読み回す温キャッシュ
 だったため、並列度の低い自前カーネルが冷の DRAM レイテンシを隠せない負けが
 見えていなかった (HC 融合: 温 +13 us -> 冷 +78 us/回 x 97 層 = +7.6 ms/forward、
 docs/research/SESSION-2026-09-02-CATCHUP.md の「2026-09-03 12:00 custom kernel が
@@ -91,9 +91,10 @@ from micro_kernel_latency import (  # noqa: E402
     WEIGHT_SET_DEFAULTS,
     _combine,
     _cycle_index,
-    _quant_linear,
     _report_weight_sets,
     _weight_bytes,
+    hc_fused_call,
+    hc_weight_set,
     plain_gated_residual,
     plain_gdn_prework,
 )
@@ -234,26 +235,22 @@ def build_hc_items(n_sets: int | None = None):
     まとめて作り、連鎖のステップ i が `weights[i % n_sets]` を巡回する
     (fused/plain は独立カウンタ)。既定は `WEIGHT_SET_DEFAULTS["hc"]` (97、HC の
     発火回数、docs/research/SESSION-2026-09-02-CATCHUP.md の「2026-09-03 12:00」
-    節)。`n_sets=1` で旧来通り重み 1 組 (約 7 MB) を 200 回使い回す温キャッシュに
+    節)。`n_sets=1` で旧来通り重み 1 組 (約 3.8 MB) を 200 回使い回す温キャッシュに
     戻る -- この温キャッシュこそが、並列度の低い自前カーネルが冷の DRAM
     レイテンシを隠せない負けを見えなくしていた当人 (HC 融合: 温 +13 us -> 冷
     +78 us/回)。判定ゲートは「重みを 100 MB 超巡回させた冷の連鎖」。
     """
     import mlx.core as mx
 
-    from mlxturbo.kernels.hyper_connection import fused_gated_residual
-
     n_sets = n_sets or WEIGHT_SET_DEFAULTS["hc"]
     dtype = mx.bfloat16
 
-    weight_sets = []
-    for _ in range(n_sets):
-        norm_weight = mx.zeros(HC * HIDDEN, dtype=dtype)
-        down = _quant_linear(HC_LOWRANK, HC * HIDDEN, dtype)
-        up = _quant_linear(HC * HIDDEN, HC_LOWRANK, dtype)
-        inject = _quant_linear(HC, HC * HIDDEN, dtype)
-        mx.eval(norm_weight, down, up, inject)
-        weight_sets.append((norm_weight, down, up, inject))
+    # 重みは実モデル (~/models/ddalcu-mlxlm) の設定で作る:
+    # down/up は 4bit/gs64、block_inject_weight は量子化されず bf16 のまま。
+    # **8bit で測ると融合カーネルと素の優劣が逆に出る** ので、この 1 行を
+    # `_quant_linear` の既定 (8bit) に戻さないこと
+    # (micro_kernel_latency.py の `HC_QBITS` の注記に実測値がある)。
+    weight_sets = hc_weight_set(dtype, n_sets)
 
     init_hyper = mx.random.normal((1, HC * HIDDEN)).astype(dtype)
     mx.eval(init_hyper)
@@ -271,7 +268,7 @@ def build_hc_items(n_sets: int | None = None):
 
         return step
 
-    fused_step = _make_step(fused_gated_residual)
+    fused_step = _make_step(hc_fused_call)
     plain_step = _make_step(plain_gated_residual)
     return fused_step, plain_step, (lambda: init_hyper), meta
 

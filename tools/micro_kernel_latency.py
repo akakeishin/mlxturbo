@@ -11,7 +11,7 @@ CLAUDE.md の「温キャッシュのマイクロを信じない」は帯域 (�
 負けた前例が複数ある: moe_glu、moe_route、HC prefill 融合)。
 
 `run_hc_kernel` の連鎖はさらに一枚落とし穴があった: 重み 1 組 (norm_weight
-/down/up/inject、約 7 MB) を 200 回読み回す**温キャッシュ**で、並列度の低い
+/down/up/inject、約 3.8 MB) を 200 回読み回す**温キャッシュ**で、並列度の低い
 自前カーネルが冷の DRAM レイテンシを隠せない負けを覆い隠していた
 (`docs/research/SESSION-2026-09-02-CATCHUP.md` の「2026-09-03 12:00 custom
 kernel が decode の in-model で負ける理由」節)。そのため既定を **`--weight-sets`
@@ -54,6 +54,23 @@ RMS_EPS = 1e-6
 VOCAB = 248320
 QBITS = 8
 QGROUP = 64
+
+# HC (hyper-connections) の 3 層だけは実モデルの設定が違う。
+# ~/models/ddalcu-mlxlm/config.json の quantization を見ると
+# `*.input_mix_weight_down` / `*.input_mix_weight_up` は 194 エントリ全部が
+# **4bit / group_size 64**、`block_inject_weight` はそもそも量子化対象に
+# 入っていない (bf16 の nn.Linear のまま。診断は
+# `tools/decode_ab.py` の `_knob_hc_kernel` docstring)。
+#
+# **QBITS=8 で HC を測ると融合カーネルと素の優劣が逆転する** (2026-09-03 実測、
+# 冷の連鎖 97 組):
+#   8bit/量子化 inject … 素 205.0 / 融合 48.5 us/call (融合が 4.2 倍速い)
+#   4bit/bf16 inject  … 素  61.9 / 融合 135.5 us/call (融合が 2.2 倍遅い)
+# 後者が docs/research/SESSION-2026-09-02-CATCHUP.md の
+# 「2026-09-03 12:00」節の数字 (素 62.5 / 融合 140.8) と in-model の負けに一致する。
+# HC の重みはこの 2 つの定数と `_hc_weight_set` からだけ作ること。
+HC_QBITS = 4
+HC_QGROUP = 64
 
 WARMUP = 20
 N_OP_CHAIN = 2000
@@ -135,10 +152,15 @@ def _qmm_linear(x, w):
     """`mlxturbo/fused.py::_build` 内の qmm と同じ量子化線形。
 
     w は `(weight, scales, biases, group_size, bits)` (`fused._pack_quantized`
-    や `mlxturbo/kernels/hyper_connection.py` の down/up/inject と同じ形)。
+    や `mlxturbo/kernels/hyper_connection.py` の down/up/inject と同じ形)、
+    または素の 1-tuple `(weight,)`。後者は HC の `block_inject_weight` 用
+    (実モデルでは量子化されず bf16 の nn.Linear のまま残っている)。
+    `fused.py::_build` の qmm も同じ 2 通りを受ける。
     """
     import mlx.core as mx
 
+    if len(w) == 1:
+        return x @ w[0].T
     wt, sc, bi, gs, bits = w
     return mx.quantized_matmul(x, wt, scales=sc, biases=bi, transpose=True, group_size=gs, bits=bits)
 
@@ -192,6 +214,49 @@ def plain_gated_residual(hyper, norm_weight, eps, hc, d, down, up, inject):
         return mixed
     inj = 2 * mx.sigmoid(_qmm_linear(normed, inject) / hc)
     return mixed, inj
+
+
+def hc_weight_set(dtype, n_sets: int = 1):
+    """HC の重み `(norm_weight, down, up, inject)` を実モデルの設定で `n_sets` 組作る。
+
+    実モデル (~/models/ddalcu-mlxlm) の設定に合わせる:
+      - `input_mix_weight_down` / `up` … `HC_QBITS`/`HC_QGROUP` (4bit / gs64)
+      - `block_inject_weight`          … 量子化せず bf16 のまま (素の 1-tuple)
+
+    **HC の重みを作る場所はここ 1 つに集約してある。**`tools/kernel_chain_cost.py`
+    の `build_hc_items` もこれを呼ぶ。以前は両方で `_quant_linear` の既定
+    (8bit) を使っていて、融合カーネルと素の優劣が逆に出ていた
+    (`HC_QBITS` の注記を参照)。
+    """
+    import mlx.core as mx
+
+    sets = []
+    for _ in range(n_sets):
+        norm_weight = mx.zeros(HC * HIDDEN, dtype=dtype)
+        down = _quant_linear(HC_LOWRANK, HC * HIDDEN, dtype,
+                             group_size=HC_QGROUP, bits=HC_QBITS)
+        up = _quant_linear(HC * HIDDEN, HC_LOWRANK, dtype,
+                           group_size=HC_QGROUP, bits=HC_QBITS)
+        # block_inject_weight は nn.Linear のまま (量子化されていない)
+        inject = ((mx.random.normal((HC, HC * HIDDEN)) * 0.02).astype(dtype),)
+        mx.eval(norm_weight, down, up, inject)
+        sets.append((norm_weight, down, up, inject))
+    return sets
+
+
+def hc_fused_call(hyper, norm_weight, eps, hc, d, down, up, inject):
+    """`fused_gated_residual` を `hc_weight_set` のパックで呼ぶ。
+
+    融合カーネル側は非量子化 inject を `("bf16", weight)` という印で受け取る
+    (`mlxturbo/kernels/hyper_connection.py` の `eligible` / `inject_kind`)ので、
+    素の 1-tuple をここで変換する。素の op 列 (`plain_gated_residual`) は
+    `_qmm_linear` が 1-tuple をそのまま扱うので変換は要らない。
+    """
+    from mlxturbo.kernels.hyper_connection import fused_gated_residual
+
+    if inject is not None and len(inject) == 1:
+        inject = ("bf16", inject[0])
+    return fused_gated_residual(hyper, norm_weight, eps, hc, d, down, up, inject)
 
 
 def plain_gdn_prework(mixed_qkv, conv_state, conv1d, a, b, A_log, dt_bias,
@@ -378,27 +443,23 @@ def run_hc_kernel(n_sets: int | None = None):
     (fused/plain は独立カウンタ)。既定は `WEIGHT_SET_DEFAULTS["hc"]` (97、HC の
     発火回数)。`n_sets=1` を渡すと旧来通り重み 1 組を使い回す温キャッシュに戻る。
 
-    背景: この関数がまさに温キャッシュだった当人 (重み 1 組・約 7 MB を
-    200 回読み回す、`docs/research/SESSION-2026-09-02-CATCHUP.md` の
+    重みは `hc_weight_set` が実モデルの設定 (down/up 4bit・gs64 で 1 組
+    約 3.8 MB、inject は bf16) で作る。
+
+    背景: この関数がまさに温キャッシュだった当人 (重み 1 組を 200 回
+    読み回す、`docs/research/SESSION-2026-09-02-CATCHUP.md` の
     「2026-09-03 12:00 custom kernel が decode の in-model で負ける理由」節)。
     重みを 48 組 (157 MB) 巡回させると融合カーネルだけ 81 -> 140.8 us/回
     (+74%) に悪化し、in-model の負けを説明した。
     """
     import mlx.core as mx
 
-    from mlxturbo.kernels.hyper_connection import fused_gated_residual
-
     n_sets = n_sets or WEIGHT_SET_DEFAULTS["hc"]
     dtype = mx.bfloat16
 
-    weight_sets = []
-    for _ in range(n_sets):
-        norm_weight = mx.zeros(HC * HIDDEN, dtype=dtype)
-        down = _quant_linear(HC_LOWRANK, HC * HIDDEN, dtype)
-        up = _quant_linear(HC * HIDDEN, HC_LOWRANK, dtype)
-        inject = _quant_linear(HC, HC * HIDDEN, dtype)
-        mx.eval(norm_weight, down, up, inject)
-        weight_sets.append((norm_weight, down, up, inject))
+    # 重みは実モデルの設定 (down/up 4bit・gs64、inject は bf16)。`hc_weight_set`
+    # の docstring と `HC_QBITS` の注記を参照
+    weight_sets = hc_weight_set(dtype, n_sets)
 
     init_hyper = mx.random.normal((1, HC * HIDDEN)).astype(dtype)
     mx.eval(init_hyper)
@@ -415,7 +476,7 @@ def run_hc_kernel(n_sets: int | None = None):
 
         return step
 
-    fused_step = _make_step(fused_gated_residual)
+    fused_step = _make_step(hc_fused_call)
     plain_step = _make_step(plain_gated_residual)
 
     fused_samples, plain_samples = _bench_chained_hc_ab(fused_step, plain_step, init_hyper, N_HC // 2)

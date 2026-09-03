@@ -2112,3 +2112,13 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - in-model: prefill-attn 17k **-3.7%** (旧 -0.9%)、50k **-23.2%** (旧 -21.3%)。min-kv 17k: 8192 対 12288 で -0.3% (誤差、効く層が 9 チャンク中 2 つ)。品質ゲート 17k n=8: 両方 recall 1.0 / quote 0.625 で同一。
 - MIN_KV 8192 の採否は 10k の A/B (chain95) で決める (-1% 以上なら 8192)。
 - `verify_prefill_attn.py` のモデルレベルは MIN_S=64 と MIN_KV 12288 の 2 つで発火していなかった。合成側を S=64 に広げ、check_model の中だけ MIN_KV=0 にして戻す形に直し、配列・モデルとも合格。
+
+### 2026-09-03 14:55 HC の切り分け (elem / off / kernel、17k、1 プロセス、`bench/results/hc-elem-off-*.json`) と冷連鎖ゲートの修正
+
+- ゲート修正: HC 項目を実モデルの設定 (4bit/gs64、inject は bf16) に (`hc_weight_set` / `hc_fused_call`)。冷 97 組 367.5 MB で **fused 136.5 / plain 61.6 us (2.22 倍)**、CATCHUP の帯 (135〜141 / 62) を再現。
+  修正前は 46.5 / 200.0 で符号が逆だった。GDN 系と床は不変。
+- **既定の HC=kernel は受理率を売っていない**: hc-off (A = 素、B = 既定) で tok/round 短 -0.2% / 長 +0.1% (0.2% 以内)、ms/round は既定の方が短 -2.7% / 長 -0.2% 速い。
+  9% の呼び出しだけ融合している現状は割に合っている。**HC=kernel の既定は据え置き。**
+- elem の tok/round が高く出たのは品質ではなく別の軌道: elem は decode / verify 幅 (M ≤ 6) では全段ビット一致だが、**M ≥ 62 で post 段 (mean の bf16 逐次加算の模倣か、写した sigmoid の 1 パターン) が素と食い違う**
+  (mixed の不一致率 M=62 3.2e-5、M=2048 2.5e-4、normed も M=2048 で 7e-6)。prefill がこの経路を通るので軌道が分かれる。ビット一致で使うなら行数の上限が要るが、速度で棄却済みなので実装しない。
+- **HC v4 は完全に閉じる。**`hc-elem` / `hc-off` knob は残す (docstring に実測を記録)。
