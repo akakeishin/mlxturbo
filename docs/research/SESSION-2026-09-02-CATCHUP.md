@@ -2291,3 +2291,23 @@ prefill_s: 2048 幅 12.784 / 1024 幅 12.763 / 512 幅 13.238。非 MoE のメ�
 - 相手比: 冷 prefill 1.04 / 1.09 / 1.05 / 1.05 / 1.06x 負け (9/3 朝の 1.13〜1.21x から縮小)、decode 4k -7% / 17k -3% / 25k -22% / 32k -5% / 50k **+2%**。温 TTFT は 4〜6 倍速 (50k は 20 倍)。
 - **気になる差**: 17k の冷 prefill は decode_ab (末尾 v2 の A) で 26.4 s なのに、サーバー経路では 30.3 s (+15%)。checkpoint あり (BPE 境界) のチャンク割り、n-gram の同期、thinking テンプレートの差のどれかで、サーバー経路にだけ乗っている費用がある。次の prefill の的。
 - 変な値は無いので push した。
+
+### 2026-09-03 19:35 decode の糊の融合 (P11、4 つの的): **全部負け。糊の本数を減らしても decode は速くならない**
+
+1 プロセス ABBA、burn-in、短 3 本 × 512、`MLXTURBO_DEPTH_ADAPT=0 --depth 2`。null 対照の雑音 -0.0% (±0.3%)。
+
+| knob | 仕組み | op の減り (S=1 / S=3) | 短 ms/round | tok/round |
+|---|---|---|---|---|
+| moe-sort-min=128 | verify 幅の MoE gather を argsort 無しに | 0 / -384 (4.7%) | **+0.6%** | ±0 |
+| glue-compile | MLP の `*up` と shared 合流を `mx.compile` で 1 本に | -192 / -192 | **+1.2%** | ±0 |
+| moe-combine-glue (compile / matmul) | `(y·w).sum(-2)` を 1 本に | -96 | +0.3% / -0.1% | -3.4% (compile はビット一致が GPU で崩れた) / ±0 |
+| wide-decode | attention の qkv 連結を decode 幅にも | — | +0.1% | **-4.1%** (qmv の変種が N で変わり出力が割れる) |
+| fast-rope (既存) | rope の slice/concat を `mx.fast.rope` に | -96 | -0.0% | +0.3% |
+
+- **読み**: trace の「dispatch 4499 本が壁」は糊の側では成り立たない。GPU busy 93% で、op を 5% 減らしても壁時計は動かない = 残りは行列積 (帯域の半分で走る qmv、S=3 の gather_qmv 64 us/呼び出し = 行ごとに違う専門家を読む代金) の側。
+  短文脈 decode で残る手は (a) lm_head 4bit (既定に入れた、-0.9 ms)、(b) 受理率 (draft の top-k 命中率 → rerank、depth 4 は行費用 4.9 ms が壁)、(c) MoE の行間で専門家の読みを共有する自前 gather (D5 は重複率で畳んだ)。
+  **短文脈 100 tok/s は M3 Max では現行の構造で届かない (現実線 55〜58)。**長文脈 (K2c) と prefill が勝ち筋。
+- copy 133 本の出所 (`tools/decode_copy_probe.py`、グラフの op を出所別に数える): Attention 84 (うち rope の slice/concat 48)、GDN 36 (conv 窓の concat、消すには棄却済みの prework 融合が要る)、indexer 12、PLE 2。
+  `Broadcast strided` 96 本 = ルータ重みの実体化 48 + shared gate の sigmoid 48。消しても速くならなかった。
+- 危ない教訓: **CPU の合成モデルでビット一致しても GPU で崩れる** (moe-combine-glue の compile 版、bf16/fp32 の昇格の順)。ビット一致の主張は GPU で取る。
+- 4 knob のコードは取り除く (方針: 効かない変種を二重に持たない)。`decode_copy_probe.py` は残す。
