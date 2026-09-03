@@ -19,7 +19,25 @@ BM を上げるのに `_steel_flat.STEEL_HEADER` の `qmm_t_impl` はそのま�
   2. X 側 `BlockLoader` の `n_reads` を template 引数 (`XREADS`) にした
      (BM=64 / BK=64 で既定の n_reads が 16〜32 まで膨らみ、1 スレッドが
      32〜64 バイトのベクタ読みをする形になるので、8 で頭打ちにできるように)
-  3. 端数タイルの分岐 (`num_els < BM`) と store は写しのまま
+  3. W 側 `load_safe` の引数の順を直した (下の「N の端」)
+  4. 端数タイルの分岐 (`num_els < BM`) と store は写しのまま
+
+## N の端 (BN != BK のタイルで写しをそのまま使うと壊れる)
+
+`QuantizedBlockLoader::load_safe` は `reduction_dim == 1` のとき
+`bi >= src_tile_dim.x` で 0 埋めするが、この `bi` は **N の添字** (BROWS = BN)
+なので、比べる相手は N の残り (`num_outs`) でなければならない。本家の
+`qmm_t_impl` は `short2(BK, num_outs)` を渡していて `.x` が BK になっている。
+本家は BN == BK == 32 しか作らないので `bi >= BK` は決して立たず、N の端の
+W タイルは 0 埋めされずに**範囲外を読む** (読んだ値は `store_result_safe` の
+マスクで捨てられるので結果は正しい)。
+
+このファイルは BN=64 のタイルを作るので、そのまま写すと `bi >= 32` が
+**有効な行 (bi = 32..63) にも立ち**、N の端のタイルで出力の後ろが 0 になる
+(N=300 / BN=64 で最後の 12 列が 0 になるのを 2026-09-04 に観測)。そこで
+呼び出しを `short2(num_outs, BK)` にして、`.x` に N の残りを入れる。
+BN == BK のタイルでは結果は変わらない (0 埋めか範囲外読みかの違いで、どちらも
+store のマスクで捨てられる列) が、範囲外読みは無くなる。
 
 MMA・ローダー・dequantize・store は `STEEL_HEADER` の写しをそのまま呼ぶ。
 
@@ -28,10 +46,31 @@ MMA・ローダー・dequantize・store は `STEEL_HEADER` の写しをそのま
 K の縮約順は **タイル形を変えても変わらない**。`BlockMMA::mma` は
 threadgroup タイルの中を `kFragSize = 8` 刻みで昇順に回るだけで、BM / BN は
 どの出力要素をどのスレッドが持つかを決めるだけ、BK は 1 回の外側ループで
-何刻み進むかを決めるだけだから。したがって全変種が
-`mx.quantized_matmul(transpose=True)` と**ビット一致するのが期待値**で、
-一致しなければタイルの張り方を間違えている合図になる (計測より先に効く
-検査として使う)。
+何刻み進むかを決めるだけだから。したがって**全変種がお互いにビット一致する**
+のが期待値で、変種どうしが割れたらタイルの張り方を間違えている合図になる
+(計測より先に効く検査として使う)。
+
+`mx.quantized_matmul(transpose=True)` とのビット一致は、**素が `qmm_t` を
+選ぶ形でだけ**成り立つ。MLX 0.32.2 は同じ呼び出しを 3 つの実装に振り分ける
+(`libmlx.dylib` のカーネル名 `qmv_fast` / `qmm_t` / `qmm_t_splitk`)。
+
+  - ``M < 13``: `qmv` 系。1 行を複数スレッドで割る別の縮約順。
+  - ``K >= 128`` かつ出力タイル数 ``ceil(M/32) * ceil(N/32) < 256``:
+    **`qmm_t_splitk`**。K を分割して部分和を出し、あとで足す。並列度を稼ぐ
+    代わりに部分和が出力 dtype (bf16) を経由するので、**素の側が真値から離れる**。
+  - それ以外: `qmm_t`。ここでだけ写しと**ビット一致**する。
+
+`stock_bit_matches` がこの振り分けを写している。境界の 13 / 256 / 128 は
+`tools/qmm_wide_shape_micro.py` の掃引で当てた実測値 (M3 Max / MLX 0.32.2。
+タイル数の 256 は N=320 / 640 / 1280 の 3 本、M の 13 は N=320 と N=12288 の
+2 本で一致) であって MLX の契約ではない。
+
+**splitk 帯での食い違いは写しの欠陥ではない。**同じ掃引で、素と同形のタイル
+`m32n32k32w2x2` も BM=64 のタイルとまったく同じだけ素から外れ、両者は
+お互いにビット一致し、float32 の参照に対しては**どちらも素より近い**
+(HC の down, K=10240 N=320, M=256 で 素 0.074 に対し写しは 0.031)。
+つまり `qmm_wide` は splitk 帯でも `qmm_t` の答えをそのまま出しているだけで、
+比較相手のほうが M で入れ替わっている。
 
 ## 現状
 
@@ -67,7 +106,9 @@ _KERNELS: dict[str, Any] = {}
 _WIDE_HEADER = r"""
 // ---- mlxturbo: quantized.h:1192-1318 (qmm_t_impl) の写し。
 // 変更点は (1) WM / WN を template に上げた (2) X 側 BlockLoader の n_reads を
-// template (XREADS) にした、の 2 つだけ。それ以外は 1 文字も変えていない。
+// template (XREADS) にした (3) W 側 load_safe の short2 の順を直した (BN != BK の
+// タイルで N の端が壊れるため。上の「N の端」)、の 3 つだけ。
+// それ以外は 1 文字も変えていない。
 template <
     typename T,
     const int group_size,
@@ -146,7 +187,10 @@ METAL_FUNC void mlxturbo_qmm_t_wide(
       for (int k = 0; k < K_eff; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         loader_x.load_safe(short2(BK, num_els));
-        loader_w.load_safe(short2(BK, num_outs));
+        // mlxturbo: 本家は short2(BK, num_outs)。reduction_dim == 1 の
+        // QuantizedBlockLoader は .x を N の添字と比べるので、BN != BK だと
+        // 有効な行まで 0 埋めされる (ヘッダ冒頭の「N の端」)
+        loader_w.load_safe(short2(num_outs, BK));
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mma_op.mma(Xs, Ws);
         loader_x.next();
@@ -168,7 +212,7 @@ METAL_FUNC void mlxturbo_qmm_t_wide(
       for (int k = 0; k < K_eff; k += BK) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
         loader_x.load_unsafe();
-        loader_w.load_safe(short2(BK, num_outs));
+        loader_w.load_safe(short2(num_outs, BK));  // mlxturbo: 上と同じ
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mma_op.mma(Xs, Ws);
         loader_x.next();
@@ -327,6 +371,32 @@ def tile_ok(tile: Tile, K: int, N: int, group_size: int = GROUP_SIZE,
     return None
 
 
+# 素が `qmm_t` を選ぶ帯 (= 写しとビット一致する帯) の判定。上の「数値」の節。
+_STOCK_QMV_MAX_ROWS = 13   # M < これ は qmv 系
+_STOCK_SPLITK_TILES = 256  # 出力タイル数がこれ未満なら qmm_t_splitk
+_STOCK_SPLITK_MIN_K = 128  # K がこれ未満なら分割しない
+
+
+def stock_bit_matches(M: int, K: int, N: int) -> bool:
+    """`mx.quantized_matmul(transpose=True)` がこの形で `qmm_t` を選ぶか。
+
+    ``True`` の帯でだけ :func:`qmm_wide` は素とビット一致する。``False`` の帯
+    (小さい M、または出力タイルが少ない細長い形) では素が `qmv` / `qmm_t_splitk`
+    に振れるので、素との差は写しの欠陥ではない (「数値」の節)。
+
+    :func:`eligible` には入れていない。splitk 帯でも写しの答えは `qmm_t` の答え
+    そのもので、float32 参照に対しては素より近い。ここで弾くと、正しくて速い形を
+    落とすことになる。**素とのビット一致を検査に使うとき**にだけ使う判定。
+    """
+
+    if M < _STOCK_QMV_MAX_ROWS:
+        return False
+    if K < _STOCK_SPLITK_MIN_K:
+        return True
+    tiles = ((M + 31) // 32) * ((N + 31) // 32)
+    return tiles >= _STOCK_SPLITK_TILES
+
+
 def _get_kernel(tile: Tile):
     kernel = _KERNELS.get(tile.name)
     if kernel is None:
@@ -440,5 +510,6 @@ __all__ = [
     "Tile",
     "eligible",
     "qmm_wide",
+    "stock_bit_matches",
     "tile_ok",
 ]

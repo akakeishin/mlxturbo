@@ -753,9 +753,18 @@ mlx_lm の更新で写しが壊れる頻度が月 2 回を超えるなら、写�
 ブロック局所ヒストグラム (threadgroup 内で数える) → `cumsum` → ブロック内順位 (原子操作なしで決定的) の 2 カーネル + 小 op 数本にすれば 0.05〜0.08 ms/層 に落ちる見込み = **-0.25 ms/層 = 8k prefill の -0.4%**。
 専門家内の行順は結果に影響しない (行ごとの GEMM は位置に依らず、`combine` は k の固定順で足す) ので**出力はビット一致**。P7 第 3 段で残った唯一の的 (router は床、swiglu と topk は合わせて -0.15 ms/層で揺れの中、`docs/research/SESSION-2026-09-02-CATCHUP.md` の 2026-09-03 20:55)。
 
-## `qmm_wide` は M < 1024 で HC の down (10240→320) が素と食い違う (2026-09-04 03:10、HC エージェントの副産物、未調査)
+## `qmm_wide` は M < 1024 で HC の down (10240→320) が素と食い違う → 欠陥ではない (2026-09-04 04:00 に決着)
 
-`tools/hc_prefill_micro.py` で本番の行数ゲート `fused._QMM_WIDE_MIN_ROWS` (=1024) より小さい幅を測ると、down (K=10240, N=320) が
-M=256 で相対 0.53 (max_abs 2.0)、M=512 で 0.373、M ≥ 2048 で 0.0。up (K=320, N=10240) は全幅で一致。本番は prefill のチャンクが 2048 で
-ゲートが 1024、C の in-model も 4k / 8k / 17k でビット一致なので届いていないが、**`MLXTURBO_QMM_WIDE_MIN_ROWS` を下げる前にここを潰す**こと
-(N=320 の細長形で M が小さいときのタイル端の扱いを疑う)。micro の numerics に `below_prod_min_rows` / `prod_min_rows` を出してある。
+HC エージェントの副産物 (03:10): `tools/hc_prefill_micro.py` で本番の行数ゲート `fused._QMM_WIDE_MIN_ROWS` (=1024) より小さい幅を測ると、down (K=10240, N=320) が
+M=256 で相対 0.53、M=512 で 0.373、M ≥ 2048 で 0.0。調査 (`tools/qmm_wide_shape_micro.py`、`bench/results/qmm-wide-shapes.json`) の結論:
+
+- **素の側が実装を切り替えている。**MLX 0.32.2 の `quantized_matmul(transpose=True)` は M < 13 で qmv 系、K ≥ 128 かつ ceil(M/32)·ceil(N/32) < 256 で
+  `qmm_t_splitk` (部分和が bf16 を経由)、それ以外で `qmm_t`。N=320 の down は M ≤ 800 が splitk 帯で、そこでは素と同形の写し (`m32n32k32w2x2`) も
+  BM=64 も 1 ビット違わず同じだけ素から外れ、**fp32 参照には写しのほうが近い** (M=256 で素 0.062 / 写し 0.031)。品質の問題ではない。
+  判定は `qmm_wide.stock_bit_matches(M, K, N)` (境界 13 / 256 / 128 は M3 Max + MLX 0.32.2 の実測。MLX の契約ではないので更新で動きうる)。
+  `eligible()` には入れない (splitk 帯でも写しは `qmm_t` の答えそのもの)。
+- **副産物で本物の欠陥を 1 つ直した**: `_WIDE_HEADER` の `loader_w.load_safe(short2(BK, num_outs))` は本家 (BN == BK == 32) の写しで、BN=64 のタイルでは
+  N の端の有効な行 (32..63) まで 0 埋めしていた → `short2(num_outs, BK)`。本番のタイル `m64n32k32w2x2r8` は直す前後でビット一致 (変わるのは BN=64 の 4 タイル ×
+  `N % 64 > 32` の形だけ、本番の N は全部 64 の倍数)。`bench/test_qmm_wide_shapes.py` 4 本。
+- `MLXTURBO_QMM_WIDE_MIN_ROWS` を下げるときの注意は数値の質ではなく、**splitk 帯では素とのビット一致が成り立たない**こと (in-model のビット一致検査は必ず落ちる。
+  品質は写しが良い側)。速度はその帯では未測定。

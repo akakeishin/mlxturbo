@@ -58,9 +58,11 @@ CLAUDE.md)。段和と全体の壁時計の差は結果の `sum_check` に出す
   中 (写した sigmoid か Metal の bf16 積の丸め)
 - `qmm_wide`: 広タイルが素とビット一致するか (本番の既定、`fused.enable_hc_qmm_wide`)。
   **`--rows` は本番の行数ゲート (`fused._QMM_WIDE_MIN_ROWS`、既定 1024) 以上で測ること。**
-  下回ると down 側が素と食い違う (M=256 で 0.53 / M=512 で 0.373、M>=2048 で 0.0)。
-  本番はゲートで届かないので実害は無いが、小さい `--rows` の数字を欠陥と読み違えない
-  ように `below_prod_min_rows` を結果に出している
+  下回ると down 側 (N=320) が素と食い違う (M=256 で 0.53 / M=512 で 0.373、M>=2048 で 0.0) が、
+  これは欠陥ではなく **MLX の素の側が M ≤ 800 (N=320) で `qmm_t_splitk` に切り替わる**ため
+  (部分和が bf16 を経由。写しは `qmm_t` の答えそのもので fp32 参照には近い、
+  `kernels/qmm_wide.py` の `stock_bit_matches`、BACKLOG 2026-09-04)。小さい `--rows` の
+  数字を欠陥と読み違えないように `below_prod_min_rows` を結果に出している
 
 モデルは読まない。
 
