@@ -81,7 +81,7 @@ MoE router 融合、union gather (真の union が 6 割)、wide 連結。理由
    空き率が大きければ「カーネル数を減らす融合を帯域最適に書く」(消費の大きい順)、小さければ帯域の壁 (lm_head 8bit、PLE の参照、MoE の専門家読み) を削る。
    その後 depth 4 の既定化 (K2c で行の費用が下がった後、oracle の天井 tok/round を見て rerank と組む)。判定は短 / 17k / 50k の ms/tok。
 3. **P9 チャンク 8192** (prefill): P7 の後。query 化で可視集合はチャンク割りに依存しない (前提は済)。判定は 8k / 17k / 50k の prefill_s と温 TTFT (checkpoint の粗さ)。
-4. **小ベンチ → フルベンチ (対 mlx-serve)**: 2 と 3 で「decode 短文脈が同着以上、prefill 1.03x 以内」が小ベンチで出たらフルベンチ。出なくてもユーザーが呼べばフルベンチ。
+4. **小ベンチ → フルベンチ (対 mlx-serve)** (ベンチは lm_head 4bit のパック `~/models/ddalcu-mlxlm-head4` で。相手と条件を揃える、ユーザー 2026-09-03 18:55): 2 と 3 で「decode 短文脈が同着以上、prefill 1.03x 以内」が小ベンチで出たらフルベンチ。出なくてもユーザーが呼べばフルベンチ。
 5. **27B / 35B-A3B (qwen3_5)**: 素の数字 (mlx-lm / mlx-serve / oMLX / うち) → 融合の対応表 (アーキテクチャ追従の投資、BACKLOG) → GDN Metal / sdpa 行タイル / BM=64 qmm (MLP 込み) の移植 → Lily の 5 (GQA packing、固定ブロック attention) → 6 (35B-A3B の AR 対 MTP)。
    teacher (27B の bf16、54 GB) もここで作る。
 6. Gemma 4 (assistant drafter の KV 共有エンジン、sliding window の prefill)。
