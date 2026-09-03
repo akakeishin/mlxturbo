@@ -1472,6 +1472,16 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         fused.enable_gdn_metal_kernel()
         if os.environ.get("MLXTURBO_GDN_METAL") != "0":
             print(f"{log_prefix} GDN blocked-seq Metal カーネル有効 (oMLX 移植、既定 on)")
+        # 上の 4 つは `_vendor/qwen4_exp.py` の `GatedDeltaNet.__call__` に
+        # あるシームを立てるだけなので、シームを持たない族 (qwen3_5 =
+        # Qwen3.8-27B) には届かない。enable_gdn_port は同じ 3 部品を
+        # 「モジュールの形の契約」で当てる (契約が合わなければ何もしない)。
+        # 切り方は上と共用 (MLXTURBO_GDN_METAL / MLXTURBO_GDN_DECODE_FUSED)。
+        gdn_port = fused.enable_gdn_port(model)
+        if gdn_port["layers"]:
+            print(f"{log_prefix} GDN 部品を構造の契約で適用 ({gdn_port['layers']} 層): "
+                  f"decode 前処理 {gdn_port['prework']} / 出力 norm {gdn_port['norm']} / "
+                  f"prefill Metal 再帰 {'有効' if gdn_port['metal'] else '無効'}")
         # enable_sdpa_split 自身が MLXTURBO_SDPA_SPLIT=0 で無効化する
         # ゲートを持っているので、ここでは呼ぶだけでよい (既定 on)。
         # decode/verify 幅 (S<=8) の sdpa が vector カーネルの適格幅
@@ -1540,10 +1550,13 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         # enable_sdpa_rowtile 自身が MLXTURBO_SDPA_ROWTILE (未設定 = 256、
         # =0 で off) を読むので、ここでは呼ぶだけ。decode/verify 幅 (S < 64) は
         # 常に素の sdpa に落ちる。
-        fused.enable_sdpa_rowtile(model)
+        # 差し替え先のモジュールは族で決め打ちせず、層を歩いて attention の
+        # `__call__` の名前空間を見つける (qwen4_exp / qwen3_next)。
+        n_rt = fused.enable_sdpa_rowtile(model)
         _rt = os.environ.get("MLXTURBO_SDPA_ROWTILE", "256")
         if _rt not in ("0", ""):
-            print(f"{log_prefix} sdpa 行タイル有効 (段 P5、R={_rt}、MLXTURBO_SDPA_ROWTILE=0 で off)")
+            print(f"{log_prefix} sdpa 行タイル有効 (段 P5、{n_rt} 層、R={_rt}、"
+                  f"MLXTURBO_SDPA_ROWTILE=0 で off)")
 
         # 段 P3 (混合タイル): prefill 幅の MoE 行列積を自前の grouped GEMM に
         # 置き換え、専門家ごとに 16 行 / 32 行タイルを選ぶ (`MLXTURBO_MOE_GEMM_MIX`、

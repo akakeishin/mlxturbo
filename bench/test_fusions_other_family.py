@@ -108,6 +108,7 @@ def _structure_walkers(model):
          lambda: sum(fused.enable_wide_projections(model).values()), 0),
         ("fused.disable_wide_projections", lambda: fused.disable_wide_projections(model), 0),
         ("fused.enable_qmm_wide", lambda: fused.enable_qmm_wide(model), 0),
+        ("fused.enable_sdpa_rowtile", lambda: fused.enable_sdpa_rowtile(model), 0),
         ("fused.enable_hc_qmm_wide", lambda: fused.enable_hc_qmm_wide(model), 0),
         ("fused.disable_hc_qmm_wide", lambda: fused.disable_hc_qmm_wide(model), None),
         ("fused._hc_gated_residuals", lambda: len(list(fused._hc_gated_residuals(model))), 0),
@@ -194,6 +195,43 @@ def test_qwen4_exp_fusions_still_apply():
     assert indexer_lean.disable_indexer_lean(model) == n_attn
     assert qsa_decode.enable_qsa_decode_kernel(model) == n_attn
     assert qsa_decode.disable_qsa_decode_kernel(model) == n_attn
+
+
+def test_qwen4_exp_moe_has_no_dense_mlp_projections():
+    """`_QMM_WIDE_TARGETS` に足した `mlp` の 3 本は qwen4_exp に当たらない。
+
+    27B (qwen3_5) の dense MLP のために
+    `("mlp", ("gate_proj","up_proj","down_proj"))` を足したが、qwen4_exp の
+    `layer.mlp` は `SparseMoeBlock` で、専門家は `mlp.switch_mlp` (SwitchGLU)、
+    共有専門家は `mlp.shared_expert` の下にある。**`mlp` 直下にはこの 3 つの
+    名前が無い**ので、印を付ける層が 1 つも増えない。
+    """
+    model = _build_qwen4_exp()
+    names = dict(fused._QMM_WIDE_TARGETS)["mlp"]
+    assert names == ("gate_proj", "up_proj", "down_proj")
+    for layer in model.model.layers:
+        mlp = getattr(layer, "mlp", None)
+        assert mlp is not None
+        for name in names:
+            assert getattr(mlp, name, None) is None, f"{type(mlp).__name__}.{name}"
+
+
+def test_sdpa_rowtile_patches_qwen4_exp_for_any_model():
+    """行タイルの差し替え先は族で決め打ちしないが、qwen4_exp は常に差さる。
+
+    `enable_sdpa_rowtile(model=None)` という従来の呼び方 (`tools/decode_ab.py`
+    と `runner.py`) を保つため。他の族のモデルを渡しても qwen4_exp 側の
+    差し替えは変わらず、その族の attention 層が見つからなければ 0 を返す。
+    """
+    import mlx_lm.models.qwen4_exp as Q4
+
+    try:
+        assert fused.enable_sdpa_rowtile(None, rows=256) == 0
+        assert getattr(Q4.scaled_dot_product_attention,
+                       "_mlxturbo_rowtile_module", None) == Q4.__name__
+        assert fused.enable_sdpa_rowtile(_StubOtherFamily(n_layers=4)) == 0
+    finally:
+        fused.disable_sdpa_rowtile()
 
 
 def test_enable_default_fusions_qwen4_exp_still_runs():

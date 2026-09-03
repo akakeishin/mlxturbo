@@ -998,6 +998,395 @@ def disable_gdn_metal_kernel() -> None:
     Q.GatedDeltaNet._gdn_metal = False
 
 
+# --------------------------------------------------------------------------
+# GDN の自前部品を「構造の契約」で他の族に当てる (2026-09-04、27B レーン 第 1 段)
+# --------------------------------------------------------------------------
+#
+# 上の 4 つの enable_gdn_* は `Q.GatedDeltaNet.<flag> = True` を立てるだけで、
+# 実際にカーネルを呼ぶのは `_vendor/qwen4_exp.py` の `GatedDeltaNet.__call__`
+# にあるシームのほう。qwen3_5 (Qwen3.8-27B) の `GatedDeltaNet` にはシームが
+# 無いので、そのままでは 1 つも届かない。
+#
+# ここでは `docs/BACKLOG.md:713` の方針 (構造の探索 = duck typing、契約検査
+# つきの適用、素の forward はそのままでフックだけ差す) で当てる:
+#
+#   1. 形の契約 (`_gdn_spec`) が合う GDN インスタンスだけを選ぶ。
+#   2. decode/verify 幅の前処理は、そのインスタンスの `__class__` を動的
+#      サブクラスに差し替えて `__call__` の**速い側だけ**を自前にする
+#      (契約・幅が外れたら素の `__call__` をそのまま呼ぶ = 写しを作らない)。
+#      `__class__` の差し替えは `kernels/dispatch.py:227` と同じ手で、
+#      モジュールの identity・パラメータ名・凍結状態・読み込み済みの配列を
+#      そのまま保つ。
+#   3. 出力 norm も同じく norm インスタンスの `__class__` 差し替え。活性化
+#      (sigmoid / silu) は族ごとに違い、qwen3_5 側には `activation` 属性が
+#      無い (`_precise_swiglu` = silu 固定) ので、**起動時に合成入力で素と
+#      突き合わせて決める** (ビット一致した活性化だけ採る)。
+#   4. prefill 幅の再帰 (GDN Metal) は、GDN のクラスを定義しているモジュール
+#      の `gated_delta_update` を包む (形の契約に合えば Metal、外れれば素を
+#      そのまま呼ぶ)。クラスパッチではなく関数の差し替えで、契約に合う GDN が
+#      1 層でも見つかったときだけ入れる。
+#
+# qwen4_exp はシームを持っているので**この経路の対象外** (二重に当てない)。
+# 環境変数は上と共用: `MLXTURBO_GDN_METAL` (既定 on) が 4、
+# `MLXTURBO_GDN_DECODE_FUSED` (既定 1) が 2 と 3 を切る。
+
+# ベースクラスごとに 1 つだけ作る動的サブクラス (48 層で 48 個作らない)
+_GDN_CALL_CLASSES: dict = {}
+_GDN_NORM_CLASSES: dict = {}
+# 包んだ `gated_delta_update` を持つモジュール (disable で戻すため)
+_GDN_UPDATE_PATCHED: list = []
+
+
+def _gdn_spec(gdn):
+    """GDN 層の形の契約。合えば必要な数を集めた `SimpleNamespace`、
+    合わなければ None。
+
+    戻り値を dict / tuple にしないこと: `nn.Module.__setattr__` は
+    array/dict/list/tuple をモジュール辞書 (パラメータ・子モジュール) に
+    入れてしまい、`children()` / `named_modules()` の走査に混ざる。
+
+    族ごとに属性名が違う (qwen4_exp の `n_v`/`n_k`/`dk`/`dv` に対して
+    qwen3_5 は `num_v_heads`/`num_k_heads`/`head_k_dim`/`head_v_dim`) ので、
+    意味ごとに候補名を並べて拾う。名前が 1 つでも欠けるか、形の関係
+    (`key_dim == n_k*dk` など) が崩れていれば None を返して当てない。
+    """
+
+    import mlx.core as mx
+
+    for name in ("conv1d", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
+                 "norm", "out_proj"):
+        if getattr(gdn, name, None) is None:
+            return None
+    A_log = getattr(gdn, "A_log", None)
+    dt_bias = getattr(gdn, "dt_bias", None)
+    if not isinstance(A_log, mx.array) or not isinstance(dt_bias, mx.array):
+        return None
+
+    def pick(*names):
+        for n in names:
+            v = getattr(gdn, n, None)
+            if isinstance(v, int) and not isinstance(v, bool):
+                return v
+        return None
+
+    n_v = pick("n_v", "num_v_heads")
+    n_k = pick("n_k", "num_k_heads")
+    dk = pick("dk", "head_k_dim")
+    dv = pick("dv", "head_v_dim")
+    key_dim = pick("key_dim")
+    value_dim = pick("value_dim")
+    conv_dim = pick("conv_dim")
+    K = pick("conv_kernel_size")
+    if None in (n_v, n_k, dk, dv, key_dim, value_dim, conv_dim, K):
+        return None
+    if key_dim != n_k * dk or value_dim != n_v * dv:
+        return None
+    if conv_dim != 2 * key_dim + value_dim:
+        return None
+    w = getattr(gdn.conv1d, "weight", None)
+    if not isinstance(w, mx.array) or w.shape != (conv_dim, K, 1):
+        return None
+    if A_log.shape != (n_v,) or dt_bias.shape != (n_v,):
+        return None
+    norm_w = getattr(gdn.norm, "weight", None)
+    if not isinstance(norm_w, mx.array) or norm_w.shape != (dv,):
+        return None
+    if not isinstance(getattr(gdn.norm, "eps", None), float):
+        return None
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        n_k=n_k, n_v=n_v, dk=dk, dv=dv,
+        key_dim=key_dim, value_dim=value_dim, conv_dim=conv_dim, K=K,
+    )
+
+
+def _gdn_norm_activation(norm, base) -> str | None:
+    """出力 norm の活性化 (`sigmoid` / `silu`) を決める。
+
+    `activation` 属性を持つ族 (qwen4_exp) はそれをそのまま使う。持たない族
+    (qwen3_5 は `Qwen3NextRMSNormGated` で `_precise_swiglu` = silu 固定) は、
+    **合成入力 1 回で素の実装と突き合わせて**決める (`docs/BACKLOG.md:716`
+    「起動時に合成入力で素の実装と突き合わせる」)。ビット一致する活性化が
+    無ければ None を返し、その層の norm は素のままにする。
+    """
+
+    import mlx.core as mx
+
+    from .kernels import rms_norm_gated as rng
+
+    w = norm.weight
+    act = getattr(norm, "activation", None)
+    rows, dv = 8, w.shape[0]
+    # 大域の PRNG 状態を進めない (生成の乱数列を動かさないため、鍵を明示する)
+    key = mx.random.key(0)
+    x = mx.random.normal((rows, dv), key=key).astype(w.dtype)
+    gate = mx.random.normal((rows, dv), key=mx.random.key(1)).astype(w.dtype)
+    if not rng.eligible(x, w, gate):
+        return None
+    try:
+        ref = base.__call__(norm, x, gate)
+        mx.eval(ref)
+    except Exception:  # noqa: BLE001 -- 素が呼べない形なら当てない
+        return None
+    for cand in ((act,) if act else ("silu", "sigmoid")):
+        if cand not in ("silu", "sigmoid"):
+            continue
+        got = rng.rms_norm_gated(x, w, gate, norm.eps, cand, rows_per_tg=1)
+        mx.eval(got)
+        if got.dtype == ref.dtype and mx.array_equal(got, ref):
+            return cand
+    return None
+
+
+def _gdn_norm_subclass(base, activation: str):
+    """`base` (族の RMSNormGated) の動的サブクラス。decode/verify 幅の
+    行数 (<= :data:`_GDN_NORM_MAX_ROWS`) だけ融合カーネルへ回す。"""
+
+    key = (base, activation)
+    cls = _GDN_NORM_CLASSES.get(key)
+    if cls is not None:
+        return cls
+
+    from math import prod
+
+    from .kernels import rms_norm_gated as rng
+
+    def patched(self, x, gate=None):
+        if gate is None or prod(x.shape[:-1]) > _GDN_NORM_MAX_ROWS:
+            return base.__call__(self, x, gate)
+        w = self.weight
+        if not rng.eligible(x, w, gate):
+            return base.__call__(self, x, gate)
+        # 行数が 48〜768 しかないので 1 行 = 1 threadgroup
+        # (`enable_gdn_decode_fused` と同じ理由)
+        return rng.rms_norm_gated(x, w, gate, self.eps, activation, rows_per_tg=1)
+
+    cls = type(
+        f"{base.__name__}_mlxturbo_gdn",
+        (base,),
+        {"__call__": patched, "_mlxturbo_gdn_base": base},
+    )
+    cls.__module__ = __name__
+    _GDN_NORM_CLASSES[key] = cls
+    return cls
+
+
+def _gdn_call_subclass(base):
+    """`base` (族の GatedDeltaNet) の動的サブクラス。
+
+    decode/verify 幅で契約が合うときだけ `gdn_prework` + 逐次カーネル +
+    出力 norm を自前で通す。**それ以外は素の `__call__` をそのまま呼ぶ**
+    (素の forward の写しは持たない)。
+    """
+
+    cls = _GDN_CALL_CLASSES.get(base)
+    if cls is not None:
+        return cls
+
+    import mlx.core as mx
+    from mlx_lm.models.gated_delta import gated_delta_kernel
+
+    from .kernels import gdn_prework as gp
+
+    def patched(self, inputs, mask=None, cache=None):
+        spec = getattr(self, "_mlxturbo_gdn_spec", None)
+        if spec is None or inputs.ndim != 3:
+            return base.__call__(self, inputs, mask, cache)
+        B, S, _ = inputs.shape
+        # 幅の判定を射影より先に置く (prefill では 1 op も余分に組まない)
+        if (
+            S > gp.MAX_S
+            or B * S > gp.MAX_M
+            or mask is not None
+            or cache is None
+            or self.training
+            or getattr(cache, "lengths", None) is not None
+            or getattr(self, "sharding_group", None) is not None
+        ):
+            return base.__call__(self, inputs, mask, cache)
+
+        n_k, n_v = spec.n_k, spec.n_v
+        dk, dv = spec.dk, spec.dv
+        key_dim, value_dim = spec.key_dim, spec.value_dim
+        conv_w = self.conv1d.weight
+        A_log, dt_bias = self.A_log, self.dt_bias
+
+        mixed_qkv = self.in_proj_qkv(inputs)
+        z = self.in_proj_z(inputs).reshape(B, S, n_v, dv)
+        b = self.in_proj_b(inputs)
+        a = self.in_proj_a(inputs)
+        conv_state = (
+            cache[0]
+            if cache[0] is not None
+            else mx.zeros((B, spec.K - 1, spec.conv_dim), dtype=inputs.dtype)
+        )
+        if not gp.eligible(mixed_qkv, conv_state, conv_w, a, b, A_log, dt_bias,
+                           n_k, n_v, dk, key_dim, value_dim):
+            # MLX は遅延評価なので、ここで捨てた射影は評価されない
+            # (`enable_moe_route` の patched と同じ理屈)
+            return base.__call__(self, inputs, mask, cache)
+
+        q, k, v, g, beta, new_conv_state = gp.fused_gdn_prework(
+            mixed_qkv, conv_state, conv_w, a, b, A_log, dt_bias,
+            n_k, n_v, dk, dv, key_dim, value_dim,
+        )
+        cache[0] = new_conv_state
+        state = cache[1]
+        if state is None:
+            state = mx.zeros((B, n_v, dv, dk), dtype=mx.float32)
+        out, state = gated_delta_kernel(q, k, v, g, beta, state, None)
+        cache[1] = state
+        cache.advance(S)
+        return self.out_proj(self.norm(out, z).reshape(B, S, -1))
+
+    cls = type(
+        f"{base.__name__}_mlxturbo_gdn",
+        (base,),
+        {"__call__": patched, "_mlxturbo_gdn_base": base},
+    )
+    cls.__module__ = __name__
+    _GDN_CALL_CLASSES[base] = cls
+    return cls
+
+
+def _gdn_patch_update(mod) -> bool:
+    """`mod.gated_delta_update` を GDN Metal 付きの版で包む。
+
+    prefill 幅の再帰だけを差し替える (`gdn_blocked_metal.eligible` が
+    Dk==128 / Dv%32==0 / mask 無し / T>=64 を見る)。外れたら元の関数を
+    そのまま呼ぶので、decode/verify 幅と mask 付きは素のまま。
+    """
+
+    orig = getattr(mod, "gated_delta_update", None)
+    if orig is None or getattr(orig, "_mlxturbo_gdn_metal", False):
+        return False
+
+    from .kernels import gdn_blocked_metal as gbm
+
+    def patched(q, k, v, a, b, A_log, dt_bias, state=None, mask=None,
+                use_kernel=True):
+        if use_kernel and gbm.eligible(q, k, v, state, mask):
+            return gbm.gated_delta_update_blocked_metal(
+                q, k, v, a, b, A_log, dt_bias, state)
+        return orig(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel)
+
+    patched._mlxturbo_gdn_metal = True
+    patched._mlxturbo_gdn_orig = orig
+    mod.gated_delta_update = patched
+    _GDN_UPDATE_PATCHED.append(mod)
+    return True
+
+
+def enable_gdn_port(model=None) -> dict:
+    """qwen4_exp 以外の族の GDN 層に、GDN の自前部品を当てる (2026-09-04)。
+
+    戻り値は当たった数の内訳 ``{"metal": 0/1, "prework": 層数,
+    "norm": 層数, "layers": 契約の合った層数}``。契約が合う層が 1 つも
+    無ければ全部 0 で、モデルには何も起きない。
+
+    qwen4_exp は `_vendor/qwen4_exp.py` の `GatedDeltaNet.__call__` に
+    シームを持っていて上の 4 つの enable_gdn_* が当たるので、ここでは
+    **対象外にする** (二重に当てない)。
+
+    切り方は Flash-Next と共用:
+
+    - ``MLXTURBO_GDN_METAL=0`` -> prefill 幅の再帰 (Metal) を入れない
+    - ``MLXTURBO_GDN_DECODE_FUSED=0`` -> decode/verify 幅の前処理と
+      出力 norm を入れない (``pre`` / ``norm`` で片方だけ)
+    """
+
+    import os
+    import sys
+
+    counts = {"metal": 0, "prework": 0, "norm": 0, "layers": 0}
+    if model is None:
+        return counts
+
+    mode = (os.environ.get("MLXTURBO_GDN_DECODE_FUSED") or "1").lower()
+    if mode not in ("1", "all", "pre", "norm", "0", "off", ""):
+        raise ValueError(
+            f"MLXTURBO_GDN_DECODE_FUSED={mode!r} は 1/all/pre/norm/0 のいずれか")
+    want_pre = mode in ("1", "all", "pre")
+    want_norm = mode in ("1", "all", "norm")
+    want_metal = os.environ.get("MLXTURBO_GDN_METAL") != "0"
+
+    norm_act: dict = {}
+    modules: set = set()
+    for layer in _model_layers(model):
+        gdn = getattr(layer, "linear_attn", None)
+        if gdn is None:
+            continue
+        base = type(gdn)
+        if getattr(base, "_mlxturbo_gdn_base", None) is not None:
+            base = base._mlxturbo_gdn_base   # 既に当たっている (idempotent)
+        if base.__module__ == "mlx_lm.models.qwen4_exp":
+            continue                          # シーム持ち。ここでは触らない
+        spec = _gdn_spec(gdn)
+        if spec is None:
+            continue
+        counts["layers"] += 1
+        modules.add(base.__module__)
+
+        if want_pre:
+            gdn._mlxturbo_gdn_spec = spec
+            if type(gdn) is base:
+                gdn.__class__ = _gdn_call_subclass(base)
+            counts["prework"] += 1
+
+        if want_norm:
+            norm = gdn.norm
+            nbase = type(norm)
+            if getattr(nbase, "_mlxturbo_gdn_base", None) is not None:
+                nbase = nbase._mlxturbo_gdn_base
+            act = norm_act.get(nbase)
+            if act is None:
+                act = _gdn_norm_activation(norm, nbase)
+                norm_act[nbase] = act or False
+            if act:
+                if type(norm) is nbase:
+                    norm.__class__ = _gdn_norm_subclass(nbase, act)
+                counts["norm"] += 1
+
+    if want_metal and counts["layers"]:
+        for name in modules:
+            mod = sys.modules.get(name)
+            if mod is not None and _gdn_patch_update(mod):
+                counts["metal"] += 1
+    return counts
+
+
+def disable_gdn_port(model=None) -> dict:
+    """`enable_gdn_port` を打ち消す (A/B で交互に測るために要る)。"""
+
+    counts = {"metal": 0, "prework": 0, "norm": 0}
+    while _GDN_UPDATE_PATCHED:
+        mod = _GDN_UPDATE_PATCHED.pop()
+        fn = getattr(mod, "gated_delta_update", None)
+        orig = getattr(fn, "_mlxturbo_gdn_orig", None)
+        if orig is not None:
+            mod.gated_delta_update = orig
+            counts["metal"] += 1
+    if model is None:
+        return counts
+    for layer in _model_layers(model):
+        gdn = getattr(layer, "linear_attn", None)
+        if gdn is None:
+            continue
+        base = getattr(type(gdn), "_mlxturbo_gdn_base", None)
+        if base is not None:
+            gdn.__class__ = base
+            counts["prework"] += 1
+        if hasattr(gdn, "_mlxturbo_gdn_spec"):
+            del gdn._mlxturbo_gdn_spec
+        norm = getattr(gdn, "norm", None)
+        nbase = getattr(type(norm), "_mlxturbo_gdn_base", None) if norm else None
+        if nbase is not None:
+            norm.__class__ = nbase
+            counts["norm"] += 1
+    return counts
+
+
 def enable_sdpa_split() -> None:
     """decode/verify 幅の sdpa を、vector カーネルの適格幅 (S * gqa_factor <= 32)
     に収まる幅で S 軸に分割して呼ぶ (docs/research/SDPA-WIDTH-WALL.md,
@@ -1038,10 +1427,19 @@ def disable_sdpa_split() -> None:
     Q.Attention._sdpa_split_width = False
 
 
-_ORIG_SDPA_ROWTILE = None
 _SDPA_ROWTILE_ROWS = 0
 _SDPA_ROWTILE_TRACE = False
 _SDPA_ROWTILE_MIN_S = 64
+# 差し替え済みの名前空間。モジュール名 -> 素の関数。族ごとに attention の
+# `__call__` が定義されているモジュールが違う (qwen4_exp / qwen3_next / ...)
+# ので、「どこを差し替えたか」を覚えておいて二重差し替えを避ける。
+_SDPA_ROWTILE_ORIGS: dict = {}
+# 行タイルが得をする条件。MLX 0.32.2 の fast sdpa は head_dim <= 128 なら
+# steel のカーネルでマスク済みタイルを飛ばすので、行タイルに割る取り分が無い。
+# 256 は fallback (matmul->where->softmax->matmul) に落ちる = 上三角を毎回
+# 計算しているので、そこだけを対象にする。
+_SDPA_ROWTILE_MIN_HEAD_DIM = 129
+_SDPA_ROWTILE_FN = "scaled_dot_product_attention"
 
 
 def _sdpa_rowtile_call(orig, q, k, v, cache, scale, mask, sinks, rows):
@@ -1076,60 +1474,128 @@ def _sdpa_rowtile_call(orig, q, k, v, cache, scale, mask, sinks, rows):
     return mx.concatenate(outs, axis=2)
 
 
-def _sdpa_rowtile_dispatch(queries, keys, values, cache=None, scale=1.0, mask=None, sinks=None):
-    """`mlx_lm.models.qwen4_exp.scaled_dot_product_attention` の身代わり (段 P5)。
+def _make_sdpa_rowtile_dispatch(modname: str, orig):
+    """`modname` の `scaled_dot_product_attention` の身代わりを作る (段 P5)。
 
-    `_vendor/qwen4_exp.py` はモジュール直下に `scaled_dot_product_attention`
-    という名前を import している (`from .base import ... scaled_dot_product_attention`、
-    `_arch_registry.py` の meta_path フックでこのモジュールは
-    `mlx_lm.models.qwen4_exp` として読み込まれる)。その名前をこの関数に
-    差し替えることで、vendor ファイルを 1 行も触らずに `Attention.__call__`
-    の dense 分岐 (S>=64、量子化 cache でない) だけを行タイルに割る
-    (`docs/research/IDEAS-2026-09-03.md` の P5)。`Attention` クラス自体には
-    触らないので、既存の 2 枠 (`_positions`/`_final_mask`、batch.py/
-    batch_spec.py) は増えない。
+    族のモデルファイルはモジュール直下に `scaled_dot_product_attention` と
+    いう名前を import している (`from .base import ...`)。qwen4_exp は
+    `_vendor/qwen4_exp.py` (`_arch_registry.py` の meta_path フックで
+    `mlx_lm.models.qwen4_exp` として読み込まれる)、Qwen3.8-27B は
+    `mlx_lm.models.qwen3_next` (qwen3_5 が `Qwen3NextAttention` を import
+    しているので、sdpa を呼ぶのは qwen3_next 側の名前)。その名前をこの
+    関数に差し替えることで、モデルファイルを 1 行も触らずに
+    `Attention.__call__` の dense 分岐 (S>=64、量子化 cache でない) だけを
+    行タイルに割る (`docs/research/IDEAS-2026-09-03.md` の P5)。`Attention`
+    クラス自体には触らないので、既存の 2 枠 (`_positions`/`_final_mask`、
+    batch.py/batch_spec.py) は増えない。
 
-    **`_gather_tile_attn` (段 3(b)、`MLXTURBO_GATHER_ATTN`/`MLXTURBO_PREFILL_ATTN`
-    -- 既定 on -- が立てる) の else 節も同じ名前を呼ぶ。**そちらの k/v は
-    union で `take_along_axis` して集めた列で、位置順ではない。この関数の
-    「前方 `[0, kv_end)` だけ見れば残りは因果的に不可視」という前提は
-    位置順の K/V でしか成り立たないので、誤ってそちらを行タイル化すると
-    shape は揃ったまま**サイレントに違う値を返しうる**。呼び出し元フレームの
-    関数名とモジュール名で区別する (`Attention.__call__` だけ通す、
-    `_gather_tile_attn` は素通しさせる --- この名前を呼ぶのはこの 2 か所だけ、
-    2026-09 時点で grep 済み)。
+    **qwen4_exp の `_gather_tile_attn` (段 3(b)、`MLXTURBO_GATHER_ATTN`/
+    `MLXTURBO_PREFILL_ATTN` -- 既定 on -- が立てる) の else 節も同じ名前を
+    呼ぶ。**そちらの k/v は union で `take_along_axis` して集めた列で、
+    位置順ではない。行タイルの「前方 `[0, kv_end)` だけ見れば残りは因果的に
+    不可視」という前提は位置順の K/V でしか成り立たないので、誤って
+    そちらを行タイル化すると shape は揃ったまま**サイレントに違う値を
+    返しうる**。呼び出し元フレームの関数名とモジュール名で区別する
+    (`Attention.__call__` だけ通す、`_gather_tile_attn` は素通しさせる ---
+    qwen4_exp でこの名前を呼ぶのはこの 2 か所だけ、qwen3_next では
+    `Qwen3NextAttention.__call__` の 1 か所だけ、2026-09 時点で grep 済み)。
     """
-    rows = _SDPA_ROWTILE_ROWS
-    orig = _ORIG_SDPA_ROWTILE
-    if (
-        rows > 0
-        and sinks is None
-        and not (cache is not None and hasattr(cache, "bits"))
-    ):
-        mask_ok = (mask == "causal") if isinstance(mask, str) else (mask is not None)
+
+    def _dispatch(queries, keys, values, cache=None, scale=1.0, mask=None, sinks=None):
+        rows = _SDPA_ROWTILE_ROWS
         if (
-            mask_ok
-            and queries.shape[2] >= _SDPA_ROWTILE_MIN_S
-            and queries.shape[2] > rows
+            rows > 0
+            and sinks is None
+            and not (cache is not None and hasattr(cache, "bits"))
         ):
-            import sys
-
-            frame = sys._getframe(1)
+            mask_ok = (mask == "causal") if isinstance(mask, str) else (mask is not None)
             if (
-                frame.f_code.co_name == "__call__"
-                and frame.f_globals.get("__name__") == "mlx_lm.models.qwen4_exp"
+                mask_ok
+                and queries.shape[2] >= _SDPA_ROWTILE_MIN_S
+                and queries.shape[2] > rows
             ):
-                if _SDPA_ROWTILE_TRACE:
-                    from mlxturbo.kernels import _fire
+                import sys
 
-                    _fire.bump("sdpa_rowtile")
-                return _sdpa_rowtile_call(
-                    orig, queries, keys, values, cache, scale, mask, sinks, rows
-                )
-    return orig(queries, keys, values, cache=cache, scale=scale, mask=mask, sinks=sinks)
+                frame = sys._getframe(1)
+                if (
+                    frame.f_code.co_name == "__call__"
+                    and frame.f_globals.get("__name__") == modname
+                ):
+                    if _SDPA_ROWTILE_TRACE:
+                        from mlxturbo.kernels import _fire
+
+                        _fire.bump("sdpa_rowtile")
+                    return _sdpa_rowtile_call(
+                        orig, queries, keys, values, cache, scale, mask, sinks, rows
+                    )
+        return orig(queries, keys, values, cache=cache, scale=scale, mask=mask, sinks=sinks)
+
+    _dispatch.__name__ = "_sdpa_rowtile_dispatch"
+    _dispatch.__qualname__ = f"_sdpa_rowtile_dispatch[{modname}]"
+    _dispatch._mlxturbo_rowtile_module = modname
+    return _dispatch
 
 
-def enable_sdpa_rowtile(model=None, rows: int = 256) -> None:
+def _sdpa_rowtile_patch(ns: dict, modname: str) -> bool:
+    """名前空間 `ns` (モジュールの `__dict__`) の
+    `scaled_dot_product_attention` を身代わりに差し替える。
+
+    既に差し替えてあるか、その名前が呼べる関数でなければ何もしない
+    (戻り値は「今回新しく差し替えたか」)。
+    """
+    if modname in _SDPA_ROWTILE_ORIGS:
+        return False
+    orig = ns.get(_SDPA_ROWTILE_FN)
+    if not callable(orig) or getattr(orig, "_mlxturbo_rowtile_module", None):
+        return False
+    _SDPA_ROWTILE_ORIGS[modname] = orig
+    ns[_SDPA_ROWTILE_FN] = _make_sdpa_rowtile_dispatch(modname, orig)
+    return True
+
+
+def _sdpa_rowtile_attn_namespaces(model):
+    """行タイルを差せる attention の `__call__` の名前空間を列挙する。
+
+    戻り値は `[(モジュール名, その `__call__` の globals, 層数), ...]`。
+    契約 (`docs/BACKLOG.md` の「動的な構造の探索 (duck typing)」):
+
+      1. 層が `self_attn` を持ち、そこに `q_proj` がある (attention 層)。
+      2. `head_dim` が :data:`_SDPA_ROWTILE_MIN_HEAD_DIM` 以上 --- MLX の
+         fast sdpa がタイルを飛ばさない (fallback に落ちる) 幅だけが的。
+      3. その `__call__` が Python 関数で、定義元の名前空間に
+         `scaled_dot_product_attention` という呼べる名前がある。
+
+    1 つでも欠ければその層は数えない。全部欠ければ空リストで、
+    `enable_sdpa_rowtile` はその族に対して何もしない。
+    """
+    found: dict = {}
+    for layer in _model_layers(model):
+        attn = getattr(layer, "self_attn", None)
+        if attn is None or getattr(attn, "q_proj", None) is None:
+            continue
+        head_dim = getattr(attn, "head_dim", None)
+        if not isinstance(head_dim, int) or isinstance(head_dim, bool):
+            continue
+        if head_dim < _SDPA_ROWTILE_MIN_HEAD_DIM:
+            continue
+        call = getattr(type(attn), "__call__", None)
+        ns = getattr(call, "__globals__", None)
+        if not isinstance(ns, dict):
+            continue
+        modname = ns.get("__name__")
+        if not isinstance(modname, str):
+            continue
+        fn = ns.get(_SDPA_ROWTILE_FN)
+        if not callable(fn):
+            continue
+        if modname in found:
+            found[modname][1] += 1
+        else:
+            found[modname] = [ns, 1]
+    return [(m, ns, n) for m, (ns, n) in found.items()]
+
+
+def enable_sdpa_rowtile(model=None, rows: int = 256) -> int:
     """P5: `Attention.__call__` の dense sdpa (S>=64、量子化 cache でない) を
     q 行 `rows` 行ずつのタイルに割り、各タイルは前方 K/V だけを見て呼ぶ
     (`docs/research/IDEAS-2026-09-03.md` の P5)。MLX 0.32.2 の sdpa は
@@ -1140,12 +1606,19 @@ def enable_sdpa_rowtile(model=None, rows: int = 256) -> None:
     (`tools/decode_ab.py --knob sdpa-rowtile` は `control_identical=False`、
     KLD で確認する)。
 
-    `_vendor/qwen4_exp.py` は触らない --- モジュール直下の
+    モデルファイルは触らない --- モジュール直下の
     `scaled_dot_product_attention` という名前 (`from .base import ...` で
-    import された参照) を `_sdpa_rowtile_dispatch` に差し替えるだけ。
-    `model` 引数は他の `enable_*(model, ...)` と呼び方を揃えるためだけで
-    実際には使わない (パッチはモジュール直下の 1 関数だけで、layer ごとの
-    属性は要らない)。
+    import された参照) を身代わりに差し替えるだけ。**どのモジュールを
+    差し替えるかは族で決め打ちしない**: `model` の層を歩いて attention 層
+    (`self_attn` に `q_proj`、`head_dim` が fallback 幅) を見つけ、その
+    `__call__` が定義されている名前空間を差す
+    (`_sdpa_rowtile_attn_namespaces`)。qwen4_exp は
+    `mlx_lm.models.qwen4_exp`、Qwen3.8-27B (qwen3_5) は
+    `mlx_lm.models.qwen3_next` になる。qwen4_exp は `model=None` でも
+    呼べる従来の呼び方を保つため無条件でも差す (層が 1 つも無ければ
+    ただ差し替えるだけで発火しない)。
+
+    戻り値は行タイルが当たる attention 層の数 (契約が合わなければ 0)。
 
     既定 off。環境変数 `MLXTURBO_SDPA_ROWTILE=<R>` でも上書きできる (未設定/0
     なら off)。`MLXTURBO_SDPA_ROWTILE_TRACE=1` で発火するたびに
@@ -1156,21 +1629,31 @@ def enable_sdpa_rowtile(model=None, rows: int = 256) -> None:
     `tools/decode_ab.py --knob sdpa-rowtile` の prefill_s と tok/round
     (悪化しないこと)。
     """
-    global _ORIG_SDPA_ROWTILE, _SDPA_ROWTILE_ROWS, _SDPA_ROWTILE_TRACE
+    global _SDPA_ROWTILE_ROWS, _SDPA_ROWTILE_TRACE
     import os
-
-    import mlx_lm.models.qwen4_exp as Q
 
     env = os.environ.get("MLXTURBO_SDPA_ROWTILE")
     r = int(env) if env else int(rows)
     _SDPA_ROWTILE_TRACE = os.environ.get("MLXTURBO_SDPA_ROWTILE_TRACE") == "1"
     if r <= 0:
         _SDPA_ROWTILE_ROWS = 0
-        return
-    if _ORIG_SDPA_ROWTILE is None:
-        _ORIG_SDPA_ROWTILE = Q.scaled_dot_product_attention
-        Q.scaled_dot_product_attention = _sdpa_rowtile_dispatch
+        return 0
+
+    # qwen4_exp は従来どおり無条件 (`model=None` の呼び方を保つ)
+    try:
+        import mlx_lm.models.qwen4_exp as Q
+    except Exception:  # noqa: BLE001 -- 族のモジュールが無い環境でも進む
+        pass
+    else:
+        _sdpa_rowtile_patch(Q.__dict__, Q.__name__)
+
+    n = 0
+    for modname, ns, count in _sdpa_rowtile_attn_namespaces(model):
+        _sdpa_rowtile_patch(ns, modname)
+        if modname in _SDPA_ROWTILE_ORIGS:
+            n += count
     _SDPA_ROWTILE_ROWS = r
+    return n
 
 
 def disable_sdpa_rowtile() -> None:
@@ -2626,9 +3109,18 @@ _QMM_WIDE_MIN_ROWS = 1024     # decode/verify 幅は BM=64 が行を無駄にす
 # o_proj 6144->2560、GDN の in_proj_qkv 2560->10240 / in_proj_z 2560->6144 /
 # out_proj 6144->2560。k_proj / v_proj (N=512) は micro で測っていないので
 # 入れない。
+#
+# `mlp` の 3 本は Qwen3.8-27B (qwen3_5) の dense MLP
+# (gate/up 5120->17408、down 17408->5120、64 層で 192 射影)。qwen4_exp の
+# `layer.mlp` は `SparseMoeBlock` で、専門家は `mlp.switch_mlp` (SwitchGLU の
+# `QuantizedSwitchLinear`)、共有専門家は `mlp.shared_expert` の下にあり、
+# **`mlp` 直下には gate_proj/up_proj/down_proj が無い**ので当たらない
+# (`bench/test_fusions_other_family.py` で確認)。形の適格判定はどの族でも
+# `qmm_wide.eligible()` に任せる。
 _QMM_WIDE_TARGETS = (
     ("self_attn", ("q_proj", "o_proj")),
     ("linear_attn", ("in_proj_qkv", "in_proj_z", "out_proj")),
+    ("mlp", ("gate_proj", "up_proj", "down_proj")),
 )
 
 
@@ -2965,6 +3457,8 @@ __all__ = [
     "enable_gdn_metal_kernel",
     "enable_gdn_decode_fused",
     "enable_gdn_prework_kernel",
+    "enable_gdn_port",
+    "disable_gdn_port",
     "enable_moe_glu",
     "enable_moe_shared_fold",
     "enable_moe_verify_gather",
