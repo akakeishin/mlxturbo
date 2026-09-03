@@ -86,6 +86,10 @@ prefill の内訳の取り直し (4k / 8k / 17k、今日の既定)。診断の�
 
 ## 数日の集中 (ユーザー 2026-09-03 20:05): decode の tok/s
 
+**結末 (22:00)**: 糊の融合は GDN (-2.4%、ビット一致) だけが勝ち、HC elem ±0、HC 書き戻し +0.6%、MoE router〜combine +0.05% (ビット一致の対照で dispatch -5% → ±0.0%)、MoE の重複まとめは帯域で負け。
+**dispatch の本数の値段は稼働率 96% では実質ゼロ**、行列積は 430 GB/s でピーク。短文脈 decode は MLX の上では 52〜54 tok/s が天井 (相手 55.7)。残りは MoE fused:1 の結果だけ。
+その後は 27B レーン (部品の置き換え) と prefill の 3 本 (n-gram 先読み、HC 読み、小 kv の attention) に移る。
+
 短文脈の tok/s に数日集中する。壁は dispatch の床 (5 us × 4499 本/step、Lily は 795 本) なので、**層の塊ごとの大きい融合で本数を 1/3 に**:
 1. MoE decode (ルーティング + gather + gate/up + SwiGLU + down + combine を 3 本程度、行間で専門家を共有、並列度は MLX の qmv 以上) — PoL 走行中。
 2. GDN の層まるごと (前処理 + 再帰 + norm。prework の負けは並列度不足だったので直して再挑戦)。
