@@ -2775,3 +2775,18 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - in-model (head4、ABBA × 3、prefill_s): 4k +0.1 / -0.0%、8k -0.7%、17k -0.7% (±1% の揺れの中)。tok/round と head は完全一致 (ビット一致)。どの文脈でも遅くならない。
 - **判定: 既定に入れない。**代金ゼロ規則の「代金」に写し (`segment_tables` の式) と vendor のシーム 1 個 (`_MOE_SORT`) が含まれ、測れない取り分に払わない。配線は外してカーネルと micro を記録として残す。P7 第 3 段はこれで閉じる。
 - **罠 19**: op 1 本ごとの `mx.eval` で測った us は投入・同期の往復が床になる (この機体で 165〜270 us)。部品の費用は層ぶん (48 層) を 1 本のコマンドバッファに積んで測る。
+
+### 2026-09-04 08:51 27B レーン: GDN 部品を qwen3_5 に契約で当てた (48 層)。品質の物差しは「素の 4bit (融合なし) を参照にした KLD」
+
+- 移植 (`fused.enable_gdn_port`、`_gdn_call_subclass` / `_gdn_norm_subclass` / `_gdn_patch_update`、`runner.py:1475`): 形は Flash-Next と同一 (n_k 16 / n_v 48 / dk=dv 128、hidden だけ 2560 → 5120)。属性名の違いだけを契約 (`_gdn_spec`) で吸収し、インスタンスの `__class__` を動的サブクラスに差し替える (素の forward の写しは持たない)。qwen4_exp は読み飛ばす。
+  合成テスト 12 本: decode/verify 幅 S=1,2,3,6 でビット一致、prefill Metal は相対 5e-4〜1.9e-3 (1 ulp 内)、再帰状態はビット一致。実機 27B: 発火 48 層、貪欲 32 トークン × 3 本が素と一致。qwen4_exp 側は fingerprint 完全一致、458 passed。
+- 27B の KLD (`bench/quant_eval.py`、参照 = 素の 4bit の logits (bf16 の 27B は手元に無い)、31 prompt、`bench/results/quant-eval/compare-27b-*.json`):
+
+| 構成 | kld_mean | top-1 一致 |
+|---|---|---|
+| 今日の既定 (GDN Metal + decode 融合 + qmm_wide + 行タイル) | **0.00027** | 0.995 |
+| GDN Metal off (他は on) | 0.00000 | 1.000 |
+| 全部 off | 0.00000 | 1.000 |
+
+  → 0.00027 は全部 prefill の GDN Metal 再帰 (積和順の差) で、他の部品はビット一致。Flash-Next での GDN Metal (+0.00014、対 bf16) と同じ性質、受け入れ幅 +0.0005 の中。**27B の以後の KLD の基準はこの 3 本** (参照が素の 4bit なので「bf16 との距離」ではなく「素からのずれ」を測っている点に注意)。
+- 煙試験 (冷却なし、64 トークン、MTP 写しあり): decode 4k = mlx-serve 43.2 / oMLX 32.8 / MTPLX 28.4 / mlxturbo 27.3 / mlx-lm 20.9。同じ MTP 頭で mlxturbo が投機組の最下位 = 27B の decode 経路 (SpecEngine + staged、spec_flash の段階投入と融合が無い) が最大の的。

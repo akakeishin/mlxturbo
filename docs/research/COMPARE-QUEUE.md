@@ -439,3 +439,19 @@ BIGLOCK_NO_WORKER=1 tools/biglock.sh bench/run_27b_baseline.sh <tag> reverse
 
 先頭で前提を確認して、欠けていたら止まる (`~/.omlx/model_settings.json` の
 ペア付け、接頭辞の写し、3 つの symlink ディレクトリ)。
+
+# 27B の部品 A/B (tools/decode_ab_generic.py、2026-09-04)
+
+`tools/decode_ab.py` は Flash-Next 専用 (`FlashSpecEngine` / qwen4_exp の knob 表) なので、
+27B (`SpecEngine`) 用に env 1 本を切り替える最小版を別に置いた。`--ctx 0` が短文脈 3 本、
+`--ctx N` が池から切った窓 1 本 (`--prefill-once` で prefill を 1 回に畳む)。variant ごとに
+「disable 群 → env → `enable_default_fusions`」を踏み直すので、`--knob` にはどの env でも渡せる
+(空文字はその変数を未設定に戻す意味)。常駐 worker には乗らないので `BIGLOCK_NO_WORKER=1` が要る。
+
+```bash
+BIGLOCK_NO_WORKER=1 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py \
+    --model ~/models/qwen38-27b-4bit --mtp ~/models/qwen38-27b-mtp \
+    --knob MLXTURBO_QMM_WIDE=auto,off --ctx 0 --tokens 128 \
+    --out bench/results/qmm-wide-27b-short-0904.json
+# 長文脈: --ctx 4000 --prefill-once (prefill に効く knob には使わない)
+```
