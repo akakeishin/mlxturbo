@@ -70,8 +70,11 @@ n_blocks が threadgroup メモリに載る間 (<= ``_CACHE_CAP``) はキーを 
 だけ作って常駐させ、4 pass はそこから読む。超える長さは pass ごとに
 device から読み直す (その分だけ遅い。kv 25.6k 相当までは常駐側)。
 
-**まだ配線していない。**`_pooled_and_top` を割って呼ぶのは段 K2b と一緒に
-やる (設計メモ「配線」)。
+配線は段 K2c。`QSAIndexer._pooled_and_top` を `_block_scores` (pooled と
+スコアの生値まで) と `_select_keep` (argpartition 経路) に割って、こちらは
+`QSAIndexer.select_bits` から `mode="bits"` で呼ばれる
+(`mlxturbo/_vendor/qwen4_exp.py`)。**既定 off**
+(`mlxturbo/qsa_decode.py`、環境変数 ``MLXTURBO_QSA_DECODE_KERNEL=1``)。
 """
 
 from __future__ import annotations

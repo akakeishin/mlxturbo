@@ -2069,3 +2069,13 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - コードの鮮度: `mlxturbo/**`、`_vendor`、`decode_ab.py`、run_with_model を持つ `tools/*.py` の mtime が変わっていたらジョブ前に自分を作り直す (実地で 1 回発火、ジョブは生き残った)。
 - 段 2 (micro) のメモリ待ちは 8 GB。worker が居ると旧 biglock の `pgrep` に「ロック無しの python」と見なされて待ち手が固まった → 両ツールは絶対パスで `os.execv` する。
 - 段の待ち規則は biglock と同じ (上の段、同じ段は札の mtime 順)。**先着順と STOP を組み合わせると、止めた古い札に新しい待ち手が譲り続けて固まる** (13:40〜13:52 に gpu3 が 12 分止まった)。止めるなら札を消す (kill) こと。
+
+### 2026-09-03 14:00 K2c: decode QSA カーネルの配線 (`mlxturbo/qsa_decode.py`、knob `MLXTURBO_QSA_DECODE_KERNEL=1`、既定 off)
+
+- vendor: `QSAIndexer._pooled_and_top` を `_block_scores` + `_select_keep` に割り (op 列不変、指紋はバイト一致)、`select_bits` (K2a のビットマップ) と `Attention._decode_qsa_forward` を追加。
+  `__call__` の **`_gather_attn` より前の第 3 分岐** (kv ≥ 25k は decode 幅でも ratio guard を通って gather に入るため)。シームの引数・返り値は不変、`_IndexerCache` に新状態なし。
+- ゲートは全部 host 側でキャッシュを進める前に判定 (B=1、1≤S≤8、素の KVCache、offset+S > budget、`MLXTURBO_QSA_TAIL=query`、TIEBREAK off、`_positions` / `_final_mask` / `QSAIndexer.__call__` が未差し替え、`n_blocks ≤ MAX_BLOCKS`、mirror_blocks あり)。
+  batch / batch_spec は `_positions` 等を差し替えるので同一性判定で退く (`--max-batch>1` はプロセス全体で K2c が消える、`_wide_qkv` の警告と同じ形)。spec_flash の verify forward (S=depth+1) と `_staged_forward` は `Attention.__call__` を通るので K2c に当たる。
+- 検証: 指紋バイト一致、`verify_qsa_attn_decode.py` の配線節 (実 Attention、kv=6000、S=1..6) で knob on/off ビット一致・全 S 発火、`bench/test_server.py` 417 pass。
+- decode_ab knob `qsa-decode-kernel` (control_identical、DECODE_ONLY)。50k の対照 NG は想定内 (B 側が `_gather_tile_attn` を通り dense と非一致)、17k の不一致は本物。
+- **両側 `MLXTURBO_QSA_TAIL=query` 必須。worker は投入側の環境変数を読まないので、この A/B は別プロセス (`BIGLOCK_NO_WORKER=1`) で流す** (chain95)。worker への環境変数の受け渡しは要望済み。

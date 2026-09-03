@@ -374,14 +374,18 @@ class QSAIndexer(nn.Module):
         # 既定 on (ビット不変なので)。A/B 用の口は mlxturbo/pooled_cache.py。
         self._pooled_cache = True
 
-    def _pooled_and_top(self, x, rope, cache, offset: int, positions=None):
-        """pooled key の作成からブロック top-k 選択まで。``__call__`` と
-        ``select_blocks`` の共通部 (段 3(b) で切り出した)。
+    def _block_scores(self, x, rope, cache, offset: int, positions=None):
+        """pooled key の作成からブロックスコアの**生値**まで。
 
         ``kv_len <= self.token_budget`` (疎化が要らない) のときは ``None``。
-        それ以外は ``(keep_block, n_blocks, kv_len, q_col)`` を返す。
-        ``keep_block`` は (B, S, n_blocks) の bool で、まだトークン幅へは
-        展開していない。
+        それ以外は ``(raw, block_end, n_blocks, kv_len, q_col)`` を返す。
+        ``raw`` は einsum ``"bshd,bnd->bsnh"`` の出力 (B, S, n_blocks, 4) の
+        fp32 で、relu 以降 (可視判定・top-k) はまだ掛けていない。
+
+        ここで切ってあるのは、選択に 2 通りあるため:
+        `_select_keep` (argpartition 経路、`_pooled_and_top` が使う) と
+        `select_bits` (段 K2a のカーネル、`Attention._decode_qsa_forward` が
+        使う)。**pooled とスコアの計算はどちらも共通で、ここが唯一の実装。**
 
         ``self._indexer_lean`` (MLXTURBO_INDEXER_LEAN、既定 off、
         `mlxturbo/indexer_lean.py`) が立っていて decode/verify 幅 (S<=8) の
@@ -466,12 +470,21 @@ class QSAIndexer(nn.Module):
         q = _rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
 
         # scores: sum over heads of relu(q.k), per block
-        scores = mx.einsum(
+        raw = mx.einsum(
             "bshd,bnd->bsnh",
             q.astype(mx.float32),
             pooled_f32 if pooled_f32 is not None else pooled.astype(mx.float32),
         )
-        scores = mx.maximum(scores, 0).sum(axis=-1) / math.sqrt(self.head_dim)
+        return raw, block_end, n_blocks, kv_len, q_col
+
+    def _select_keep(self, raw, block_end, q_col, n_blocks: int):
+        """ブロックスコアの生値から ``keep_block`` (B, S, n_blocks) bool へ。
+
+        `_block_scores` の続き。元の `_pooled_and_top` の後半をそのまま
+        切り出したもので、op 列は変えていない。
+        """
+        B, S = raw.shape[0], raw.shape[1]
+        scores = mx.maximum(raw, 0).sum(axis=-1) / math.sqrt(self.head_dim)
 
         # a block is only a candidate if it lies entirely in the query's past
         visible = block_end[None, None, :] <= q_col[None, :, None]
@@ -493,7 +506,53 @@ class QSAIndexer(nn.Module):
         keep_block = mx.put_along_axis(keep_block, top, mx.array(True), axis=-1)[
             ..., :n_blocks
         ]
-        return keep_block, n_blocks, kv_len, q_col
+        return keep_block
+
+    def _pooled_and_top(self, x, rope, cache, offset: int, positions=None):
+        """pooled key の作成からブロック top-k 選択まで。``__call__`` と
+        ``select_blocks`` の共通部 (段 3(b) で切り出した)。
+
+        ``kv_len <= self.token_budget`` (疎化が要らない) のときは ``None``。
+        それ以外は ``(keep_block, n_blocks, kv_len, q_col)`` を返す。
+        ``keep_block`` は (B, S, n_blocks) の bool で、まだトークン幅へは
+        展開していない。
+        """
+        res = self._block_scores(x, rope, cache, offset, positions)
+        if res is None:
+            return None
+        raw, block_end, n_blocks, kv_len, q_col = res
+        return self._select_keep(raw, block_end, q_col, n_blocks), \
+            n_blocks, kv_len, q_col
+
+    def select_bits(self, x, rope, cache, offset: int, positions=None):
+        """段 K2a: top-k 選択を 1 dispatch のカーネルにした版。
+
+        `_pooled_and_top` と同じ入力から、``keep_block`` の代わりに
+        **keep ビットマップ** (B, S, ceil(n_blocks/32)) uint32 を返す
+        (`mlxturbo/kernels/qsa_select.py`)。選ぶ集合は argpartition 経路と
+        同一 (同点は添字の昇順、`tools/verify_qsa_select.py` で確認済み)。
+
+        戻り値は ``(bits, n_blocks, kv_len, q_col)``、疎化が要らないときは
+        ``None``。**端数 (tail) はビットマップに入らない** --- 段 K2b の
+        カーネルが ``q`` から直に判定する規約 (`qsa_select` の docstring)。
+
+        呼び手は `Attention._decode_qsa_forward` だけで、そちらが
+        ``MLXTURBO_QSA_TIEBREAK`` off / GPU / n_blocks の上限を確かめてから
+        呼ぶ (カーネルは同点 bias を実装していない)。
+        """
+        from mlxturbo.kernels import qsa_select as _qs
+
+        res = self._block_scores(x, rope, cache, offset, positions)
+        if res is None:
+            return None
+        raw, _block_end, n_blocks, kv_len, q_col = res
+        S = raw.shape[1]
+        k = min(self.block_topk, n_blocks)
+        n_vis = _qs.visible_counts_host(offset, S, self.compress_ratio, n_blocks)
+        bits, _cnt = _qs.select(
+            raw, n_vis, k, head_dim=self.head_dim, mode="bits"
+        )
+        return bits, n_blocks, kv_len, q_col
 
     def __call__(
         self, x, rope, cache, offset: int, positions=None
@@ -887,6 +946,142 @@ class Attention(nn.Module):
             )
         return out
 
+    def _decode_qsa_forward(self, x, rope, cache, idx_cache, offset: int,
+                            positions):
+        """段 K2c: decode / verify 幅 (B=1、S<=8) の QSA attention を、選択
+        (`mlxturbo/kernels/qsa_select.py`、段 K2a) と attention
+        (`mlxturbo/kernels/qsa_attn_decode.py`、段 K2b) の 2 本のカーネルに
+        置き換える。
+
+        置き換える相手は ``__call__`` の
+
+            sparse = self.indexer(...)          # (B,1,S,kv_len) bool を実体化
+            mask   = self._final_mask(...)
+            ... ceil(S*gqa/32) 回の sdpa 呼び + concatenate
+
+        という並び。**選ぶ集合も演算の順も本家の写し**なので出力はビット
+        一致する (`tools/verify_qsa_attn_decode.py` が S∈{1..6} × kv 2k〜50k
+        × スコア 4 種で `mx.array_equal` を取っている)。取り分は消える
+        op の本数 --- argpartition (GPU では全ソート) とマスク組みで 25〜40 本、
+        sdpa 側は全キーの mask バイトを直列に待つ 2-pass が候補判定だけになる。
+
+        ``_gather_forward`` より**前**に呼ばれること。kv >= 25k では decode
+        幅も比のガードを通って gather 経路に入っているので、後ろに置くと
+        発火しない。
+
+        既定 off。`mlxturbo/qsa_decode.py` の ``enable_qsa_decode_kernel``
+        (環境変数 ``MLXTURBO_QSA_DECODE_KERNEL=1``) が ``_qsa_decode`` を立てる。
+
+        引き受けられない形では ``None`` を返して呼び出し側の通常経路に任せる。
+        **判定はすべてキャッシュを触る前に済ませる** --- ``select_bits`` も
+        ``_qkv`` もキャッシュを進めるので、触った後に ``None`` を返すと
+        呼び手のフォールバックが二重に更新する (`_gather_forward` の同じ
+        注記を参照。実際に踏んで max|diff|=0.33 で落ちた前例がある)。
+        """
+        # このファイルは `mlx_lm.models.qwen4_exp` として読み込まれるので
+        # 相対 import は mlx_lm 側を指す (`_gather_forward` と同じ作法)。
+        from mlxturbo.kernels import _fire
+        from mlxturbo.kernels import qsa_attn_decode as _k2b
+        from mlxturbo.kernels import qsa_select as _k2a
+
+        B, S, _ = x.shape
+        cr = self.indexer.compress_ratio
+        kv_len = offset + S
+
+        # --- 幅とキャッシュ (K2b が写した形そのもの) -----------------------
+        if B != 1 or S < 1 or S > 8:
+            return None
+        if cache is None or idx_cache is None or hasattr(cache, "bits"):
+            return None
+        if kv_len <= self.indexer.token_budget or offset < cr - 1:
+            return None
+        # `select_bits` は idx_cache 側の長さで kv_len を決める。ここが
+        # 食い違うと「触った後に None」になるので、先に一致を見ておく。
+        if getattr(idx_cache, "offset", None) != offset:
+            return None
+
+        # --- 規約 (写した参照は 1 本だけ) ---------------------------------
+        if _qsa_tail.MODE != "query":
+            _k2b._warn_once(
+                "tail_mode",
+                f"MLXTURBO_QSA_TAIL={_qsa_tail.MODE} は未対応 (query だけを写した)",
+            )
+            return None
+        if _qsa_tail.TIEBREAK:
+            _k2b._warn_once(
+                "tiebreak", "MLXTURBO_QSA_TIEBREAK=1 は未対応 (同点 bias は写していない)")
+            return None
+        if mx.default_device() != mx.gpu or not mx.metal.is_available():
+            return None
+
+        # --- 差し替え検知 (バッチ経路が走っている間は絶対に入らない) -------
+        # `mlxturbo/batch.py` と `batch_spec.py` は `_positions` /
+        # `_final_mask` / `QSAIndexer.__call__` を差し替える。K2b が写した
+        # のは単一系列の規約 (positions == offset + arange(S)、行ごとの
+        # ブロック格子) だけなので、差し替えを見たら素の経路へ退く
+        # (`_qkv` の `_fast_rope` と同じ同一性判定)。
+        if (
+            type(self)._positions is not _ORIG_ATTN_POSITIONS
+            or type(self)._final_mask is not _ORIG_ATTN_FINAL_MASK
+            or type(self.indexer).__call__ is not _ORIG_INDEXER_CALL
+        ):
+            return None
+        # `_sdpa_split_width` off だと参照側 (本家) の sdpa 分割が変わり、
+        # `mirror_blocks` の前提 (blocks の表) が成り立たなくなる。
+        if not getattr(self, "_sdpa_split_width", True):
+            return None
+
+        # --- カーネル側の構造条件 (`qsa_attn_decode.eligible` と同じもの) --
+        # eligible() は配列を見るので、キャッシュを進めた後にしか呼べない。
+        # ここでは同じ条件をホスト側の値 (モデル構成と確保済みバッファ) で
+        # 先に確かめる。**eligible() を変えたらここも見ること。**
+        n_blocks = kv_len // cr
+        gqa = self.n_heads // self.n_kv_heads
+        keys, values = cache.keys, cache.values
+        if n_blocks < 1 or n_blocks > _k2a.MAX_BLOCKS:
+            return None
+        if self.indexer.n_heads != 4:
+            # K2a のカーネルは indexer_n_heads=4 の和を展開してある
+            # (`qsa_select._HEADER`)。違う形は `select` が例外を投げるので、
+            # ここで先に退く。
+            return None
+        if self.head_dim % 32 != 0 or 32 * gqa > 1024:
+            return None
+        if self.n_heads % self.n_kv_heads != 0:
+            return None
+        if keys is None or values is None:
+            return None
+        if keys.ndim != 4 or keys.shape != values.shape:
+            return None
+        if keys.dtype != values.dtype:
+            return None
+        if keys.shape[0] != B or keys.shape[1] != self.n_kv_heads:
+            return None
+        if keys.shape[3] != self.head_dim:
+            return None
+        blocks = _k2b.mirror_blocks(kv_len, gqa, S)
+        if blocks is None:
+            return None
+
+        # --- ここから先はキャッシュを進める (もう None は返さない) ---------
+        bits, n_blocks, kv_len, _q_col = self.indexer.select_bits(
+            x, rope, idx_cache, offset, positions
+        )
+        q, _k, _v, gate = self._qkv(x, positions, rope, cache)
+
+        # K2b は q を (B,S,Hq,D) で、K/V は **確保済みバッファそのもの**で
+        # 受ける (途中切りのビューを渡すと metal_kernel が毎回 KV 全体を
+        # 複製する)。読む列は候補 i < kv_len に限られるので、バッファの尻の
+        # 未使用域には触らない。
+        _fire.bump("qsa_decode_kernel")
+        out = _k2b.qsa_attn_decode(
+            q.transpose(0, 2, 1, 3), cache.keys, cache.values, bits,
+            cr=cr, kv_len=kv_len, n_blocks=n_blocks, offset=offset,
+            scale=self.scale, blocks=blocks,
+        )
+        out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
+        return self.o_proj(out * mx.sigmoid(gate))
+
     def _gather_forward(self, x, rope, cache, idx_cache, offset: int, positions):
         """段 3(b)/P1a: 選ばれたブロックだけ集めてから、mask 無しの dense sdpa に渡す経路。
 
@@ -1121,6 +1316,16 @@ class Attention(nn.Module):
         B, S, _ = x.shape
         offset, positions = self._positions(cache, S)
 
+        # 段 K2c (既定 off、`mlxturbo/qsa_decode.py`)。**gather 経路より前。**
+        # kv >= 25k では decode 幅も比のガードを通って `_gather_forward` に
+        # 入るので、後ろに置くと発火しない。
+        if getattr(self, "_qsa_decode", False) and cache is not None:
+            fused = self._decode_qsa_forward(
+                x, rope, cache, idx_cache, offset, positions
+            )
+            if fused is not None:
+                return fused
+
         if getattr(self, "_gather_attn", False) and cache is not None:
             gathered = self._gather_forward(
                 x, rope, cache, idx_cache, offset, positions
@@ -1194,6 +1399,14 @@ class Attention(nn.Module):
 # `_positions`'s docstring) apart from a batching override, without ever
 # reading `positions`' actual values.
 _ORIG_ATTN_POSITIONS = Attention._positions
+
+# 段 K2c (`_decode_qsa_forward`) も同じ理由で 3 つのシームの同一性を見る。
+# K2b が写したのは単一系列の規約 (positions == offset + arange(S)、行ごとの
+# ブロック格子、`_final_mask` の「sparse だけを見る」規約) だけなので、
+# `mlxturbo/batch.py` / `batch_spec.py` がどれか 1 つでも差し替えている間は
+# 素の経路へ退く。
+_ORIG_ATTN_FINAL_MASK = Attention._final_mask
+_ORIG_INDEXER_CALL = QSAIndexer.__call__
 
 
 # ------------------------------------------------------------------- gated deltanet

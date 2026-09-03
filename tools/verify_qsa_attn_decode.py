@@ -348,11 +348,103 @@ def bench(S: int, kv_len: int, rounds: int = 7) -> dict:
 
 
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# 配線 (段 K2c): `Attention._decode_qsa_forward` を knob on/off で比べる
+# --------------------------------------------------------------------------
+# `tools/vendor_fingerprint.py` は CPU で走るので、この分岐は
+# `mx.default_device() != mx.gpu` で必ず退き、一度も通らない (合成モデルの
+# kv も indexer_budget を超えない)。よって配線の一次検査はここに置く ---
+# 本物の `Attention` を 1 層だけ組み、KV / indexer キャッシュに budget 超の
+# 列を積んでから decode 幅を 1 回流し、knob on/off の出力を `mx.array_equal`
+# で比べる。上の「ビット一致」節がカーネル単体を見るのに対し、こちらは
+# **適格判定・キャッシュの進み方・q の並べ替え・o_proj までの繋ぎ**を見る。
+WIRING_KV = 6000      # budget 2048 を超えていればよい (実モデル相当は上の節)
+WIRING_HIDDEN = 256   # 射影の重みを小さくするためだけ。head_dim は実値のまま
+
+
+def _wiring_args():
+    import mlx_lm.models.qwen4_exp as Q
+
+    return Q.TextArgs(
+        hidden_size=WIRING_HIDDEN,
+        num_attention_heads=N_HEADS,
+        num_key_value_heads=N_KV,
+        head_dim=HEAD_DIM,
+        indexer_n_heads=N_IHEADS,
+        indexer_kv_heads=1,
+        indexer_head_dim=IDX_HEAD_DIM,
+        indexer_budget=BUDGET,
+        indexer_compress_ratio=CR,
+    )
+
+
+def _wiring_run(attn, rope, seeds, s_len: int, on: bool):
+    """キャッシュを毎回作り直して decode 幅を 1 回流す。"""
+    import mlx_lm.models.qwen4_exp as Q
+
+    cache = Q._AttnCache()
+    idx = cache.indexer
+    k0, v0, rk0, x = seeds
+    cache.update_and_fetch(k0, v0)
+    idx.update(rk0)
+    attn._qsa_decode = on
+    out = attn(x, rope, None, cache, idx)
+    mx.eval(out)
+    return out
+
+
+def wiring_check(problems: list, s_list) -> None:
+    import mlx.nn as nn  # noqa: F401  (Attention は nn.Module)
+    import mlx_lm.models.qwen4_exp as Q
+
+    from mlxturbo.kernels import _fire
+
+    args = _wiring_args()
+    attn = Q.Attention(args)
+    attn.set_dtype(mx.bfloat16)
+    rope = Q.RotaryEmbedding(
+        int(args.head_dim * args.partial_rotary_factor), args.rope_theta
+    )
+
+    print("\n== 配線 (Attention._decode_qsa_forward、knob on/off) ==")
+    for s_len in s_list:
+        rng = np.random.default_rng(4242 + s_len)
+        n_pre = WIRING_KV - s_len
+        seeds = (
+            mx.array(rng.standard_normal((1, N_KV, n_pre, HEAD_DIM))
+                     .astype(np.float32)).astype(mx.bfloat16),
+            mx.array(rng.standard_normal((1, N_KV, n_pre, HEAD_DIM))
+                     .astype(np.float32)).astype(mx.bfloat16),
+            mx.array(rng.standard_normal((1, n_pre, IDX_HEAD_DIM))
+                     .astype(np.float32)).astype(mx.bfloat16),
+            mx.array(rng.standard_normal((1, s_len, WIRING_HIDDEN))
+                     .astype(np.float32)).astype(mx.bfloat16),
+        )
+        before = _fire.snapshot().get("qsa_decode_kernel", 0)
+        got = _wiring_run(attn, rope, seeds, s_len, True)
+        fired = _fire.snapshot().get("qsa_decode_kernel", 0) - before
+        want = _wiring_run(attn, rope, seeds, s_len, False)
+        same = bool(mx.array_equal(got, want))
+        if not fired:
+            problems.append(f"配線 S={s_len}: knob on で 1 回も発火しなかった")
+        if not same:
+            ulp = _bf16_ulp(got, want)
+            problems.append(
+                f"配線 S={s_len}: knob on/off で出力が違う "
+                f"({int((ulp != 0).sum())}/{ulp.size} 要素、最大 {int(ulp.max())} ulp)"
+            )
+        print(f"  S={s_len} kv={WIRING_KV}: 発火 {fired}  "
+              f"{'ok' if (same and fired) else 'NG'}")
+    attn._qsa_decode = False
+
+
+# --------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true", help="形を絞って早く回す")
     ap.add_argument("--no-bench", action="store_true")
     ap.add_argument("--no-check", action="store_true")
+    ap.add_argument("--no-wiring", action="store_true")
     ap.add_argument(
         "--pin-blocks", type=int, default=0,
         help="MLX_SDPA_BLOCKS を釘付けにして両側を同じ kv 分割で走らせる",
@@ -446,6 +538,16 @@ def main() -> int:
             )
         else:
             print("  すべてビット一致 (array_equal)")
+
+    if not args.no_wiring:
+        wire_problems: list[str] = []
+        wiring_check(wire_problems, [1, 2] if args.quick else [1, 2, 3, 4, 6])
+        if wire_problems:
+            rc = 1
+            for p in wire_problems:
+                print("   -", p)
+        else:
+            print("  配線: knob on/off でビット一致、全 S で発火")
 
     if args.no_bench:
         return rc

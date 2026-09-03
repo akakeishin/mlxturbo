@@ -68,10 +68,15 @@ threadgroup 数は本家の S 倍になるので、並列度は落ちない。
 **既定は表のまま** (呼び出し側が :func:`mirror_blocks` を渡す) にしてある。
 32/64 を使うなら本家側も同じ値に揃える必要があり、それは段 K2c の判断。
 
-## まだ配線していない
+## 配線 (段 K2c)
 
-`Attention.__call__` への分岐は段 K2c。ここは K2a と同じく、単体で検証
-できる部品として置くだけ。
+`Attention._decode_qsa_forward` (`mlxturbo/_vendor/qwen4_exp.py`) が
+`_gather_forward` より前の第 3 分岐として呼ぶ。**既定 off**
+(`mlxturbo/qsa_decode.py`、環境変数 ``MLXTURBO_QSA_DECODE_KERNEL=1``)。
+適格判定はキャッシュを触る前にホスト側の値だけで済ませる規約なので、
+:func:`eligible` の**構造条件は呼び出し側にも写してある** --- ここを変えたら
+`_decode_qsa_forward` の前半も見ること。配線そのものの一次検査は
+`tools/verify_qsa_attn_decode.py` の「配線」節 (knob on/off の `array_equal`)。
 """
 
 from __future__ import annotations

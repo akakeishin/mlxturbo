@@ -2772,6 +2772,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "`rows[].prompt_ids` を使う) へのパス。真の続き "
                          "トークン列を draft として流す (`_knob_oracle_draft` "
                          "の docstring 参照)。他の knob では無視される。")
+    ap.add_argument("--no-burn-in", action="store_true",
+                    help="読み込み直後の空焼き (`burn_in`) をしない。既定では "
+                         "32 トークンの null A/B を 1 本捨ててから本番を測る "
+                         "-- **プロセスの 1 本目だけが冷たい**のを消すため "
+                         "(理由と実測は `burn_in` の docstring)。切ると "
+                         "2026-09-03 以前の挙動に戻る")
     return ap
 
 
@@ -3242,10 +3248,53 @@ def run_with_model(argv, bundle) -> int:
     return 0
 
 
+def burn_in(args, bundle, log=print) -> None:
+    """読み込み直後に null の A/B を 1 本流して捨てる。
+
+    **プロセスの 1 本目だけが冷たいのを消すため。**実測 (2026-09-03、
+    常駐 worker で null knob を 2 本続けて流した): 読み込み直後の 1 本目は、
+    このハーネス自身の温め (冒頭の warmup と文脈グループごとの 1 本捨て) を
+    済ませてもなお**各ケースの 1 行目が 8〜9% 遅い** (40.5 / 36.7 / 37.2 /
+    36.8 ms/round)。2 本目には段差が無い (36.9 / 36.8 / 36.9 / 36.9)。
+
+    回文順 (A,B,B,A) が相殺できるのは線形のドリフトだけで、**位置 1 の
+    段差は相殺できない。しかも A が必ず位置 1 に来る**ので、この段差は
+    そのまま A の下駄になる (上の数字なら A に +4.7%)。2026-09-01 に
+    `null` knob が長文脈 +5.6% を出したのと同じ形の罠。
+
+    ここで 1 本焼いておけば、本番の測定は必ず「2 本目以降」の状態から
+    始まる。`tools/ab_daemon.py` も読み込み直後に同じことをするので、
+    **CLI で測っても worker 経由で測っても条件が揃う**
+    (片方だけ変えないこと --- 揃っていることが目的)。
+
+    短文脈 3 本 x 32 トークンで 10 秒級。出力は読まないので捨てる
+    (`--out` も渡さないので結果 JSON も書かない)。
+    """
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    argv = ["--knob", "null", "--only", "short", "--tokens", "32",
+            "--model", args.model]
+    if args.ngram:
+        argv += ["--ngram", args.ngram]
+    t0 = time.perf_counter()
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf), redirect_stderr(buf):
+            run_with_model(argv, bundle)
+    except Exception as e:  # noqa: BLE001  空焼きの失敗で本番を止めない
+        log(f"[decode_ab] 空焼きに失敗した (続行): {e!r}")
+        return
+    log(f"[decode_ab] 空焼き 1 本を捨てた ({time.perf_counter() - t0:.1f}s)。"
+        "本番は 2 本目以降の温度で測る (--no-burn-in で切れる)")
+
+
 def main() -> int:
     argv = sys.argv[1:]
     args, _knob_names = parse_args(argv)   # モデルを読む前に引数を弾く
     bundle = load_bundle(args)
+    if not args.no_burn_in:
+        burn_in(args, bundle)
     rc = run_with_model(argv, bundle)
     if rc:
         return rc

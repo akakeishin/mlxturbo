@@ -1496,6 +1496,29 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         if _rt not in ("0", ""):
             print(f"{log_prefix} sdpa 行タイル有効 (段 P5、R={_rt}、MLXTURBO_SDPA_ROWTILE=0 で off)")
 
+        # 段 P3 (混合タイル): prefill 幅の MoE 行列積を自前の grouped GEMM に
+        # 置き換え、専門家ごとに 16 行 / 32 行タイルを選ぶ (`MLXTURBO_MOE_GEMM_MIX`、
+        # 既定 0 = 素の `mx.gather_qmm` のまま呼ばない、48 で mix48/WM=1)。
+        # 素の segmented (mix なし) は in-model で 8k -1.4% / 17k -0.6% しか
+        # 出ず既定に入れていない (2026-09-03 09:15)。混合タイルの採否は
+        # `tools/decode_ab.py --knob moe-mix48` の prefill_s で決める。
+        _mix = int(os.environ.get("MLXTURBO_MOE_GEMM_MIX", "0") or "0")
+        if _mix > 0:
+            fused.enable_moe_grouped_gemm(model, mode="seg", mix_threshold=_mix)
+            print(f"{log_prefix} MoE grouped GEMM 有効 (段 P3、混合タイル"
+                  f" mix={_mix}、MLXTURBO_MOE_GEMM_MIX=0 で off)")
+
+        # 段 P10: prefill 幅の dense 射影 (q_proj / o_proj / in_proj_qkv /
+        # in_proj_z / out_proj) を BM=64 の自前 qmm に通す。素とビット一致、
+        # micro では素の 0.935〜0.947 (M=2048 / 8192)。enable_qmm_wide 自身が
+        # MLXTURBO_QMM_WIDE (auto|on|off、**既定 off**) を読むので、ここでは
+        # 呼ぶだけ。auto は非 NAX 機だけ on。行数 < 1024 (decode/verify 幅) は
+        # 常に素の `mx.quantized_matmul` に落ちる。
+        n = fused.enable_qmm_wide(model)
+        if n:
+            print(f"{log_prefix} qmm_wide 有効 (段 P10、{n} 射影、"
+                  f"MLXTURBO_QMM_WIDE={os.environ.get('MLXTURBO_QMM_WIDE')})")
+
         # QK-norm 後の rope (cos/sin 生成 + _rope_partial x2) を mx.fast.rope
         # 1 dispatch x2 (q/k) に畳む。enable_fast_rope 自身が MLXTURBO_FAST_ROPE=1
         # をゲートに持っているので、ここでは呼ぶだけで安全 (既定 off が保たれる)。
@@ -1524,6 +1547,17 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         from . import indexer_lean
 
         indexer_lean.enable_indexer_lean_default(model, log_prefix=log_prefix)
+
+        # 段 K2c: decode/verify 幅の QSA attention を 2 本の自前カーネル
+        # (選択 = qsa_select、attention = qsa_attn_decode) に置き換える。
+        # **既定 off。**出力はビット一致する写しだが、参照が HF と同じ
+        # per-query tail 1 本だけなので `MLXTURBO_QSA_TAIL=query` が要る
+        # (現在の既定は global)。enable_qsa_decode_kernel_default 自身が
+        # MLXTURBO_QSA_DECODE_KERNEL=1 をゲートに持っているので、ここでは
+        # 呼ぶだけで安全。採否は tools/decode_ab.py --knob qsa-decode-kernel。
+        from . import qsa_decode
+
+        qsa_decode.enable_qsa_decode_kernel_default(model, log_prefix=log_prefix)
 
 
 def set_wired_limit_default(log_prefix: str = "") -> int | None:
