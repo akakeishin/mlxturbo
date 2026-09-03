@@ -201,3 +201,7 @@ CLAUDE.md の knob の段落も直す。フルテスト (対 mlx-serve) と over
 今日の判定と数字は全部 `docs/research/SESSION-2026-09-02-CATCHUP.md` の 2026-09-03 の節、案の台帳は `docs/research/IDEAS-2026-09-03.md`。
 既定に入ったもの (今日): mmap (`FASTMLX_NGRAM_BACKEND`)、P5 行タイル (`MLXTURBO_SDPA_ROWTILE`)。knob で待機中: tail-in-group、prefill-attn の uint4 版、qsa-tail、moe-grouped-gemm。
 小さいベンチは chain94 (未起動、P6 と tail v2 が入ったら起動)。フルベンチは小さいベンチで「decode 同着以上、prefill 1.03x 以内」が出てから。
+
+追記 (12:15、compact 前の 2 回目): 今日の午前後半の決着 — custom kernel が decode で負ける正体は「温キャッシュの連鎖 micro」(CATCHUP 12:00、CLAUDE.md の作法に追加)。
+K2a (radix select) は集合 100% 一致・13 us で通過、K2b を実装中。HC は第 4 変種 (elementwise だけ融合、GEMV は MLX の qmv) を実装中で見込み 4.7 → 2.2 ms。
+ANE は見送り (INT8 の重みコピーでメモリが増える)。最終ゴールは短文脈 100 tok/s (MTP 学習なし)。P8 は保留 (P10 次第)。走行中の一覧は scratchpad の INFLIGHT-2026-09-03.md の「12:15 時点」。
