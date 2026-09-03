@@ -47,6 +47,14 @@
    **絶対値の比較には使わない**。配分を見るときだけ使い、固定費
    (= split-cb の合計 - 既定の合計、を dispatch 数で割る) を引いて読む。
    この指定はプロセス全体に効く env なので、走行を分けること。
+   **`--split-cb` の「1 カーネルあたり us」は、そのカーネルが入った CB の
+   GPU 区間 (GPUStartTime→GPUEndTime) まるごとであって実費ではない。**
+   1 CB 1 dispatch では、その CB に落ちた泡や待ちを 1 本で背負う (前例:
+   最終 mixer の `hc_elem_post` が 462 us/call と出たが、実費は 4.3 us。
+   回数が 1 でも 3 でも合計 ~0.5 ms/round で固定 = 回数に比例しない、が
+   見分け方。`tools/hc_elem_post_micro.py --probe` が同じ形を再現する:
+   同じカーネルが投入の仕方だけで 44.8 と 7.0 us/call に振れる)。
+   **回数に比例しない項目を見たら、必ず単体 micro で裏を取ること。**
 2. dispatch 数は compute の dispatch だけ (直接・間接の両方)。blit (コピー)
    は command buffer としては数えるが dispatch には数えない。
 3. install より前に作られた pipeline は名前の台帳に無く、`label` が空なら
