@@ -2192,3 +2192,7 @@ gdn_prework fused 39.2 / plain 33.3 (1.18)、rms_norm_gated 5.7 / 11.3 (0.50)。
 - 速度は中立 (17k ms/round -0.7%、prefill +0.5%、短は同一)。正答率 17k: query は recall 6/6 → 12/12、quote は dense 5/6 (global と同じ) → 12 問で dense 7/12 / kernel 8/12。
 - `mlxturbo/qsa_tail.py` の既定を query に。`MLXTURBO_QSA_TAIL=global` で旧規則。teacher (bf16、query) の作り直しは SSD が読めるようになってから (挿し直しても readdir が EINTR で読めない)。
 - K2c (decode QSA カーネル) は query が前提。-0.7% でビット一致なので代金ゼロ方針では既定候補だが、天井 13% との差の切り分けと 50k の確認を待つ。
+
+### 2026-09-03 17:51 D1 (draft 同梱) の burn-in 付き再測 (`draft-presync-burnin.json`、短長 3 本 × 512、worker): ms/tok 短 +1.0% / 長 +0.4% → 畳んだまま
+
+起動直後の段差を除いても A (同梱) が遅い (ms/round 短 +2.0% / 長 +1.5%、tok/round +0.9% / +1.0%、出力一致)。代金ゼロではない (遅い) ので既定に入れない。
