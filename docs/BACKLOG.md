@@ -660,3 +660,32 @@ q_col >= 2048 なので発生しないが、budget をチャンク幅より小�
 恒久解は「causal を捨てず sparse と連言を取る」で、batch 経路は左パディングの
 bool mask があるときだけ既にそうしている。効果と速度の両方を測る話なので
 別項目に切る。
+
+## アーキテクチャ追従の投資 (ユーザー方針 2026-09-03 14:30: qwen4_exp の最適化が終わってから着手)
+
+**目標**: 全モデルで最高の最適化は目指さない。新しい族が出たとき **8〜9 割の追従が既定で得られる** 状態にする。
+毎日のように新しいアーキテクチャが出るので、全部を族ごとに手で書くのは無理という前提。
+
+**「8〜9 割」の定義 (新しい族を載せたときに、対応表 1 枚で当たるもの)**
+- 汎用の計測と運用: worker (`tools/ab_daemon.py`)、biglock、decode_ab、小ベンチ、KLD の道具 (teacher は族ごとに作る)。
+- 投機 decode の制御: depth 適応、rerank、prime 窓、detokenizer (MTP 頭がある族はそのまま。無い族は draft 経路が別途要る)。
+- 汎用カーネル: GDN の Metal 再帰 (GDN を持つ族全部)、head_dim 256 の sdpa 行タイル / d=256 flash attention、BM=64 の qmm (dense 射影 + MLP)、MoE の segmented GEMM (混合タイル)。
+
+**族ごとに残るもの (1〜2 割)**: 本家 forward の写し (staged / group prefill / capture) とビット一致ゲート、族固有のサイドカー (PLE n-gram、QSA)、
+KLD の bf16 teacher、MTP 無しの族の draft 経路 (n-gram か小さい draft モデル)。
+
+**現状の障害** (2026-09-03 に確認): `mlxturbo/fused.py` の enable_* 25 個が全部 `mlx_lm.models.qwen4_exp` を import し、`runner.py` は
+`model_type == "qwen4_exp"` で分岐するので、27B (qwen3_5_text) では融合が一つも当たらない。BM=64 qmm の対象も q/o/in_proj だけで MLP が無い
+(Flash-Next の MLP は MoE だったため)。
+
+**順序と、対応表を切る場所**
+1. qwen4_exp の最適化を終える (prefill 1.5 倍、decode の改修)。
+2. **qwen3_5 (27B / 35B-A3B) を 2 族目として載せる。ここで対応表を切る** (1 族目では共通部分が見えない、2 族目で初めて分かる)。
+   対応表の中身: 族ごとの attention / GDN / MLP / MoE のモジュール名と形 (head_dim、Hq/Hk、GDN の頭数と次元、layer_types)、
+   融合の適格判定、forward の写しの所在。enable_* は対応表越しに呼ぶ。上の「アーキ能力レイヤの設計」(能力は名前付き、写しは抽象化しない、
+   `_arch()` は一本化しない) の決定はそのまま生かす。
+3. Gemma 4 (手元に 26B / 31B の 4-bit) を 3 族目として載せ、対応表で追従がどれだけ速くなったかを測る。Gemma 4 は GDN も MoE も無く
+   sliding window + global の混成、MTP 頭も無いので、効くのは attention のカーネルと qmm、それに MTP 無しの投機の経路 (「Gemma 4 対応の下調べ」を参照)。
+
+**反転条件**: 2 族目で共通化できたカーネルが 2 つ未満なら、対応表は作らず族ごとの配線に留める (抽象の維持費だけ残るため)。
+mlx_lm の更新で写しが壊れる頻度が月 2 回を超えるなら、写しの数を減らす方 (層のフックで staged を組む) を先にやる。
