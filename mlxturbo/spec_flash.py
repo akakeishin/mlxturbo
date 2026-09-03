@@ -1265,6 +1265,20 @@ class FlashSpecEngine:
         # (_trace_top2 と全く同じ規約 --- _draft_chain が置き、
         # _trace_depth_round が 1 ラウンドに 1 回だけ対で消費する)。
         self._trace_margins: list | None = None
+        # 受理率の余地を測る trace (`tools/decode_ab.py --draft-topk K` が
+        # 立てる。既定 0 = off で 1 ビットも変わらない)。環境変数ではなく
+        # 属性なのは、読み込み済みの常駐 worker (tools/ab_daemon.py) に
+        # 後から効かせるため。`_draft_chain` が**全段**の上位 K 候補
+        # (rerank 前の粗ヘッド順と、再採点後の順の 2 本) を `_trace_topk`
+        # に、`_verify` が検証フォワードの全位置の真のトークンを
+        # `_trace_topk_true` に置き、`_trace_depth_round` が 1 ラウンドに
+        # 1 回だけ対で消費して `_topk_records` に積む (`_trace_top2` /
+        # `_trace_margins` と全く同じ規約)。読むだけで draft/受理の決定には
+        # 一切関わらない。
+        self._topk_k: int = 0
+        self._topk_records: list | None = None
+        self._trace_topk: list | None = None
+        self._trace_topk_true: list | None = None
         # tools/decode_ab.py がプロンプトごとに設定できる識別子 (任意)。
         # None のままなら depth trace レコードの prompt_id は null になる。
         self.depth_trace_prompt_id: str | None = None
@@ -1384,6 +1398,48 @@ class FlashSpecEngine:
         order = mx.argsort(-vals, axis=-1)
         top2 = mx.take_along_axis(top, mx.take_along_axis(part, order, axis=-1), axis=-1)
         return (tok, top2, margin) if want_margin else (tok, top2)
+
+    def _draft_topk_probe(self, out, k: int):
+        """draft ヘッドの上位 k 候補を読むだけの計測専用の枝 (`_topk_k`)。
+
+        `_draft_argmax` には**触らない** --- あちらは出荷経路そのもので、
+        戻り値の組み合わせが既に 4 通りある。ここは trace のときにしか
+        呼ばれないので、粗ヘッドの行列積を 1 回余分に払ってでも独立させる
+        (トークンの決定は `_draft_argmax` 側のまま。同じ入力・同じ演算なので
+        ここが返す 1 位は必ず `_draft_argmax` の argmax と一致する)。
+
+        戻り値は ``(coarse, rerank)`` の 2 本。``coarse`` は 2bit の粗ヘッド
+        のスコア順 (rerank する**前**の候補集合)、``rerank`` は粗 top-32 を
+        trunk のヘッドで再採点した順 (実際に draft が選ぶ側)。rerank 無しの
+        パックでは ``coarse`` は None で ``rerank`` が trunk ヘッドの上位 k。
+        どちらも語彙 id の Python int リスト (長さ k)。
+        """
+        if self._rerank is None:
+            logits = self._head(out)[:, -1]
+            part = mx.argpartition(-logits, k - 1, axis=-1)[..., :k]
+            vals = mx.take_along_axis(logits, part, axis=-1)
+            top = mx.take_along_axis(part, mx.argsort(-vals, axis=-1), axis=-1)
+            mx.eval(top)
+            return None, top[0].tolist()
+        lm = self.model.lm_head
+        row = out[:, -1]
+        cw, cs, cb = self._rerank
+        coarse = mx.quantized_matmul(
+            row, cw, scales=cs, biases=cb, transpose=True,
+            group_size=64, bits=self.RERANK_BITS)
+        pool = mx.argpartition(
+            -coarse, self.RERANK_TOP - 1, axis=-1)[..., : self.RERANK_TOP]
+        cvals = mx.take_along_axis(coarse, pool, axis=-1)
+        ctop = mx.take_along_axis(
+            pool, mx.argsort(-cvals, axis=-1)[..., :k], axis=-1)
+        rows = mx.dequantize(
+            lm.weight[pool[0]], lm.scales[pool[0]], lm.biases[pool[0]],
+            group_size=lm.group_size, bits=lm.bits)
+        scores = (row.astype(rows.dtype) @ rows.T)
+        rtop = mx.take_along_axis(
+            pool, mx.argsort(-scores, axis=-1)[..., :k], axis=-1)
+        mx.eval(ctop, rtop)
+        return ctop[0].tolist(), rtop[0].tolist()
 
     def _draft_argmax_rows(self, row, lm, cw, cs, cb, want_margin: bool = False):
         """`_draft_argmax` の rerank 経路の B 行版 (バッチ x 投機で使う)。
@@ -1565,13 +1621,18 @@ class FlashSpecEngine:
         tok, hyper = cur, hyper_prev
         want_top2 = trace_top2 and _DRAFT_TRACE
         want_margin = trace_top2 and _DEPTH_TRACE_PATH is not None
+        topk_k = getattr(self, "_topk_k", 0) if trace_top2 else 0
         margins: list | None = [] if want_margin else None
+        topks: list | None = [] if topk_k else None
         start = 0
         if first is not None:
             tok, hyper, margin0 = first
             drafts.append(tok)
             if want_margin:
                 margins.append(margin0)
+            if topk_k:
+                # 案 D1 (既定 off) では 1 段目がここに無いので候補も取れない
+                topks.append(None)
             start = 1
         for step in range(start, depth):
             emb = self.model.model.embed_tokens(tok)
@@ -1581,6 +1642,8 @@ class FlashSpecEngine:
                 x, self.rope, mask, None, cache, cache.indexer, None, None
             )
             out = self.mtp.hyper_connection_mixer(x)
+            if topk_k:
+                topks.append(self._draft_topk_probe(out, topk_k))
             step_want_top2 = want_top2 and step == 0
             margin = None
             if not step_want_top2 and not want_margin:
@@ -1614,6 +1677,8 @@ class FlashSpecEngine:
         trim_attn_cache(cache, keep)
         if want_margin:
             self._trace_margins = margins
+        if topk_k:
+            self._trace_topk = topks
         return drafts
 
     def _prime_accepted_gap(self, toks: list, hypers: list, cache) -> None:
@@ -1691,20 +1756,42 @@ class FlashSpecEngine:
         と合わせて 1 レコードにし、``self._depth_trace_records`` (無ければ
         黙ってスキップ) に積む。ファイルへの書き出しはラウンドごとではなく
         ``generate_stream`` の終了時にまとめて行う。
+
+        ``self._topk_k`` (`tools/decode_ab.py --draft-topk`) が立っている
+        ときは、同じレコードに ``topk`` と ``true`` を足したものを
+        ``self._topk_records`` にも積む (**depth trace 側のレコードの形は
+        変えない** --- `tools/depth_trace_stats.py` が読む)。
+
+        - ``topk`` -- 段ごと (0-indexed、長さ ``depth``) の
+          ``[粗ヘッド上位 k, 再採点後の上位 k]``。段 i は「先行する i 個の
+          draft を前提に引いた (i+1) 個目の draft」
+        - ``true`` -- 検証フォワードの全位置の argmax (長さ ``depth+1``)。
+          ``true[i]`` が段 i の draft が当てるべきだった答え
+          (``true`` は draft 列を前置きした条件付きなので、受理が途中で
+          切れたラウンドでも段ごとの命中判定にそのまま使える)。
         """
         margins = getattr(self, "_trace_margins", None)
         self._trace_margins = None
+        topk = getattr(self, "_trace_topk", None)
+        true_vals = getattr(self, "_trace_topk_true", None)
+        self._trace_topk = None
+        self._trace_topk_true = None
         records = getattr(self, "_depth_trace_records", None)
-        if records is None:
+        topk_records = getattr(self, "_topk_records", None)
+        if records is None and topk_records is None:
             return
-        records.append({
+        rec = {
             "round": round_no,
             "depth": depth,
             "hit": hit,
             "margins": margins,
             "pos": pos,
             "prompt_id": getattr(self, "depth_trace_prompt_id", None),
-        })
+        }
+        if records is not None:
+            records.append(rec)
+        if topk_records is not None:
+            topk_records.append({**rec, "topk": topk, "true": true_vals})
 
     def _verify(self, cap, lg, drafts, temp, precomputed=None, sampler=None):
         """検証フォワードの結果から、採用するトークンと hyper を取り出す。
@@ -1750,6 +1837,12 @@ class FlashSpecEngine:
             dvals = dv[0].tolist()
             if _DRAFT_TRACE:
                 self._trace_draft_hit(all_vals[0])
+            if getattr(self, "_topk_k", 0):
+                # 位置 j の argmax は「draft の先頭 j 個を前置きしたときの
+                # トランクの次トークン」なので、受理が途中で切れても全位置ぶんが
+                # 「その段の draft が当てるべきだった答え」になる
+                # (`_trace_depth_round` の docstring)。
+                self._trace_topk_true = all_vals
             hit = 0
             while hit < k and all_vals[hit] == dvals[hit]:
                 hit += 1
@@ -1772,6 +1865,12 @@ class FlashSpecEngine:
         dvals = dv[0].tolist()
         if _DRAFT_TRACE:
             self._trace_draft_hit(all_vals[0])
+        if getattr(self, "_topk_k", 0):
+            # 位置 j の argmax は「draft の先頭 j 個を前置きしたときの
+            # トランクの次トークン」なので、受理が途中で切れても全位置ぶんが
+            # 「その段の draft が当てるべきだった答え」になる
+            # (`_trace_depth_round` の docstring)。
+            self._trace_topk_true = all_vals
         hit = 0
         while hit < k and all_vals[hit] == dvals[hit]:
             hit += 1
@@ -2506,7 +2605,7 @@ class FlashSpecEngine:
                 # 仕事は終わっている。
                 round_ms = (time.perf_counter() - _round_t0) * 1000.0
                 self._depth_controller.observe(hit, len(drafts), round_ms)
-            if _DEPTH_TRACE_PATH is not None:
+            if _DEPTH_TRACE_PATH is not None or getattr(self, "_topk_k", 0):
                 self._trace_depth_round(rounds, len(drafts), hit, _round_pos)
 
             cut = next((k for k, v in enumerate(vals) if v in eos), None)

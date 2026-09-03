@@ -2902,6 +2902,26 @@ def build_parser() -> argparse.ArgumentParser:
                          "MLXTURBO_DEPTH_ADAPT=0 も一緒に渡すこと)。"
                          "MLXTURBO_DEPTH_TRACE の trace 採取を `--knob null` "
                          "と組み合わせて 1 本だけ流すために足した")
+    ap.add_argument("--draft-topk", type=int, default=0, metavar="K",
+                    help="受理率の余地を測る trace。`eng._topk_k` を立て、"
+                         "draft chain の**全段**の上位 K 候補 (2bit 粗ヘッド"
+                         "の順と、trunk ヘッドで再採点した後の順) と、検証"
+                         "フォワードが確定させた全位置の真のトークンを"
+                         "ラウンドごとに集める。`--topk-trace <path>` で "
+                         "JSON Lines に書き出す。読むだけで draft/受理の決定"
+                         "には関与しない (spec_flash._draft_topk_probe)。"
+                         "**環境変数ではなく属性なので常駐 worker に載る**"
+                         "(--draft-trace と違い load-time flag ではない)。"
+                         "K>0 のときは `eng._depth_adapt` も False にする "
+                         "(段ごとの命中率を全ラウンド同じ深さで見るため。"
+                         "深さ自体は `--depth` で指定すること)")
+    ap.add_argument("--topk-trace", default=None, metavar="PATH",
+                    help="`--draft-topk` が集めたレコードの追記先 (JSON "
+                         "Lines)。1 行 = 1 ラウンドで、キーは depth trace と"
+                         "同じ (round/depth/hit/margins/pos/prompt_id) に "
+                         "topk (段ごとの [粗上位K, 再採点後上位K]) と true "
+                         "(検証フォワードの全位置の argmax) を足したもの。"
+                         "tools/draft_topk_stats.py が読む")
     ap.add_argument("--save-out", action="store_true",
                     help="既定では rows に生成トークンの先頭 24 個 "
                          "(head=out[:24]) しか残さない。このフラグを立てると "
@@ -3010,6 +3030,15 @@ def run_with_model(argv, bundle) -> int:
         # まま全位置を観測できない。
         eng.depth = args.depth
         eng.depth_ctx_limit = 1 << 30
+    # `--draft-topk` の trace 用スロット。**毎ジョブ必ず書く** --- 常駐
+    # worker は同じエンジンを使い回すので、前のジョブが立てたまま残ると
+    # 次のジョブが黙って粗ヘッドを 1 段ごとに余分に引くことになる。
+    eng._topk_k = max(0, args.draft_topk)
+    eng._topk_records = [] if eng._topk_k else None
+    if eng._topk_k:
+        # 段ごとの命中率は全ラウンド同じ深さで取る (controller が長文脈で
+        # 深さを変えると、段 3/4 のサンプルがラウンドによって無くなる)。
+        eng._depth_adapt = False
 
     # ---- プロンプトを組む -------------------------------------------
     from _bench_text import long_prompts
@@ -3390,6 +3419,15 @@ def run_with_model(argv, bundle) -> int:
                 _p = _p.with_name(f"{_p.stem}-{_name}{_p.suffix}")
             _p.write_text(json.dumps(rows, ensure_ascii=False, indent=1))
             print(f"\n書き出し: {_p}")
+
+    if args.topk_trace and eng._topk_records:
+        _tp = Path(args.topk_trace)
+        with open(_tp, "a") as _f:
+            for _rec in eng._topk_records:
+                _f.write(json.dumps(_rec, ensure_ascii=False) + "\n")
+        print(f"topk trace 書き出し: {_tp} ({len(eng._topk_records)} ラウンド)")
+    eng._topk_k = 0
+    eng._topk_records = None
     return 0
 
 

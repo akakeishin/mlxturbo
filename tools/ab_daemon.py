@@ -552,6 +552,13 @@ def reset_engine(bundle) -> None:
     eng.depth_trace_prompt_id = None
     eng._trace_top2 = None
     eng._trace_margins = None
+    # `decode_ab --draft-topk` の trace スロット。属性なので (load-time env と
+    # 違い) worker に載る -- 前のジョブから漏れると、次のジョブが黙って段ごと
+    # に粗ヘッドを余分に引くことになる。
+    eng._topk_k = 0
+    eng._topk_records = None
+    eng._trace_topk = None
+    eng._trace_topk_true = None
     _fire.reset()
     mx.clear_cache()
 
