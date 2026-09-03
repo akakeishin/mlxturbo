@@ -78,6 +78,10 @@ GPU は `tools/biglock.sh` で 1 本ずつ直列。親の連鎖スクリプト�
 
 案出し Studio (Scout 5 本 + decode advisor) の凍結ポートフォリオと落とした的は `docs/research/IDEAS-2026-09-03.md`。
 ユーザーの Commit (07:50): 選抜は親に任せる。**カーネル (P3) はフルベンチの前に書く。**
+ユーザー方針 (09:15): **decode より先に prefill をもっとやる** (attention は長文脈有利のままでよいが、まだ手があるはず)。
+途中の小さいベンチ (chain87、4k / 17k / 50k) は「カーネルと decode 案の前、mmap 既定まで」の prefill を出す位置づけ。
+A/B は `--knobs a,b,c` で 1 プロセスにまとめ、プロセス内 ABBA では冷却の休止を入れない (別プロセス比較だけ休止)。
+フルベンチは小さいベンチで「decode 同着以上、prefill 1.03x 以内」が出てから。
 
 順番:
 1. 測定だけ (今日)。
