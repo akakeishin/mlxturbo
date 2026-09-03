@@ -1907,3 +1907,9 @@ P6 の品質ゲート (11:19、`tools/longctx_quality.py`、17k、n=8、seed 0):
 qmm はこの形で 11.5〜11.7 TFLOPS (見込みの 10.3〜11.3 より上)、bf16 matmul は 12.7〜13.0。max|diff| は全形 0.0 (同じ重みなら累算も同じ)。
 判定線 (常駐 0.85 / 込み 0.90) には届かず、取り分は GEMM の 5〜10% = prefill 2〜4% (M=8192 側が有利)。
 **保留**: P10 (BM=64 の自前 qmm) が 13 TFLOPS 級に届けば不要。届かなければ P9 (チャンク 8192) と合わせて in-model の候補に戻す。
+
+### 2026-09-03 11:41 decode 側の mmap 確認 (chain85、短 3 本 × 512、別プロセス、null knob の B 行で比較)
+
+pread B1 37.44 / B2 37.44 ms/round、mmap A2 37.03 ms/round (mmap A1 は連鎖の組み替えで消えた)。tok/round は 2.144 で同一。
+mmap の 16 行取得は decode を遅くしない (むしろ -1%、揺れの幅)。**mmap 既定は decode 側も問題なし**。
+P7 の `tools/moe_split.py` は n-gram サイドカー無しでモデルを読んで shard 重みの欠落で落ちた (--ngram の経路が無い)。直して再投入。
