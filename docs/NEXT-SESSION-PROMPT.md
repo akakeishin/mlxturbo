@@ -824,3 +824,18 @@ MLXTURBO_MIN_FREE_GB=4 BIGLOCK_PRIO=1 tools/biglock.sh .venv/bin/python tools/gp
 ```bash
 rg -n "capture|rollback|cache_offset|state|_verify|_staged_forward" mlxturbo/spec_flash.py mlxturbo/runner.py mlxturbo/arch.py
 ```
+
+## cold本体: persistent streaming MoEの試作線を通過 (2026-09-04 21:24 JST)
+
+- 常用冷却17kの詳細分解はwall 29.099秒。以前の27.215秒との差は熱ドリフトなので速度比較には使わない。
+- 1層wallはgroup 0/1で98.61/101.27ms。dense routed GEMM下限69.5msとrouter/topk/sharedを
+  除いた余白は17.10/19.59msで、事前に決めた16ms/callの試作開始線を両方通った。
+- 既存q4 weightをそのまま読み、gate/up→SiLU→down→weighted combineの中間だけをstreamする。
+  weight複製は禁止。全48層array equalが最初のgate、17k採用線は同条件wall≤25.854秒。
+- MTPLX 2.11.1のfirst-gatherとstate-pure graphbankのexact候補を先に閉じ、その後の研究レーン。
+
+再開の1コマンド:
+
+```bash
+rg -n "def _group_prefill_forward|class SparseMoeBlock|def _moe_fold_block|def qmm_segmented" mlxturbo/spec_flash.py mlxturbo/_vendor/qwen4_exp.py mlxturbo/fused.py mlxturbo/kernels/moe_grouped_gemm.py
+```

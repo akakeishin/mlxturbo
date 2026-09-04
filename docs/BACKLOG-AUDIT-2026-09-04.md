@@ -86,7 +86,8 @@ wall -7.5%、約535→578 tok/s (+8.1%)、出力3/3一致で既定onを確定し
 | GDN state_out削除 | 棄却 | in-model ±0.0%、peak -12.6MBだけ |
 | qkv wide | 棄却 | 8k prefill +0.3%、取り分なし |
 | grouped MoE / qmm_wide / GDN blocked / prefill-attn | 完了 | 既定採用済み。新候補は現行後の差分として測る |
-| 新しいモデル本体候補 | 実行可 | MoE/GDN/attentionのどれかで全体5%を説明できるmicro/traceを先に出し、出力一致またはΔKLD≤+0.0005でA/B |
+| persistent streaming MoE | 実行可・研究 | 1層の非GEMM余白17.1/19.6msが事前線16msを通過。全48層array_equalを先に通し、17k wall≤25.854秒でのみ採用 |
+| 新しいGDN/attention候補 | 実行可 | 全体5%を説明できるmicro/traceを先に出し、出力一致またはΔKLD≤+0.0005でA/B |
 
 ## 汎用architecture / forward copy
 

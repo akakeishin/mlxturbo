@@ -3534,3 +3534,21 @@ capacity generation単位でbankを成長・切替する。既存depthを幅4へ
 first-chunk gather at arrivalは現行のrunner内同期waitとの差として独立A/Bする。既存chunk lookaheadは
 50k cold -7.5%で同型を採用済み。FR-Spec Q8は手元coverage 89.02%なので棄却を変えない。
 詳細は`docs/research/MTPLX-2.11-GAP-2026-09-04.md`。
+
+### 2026-09-04 21:24 cold本体のpersistent streaming MoEは試作線を通過
+
+常用冷却で17kを`tools/prefill_ctx_anatomy.py --sub --reps 3`により分解した。wallは29.099秒で、
+直前の27.215秒より遅いが、これはarmを交互に置かない別走行の熱ドリフトなので改善判定には使わない。
+総時間はMoE 9.701秒 (33.3%)、GDN 7.875秒 (27.1%)、attention 5.835秒 (20.1%)、
+HC read 2.873秒 (9.9%)。
+
+| 1 MoE層 | wall | routed up+gate+down | router+topk | shared | dense GEMM下限を除く余白 |
+|---|---:|---:|---:|---:|---:|
+| group 0 | 98.61ms | 82.97ms | 3.54ms | 8.47ms | **17.10ms** |
+| group 1 | 101.27ms | 85.47ms | 3.64ms | 8.54ms | **19.59ms** |
+
+余白は`wall - (69.5ms dense routed GEMM下限 + router + topk + shared)`で算出した。両groupが
+事前線16ms/callを通ったため、既存q4 weightを複製せず、gate/up→SiLU→down→weighted combineの
+中間をpersistent kernel内でstreamする試作へ進めてよい。最初のgateは全48層array equal。
+速度採用線は同じ常用冷却のABBAで17k wall **25.854秒以下**（27.215秒から-5%）。
+結果は`bench/results/prefill-anatomy-current-sub-17k-0904.json`（gitignore）。

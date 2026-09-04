@@ -1061,3 +1061,16 @@ prefetch onは平均86.255秒、offは93.252秒で、wall **-7.5%**、入力速�
 GDN 29.3%、attention 21.3%、HC read 10.5%だった。先読みはcold全体tok/sを上げるが、
 モデル本体の次の対象は引き続きMoE、GDN、attention。既棄却案を再開せず、新しい候補は
 各単独で全体5%以上を説明できる見込みを出してからA/Bする。
+
+## 調査継続: persistent streaming MoE (2026-09-04 21:24)
+
+常用冷却17kの`--sub --reps 3`はwall 29.099秒。熱ドリフトで上の27.215秒とは直接比較せず、
+同じ走行内の1 MoE層だけを分解した。group 0はwall 98.61msに対し、dense routed GEMM下限
+69.5ms、router/topk 3.54ms、shared 8.47msを除く余白が**17.10ms**。group 1はwall
+101.27ms、同じ下限とrouter/topk 3.64ms、shared 8.54msから**19.59ms**。宣言済みの
+試作開始線16ms/callを両groupが通った。
+
+候補はexpert mixed-BMを変えず、既存q4 weightを読み、gate/up→SiLU→down→weighted combineの
+中間だけをpersistent kernel内でstreamする。weight複製は約45GBになるため禁止。まず全48層の
+出力をarray equalで比較し、丸め差が出る場合はそこで止める。速度採用線は同じ常用冷却ABBAで
+17k wall 27.215→25.854秒以下（-5%）。MTPLX 2.11.1のexact部品監査より後の研究レーンとする。
