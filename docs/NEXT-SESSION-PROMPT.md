@@ -311,3 +311,5 @@ Flash-Next のフルベンチは後回し (ユーザーの指示があるまで�
 - **現在地 (2026-09-04 13:15、fdc06e1)**: 小 M (M=2..5) の量子化行列積を既定 auto に (27B 短 -1.9% / 4k -4.6%、fp32 距離は素と同じ)。Gemma 4 26B の 5 者は相手 4 行が揃い、公式 draft は MoE の 26B で 2 者とも遅い → Gemma レーンから drafter を外した。
   **Codex への引き継ぎを書き始めた**: 入口 `AGENTS.md`、本体 `docs/HANDOFF-2026-09-04.md` (走行待ちの節を埋め中)、memory の写し `docs/research/NOTES-FROM-MEMORY-2026-09-04.md`。ユーザーは「どこかで完全に切り替える」意向。
   走行中: mlxturbo の煙試験 3 行 (`scratchpad/gemma4_smoke_runs3.sh`)、sdpa 幅分割の再判定 (fp32 距離 + 短文脈)、MoE compile の in-model、台帳 27 件の要約 (`docs/research/AGENT-LEDGERS-DIGEST-2026-09-04.md` 予定)。
+- **13:35**: sdpa 幅分割 (27B) と MoE compile (Flash-Next) を既定 auto に (12f861f)。煙試験 (13:22〜13:30): 27B MTP 33.8 / 32.1、投機ゼロ 23.8 / 22.9 (`MLXTURBO_RUNNER=fallback`、99ba892) → 素の効率は mlx-serve と同着、差は投機の取り分 (1.40 倍対 1.71 倍)。
+  走行中 2 本 (判定線と再開コマンドは HANDOFF の「走行中」): 小 M を Flash-Next へ (worktree)、27B の gated chain の閾値の掃引 (`MLXTURBO_SPEC_GATE_H` / `MLXTURBO_SPEC_MAX_DRAFT`)。
