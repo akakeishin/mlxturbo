@@ -38,6 +38,11 @@ from vs_mlx_serve import (  # noqa: E402
 )
 
 
+def _output_token_count(tokenizer, reply: str, n_chunks: int) -> int:
+    """SSE chunk数ではなく、生成本文を同じtokenizerで数え直す。"""
+    return len(tokenizer.encode(reply)) if reply else n_chunks
+
+
 def main() -> int:
     install_term_handler()
     ap = argparse.ArgumentParser()
@@ -166,11 +171,14 @@ def main() -> int:
                         extra_body=thinking_extra)
             log(f"温め 2 (長 {args.warm_long} tok) 完了")
         for c in ctxs:
-            colds, warms, decs, ntok = [], [], [], []
+            colds, warms, decs, ntok, nchunk, decs_ch = [], [], [], [], [], []
             for r in range(args.reps):
                 msgs = [{"role": "user", "content": prompts[c][r]}]
-                t_cold, dec, n, reply = stream_once(args.port, msgs, args.tokens, mid,
-                                                     extra_body=thinking_extra)
+                t_cold, dec, n_chunks, reply = stream_once(
+                    args.port, msgs, args.tokens, mid, extra_body=thinking_extra)
+                # MTPや別engineは複数tokenを1つのSSE deltaへまとめられる。
+                # chunk数で割るとdecodeを過小評価するため、同じtokenizerで数え直す。
+                n = _output_token_count(tok, reply, n_chunks)
                 # 追記ターン: 実クライアントは履歴をまるごと送り直す
                 msgs2 = msgs + [{"role": "assistant", "content": reply},
                                 {"role": "user", "content": "続けて。"}]
@@ -179,16 +187,23 @@ def main() -> int:
                 colds.append(t_cold)
                 warms.append(t_warm)
                 decs.append((n - 1) / dec if dec > 0 and n > 1 else 0.0)
+                decs_ch.append((n_chunks - 1) / dec
+                               if dec > 0 and n_chunks > 1 else 0.0)
                 ntok.append(n)
+                nchunk.append(n_chunks)
                 # 両エンジンが同種のテキストを出しているか後で見るための痕跡
                 prompt_meta[c][r]["reply_head"] = reply[:160]
                 prompt_meta[c][r]["reply_chars"] = len(reply)
-                log(f"文脈 {c} rep {r} 完了 (冷 {t_cold:.2f}s 温 {t_warm:.2f}s)")
+                log(f"文脈 {c} rep {r} 完了 (冷 {t_cold:.2f}s 温 {t_warm:.2f}s "
+                    f"{n} tok / {n_chunks} chunk)")
             row = dict(ctx=c, cold_ttft=statistics.median(colds),
                        warm_ttft=statistics.median(warms),
                        decode_tps=statistics.median(decs),
                        n_tokens=statistics.median(ntok),
+                       decode_tps_chunks=statistics.median(decs_ch),
+                       n_chunks=statistics.median(nchunk),
                        colds=colds, warms=warms, decs=decs, ntoks=ntok,
+                       nchunks=nchunk, decs_chunks=decs_ch,
                        prompts=prompt_meta[c])
             rows.append(row)
             pt = prompt_meta[c][0]["tokens"]
@@ -200,7 +215,8 @@ def main() -> int:
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w") as f:
         json.dump(dict(engine=label, rows=rows, tokens=args.tokens,
-                       reps=args.reps), f,
+                       reps=args.reps, argv=argv, port=args.port,
+                       thinking=args.thinking), f,
                   ensure_ascii=False, indent=2)
     print(f"\n書き出し: {args.out}")
     return 0
