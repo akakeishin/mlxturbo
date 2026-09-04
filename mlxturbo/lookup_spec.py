@@ -289,10 +289,12 @@ class LookupSpecRunner:
             cand = y.tolist() + (draft or [])
             cand_arr = mx.array(cand, dtype=mx.uint32)
             logits = self.model(cand_arr[None], cache=cache)
-            mx.eval(logits)
+            # Keep argmax in the same lazy graph as the model.  Materializing
+            # the full vocabulary logits first creates an unnecessary device
+            # barrier; only the small token-id vector is needed on the host.
+            preds = mx.argmax(logits[0], axis=-1).tolist()
             if ttft is None:
                 ttft = time.perf_counter() - t0
-            preds = mx.argmax(logits[0], axis=-1).tolist()
 
             m = len(draft) if draft else 0
             accepted = 0

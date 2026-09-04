@@ -4066,3 +4066,17 @@ sessionをpublishする。対象15 testと`bench/test_server.py`全458 testで�
 
 自然文でlookup hitが少ない場合の既存decode -32%は、このprefill/session変更とは別に残る。
 したがって`--lookup-spec`の既定offは維持し、常時onにはしない。
+
+### 2026-09-05 07:18 LookupSpecの語彙logits同期を除き、4k decode +1.97%を採用
+
+投機の各roundは、model forwardの語彙全体logitsを`mx.eval(logits)`で一度同期確定してから、
+別の`argmax`を作ってtoken IDをhostへ戻していた。hostが必要なのは幅1〜8のtoken IDだけなので、
+argmaxをmodelと同じ遅延graphへ含め、`tolist()`でその小さい結果だけを同期する形にした。
+
+Gemma 4 26B・4k、回転KV飽和後のdraft 0条件で64 tokenを`旧, 新, 新, 旧`のABBA測定した。
+旧70.84 tok/s、新72.24 tok/sで**+1.97%**。64 tokenの生成列は4 armすべて一致した。
+追加の配列保持、hot-path分岐、JIT形状はなく、既存の同期境界を1本消すだけなので、5%未満でも採用。
+結果は`bench/results/lookup-argmax-gemma4-4k-0905.json`（gitignore）。
+
+これはdraft 0時の1-token loopを改善した値であり、過去の自然文ベンチ367→245 tok/s (-32%)を
+同じpromptで再測したものではない。`--lookup-spec`の既定offは引き続き維持する。

@@ -1064,7 +1064,9 @@ rg -n "state-pure|fixed-M4|graphbank|component replacement" docs/BACKLOG.md docs
   fresh 2.819秒→warm 0.052秒 (-98.15%)、生成列一致。
 - 回転KVが窓を越えた後はrollbackできないため、境界前にdraft幅を絞り、飽和後は
   lookup draftを0にして正確な1-token greedyを続ける。既定`--lookup-spec off`は維持する。
-- 次の直接速度レーンはLookupSpecの自然文decode二重buffer、またはFlash-Next fixed-M4。
+- 続けて語彙全体logitsの同期境界も除き、4k・64 tokenで70.84→72.24 tok/s
+  (+1.97%、全arm一致) を採用した。自然文の旧-32%全体の再測はまだ行っていない。
+- 次の直接速度レーンはLookupSpecの次round先行投入、またはFlash-Next fixed-M4。
   fixed-M4は現行trunkで134 state leavesのadapterが先に必要なので、小さなpatchとしては扱わない。
 
 再開の1コマンド:

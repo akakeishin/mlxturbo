@@ -47,8 +47,10 @@
 同期waitを`async_eval`へ変え、Gemma 4 26B・4kでcold TTFT 2.792→2.765秒 (-0.95%、出力一致)。
 さらにappend-only sessionを配線し、2ターン目は4,103/4,112 tokenを再利用してTTFT
 2.819→0.052秒 (-98.15%、出力一致) まで短縮した。これはhot prefillの穴を閉じる変更で、
-自然文のlookup hit不足によるdecode -32%までは解消しない。Gemmaの回転KVは窓が埋まると
-rollback不能になるため、境界を越えるdraftだけ0へ絞り、以後は正確なgreedyへ移る。
+自然文のlookup hit不足によるdecode -32%までは解消しない。加えて語彙全体logitsの同期後に
+argmaxしていた境界を除き、4k・64 tokenで70.84→72.24 tok/s (+1.97%、出力一致) を採用した。
+Gemmaの回転KVは窓が埋まるとrollback不能になるため、境界を越えるdraftだけ0へ絞り、
+以後は正確なgreedyへ移る。
 
 残るのは、`spec` / `flash_spec` 級の速度 (1.25-1.39x) を他アーキテクチャで出すこと。
 それには MTP 相当のドラフトヘッドか、アーキテクチャ固有の状態捕獲が要る。
