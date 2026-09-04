@@ -3505,3 +3505,15 @@ wallから単純減算してはいけないが、I/O待ちをGPU forwardへ重�
 MoE 9.483秒 (34.8%)、GDN 7.966秒 (29.3%)、attention 5.810秒 (21.3%)、
 HC read 2.862秒 (10.5%)。ngram lookaheadは1.058秒だがforwardと重なる段時間なので
 部品比と単純加算しない。モデル本体の次の候補はこの4項目から探す。
+
+### 2026-09-04 21:07 Metal専用の一次指紋 B6を現行契約へ追随
+
+`tools/gpu_fingerprint.py`の初回走行はGDN preworkとprefill-attnが発火0で不合格。
+本体の退行ではなく、検査入力が旧契約のままだった。GDNは旧版のfp32
+`A_log`/`dt_bias`写しを期待していたが、現行カーネルは素の`compute_g`と丸め位置を揃えるため
+実モデルと同じbf16を受ける。prefill-attnは合成kv長70のまま本番の速度下限8192で弾かれていた。
+
+GDN direct/captureを実機形 (n_k=16、bf16) に揃え、prefill-attnは正しさ検査の間だけ
+`MLXTURBO_PREFILL_ATTN_MIN_KV=0`にした。再走はGDN direct/capture各30回、prefill-attn 2回、
+gdn-blocked 6回、MoE/HC/RMS系も全て発火。最大差は各カーネルの宣言済みゲート内で
+**総合合格**。発火0を無条件で落とす方針は維持し、BACKLOG B6を閉じる。

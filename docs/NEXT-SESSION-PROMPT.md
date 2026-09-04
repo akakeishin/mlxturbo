@@ -787,11 +787,24 @@ debug requestに限り、FlashSpecEngineの既存同期境界から`runner_prefi
 支配されることを同じrequest内で確認した。これは速度改善値ではなくP0観測の追加である。
 
 P0の次はtokenize/LCP探索/restoreの分離とbatch-forfeited reuse。cold本体の性能判定は、
-強冷却確認後の50k n-gram ABBAを優先する。
+50k n-gram ABBAまで完了したのでMoE/GDN/attentionの新候補探索へ進む。
 
 再開の1コマンド:
 
 ```bash
 uv run mlxturbo-serve --model ~/models/ddalcu-mlxlm-head4 --ngram ~/models/ddalcu-ngram \
   --served-model-name qwen38fn --require-runner flash_spec --log-level debug
+```
+
+## 完了: Metal専用の一次指紋 B6 (2026-09-04 21:07 JST)
+
+`tools/gpu_fingerprint.py`を現行契約へ追随させた。GDN前処理は実モデルと同じ
+bf16 `A_log`/`dt_bias`を使い、直接forwardとcapture経路を各30回発火。
+prefill-attnは本番の8192速度下限だけ検査中に0へ下げ、標準KVCache契約で2回発火した。
+HC、gdn-blocked、MoE verify、RMS norm、MoE routeを含む全8系統が対照の誤差ゲート内で総合合格。
+
+再開の1コマンド:
+
+```bash
+MLXTURBO_MIN_FREE_GB=4 BIGLOCK_PRIO=1 tools/biglock.sh .venv/bin/python tools/gpu_fingerprint.py
 ```

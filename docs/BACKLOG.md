@@ -111,9 +111,10 @@ fastmlx/mlxturbo 側の現状:
 
 ### B. 一次検査の穴
 
-6. **`tools/vendor_fingerprint.py` は CPU で走るので、2026-09-01 に足した
-   `eligible()` が常に False になる。**Metal を要求する分岐を、唯一の一次検査が
-   **一度も実行していない。**緑が出ても新しい分岐については何も保証しない。
+6. **解決済み (2026-09-04): Metal専用の一次指紋を追加し、全8系統が発火。**
+   `tools/gpu_fingerprint.py`をbiglock下で実行し、GDN direct/capture各30回、
+   prefill-attn 2回、gdn-blocked 6回、MoE/HC/RMS系も発火して対照の誤差ゲート内。
+   CPUの`vendor_fingerprint.py`とは役割を分け、発火0は無条件で不合格にする。
 7. **解決済み (2026-09-04): GDNの2分岐で外側の述語を共有。**
    `_vendor/qwen4_exp.py`の`GatedDeltaNet.__call__`と`spec_flash.py`のcapture内`gdn`は、
    `gdn_prework.wants(module, mask, cache)`で有効化、mask、cache、training、lengthsを

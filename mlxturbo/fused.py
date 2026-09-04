@@ -811,17 +811,10 @@ def enable_gdn_prework_kernel(model=None) -> None:
     `gdn_prework.eligible` が判定する。外れれば素の経路 (conv1d -> silu ->
     rms_norm -> ...) にそのまま落ちる。
 
-    `model` を渡すと、その全 GatedDeltaNet 層 (``model.model.layers[*].linear_attn``)
-    の `A_log`/`dt_bias` を fp32 に変換した写し (``_A_log_f32``/``_dt_bias_f32``)
-    を層に持たせる。実モデル (mlx_lm の 4bit 変換など) では `A_log`/`dt_bias`
-    が bf16 で読み込まれていることがあり (2026-09-02、実機ログで確認)、
-    `eligible()` は dtype を fp32 限定で見るのでそのままだと毎回弾かれて
-    カーネルが一度も発火しない。素の経路 (`mlx_lm` の `compute_g`) は
-    `A_log.astype(float32)` して計算するので、fp32 に揃えるのは意味的に
-    同じ。写しは enable 時に 1 回だけ作る (毎ステップ astype を dispatch
-    しないため)。`model` を渡さない場合はこの写しを作らず、
-    `A_log`/`dt_bias` が元から fp32 でない層は従来どおり `eligible()` の
-    dtype 判定で弾かれる。
+    `model` を渡すと、旧版が層に残したfp32の写し
+    (``_A_log_f32``/``_dt_bias_f32``) を削除する。現行カーネルは実モデルの
+    bf16 `A_log`/`dt_bias`をそのまま受け、素の`compute_g`と同じ丸め位置で
+    計算する。fp32写しを使うと`a + dt_bias`だけfp32へ昇格して別の値になる。
 
     既定 off。環境変数 `MLXTURBO_GDN_PREWORK=1` が立っているときだけ
     有効化する (enable_moe_verify_gather と同じゲート方式 -- 呼ぶだけでは
