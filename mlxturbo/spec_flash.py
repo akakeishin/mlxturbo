@@ -59,7 +59,12 @@ import numpy as np
 # snapshot_untrimmable_caches/restore_untrimmable_caches are model-independent
 # (they look only at caches' is_trimmable()/state) -- we reuse them as they are.
 # spec.py is only read, never modified.
-from .spec import CHECKPOINT_RETENTION, PREFILL_STEP_SIZE, snapshot_untrimmable_caches
+from .spec import (
+    CHECKPOINT_RETENTION,
+    CHECKPOINT_TAIL,
+    PREFILL_STEP_SIZE,
+    snapshot_untrimmable_caches,
+)
 from .prefill_common import split_and_checkpoint_tail
 from . import arch as _archmod
 from .arch import qwen4_arch as _arch
@@ -901,7 +906,7 @@ _PREFILL_PIPELINE = os.environ.get("MLXTURBO_PREFILL_PIPELINE") == "1"
 # 単独処理) に戻る。A/B は tools/decode_ab.py の knob `fold-tail`。
 _PREFILL_FOLD_TAIL = os.environ.get("MLXTURBO_PREFILL_FOLD_TAIL", "1") != "0"
 
-# 末尾チャンクの「最後の 1 トークンを除いた部分」を直前のレイヤー主導
+# 末尾チャンクの「最後の CHECKPOINT_TAIL tokenを除いた部分」を直前のレイヤー主導
 # グループの最終メンバーとして流すか。**既定 on**
 # (**既定 on**、MLXTURBO_PREFILL_TAIL_IN_GROUP=0 で off。2026-09-03: 4k -4.9% / 8k -3.4% / 17k -0.6%、
 #  サーバー経路 (checkpoint あり) は chunk 主導とビット一致)。
@@ -912,21 +917,21 @@ _PREFILL_FOLD_TAIL = os.environ.get("MLXTURBO_PREFILL_FOLD_TAIL", "1") != "0"
 # 残るのは gather_qmm の行数効果だけ (専門家あたり 36 -> 75 行)。末尾を同じ
 # グループに入れると MoE が 1 回になる。実測 4k -4.6% / 8k -4.1% / 17k -1.3%。
 #
-# **末尾 1 トークンはグループに入れず、従来どおり chunk 主導で流す。**そう
-# すると BPE 境界 checkpoint (prefill_common.py の split_and_checkpoint_tail)
-# と同じ割り方 (手前 n-1 + 末尾 1) になり、n-1 の checkpoint がグループ側の
+# **末尾 CHECKPOINT_TAIL tokenはグループに入れず、chunk 主導で流す。**そう
+# すると末尾再書換えcheckpoint (prefill_common.py の split_and_checkpoint_tail)
+# と同じ割り方 (手前 n-8 + 末尾 8) になり、n-8 の checkpoint がグループ側の
 # 通常の境界 checkpoint としてそのまま積まれる。この checkpoint が無いと、
 # 会話 2 ターン目の retemplate で末尾トークンが BPE マージにより化けたとき
 # LCP が checkpoint のちょうど 1 トークン手前に落ち、セッションが毎ターン
 # ほぼ全再 prefill になる (prefill_common.py の docstring)。lm_head と最終
-# mixer も、その 1 トークンの chunk 主導フォワードがこれまでどおり通す。
+# mixer も、その末尾tokenの chunk 主導フォワードがこれまでどおり通す。
 #
 # チャンク割り (grid) について:
-#   - checkpoints 有効 (サーバー経路): 既定側も 2047 + 1 に割っているので
+#   - checkpoints 有効 (サーバー経路): 既定側も 2040 + 8 に割っているので
 #     grid は完全に同一。演算の差は MoE の concat 粒度だけで、出力はビット
 #     一致するはず (tools/vendor_fingerprint.py の group 検査と同じ理屈)。
 #   - checkpoints=None (generate() / ベンチ / 検証プローブ): 既定側は末尾
-#     2048 を 1 回で流すので、この knob を on にすると 2047 + 1 に割れる。
+#     2048 を 1 回で流すので、この knob を on にすると 2040 + 8 に割れる。
 #     **計算は正しいが、チャンク割りが変わると量子化行列積の丸めが動きうる**
 #     (prefill_common.py の docstring と
 #     docs/research/PREFILL-CHUNKING-DETERMINISM.md)。実測では 4k/8k の
@@ -2267,14 +2272,14 @@ class FlashSpecEngine:
                     frac_len = remaining - step
                     group_chunks = [ids[:, i : i + frac_len]]
                 if _PREFILL_TAIL_IN_GROUP and group_chunks is not None:
-                    # 末尾チャンクの「最後の 1 トークンを除いた部分」をこの
-                    # グループの最終メンバーにする。末尾 1 トークンはこの後の
-                    # chunk 主導分岐 (`j == n`、幅 1) がそのまま流し、lm_head と
-                    # 最終 mixer もそちらが通す。BPE 境界 checkpoint (n-1) は、
+                    # 末尾チャンクの「最後の CHECKPOINT_TAIL tokenを除いた部分」を
+                    # このグループの最終メンバーにする。末尾tokenはこの後の
+                    # chunk 主導分岐 (`j == n`) がそのまま流し、lm_head と
+                    # 最終 mixer もそちらが通す。末尾再書換えcheckpoint (n-8) は、
                     # このグループが積む通常の境界 checkpoint そのものになる。
                     after = remaining - sum(c.shape[1] for c in group_chunks)
-                    if 2 <= after <= step:
-                        group_chunks.append(ids[:, n - after : n - 1])
+                    if CHECKPOINT_TAIL < after <= step:
+                        group_chunks.append(ids[:, n - after : n - CHECKPOINT_TAIL])
                         group_tail = True
                     elif frac_len == 0 and len(group_chunks) == 1:
                         # g_min の緩和で作った単独グループ。末尾を足せなかった
@@ -2366,16 +2371,15 @@ class FlashSpecEngine:
                     j = n
                 chunk = ids[:, i:j]
                 if j == n:
-                    # BPE 境界 checkpoint (共有ヘルパー: prefill_common.py の
+                    # 末尾再書換えcheckpoint (共有ヘルパー: prefill_common.py の
                     # split_and_checkpoint_tail、詳しい背景はそちらの
-                    # docstring 参照)。checkpoints が有効かつ chunk が 2
-                    # トークン以上のときだけ、直前 1 トークンを切り離して
-                    # 手前 (head) にも checkpoint を積む -- そうしないと
-                    # 会話 2 ターン目の retemplate で末尾トークンが BPE
-                    # マージにより化け、LCP が checkpoint のちょうど 1
-                    # トークン手前に落ちてセッション全体が使い捨てになる
+                    # docstring 参照)。checkpoints が有効かつ chunk が末尾保持幅
+                    # より長いときだけ、末尾8 tokenを切り離して手前 (head) にも
+                    # checkpoint を積む -- そうしないと会話 2 ターン目の
+                    # retemplateでLCPが数token手前に落ち、セッション全体が
+                    # 使い捨てになる
                     # (実測: 診断で確認)。no-op 時 (checkpoints=None または
-                    # chunk 長 1 以下、generate()/検証プローブがこちら) は
+                    # chunk 長8以下、generate()/検証プローブがこちら) は
                     # head_result が空 tuple で返り、tail_split は False の
                     # まま従来の分岐に合流する。lm_head は checkpoints の
                     # 有無に関わらず、この最終チャンクの hidden の末尾 1 行
@@ -2398,6 +2402,7 @@ class FlashSpecEngine:
                         CHECKPOINT_RETENTION,
                         snapshot_untrimmable_caches,
                         _forward_head,
+                        tail_size=CHECKPOINT_TAIL,
                     )
                     if _pf:
                         _t = _pf.log(f"tail split i={i} j={j}", _t)

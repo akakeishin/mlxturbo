@@ -594,21 +594,38 @@ def _try_checkpoint_restore_session_cache(sess, lcp: int) -> int | None:
 _SESSION_SELECTION_ATTR = "_mlxturbo_session_selection"
 
 
-def _session_allocated_bytes(sess, _seen: set[int] | None = None) -> int | None:
-    """Best-effort byte count for a session being evicted.
+_SESSION_BYTE_COMPONENTS = (
+    "session_cache",
+    "indexer",
+    "mtp_cache",
+    "h_last",
+    "tail",
+    "checkpoints",
+)
+
+
+def _session_allocated_bytes_breakdown(
+    sess, _seen: set[int] | None = None
+) -> dict[str, int] | None:
+    """Best-effort byte count split by the state that owns each array.
 
     Only already-materialized MLX arrays are inspected; reading ``nbytes``
     does not evaluate a graph.  Cache/checkpoint structures are walked with an
     identity set so aliases are counted once.  An unknown leaf makes the
     result ``None`` rather than pretending the estimate is exact.
+
+    An attention cache's attached ``indexer`` is attributed separately even
+    though it lives below the target-cache wrapper.  This is the split needed
+    to compare the measured pool with the Flash-Next capacity model; the total
+    remains exactly the sum returned by ``_session_allocated_bytes``.
     """
 
     seen = _seen if _seen is not None else set()
-    total = 0
+    totals = {name: 0 for name in _SESSION_BYTE_COMPONENTS}
     unknown = False
 
-    def visit(value) -> None:
-        nonlocal total, unknown
+    def visit(value, component: str) -> None:
+        nonlocal unknown
         if value is None or isinstance(value, (str, bytes, bytearray, int, float, bool)):
             return
         ident = id(value)
@@ -618,12 +635,12 @@ def _session_allocated_bytes(sess, _seen: set[int] | None = None) -> int | None:
 
         if isinstance(value, dict):
             for key, item in value.items():
-                visit(key)
-                visit(item)
+                visit(key, component)
+                visit(item, component)
             return
         if isinstance(value, (list, tuple, set, frozenset)):
             for item in value:
-                visit(item)
+                visit(item, component)
             return
 
         try:
@@ -632,14 +649,14 @@ def _session_allocated_bytes(sess, _seen: set[int] | None = None) -> int | None:
             unknown = True
             return
         if attrs is not None:
-            before = total
-            for item in attrs.values():
-                visit(item)
+            before = sum(totals.values())
+            for name, item in attrs.items():
+                visit(item, "indexer" if name == "indexer" else component)
             # Cache wrappers often expose an aggregate ``nbytes`` property that
             # omits extension state (Flash's attached indexer is one example).
             # Prefer their concrete child arrays; the identity set also makes
             # this correct for aliases and future shared-prefix state.
-            if total != before:
+            if sum(totals.values()) != before:
                 return
 
         try:
@@ -651,21 +668,36 @@ def _session_allocated_bytes(sess, _seen: set[int] | None = None) -> int | None:
             unknown = True
             return
         try:
-            total += int(nbytes)
+            totals[component] += int(nbytes)
         except (TypeError, ValueError, OverflowError):
             unknown = True
 
     # Do not walk the session object wholesale: only the cache-bearing fields
     # can contribute to this eviction estimate.
-    for attr in ("caches", "cache", "mtp_cache", "h_last", "tail", "checkpoints"):
+    roots = (
+        ("caches", "session_cache"),
+        ("cache", "session_cache"),
+        ("mtp_cache", "mtp_cache"),
+        ("h_last", "h_last"),
+        ("tail", "tail"),
+        ("checkpoints", "checkpoints"),
+    )
+    for attr, component in roots:
         try:
             value = getattr(sess, attr, None)
         except Exception:
             unknown = True
             continue
         if value is not None:
-            visit(value)
-    return None if unknown else total
+            visit(value, component)
+    return None if unknown else totals
+
+
+def _session_allocated_bytes(sess, _seen: set[int] | None = None) -> int | None:
+    """Best-effort total allocated bytes for one session."""
+
+    breakdown = _session_allocated_bytes_breakdown(sess, _seen)
+    return None if breakdown is None else sum(breakdown.values())
 
 
 def _session_selection_info(
@@ -795,18 +827,26 @@ def _session_telemetry_snapshot() -> dict[str, Any]:
     telemetry = STATE.session_telemetry
     seen: set[int] = set()
     pool_known_bytes = 0
+    pool_known_components = {name: 0 for name in _SESSION_BYTE_COMPONENTS}
     pool_unknown_sessions = 0
     pool_processed_tokens = 0
+    pool_checkpoint_count = 0
     for sess in STATE.session_pool.values():
         try:
             pool_processed_tokens += len(sess.processed)
         except Exception:
             pass
-        nbytes = _session_allocated_bytes(sess, seen)
-        if nbytes is None:
+        try:
+            pool_checkpoint_count += len(sess.checkpoints)
+        except Exception:
+            pass
+        breakdown = _session_allocated_bytes_breakdown(sess, seen)
+        if breakdown is None:
             pool_unknown_sessions += 1
         else:
-            pool_known_bytes += nbytes
+            pool_known_bytes += sum(breakdown.values())
+            for name, nbytes in breakdown.items():
+                pool_known_components[name] += nbytes
     last = STATE.last_session_selection
     return {
         "requests": telemetry["requests"],
@@ -833,8 +873,14 @@ def _session_telemetry_snapshot() -> dict[str, Any]:
             None if pool_unknown_sessions else pool_known_bytes
         ),
         "pool_known_allocated_bytes": pool_known_bytes,
+        "pool_allocated_bytes_by_component": (
+            None if pool_unknown_sessions else dict(pool_known_components)
+        ),
+        "pool_known_allocated_bytes_by_component": dict(pool_known_components),
         "pool_unknown_sessions": pool_unknown_sessions,
         "pool_processed_tokens": pool_processed_tokens,
+        "pool_checkpoint_count": pool_checkpoint_count,
+        "pool_session_count": len(STATE.session_pool),
         "last_selection": dict(last) if isinstance(last, dict) else None,
     }
 

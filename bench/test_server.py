@@ -4598,8 +4598,21 @@ def test_session_pool_memory_counts_wrapper_children_and_cross_session_alias_onc
     snapshot = server._session_telemetry_snapshot()
     assert snapshot["pool_allocated_bytes"] == 12
     assert snapshot["pool_known_allocated_bytes"] == 12
+    assert snapshot["pool_allocated_bytes_by_component"] == {
+        "session_cache": 12,
+        "indexer": 0,
+        "mtp_cache": 0,
+        "h_last": 0,
+        "tail": 0,
+        "checkpoints": 0,
+    }
+    assert snapshot["pool_known_allocated_bytes_by_component"] == snapshot[
+        "pool_allocated_bytes_by_component"
+    ]
     assert snapshot["pool_unknown_sessions"] == 0
     assert snapshot["pool_processed_tokens"] == 3
+    assert snapshot["pool_checkpoint_count"] == 0
+    assert snapshot["pool_session_count"] == 2
 
 
 def test_session_allocated_bytes_includes_flash_indexer_extension():
@@ -4620,6 +4633,39 @@ def test_session_allocated_bytes_includes_flash_indexer_extension():
         + cache.indexer._pooled.nbytes
     )
     assert server._session_allocated_bytes(session) == expected
+    breakdown = server._session_allocated_bytes_breakdown(session)
+    assert breakdown == {
+        "session_cache": cache.keys.nbytes + cache.values.nbytes,
+        "indexer": cache.indexer.keys.nbytes + cache.indexer._pooled.nbytes,
+        "mtp_cache": 0,
+        "h_last": 0,
+        "tail": 0,
+        "checkpoints": 0,
+    }
+
+
+def test_session_allocated_bytes_breakdown_separates_state_roots_and_aliases():
+    class SizedLeaf:
+        def __init__(self, nbytes):
+            self.nbytes = nbytes
+
+    shared = SizedLeaf(2)
+    session = SimpleNamespace(
+        caches=[shared],
+        mtp_cache=SizedLeaf(3),
+        h_last=SizedLeaf(5),
+        tail=(9, SizedLeaf(7)),
+        checkpoints=[(8, [SizedLeaf(11), shared])],
+    )
+    assert server._session_allocated_bytes_breakdown(session) == {
+        "session_cache": 2,
+        "indexer": 0,
+        "mtp_cache": 3,
+        "h_last": 5,
+        "tail": 7,
+        "checkpoints": 11,
+    }
+    assert server._session_allocated_bytes(session) == 28
 
 
 def test_generation_log_includes_session_selection_fields():
@@ -5670,17 +5716,10 @@ def test_flash_spec_checkpoint_reuse_matches_full_rebuild_with_tail_mismatch(mon
     # レイヤー主導では「チャンク k を全層通した状態」がどの瞬間にも存在しない
     # (docs/research/IMPROVEMENT-QUEUE.md B2)。
     #
-    # そのグループの出口は 2026-09-03 に 9 から 11 へ移った:
-    # MLXTURBO_PREFILL_TAIL_IN_GROUP が既定 on になり、末尾チャンクの
-    # 「最後の 1 トークンを除いた部分」(9..11) が同じグループの最終メンバー
-    # として流れるため。BPE 末尾分割の n-1 (11) は、このグループが積む境界
-    # checkpoint そのものになる (spec_flash.py の _PREFILL_TAIL_IN_GROUP の
-    # コメント)。最後の 1 トークンだけが従来の chunk 主導で流れて 12 が続く。
-    # グループの内側に入った中間 checkpoint (9) が消えるのは、この既定を
-    # 入れたときに測って受け入れた代償
-    # (docs/research/SESSION-2026-09-02-CATCHUP.md の 2026-09-03 12:55
-    # 「残る性質」)。MLXTURBO_PREFILL_TAIL_IN_GROUP=0 なら [9, 11, 12]。
-    assert [pos for pos, _ in session.checkpoints] == [11, 12]
+    # 本番既定は末尾8 tokenを書換えから守る。ここではstep=3なので末尾側が
+    # 8 tokenより短く、tail-in-groupへ畳まず9でcheckpointを立てる。
+    # 残り3 tokenをchunk主導で流して12が続く。
+    assert [pos for pos, _ in session.checkpoints] == [9, 12]
 
     # FlashSpecRunner の不変条件 (6a0cd27): 最後の cur はまだ cache に
     # feed されていないので、publish されるのは tokens[:-1] まで。
@@ -5729,10 +5768,9 @@ def test_flash_spec_checkpoint_reuse_matches_full_rebuild_with_tail_mismatch(mon
     assert r2_reused["tokens"] == r2_fresh["tokens"]
 
 
-def test_flash_spec_checkpoint_reuse_disabled_when_prompt_fits_one_chunk(monkeypatch):
-    """プロンプト全体が 1 チャンクに収まる (実運用の既定 PREFILL_STEP_SIZE=2048
-    ではほぼ常にそう) 場合、チェックポイントは末尾 (プロンプト全体) の 1 個
-    しかできない。末尾より前で食い違えば再利用できず新規スロットへ倒れる --
+def test_flash_spec_checkpoint_reuse_disabled_before_retained_tail(monkeypatch):
+    """プロンプト全体が 1 チャンクに収まっても末尾8 tokenの手前に
+    checkpointを立てる。それより前で食い違えば新規スロットへ倒れる --
     「再利用できないときは安全側の全再構築に倒す」が実際に効くことの確認。"""
 
     import mlxturbo.spec_flash as spec_flash_module
@@ -5742,7 +5780,7 @@ def test_flash_spec_checkpoint_reuse_disabled_when_prompt_fits_one_chunk(monkeyp
     engine = spec_flash_module.FlashSpecEngine(model, mtp)
     runner = FlashSpecRunner(engine)
 
-    turn1_prompt = list(range(1, 9))  # 8 トークン、既定 PREFILL_STEP_SIZE の
+    turn1_prompt = list(range(1, 13))  # 12 トークン、既定 PREFILL_STEP_SIZE の
     # 下では 1 チャンク
 
     session = FallbackSession()
@@ -5754,14 +5792,10 @@ def test_flash_spec_checkpoint_reuse_disabled_when_prompt_fits_one_chunk(monkeyp
         on_tokens=None,
         session=session,
     )
-    # 末尾の 2 個。プロンプト全体 (8) に加えて、その 1 つ手前 (7) にも立つ --
-    # BPE 末尾マージ対策 (prefill_common.split_and_checkpoint_tail)。2 ターン目に
-    # retemplate されると最終トークンが後続の文字と合体して化け、LCP が
-    # ちょうど 1 トークン手前で止まるので、そこに checkpoint が無いと
-    # 再 prefill になる (実測で追記ターン 16k の TTFT が 6.14s -> 1.1s)。
-    assert [pos for pos, _ in session.checkpoints] == [7, 8]
+    # プロンプト全体 (12) に加え、末尾8 tokenの手前 (4) にも立つ。
+    assert [pos for pos, _ in session.checkpoints] == [4, 12]
 
-    turn2_prompt = [1, 2, 20, 21]  # 位置 2 で分岐 -- どの checkpoint (7, 8)
+    turn2_prompt = [1, 2, 20, 21]  # 位置 2 で分岐 -- どの checkpoint (4, 12)
     # より手前なので使えない
 
     cp_pos = server._try_checkpoint_restore_session_cache(session, lcp=2)
