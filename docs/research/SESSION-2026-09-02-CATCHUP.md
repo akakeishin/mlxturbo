@@ -2875,3 +2875,23 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 
 - 唯一実在した「使わない仕事」= GDN の `state_out` の二度書き (113 MB/forward) を消しても短 ±0.0% / 17k +0.1% (ビット一致、peak メモリ -12.6 MB で配線は効いている)。**バイトを消しても壁時計が動かない直接の例** (隣の行列積と重なって隠れる)。代金 (カーネル変種 4 本) があるので畳んだ (コードは戻した)。
 - 「積む」に新しい的は無し (router 18→4 は +0.05%、HC は既に 3 本/層、q/k norm 統合は期待値 0、dtype cast 260 本は 0.010 ms)。IDEAS の D6 (indexer 228 us/層) は長文脈で疎化が働くときの値で短文脈には掛からない。
+
+### 2026-09-04 12:05 天井の監査 (fast_qmm 型の的の一覧、`tools/ceiling_audit_micro.py`、`bench/results/ceiling-{qmm,mid,small}-0904.json`、`scratchpad/agent-ceiling-audit.md`)
+
+達成率 (帯域 410 GB/s / 11.2 TFLOPS 比) × 占有で順位:
+
+| # | 的 | 幅 | 達成率 | 占有 | 天井との差 | 正体 |
+|---|---|---|---|---|---|---|
+| 1 | **27B sdpa (d256、16 層、kv 17k)** | S=4 | **24%** | 11.5 ms/round | 7.6 ms | KV を行ごとに読み直している |
+| 2 | 同 (崖の向こう) | S≥6 | 6.5% | 43 ms/round | 39 ms | S×gqa > 32 の崖。**27B には幅分割のシームが無い** (`runner.py:1491` は無条件に「有効」と print = 誤り) |
+| 3 | prefill の MoE GEMM (素の gather_qmm、40 行/専門家) | 20480 行 | 52〜62% | 1568 ms/chunk | 210 ms (P3 後) | BM=16 タイル。P3 の 1.5x で 79〜82% に |
+| 4 | HC の束 (down / up / inject / rms) × 97 | S=1 | 4〜72% | 1.96 ms/round | 1.0 ms | 依存の直列に乗った 4 本 × 2.2〜3.5 us の固定費 |
+| 5 | `quantized_matmul` の谷 M=4〜24 (全 25 形) | M=8〜12 | **17〜35%** | (本日の経路では S ≤ 8) | | qmv は M=2 までしか行を共有せず、M ≥ 13 は `qmm_t_splitk`。**M=12〜31 では行を水増しした方が速い** (M=12 → 32 で 1.5〜2.2 倍) = バッチ × 投機 (B=4 × S=3 = 12) の帯 |
+| 6 | Flash-Next sdpa (12 層、kv 17k) | S=1 | 46% | 2.3 ms/round | 1.2 ms | gqa 12 で threadgroup が埋まらない (K2c が既に置き換え済み) |
+| 7 | prefill QSA の `argpartition` (nb=4352) × 12 | S=2048 | 3.7% | 31 ms/chunk | 30 ms | top-512 に全ソート |
+| 8 | GDN の in_proj_b / _a (N=48) × 72 | 全幅 | 5〜65% | 0.26 ms/round | 0.25 ms | N=48 では GPU が埋まらない (52 GB/s) |
+
+- **狭い形が M=1 で天井を外すのは起動の固定費 (2.2 us) で、カーネルは悪くない**: 固定費を引くと 25 形中 23 が 394〜472 GB/s。elementwise も同じ 2.2〜3.8 us の床。直す手は融合 (依存の直列に乗ったものだけ) で GEMM の書き直しではない。
+- **訂正 2 つ**: (1) CATCHUP 21:45 の「HC 読みは壁の 63〜65%」は細長 GEMM のせいではない (`hc_down` / `hc_up` は M=2048 で 100.9 / 101.4%)。差 100 ms/chunk は周りの elementwise。(2) K2 の stub の「13%」は QSA の einsum + argpartition ではない (17k decode で 0.28 ms = 1.1%)。残りは糊。
+- 死んだ的 (確認): prefill 幅の dense 射影 (98〜104%)、27B decode S=1 の qmm (96〜103%)、語彙 248k の softmax / argmax / logsumexp (占有 < 0.1 ms)、router の argpartition / argsort (起動の床だけ)。
+- **次の手 (出した)**: 27B の sdpa 幅分割 (S×gqa ≤ 32 に割る、Flash-Next のシームと同じ手、ビット一致のはず、17k で -3% が線)。小 M qmv (別途 PoL 中) は M ≤ 8 を第 1 目標にし、M=12〜31 の谷はバッチ × 投機のレーンで。QSA の argpartition (prefill 1%) と HC の束 (1 ms) は後。
