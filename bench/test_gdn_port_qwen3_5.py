@@ -197,7 +197,7 @@ def test_enable_and_disable_roundtrip():
     base = type(gdns[0])
     nbase = type(gdns[0].norm)
     orig_update = Q35.gated_delta_update
-    with _env(MLXTURBO_GDN_DECODE_FUSED="1", MLXTURBO_GDN_METAL=None):
+    with _env(MLXTURBO_GDN_DECODE_FUSED="1", MLXTURBO_GDN_METAL="1"):
         got = fused.enable_gdn_port(model)
     try:
         assert got["layers"] == 3
@@ -225,7 +225,7 @@ def test_enable_is_idempotent():
     gdns = [_make_gdn()]
     model = _StubModel(gdns)
     base = type(gdns[0])
-    with _env(MLXTURBO_GDN_DECODE_FUSED="1", MLXTURBO_GDN_METAL=None):
+    with _env(MLXTURBO_GDN_DECODE_FUSED="1", MLXTURBO_GDN_METAL="1"):
         fused.enable_gdn_port(model)
         cls1 = type(gdns[0])
         got2 = fused.enable_gdn_port(model)
@@ -249,7 +249,7 @@ def test_structure_untouched():
     model = _StubModel(gdns)
     before_p = sorted(k for k, _ in tree_flatten(gdns[0].parameters()))
     before_m = sorted(k for k, _ in gdns[0].named_modules())
-    with _env(MLXTURBO_GDN_DECODE_FUSED="1", MLXTURBO_GDN_METAL=None):
+    with _env(MLXTURBO_GDN_DECODE_FUSED="1", MLXTURBO_GDN_METAL="1"):
         fused.enable_gdn_port(model)
     try:
         assert sorted(k for k, _ in tree_flatten(gdns[0].parameters())) == before_p
@@ -353,7 +353,7 @@ def test_prefill_metal_close():
     gdn = _make_gdn()
     ref = _prefill_run(gdn, T)
     model = _StubModel([gdn])
-    with _env(MLXTURBO_GDN_DECODE_FUSED="1", MLXTURBO_GDN_METAL=None):
+    with _env(MLXTURBO_GDN_DECODE_FUSED="1", MLXTURBO_GDN_METAL="1"):
         counts = fused.enable_gdn_port(model)
     try:
         assert counts["metal"] == 1
@@ -418,3 +418,17 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_prefill_metal_is_opt_in_for_ported_families():
+    """移植した族では prefill の Metal 再帰は明示 MLXTURBO_GDN_METAL=1 のときだけ
+    (27B で取り分が無く KLD 0.00027 の代金だけ残るため、2026-09-04 に既定 off)。"""
+    gdns = [_make_gdn() for _ in range(3)]
+    model = _StubModel(gdns)
+    try:
+        with _env(MLXTURBO_GDN_DECODE_FUSED="1", MLXTURBO_GDN_METAL=None):
+            got = fused.enable_gdn_port(model)
+        assert got["metal"] == 0
+        assert got["prework"] == got["layers"] > 0
+    finally:
+        fused.disable_gdn_port(model)

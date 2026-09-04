@@ -40,6 +40,8 @@ docs/KERNEL-BRIEF-MOE-GDN.md.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 _ORIG_HC = None
 _ORIG_HC_KERNEL = None
 _ORIG_HC_COMBINE = None
@@ -1172,12 +1174,100 @@ def _gdn_norm_subclass(base, activation: str):
     return cls
 
 
+# --------------------------------------------------------------------------
+# 巻き戻し用の状態を取り出す口 (2026-09-04、27B レーン 第 1 段)
+# --------------------------------------------------------------------------
+#
+# `mlxturbo/spec.py` の `_linear_capture` は GDN の本体を手で書き下した写しで、
+# `la(...)` を一度も呼んでいなかった。そのため上の動的サブクラスが S>1 の
+# 検証フォワードに **1 度も当たっていなかった** (`_fire` で確認。数字は
+# `scratchpad/agent-27b-decode-b1.md`)。
+#
+# 写しが必要だった理由は 1 つだけ ---「巻き戻しのために位置ごとの再帰状態
+# (`states_all`) と conv の入力列 (`conv_input`) を層ごとに控える」。そこで
+# サブクラスの側に取り出し口を足して、呼び手が `la(...)` を呼べるようにする。
+#
+# `gdn_capture(sink)` で武装している間、契約の合う GDN の `__call__` は
+# `(cache, states_all, conv_input, K, old_lengths, old_left_padding)` を
+# `sink` に積む (`spec.py` の `_rollback` がそのまま受ける形)。契約・幅が
+# 外れたときは **cache を 1 つも書き換える前に** `GdnCaptureUnsupported` を
+# 投げる -- 黙って捕捉し損ねると巻き戻しが静かに壊れるため。呼び手は
+# `gdn_capture_ready` で先に全層を検査してから武装すること。
+
+_GDN_CAPTURE: list | None = None
+
+
+class GdnCaptureUnsupported(RuntimeError):
+    """`gdn_capture` の下で契約・幅が外れた (cache はまだ書き換えていない)。"""
+
+
+@contextmanager
+def gdn_capture(sink: list):
+    """この文の中で呼ばれた GDN に、巻き戻し用の材料を `sink` へ積ませる。"""
+
+    global _GDN_CAPTURE
+    prev = _GDN_CAPTURE
+    _GDN_CAPTURE = sink
+    try:
+        yield
+    finally:
+        _GDN_CAPTURE = prev
+
+
+def gdn_capture_ready(gdn, inputs, mask=None, cache=None) -> bool:
+    """`gdn_capture` の下で `gdn(...)` が捕捉できるかの前検査。
+
+    層ループを回し始めてから捕捉に失敗すると、手前の層の cache は既に進んで
+    いて戻せない。そこで **1 層も走らせる前に**全層を検査できるようにする。
+
+    射影の結果 (`mixed_qkv` / `a` / `b`) はまだ無いので、同じ形・同じ dtype の
+    プレースホルダを渡して `gdn_prework.eligible` をそのまま使う (dtype と形しか
+    見ないので評価されない)。射影の出力 dtype は入力 dtype と同じ。
+    """
+
+    import mlx.core as mx
+
+    from .kernels import gdn_prework as gp
+
+    if getattr(type(gdn), "_mlxturbo_gdn_base", None) is None:
+        return False
+    spec = getattr(gdn, "_mlxturbo_gdn_spec", None)
+    if spec is None or inputs.ndim != 3:
+        return False
+    B, S, _ = inputs.shape
+    if (
+        S > gp.MAX_S
+        or B * S > gp.MAX_M
+        or mask is not None
+        or cache is None
+        or gdn.training
+        or getattr(cache, "lengths", None) is not None
+        or getattr(gdn, "sharding_group", None) is not None
+    ):
+        return False
+    conv_state = (
+        cache[0]
+        if cache[0] is not None
+        else mx.zeros((B, spec.K - 1, spec.conv_dim), dtype=inputs.dtype)
+    )
+    probe_qkv = mx.zeros((B, S, spec.conv_dim), dtype=inputs.dtype)
+    probe_ab = mx.zeros((B, S, spec.n_v), dtype=inputs.dtype)
+    return gp.eligible(
+        probe_qkv, conv_state, gdn.conv1d.weight, probe_ab, probe_ab,
+        gdn.A_log, gdn.dt_bias,
+        spec.n_k, spec.n_v, spec.dk, spec.key_dim, spec.value_dim,
+    )
+
+
 def _gdn_call_subclass(base):
     """`base` (族の GatedDeltaNet) の動的サブクラス。
 
     decode/verify 幅で契約が合うときだけ `gdn_prework` + 逐次カーネル +
     出力 norm を自前で通す。**それ以外は素の `__call__` をそのまま呼ぶ**
     (素の forward の写しは持たない)。
+
+    `gdn_capture` で武装されている間は、逐次カーネルを位置ごとの状態も返す
+    版 (`gated_delta_update_with_states_gb`) に替えて `sink` に材料を積む。
     """
 
     cls = _GDN_CALL_CLASSES.get(base)
@@ -1188,11 +1278,21 @@ def _gdn_call_subclass(base):
     from mlx_lm.models.gated_delta import gated_delta_kernel
 
     from .kernels import gdn_prework as gp
+    from .kernels.gated_delta_states import gated_delta_update_with_states_gb
+
+    def _decline(self, inputs, mask, cache, sink, why):
+        if sink is not None:
+            raise GdnCaptureUnsupported(
+                f"gdn_capture 中に自前経路の契約が外れた ({why})。"
+                " 呼び手は gdn_capture_ready で先に検査すること"
+            )
+        return base.__call__(self, inputs, mask, cache)
 
     def patched(self, inputs, mask=None, cache=None):
+        sink = _GDN_CAPTURE
         spec = getattr(self, "_mlxturbo_gdn_spec", None)
         if spec is None or inputs.ndim != 3:
-            return base.__call__(self, inputs, mask, cache)
+            return _decline(self, inputs, mask, cache, sink, "契約なし/ndim")
         B, S, _ = inputs.shape
         # 幅の判定を射影より先に置く (prefill では 1 op も余分に組まない)
         if (
@@ -1204,7 +1304,7 @@ def _gdn_call_subclass(base):
             or getattr(cache, "lengths", None) is not None
             or getattr(self, "sharding_group", None) is not None
         ):
-            return base.__call__(self, inputs, mask, cache)
+            return _decline(self, inputs, mask, cache, sink, "幅/mask/cache")
 
         n_k, n_v = spec.n_k, spec.n_v
         dk, dv = spec.dk, spec.dv
@@ -1225,19 +1325,37 @@ def _gdn_call_subclass(base):
                            n_k, n_v, dk, key_dim, value_dim):
             # MLX は遅延評価なので、ここで捨てた射影は評価されない
             # (`enable_moe_route` の patched と同じ理屈)
-            return base.__call__(self, inputs, mask, cache)
+            return _decline(self, inputs, mask, cache, sink, "eligible=False")
 
         q, k, v, g, beta, new_conv_state = gp.fused_gdn_prework(
             mixed_qkv, conv_state, conv_w, a, b, A_log, dt_bias,
             n_k, n_v, dk, dv, key_dim, value_dim,
         )
-        cache[0] = new_conv_state
-        state = cache[1]
-        if state is None:
-            state = mx.zeros((B, n_v, dv, dk), dtype=mx.float32)
-        out, state = gated_delta_kernel(q, k, v, g, beta, state, None)
-        cache[1] = state
-        cache.advance(S)
+        if sink is None:
+            cache[0] = new_conv_state
+            state = cache[1]
+            if state is None:
+                state = mx.zeros((B, n_v, dv, dk), dtype=mx.float32)
+            out, state = gated_delta_kernel(q, k, v, g, beta, state, None)
+            cache[1] = state
+            cache.advance(S)
+        else:
+            # 巻き戻し用: 位置ごとの状態と conv の入力列を控える。`mask` は
+            # 上で None と確認済みなので、素の `mx.where(mask, qkv, 0)` は
+            # 恒等 -- conv_input は素の経路と同じ列そのもの。
+            old_lengths = getattr(cache, "lengths", None)
+            old_left_padding = getattr(cache, "left_padding", None)
+            conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
+            out, states_all = gated_delta_update_with_states_gb(
+                q, k, v, g, beta, cache[1], None
+            )
+            cache[0] = new_conv_state
+            cache[1] = states_all[:, -1]
+            cache.advance(S)
+            sink.append(
+                (cache, states_all, conv_input, spec.K,
+                 old_lengths, old_left_padding)
+            )
         return self.out_proj(self.norm(out, z).reshape(B, S, -1))
 
     cls = type(
@@ -1309,7 +1427,11 @@ def enable_gdn_port(model=None) -> dict:
             f"MLXTURBO_GDN_DECODE_FUSED={mode!r} は 1/all/pre/norm/0 のいずれか")
     want_pre = mode in ("1", "all", "pre")
     want_norm = mode in ("1", "all", "norm")
-    want_metal = os.environ.get("MLXTURBO_GDN_METAL") != "0"
+    # 移植した族では prefill の Metal 再帰は **明示 =1 のときだけ** (既定 off)。
+    # 27B で 4k -1.4% / 17k +0.1% と取り分が無く、KLD 0.00027 (参照 = 素 4bit) の
+    # 代金だけ残る (CATCHUP 2026-09-04 09:15 / 09:36)。qwen4_exp は従来どおり
+    # enable_gdn_metal_kernel 側で既定 on。
+    want_metal = os.environ.get("MLXTURBO_GDN_METAL") == "1"
 
     norm_act: dict = {}
     modules: set = set()

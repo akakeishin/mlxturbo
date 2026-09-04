@@ -426,6 +426,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--prefill-once", action="store_true",
                     help="長文脈で prefill を 1 回に畳む。"
                          "**prefill に効く knob には使わないこと**")
+    ap.add_argument("--round-trace", action="store_true",
+                    help="MLXTURBO_ROUND_TRACE=1 を立て、round ごとの "
+                         "(検証幅, 受理数, source, ms) を集めて幅ごとの平均を "
+                         "出す。生の列は JSON の `round_trace` に入る")
     ap.add_argument("--no-burn-in", action="store_true",
                     help="読み込み直後の空焼きをしない (既定は 1 本捨てる)")
     ap.add_argument("--out", default=None, help="結果 JSON の書き出し先")
@@ -503,10 +507,46 @@ def summarize(rows, variants, baseline) -> None:
     print(f"  head: {n_same} ケース一致 / {n_diff} ケース不一致")
 
 
+def summarize_round_trace(rows: list) -> None:
+    """`--round-trace` の集計: 検証幅 (= 1 + draft の本数) ごとの ms。
+
+    「82 / 95 / 111 ms/round のばらつきが draft の本数で説明できるか」を
+    見るための表。幅ごとの中央値と、幅 1 からの増分 (1 リンクあたりの ms) を
+    並べる。ケース (prompt) ごとに出す -- 幅の分布が prompt で違うのが
+    そもそもの論点なので、混ぜると平均が動いた理由が消える。
+    """
+    from statistics import median
+
+    print("\n== round trace (検証幅ごとの ms) ==")
+    for row in rows:
+        trace = row.get("round_trace")
+        if not trace:
+            continue
+        by_w: dict[int, list[float]] = {}
+        acc_w: dict[int, list[int]] = {}
+        for width, consumed, _source, ms in trace:
+            by_w.setdefault(width, []).append(ms)
+            acc_w.setdefault(width, []).append(consumed)
+        base = median(by_w[1]) if 1 in by_w else None
+        head = (f"ctx={row['ctx']} case={row['case_idx']} "
+                f"variant={row['variant'] or '(未設定)'}")
+        print(f"  {head}: rounds={len(trace)} "
+              f"ms/round(全体)={median(m for ms in by_w.values() for m in ms):.1f}")
+        for w in sorted(by_w):
+            ms_l = by_w[w]
+            per_link = ""
+            if base is not None and w > 1:
+                per_link = f"  幅1 からの増分 {(median(ms_l) - base) / (w - 1):+.2f} ms/リンク"
+            print(f"    幅 {w}: n={len(ms_l):4d}  ms 中央 {median(ms_l):6.1f}"
+                  f"  受理 平均 {sum(acc_w[w]) / len(acc_w[w]):.2f}{per_link}")
+
+
 def main() -> int:
     import mlx.core as mx
 
     args, env_name, variants, baseline = parse_args()
+    if args.round_trace:
+        os.environ["MLXTURBO_ROUND_TRACE"] = "1"
     model, tok, eng, eos_ids, guard = load_model(args)
     mx.random.seed(args.seed)
 
@@ -565,6 +605,8 @@ def main() -> int:
                                   eos_ids=eos_ids, n_draft=nd, max_draft=md)
             row.update(kind=kind, ctx=n, case_idx=case_idx, variant=v)
             row["fired"] = _fire.snapshot()
+            if args.round_trace:
+                row["round_trace"] = list(getattr(eng, "last_round_trace", None) or [])
             rows.append(row)
             fired_s = ("  発火 " + " ".join(f"{k}={c}" for k, c in
                                             sorted(row["fired"].items()))
@@ -577,6 +619,8 @@ def main() -> int:
         set_variant(baseline)
 
     summarize(rows, variants, baseline)
+    if args.round_trace:
+        summarize_round_trace(rows)
     if args.out:
         p = Path(args.out)
         p.parent.mkdir(parents=True, exist_ok=True)

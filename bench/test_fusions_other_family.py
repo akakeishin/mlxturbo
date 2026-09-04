@@ -43,9 +43,22 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 import mlx.core as mx  # noqa: E402
 
-mx.set_default_device(mx.cpu)
-
 import mlx.nn as nn  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _cpu_device():
+    """このファイルのテストだけ CPU で。module 直下で set_default_device すると
+    同じ pytest プロセスの他ファイルの GPU 判定 (mx.default_device() == gpu) が
+    収集時に False になり、一致検査が 1 つも走らなくなる (2026-09-04 に発覚)。"""
+    prev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(prev)
+
 import mlxturbo  # noqa: E402,F401 -- sys.meta_path フック (mlx_lm.models.qwen4_exp)
 from mlxturbo import fused, gather_attn, indexer_lean, qsa_decode  # noqa: E402
 from mlxturbo.runner import enable_default_fusions  # noqa: E402

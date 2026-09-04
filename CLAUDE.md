@@ -46,10 +46,13 @@
   CPU、数秒) で一次検査し、prefill を触ったなら
   `tools/verify_prefill_bitident.py` (実モデル、4 分) までやる
   (詳しい対応表は `docs/BACKLOG.md` の「本家フォワードの写し 9 種の整理」)。
-- `mlxturbo/staged.py` の `staged_forward` は site-packages の
-  `mlx_lm.models.qwen3_5.Qwen3_5TextModel.__call__` の写し (27B/qwen3_5 側)。
-  **本家 (mlx_lm 更新時) を変えたらここも変える。**qwen4_exp 側の 3 つと違い
-  専用のビット一致ゲートは無いので、変更後は出力トークン列の一致で確認する。
+- `mlxturbo/spec.py` の `SpecEngine._hidden_forward` は site-packages の
+  `mlx_lm.models.qwen3_5.Qwen3_5TextModel.__call__` の層ループの写し (27B/qwen3_5 側。
+  2026-09-04 に `staged.py` を畳んで 1 本にした。capture=True の巻き戻し用の状態の控えと
+  段階投入 (`MLXTURBO_SPEC_STAGED_VERIFY`、既定 on) を持つ)。**本家 (mlx_lm 更新時) を変えたらここも変える。**
+  ゲートは `bench/test_spec_capture_module_qwen3_5.py` (合成、ビット一致) と実機の生成列の一致 (`tools/decode_ab_generic.py`)。
+  `_linear_capture` (GDN 層本体の写し) は `MLXTURBO_SPEC_CAPTURE_MODULE=1` でモジュール呼び出しに替わるが、
+  27B の実機で幅 5/7/8/9 の verify だけ数 ulp ずれる (原因未特定) ので既定は写しのまま。
 - 「作って捨てる」遅延グラフを組まない。捨てる可能性のあるグラフは規模を
   問わず MLX の暗黙 eval に罰される (楽観先組みは 3 回失敗して棄却済み)。
 - knob の既定値は 3 種類を区別すること。同じ「既定 off」でも中身が違う。

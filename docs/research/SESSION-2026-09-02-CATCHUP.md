@@ -2813,3 +2813,20 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - qmm_wide: 27B では取り分なし (揺れの中)。ビット一致で害も無いので契約どおり当てたままにする (Flash-Next の形で勝っていた BM=64 は 27B の形では MLX の素と同等)。
 - GDN Metal (prefill): 09:15 の結果 (4k -1.4% / 17k +0.1%) と品質の代金 (KLD 0.00027) を合わせ、**27B (移植した族) では既定 off にする** (第 1 段の着地後に fused.py を触る。Flash-Next は従来どおり on)。
 - 27B の prefill の部品はこれで一巡: 取り分は合計 1% 未満。**27B の的は decode 経路** (round 82〜112 ms 対 下限 35 ms)。
+
+### 2026-09-04 10:15 27B decode 経路の第 1 段: 段階投入を S>1 の verify にも (既定 on、短 -1.9% / 4k -0.4%、生成列は完全一致)。capture の写しをモジュール呼び出しにする案は取り分なし (-0.3%) で既定 off。`staged.py` は `_hidden_forward` に畳んで写しを 1 本減らした
+
+- 発火の確認 (合成 qwen3_5、`_fire`): `_linear_capture` (写し) は `gdn_prework` 0 / `rms_norm_gated` 3、モジュール呼び出しは 3 / 3。**素通しは前処理カーネルだけ**で、出力 norm は写しでも当たっていた。両経路の出力・cache はビット一致。
+- 変更: `fused.gdn_capture(sink)` (動的サブクラスに状態の取り出し口)、`spec._capture_via_module` (`MLXTURBO_SPEC_CAPTURE_MODULE`、既定 0)、`_hidden_forward` を 1 本化して `staged.py` を削除、`MLXTURBO_SPEC_STAGED_VERIFY` (**既定 on に変更**)、`MLXTURBO_ROUND_TRACE=1` / `decode_ab_generic --round-trace`。
+- ゲート: 合成 (`bench/test_spec_capture_module_qwen3_5.py`、S=1,2,4,8 の出力・cache・sink・巻き戻し・段階投入がビット一致) 27 passed、fingerprint 通過、実機 27B (head 全条件一致):
+
+| knob | 短 3 本 × 512 × 2 (ms/round) | 4k (ms/round) | tok/round |
+|---|---|---|---|
+| `SPEC_STAGED_VERIFY` | **-1.9%** | **-0.4%** | 完全一致 (1 トークンも変わらない) |
+| `SPEC_CAPTURE_MODULE` | -0.3% | -0.1% | 幅 5/7/8/9 の round でずれる |
+
+- ずれの正体 (実機、同一 cache から 2 経路): S=1,2,3,4,6 は 48 層とも完全一致、**S=5,7,8,9 だけ `states_all` が 6e-4〜1.6e-5 ずれる** (`QMM_WIDE=off` でも同じ)。融合前処理の q が実機の形 (n_k 16 / key_dim 2048) で数 ulp ずれる幅がある、が最も筋が通る (合成の形では S=8 まで一致)。**S=1 (本番の decode 幅) は完全一致**なので port の判断は揺るがない。原因未特定 (BACKLOG)。
+- 事実 (round trace): **round ≒ 43 ms (幅 1 の固定費) + 約 10 ms × draft 本数** (幅 3 = 73、4 = 84、5 = 93、6 = 97、7 = 102、9 = 115)。固定費 43 は素の下限 35 に対して +8。**mlx-serve 4k: tok/round 2.06、draft 2.00 本/round、round 52 ms = 24.4 ms/tok** (depth 6 を持ちながら幅表で w2)。**同じ 2 本でうちは 73〜75 ms → 20 ms/round 負け。**
+- 判定: 段階投入は代金ゼロ (値が変わらず、遅くなる文脈なし) → 既定 on。capture のモジュール化は写しが 1 つ減る利点だけで速度は無く、幅 5+ のずれが未解明なので既定 off。**移植した族の prefill Metal 再帰は既定 off に** (`enable_gdn_port`、明示 `MLXTURBO_GDN_METAL=1` だけ。27B で取り分なし + KLD 0.00027)。
+- テストの罠: `bench/test_fusions_other_family.py` の module 直下 `mx.set_default_device(mx.cpu)` が同じ pytest プロセスの他ファイルの GPU 判定を収集時に False にし、一致検査が 1 つも走っていなかった → fixture に直した。
+- **第 2 段の的**: 1 リンク 10 ms (lm_head 0.64 GB の読み 1.5 ms + MTP 層 0.5 ms の下限に対して 8 ms の同期と糊) と固定費の +8 ms。

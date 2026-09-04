@@ -48,7 +48,6 @@ from .kernels.dispatch import (
 )
 from .prefill_common import split_and_checkpoint_tail
 from .sam import SuffixAutomaton
-from .staged import staged_forward
 
 # ---------- D1: confidence-gated chaining ----------
 #
@@ -167,11 +166,27 @@ CHECKPOINT_RETENTION = 8
 # ---------- staged submission (段階投入) ----------
 #
 # spec_flash.py の _staged_forward (Flash-Next 型) と同じ手法の dense 側移植:
-# 検証フォワードの層ループを every 層ごとに mx.async_eval し、グラフ構築中の
-# GPU 遊休を刈る (実装は mlxturbo/staged.py、qwen3_5 型モデル向けの汎用版)。
+# 層ループを every 層ごとに mx.async_eval し、グラフ構築中の GPU 遊休を刈る。
 # 値は spec_flash.py 側の既定に揃えている -- こちらでの掃引は未実施 (27B
-# 実モデルが手元にない。docstring 参照)。
+# 実モデルが手元にない)。
+#
+# **`async_eval` は値を変えずスケジューリングだけを変える** ので、`every` の
+# 値によらず計算内容は同一 (出力トークン列が正しさの基準)。0 で無効。
+#
+# 2026-09-04 まで実装は `mlxturbo/staged.py` の `staged_forward` にあったが、
+# あれは `_hidden_forward` の capture=False 分岐と一字一句同じ層ループの写し
+# だった (= mlx_lm の `Qwen3_5TextModel.__call__` の写しが 2 つあった)。
+# 下の `_hidden_forward` に `every` を持たせて 1 つに畳んだ。
 _STAGE_EVERY = int(os.environ.get("MLXTURBO_STAGE_EVERY", "2") or 0)
+
+
+def _env_on(name: str, default: str = "0") -> bool:
+    """env を **呼び出しのたびに**読む on/off。
+
+    `tools/decode_ab_generic.py` は 1 プロセス内で `os.environ` を書き換えて
+    A/B するので、import 時に読むと片側しか測れない。
+    """
+    return (os.environ.get(name) or default).lower() not in ("0", "", "off", "false")
 
 
 def snapshot_untrimmable_caches(caches) -> list[tuple[int, object, object, object]]:
@@ -291,6 +306,9 @@ class SpecEngine:
         self.inner = self.text.model
         self.mtp = mtp
         self.prefill_step_size = prefill_step_size
+        # (S, dtype, mask 有無) ごとの「検証フォワードをモジュール呼び出しで
+        # 通せるか」の判定を控える (_capture_via_module)。
+        self._capture_module_ok: dict = {}
         # Install the replacement without touching prefill/draft behavior.
         # Dispatch is activated only by the verification scopes below.
         enable_quantized_dispatch(self.text, active=False)
@@ -319,22 +337,56 @@ class SpecEngine:
 
     # ---------- main-model forward ----------
 
+    def _capture_via_module(self, x: mx.array, ssm_mask, caches) -> bool:
+        """検証フォワードの GDN 層を、写し (`_linear_capture`) ではなく
+        モジュール呼び出し (`layer(...)`) で通せるか。
+
+        通せるのは、全部の GDN 層に `fused.enable_gdn_port` の取り出し口が
+        当たっていて、幅・mask・dtype の契約も合っているとき。**1 層でも
+        外れたら全体で写しに落ちる** -- 層ループを回し始めてから捕捉に失敗
+        すると、手前の層の cache が進んでいて戻せないため。
+
+        判定は S ごとに 1 度だけ (S は round ごとに変わるが数種類しかない)。
+        """
+        if not _env_on("MLXTURBO_SPEC_CAPTURE_MODULE"):
+            return False
+        # 鍵に GDN のクラスを混ぜる: `enable_gdn_port` / `disable_gdn_port` は
+        # インスタンスの `__class__` を差し替えるので、A/B で剥がされたのに
+        # 「通せる」と答えると sink が空のまま層ループが回る。
+        gdn_cls = next(
+            (type(la.linear_attn) for la in self.inner.layers if la.is_linear), None
+        )
+        key = (x.shape[1], x.dtype, ssm_mask is not None, gdn_cls)
+        cached = self._capture_module_ok.get(key)
+        if cached is not None:
+            return cached
+        from . import fused
+
+        ok = all(
+            fused.gdn_capture_ready(layer.linear_attn, x, ssm_mask, c)
+            for layer, c in zip(self.inner.layers, caches)
+            if layer.is_linear
+        )
+        self._capture_module_ok[key] = ok
+        return ok
+
     def _hidden_forward(self, tokens: mx.array, caches, capture: bool,
                         staged: bool = False):
         """tokens: (S,). Returns: (hidden before the final norm (1,S,D), rollback info for the linear layers)
 
-        ``staged=True`` (capture=False のときだけ意味を持つ) は層ループを
-        `mlxturbo/staged.py` の段階投入版に差し替える。値は変わらず
-        スケジューリングだけが変わる (2 層ごとに mx.async_eval を挟んで
-        グラフ構築中の GPU 遊休を刈る)。**呼び手は staged_forward を直接
-        呼ばずここを通すこと** -- フォワードの入口が 1 つでないと、差し替えて
-        検査する側 (bench/test_spec_phase0.py の _FakeEngine) が経路を
-        押さえられなくなる。
+        ``staged=True`` は層ループに段階投入を掛ける (``_STAGE_EVERY`` 層ごとに
+        ``mx.async_eval``)。値は変わらずスケジューリングだけが変わる。
+        capture=True でも掛かるが、そちらは既定 off
+        (``MLXTURBO_SPEC_STAGED_VERIFY``、**既定 on** (2026-09-04: 27B の短 3 本 × 512 × 2 で ms/round -1.9%、4k -0.4%、生成列は完全一致)。``=0`` で off)。
+
+        層ループは ``mlx_lm.models.qwen3_5.Qwen3_5TextModel.__call__`` の本体
+        (最終 ``self.norm`` の手前まで) の写しであることが正しさの根拠 --
+        **本家 (mlx_lm 更新時) を変えたらここも変えること。**
+
+        **呼び手はここを通すこと** -- フォワードの入口が 1 つでないと、
+        差し替えて検査する側 (bench/test_spec_phase0.py の _FakeEngine) が
+        経路を押さえられなくなる。
         """
-        if staged and not capture:
-            return staged_forward(
-                self.inner, tokens[None], caches, every=_STAGE_EVERY
-            ), []
         if capture and any(
             layer.is_linear and layer.linear_attn.sharding_group is not None
             for layer in self.inner.layers
@@ -345,18 +397,38 @@ class SpecEngine:
         x = self.inner.embed_tokens(tokens[None])
         fa_mask = create_attention_mask(x, caches[self.inner.fa_idx])
         ssm_mask = create_ssm_mask(x, caches[self.inner.ssm_idx])
-        sink = []
+        sink: list = []
         h = x
+        via_module = capture and self._capture_via_module(x, ssm_mask, caches)
+        if staged or (capture and _env_on("MLXTURBO_SPEC_STAGED_VERIFY", "1")):
+            every = _STAGE_EVERY
+        else:
+            every = 0
+        layers = self.inner.layers
+        n = len(layers)
         scope = dispatch_scope() if capture else nullcontext()
-        with scope:
-            for layer, c in zip(self.inner.layers, caches):
+        if via_module:
+            from . import fused
+
+            cap_scope = fused.gdn_capture(sink)
+        else:
+            cap_scope = nullcontext()
+        with scope, cap_scope:
+            for i, (layer, c) in enumerate(zip(layers, caches)):
                 if layer.is_linear:
-                    if capture:
+                    if capture and not via_module:
                         h = self._linear_capture(layer, h, c, sink, ssm_mask)
                     else:
                         h = layer(h, mask=ssm_mask, cache=c)
                 else:
                     h = layer(h, mask=fa_mask, cache=c)
+                if every and (i + 1) % every == 0 and i < n - 1:
+                    mx.async_eval(h)
+        if via_module and len(sink) != sum(1 for layer in layers if layer.is_linear):
+            raise RuntimeError(
+                "gdn_capture が全部の GDN 層を捕捉していない "
+                f"({len(sink)} 層ぶんしか積まれていない)"
+            )
         return h, sink
 
     def _prefill_hidden(
@@ -444,7 +516,18 @@ class SpecEngine:
         return chunks[0] if len(chunks) == 1 else mx.concatenate(chunks, axis=1)
 
     def _linear_capture(self, layer, x, cache, sink, mask=None):
-        """Perform the same computation as GatedDeltaNet while retaining the per-position recurrent state."""
+        """Perform the same computation as GatedDeltaNet while retaining the per-position recurrent state.
+
+        **これは DecoderLayer の本体 (GatedDeltaNet + residual + MLP) の写し
+        で、`la(...)` を呼ばない。**したがって GDN に当てた自前部品
+        (`fused.enable_gdn_port` の `gdn_prework`) はこの経路に届かない
+        (出力 norm だけは `la.norm` のクラスを差し替えてあるので届く)。
+
+        `MLXTURBO_SPEC_CAPTURE_MODULE=1` のときは `_hidden_forward` が
+        `layer(...)` を呼び、巻き戻し用の材料は `fused.gdn_capture` の
+        取り出し口から受ける (値はビット一致)。こちらはその契約が外れた
+        ときの落とし先。knob の既定が 1 になったら消せる。
+        """
         la = layer.linear_attn
         if la.sharding_group is not None:
             raise NotImplementedError(
@@ -976,8 +1059,15 @@ class SpecEngine:
         quality_ema: dict = {}
         entropy_hist: list = []
         cap_base = max_draft if max_draft > 0 else n_draft
+        # `MLXTURBO_ROUND_TRACE=1` のときだけ round ごとに
+        # (検証幅, 受理数, 壁時計 ms) を積む (`spec_flash` の同名の env と
+        # 同じ役目)。結果は `self.last_round_trace`。既定では list を作らず
+        # 分岐 1 つで済ませる。
+        round_trace = [] if _env_on("MLXTURBO_ROUND_TRACE") else None
+        self.last_round_trace = round_trace
         while len(out_tokens) < max_tokens and out_tokens[-1] not in eos:
             ts = time.perf_counter()
+            t_round = ts
             mtp_off0 = mtp_cache.offset
             lk = None
             lookup_bucket = None
@@ -1081,17 +1171,14 @@ class SpecEngine:
             if window.shape[0] > 1:
                 hs, sink = self._hidden_forward(window, caches, capture=True)
             else:
-                # 段階投入 (staged submission, mlxturbo/staged.py 参照;
-                # spec_flash.py の _staged_forward の dense 版移植)。1
-                # トークンの検証はロールバック用 capture が要らない (capture
-                # は複数トークン投機を破棄するときだけ要る) ので、
-                # _hidden_forward の capture=False 分岐と完全に同じ層ループ
-                # (qwen3_5 型: is_linear で ssm_mask/fa_mask を使い分け、各層
-                # を layer(h, mask=mask, cache=c) で呼ぶ) を、グラフ構築中の
-                # GPU 遊休を刈る汎用ヘルパーに置き換えるだけ。async_eval は
+                # 段階投入 (staged submission; spec_flash.py の
+                # _staged_forward の dense 版移植)。1 トークンの検証は
+                # ロールバック用 capture が要らない (capture は複数トークン
+                # 投機を破棄するときだけ要る) ので、capture=False の層ループを
+                # そのまま使い、グラフ構築中の GPU 遊休を刈るために
+                # _STAGE_EVERY 層ごとに async_eval を挟むだけ。async_eval は
                 # 値を変えずスケジューリングだけを変えるので計算内容は
-                # _hidden_forward(capture=False) と同一 -- sink は capture=False
-                # のときこれまでも常に空だったので [] のままで変わらない。
+                # staged=False と同一 -- sink は capture=False のとき常に空。
                 hs, sink = self._hidden_forward(
                     window, caches, capture=False, staged=True
                 )
@@ -1246,6 +1333,11 @@ class SpecEngine:
             if on_tokens:
                 on_tokens(step_tokens)
             phase["maint"] += time.perf_counter() - ts
+            if round_trace is not None:
+                round_trace.append(
+                    (len(window_l), consumed, source,
+                     (time.perf_counter() - t_round) * 1000.0)
+                )
 
         decode_time = time.perf_counter() - t1
         n_decode = len(out_tokens) - 1
