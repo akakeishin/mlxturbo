@@ -114,23 +114,20 @@ fastmlx/mlxturbo 側の現状:
 6. **`tools/vendor_fingerprint.py` は CPU で走るので、2026-09-01 に足した
    `eligible()` が常に False になる。**Metal を要求する分岐を、唯一の一次検査が
    **一度も実行していない。**緑が出ても新しい分岐については何も保証しない。
-7. **GDN の分岐が 2 箇所にある** (`_vendor/qwen4_exp.py` の
-   `GatedDeltaNet.__call__` と `spec_flash.py` の `capture()` 内 `gdn`)。
-   条件は今日時点で一字一句同じだが、**共有の述語も回帰ゲートも無い。**
-   ずれたときの症状は「draft と verify で数値系統が食い違い受理率が動く」で、
-   バグとして表面化しない。`gdn_prework.wants(module, mask, cache)` のような
-   述語を kernels 側に置いて両方から呼ぶのが最小の直し。
+7. **解決済み (2026-09-04): GDNの2分岐で外側の述語を共有。**
+   `_vendor/qwen4_exp.py`の`GatedDeltaNet.__call__`と`spec_flash.py`のcapture内`gdn`は、
+   `gdn_prework.wants(module, mask, cache)`で有効化、mask、cache、training、lengthsを
+   同じように判定する。契約8 test、vendor fingerprint、実Flash-Next 8k prefill一致を通した。
 8. **`eligible()` が無言。**約 20 の条件が黙って False を返す。発火カウンタ
    (`mlxturbo/kernels/_fire.py`、`75bdd9d`) で空振りは見えるようになったが、
    **なぜ落ちたかは出ない。**`prefill_attn` の `_warn_once` 方式を横展開する。
 
 ### C. カーネル個別
 
-9. **GDN 前処理が `_store_conv_state` シームを迂回して `cache[0]` に直接書く。**
-   今日は等価 (オーバーライドが存在せず、`lengths is None` なら `_tail_window`
-   は末尾切りと同一)。**反転条件: lengths を持たないキャッシュ型に
-   `_store_conv_state` のオーバーライドが生えたとき。**上の 7 の `wants()` に
-   この前提を書き残すこと。
+9. **条件を固定済み (2026-09-04): GDN前処理は`_store_conv_state`を迂回する。**
+   `wants()`に直接書込みの前提を記録し、`cache.lengths`がある場合は必ず拒否する。
+   **残る反転条件**は、lengthsを持たないcache型に`_store_conv_state`のoverrideが
+   生えた場合。そのcache型を追加するときは述語も拡張する。
 10. **`prefill_attn` に S の下限が無い。**decode 幅でも比のゲートを通れば
     入るので、`--knob prefill-attn` は prefill だけの knob ではない。
     A/B は `prefill_s` と `ms_per_tok` を別々に読むこと。

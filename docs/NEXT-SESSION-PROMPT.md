@@ -745,3 +745,17 @@ git show --stat --oneline HEAD && rg -n "ignore_eos" mlxturbo/server.py docs/GUI
 ```bash
 .venv/bin/python -m pytest bench/test_fusions_other_family.py -q
 ```
+
+## GDN preworkの重複判定を共有 (2026-09-04 20:08 JST)
+
+本家forwardと投機captureに重複していた外側の5条件を`gdn_prework.wants()`へ集約した。
+`cache[0]`へ直接書く融合経路は`_store_conv_state`を通らないため、`cache.lengths`ありを
+拒否する条件と理由も同じ述語へ固定した。契約8 testとvendor fingerprintを通過。
+実Flash-Next 8kでもcheckpointありのgroup=0/4が110 cache配列すべてbit-identical。
+BACKLOG B7/C9を閉じた。
+
+再開の1コマンド:
+
+```bash
+.venv/bin/python -m pytest bench/test_gdn_prework_predicate.py -q
+```

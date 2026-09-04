@@ -1507,15 +1507,13 @@ class GatedDeltaNet(nn.Module):
         # gdn_prework.py)。mask 付き (バッチの右パディング) と長い prefill 幅
         # は対象外で、その場合は下の素の経路に落ちる。既定 off。
         _gdn_prework_on = getattr(self, "_gdn_prework", False)
-        if (
-            _gdn_prework_on
-            and mask is None
-            and cache is not None
-            and not self.training
-            and getattr(cache, "lengths", None) is None
-        ):
+        if _gdn_prework_on:
             from mlxturbo.kernels import gdn_prework as gp
+            _gdn_prework_wanted = gp.wants(self, mask, cache)
+        else:
+            _gdn_prework_wanted = False
 
+        if _gdn_prework_wanted:
             # A_log/dt_bias は実モデルの dtype (bf16) のまま渡す。
             # 2026-09-03 のカーネル書き直しで、素の compute_g と同じ順に
             # bf16 で丸めるようになった (fp32 の写しを渡すと `a + dt_bias` が

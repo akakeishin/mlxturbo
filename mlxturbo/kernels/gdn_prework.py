@@ -403,6 +403,25 @@ def eligible(
     return True
 
 
+def wants(module: Any, mask, cache) -> bool:
+    """GDN 前処理融合を試す外側の条件を共有する。
+
+    これはテンソルの形・dtype を見る ``eligible()`` の前段で、呼び出し側の
+    共通条件 (有効化、mask、cache、training、cache.lengths) だけを判定する。
+    ``cache.lengths`` があるときは拒否する。融合経路は ``_store_conv_state``
+    を通らず ``cache[0]`` に直接書くため、実長に基づく窓取りを行うキャッシュを
+    受けると状態を壊す (BACKLOG B9)。
+    """
+
+    return bool(
+        getattr(module, "_gdn_prework", False)
+        and mask is None
+        and cache is not None
+        and not module.training
+        and getattr(cache, "lengths", None) is None
+    )
+
+
 def explain_gate_miss(mask, cache, training: bool) -> None:
     """呼び出し側 (``GatedDeltaNet.__call__`` / ``spec_flash.capture()`` の
     ``gdn``) にある外側のガード (``mask is None``・``cache is not None``・
@@ -527,6 +546,6 @@ def fused_gdn_prework(
 
 
 __all__ = [
-    "eligible", "fused_gdn_prework", "explain_gate_miss",
+    "wants", "eligible", "fused_gdn_prework", "explain_gate_miss",
     "BLOCK", "MAX_S", "MAX_M", "MAX_TG_BYTES",
 ]

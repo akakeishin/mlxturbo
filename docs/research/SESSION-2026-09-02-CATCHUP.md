@@ -3441,3 +3441,14 @@ GuideLLMで32-token synthetic / 8 output tokenを2 request送り、2/2がHTTP 20
 runner側だけでなく`enable_hc_write()`自身でも`MLXTURBO_HC_WRITE=0`を見て、直接呼出しで
 無条件に`DecoderLayer._combine`が差し替わる穴を閉じた。既定onの挙動は変えず、
 他モデル族を含む合成検査は**10 passed**。BACKLOG C14を完了扱いにした。
+
+### 2026-09-04 20:08 GDN preworkの外側判定を1か所へ集約
+
+`GatedDeltaNet.__call__`と`spec_flash.capture()`の写しに重複していた有効化、mask、cache、
+training、`cache.lengths`の5条件を`gdn_prework.wants()`へ集約した。融合側は
+`_store_conv_state`を迂回して`cache[0]`へ直接書くため、実長を持つcacheを拒否する理由も
+述語へ記録した。合成契約は**8 passed**、vendor fingerprintも全項目通過。
+
+実Flash-Nextでは8kでcheckpointありのgroup=0/4を比較し、**110 cache配列すべて
+bit-identical**。checkpointなしは既知のtail-in-group 2047+1丸め差だけで、この判定共有とは
+無関係。BACKLOG B7とC9を閉じた。
