@@ -639,3 +639,9 @@ rg -n "Gemma|warm TTFT|QuantizedKVCache|TurboQuant|assistant" docs/BACKLOG.md do
 ```bash
 rg -n "pre_feedforward_layernorm|pre_feedforward_layernorm_2|class Router|RMSNorm" .venv/lib/python*/site-packages/mlx_lm/models/gemma4_text.py mlxturbo
 ```
+
+## 強冷却の運用 (ユーザー 2026-09-04 18時台)
+
+1日最大2回、各数時間の強冷却を用意できる。常時運用は設備上行わない。通常条件の同一process A/Bで
+候補が生き残った後、原則Flash-Next研究候補に1枠、その日の別モデル候補に1枠を使う。開始前に
+対象モデル・固定条件・所要時間をユーザーへ明示する。候補が弱い日は使わない。
