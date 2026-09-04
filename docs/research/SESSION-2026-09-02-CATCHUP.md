@@ -2848,3 +2848,19 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - **判定: 融合もどきレーンは Flash-Next / 27B では閉じる。**Gemma 4 は Gemma レーンの中で norm の本数削減として扱う。MLA 族は将来の的。
 - 副産物 (別件、要即対応): `fused._moe_fold_block` の combine 分岐で `inv` が未束縛 → `MOE_DOWN_EPI` 既定 on × 行数 ≥ 64 = **Flash-Next の実 prefill 全部が落ちる**回帰。13f0d21 (族の回帰修正) で計数ソートの hunk を除外したときに `if inv is None:` の 5 行だけ紛れ込んだ (キーワードで hunk を選別した副作用)。10:20 に直す。
 - 追記 (10:38): 回帰修正 (d8c2c69) 後の Flash-Next 4k prefill 煙試験 OK (`decode_ab --knob null --only long --ctx 4000`、prefill 5.6〜6.0 s、0903h の 5.74 と同じ水準)。
+
+### 2026-09-04 10:41 27B decode 経路の第 2 段: draft を「引いてから捨てる」のをやめて同期ゼロで引く (NOSYNC) = **ms/tok 短 -12.5% / 4k -12.1%** → 既定 on。次 round の先行投入 (PREFETCH) は取り分ゼロ (+0.2 / +1.9%) → 畳む
+
+- 変更 (`mlxturbo/spec.py`): `_draft_chain` (argmax を `.item()` せず配列のまま次段へ、最終段以外は `async_eval`、語彙長の softmax / エントロピーは組まない)、`_plan_depth` (`_gate_depth` の EMA / 事前値だけで**引く前に**本数を決める。観測を積んだ入力では `_gate_depth` と厳密一致、単体テスト 4 件)。
+- 実機 27B (`decode_ab_generic`、`bench/results/spec-nosync-27b-{short,4k}-0904.json`):
+
+| knob | 文脈 | ms/tok | ms/round | tok/round | draft 本数/round | 生成列の分岐位置 |
+|---|---|---|---|---|---|---|
+| NOSYNC 1 / 0 | 短 3 本 × 512 × 2 | **27.67 / 31.63 (-12.5%)** | 80.4 / 94.6 (-14.9%) | 2.94 / 3.05 (-3.6%) | 3.2〜4.1 / 3.4〜4.9 | 27 / 14 / 151 トークン目 |
+| NOSYNC 1 / 0 | 4k × 256 | **32.37 / 36.83 (-12.1%)** | 82.1 / 99.3 (-17.3%) | 2.54 / 2.70 (-5.9%) | 3.30 / 3.74 | 52 |
+| PREFETCH 1 / 0 | 短 / 4k | +0.2% / +1.9% | 同 | ±0 | 同一 | 完全一致 |
+
+- **帰属の訂正**: 取り分の正体は同期の除去ではなく「引いてから捨てる」をやめたこと。素は毎 round `cap_base = 8` 本を無条件に引き、事後に 3.3 本まで捨てていた → 4.8 本 × 3.2 ms ≒ 15.4 ms/round が消えた (実測差 14.1 / 17.2 を挟む)。同期そのものは温で 0.1 ms/リンク。「1 リンク 10 ms」は draft ではなく **verify の 1 行の値段** (幅を 1 増やす費用 11.6 ms は NOSYNC 後も残る)。
+- 固定費の内訳 (`scratchpad/b2_fixed_cost_micro.py`): 幅 1 の round 45.1 ms = trunk forward **42.0** + lm_head **4.6** + 糊 ≈ 0。帯域下限との差は trunk の 64 層ループに +8.6、**lm_head に +3.0 (0.64 GB を 4.6 ms = 139 GB/s、下限の 2.9 倍遅い)**。MTP のリンク 1 本 3.2 ms (append 1.24 + lm_head 1.88)。「固定費 +8 ms」は同期でも Python でもない。
+- 数値: 貪欲でも生成列が変わる (検証幅が変わると 4bit `quantized_matmul` の丸めが変わる = prefill チャンクの注記と同じ性質)。ビット一致では受けられないが、どちらも同じモデルの正当な貪欲出力。tok/round は 3〜6% 落ちる (事前の深さ決めが事後より粗い) が、ms/tok は -12%。**判定: 既定 on** (`MLXTURBO_SPEC_DRAFT_NOSYNC=0` が逃げ道)。PREFETCH はコードごと削除。
+- **第 3 段の的**: (1) lm_head 4.6 ms (139 GB/s、draft のリンクにも効く)、(2) 幅を 1 増やす 11.6 ms の中身 (GDN の行ごと逐次 48 層が疑い)、(3) trunk の層ループの +8.6 ms、(4) tok/round の -3〜6% を取り返す深さ決め (`DepthController` の E(m)/T(m) 最大化、費用モデルの代金あり)。
