@@ -2801,3 +2801,15 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 
 - 読み: **27B では GDN 部品の取り分がほぼ無い**。理由の候補 2 つ: (1) `spec.py` の S>1 verify (主経路) が `_linear_capture` の写しを通り、移植した部品が当たっていない (advisor の指摘、第 1 段で是正中)、(2) 27B は dense の MLP と attention が重く、GDN の scan の比重が Flash-Next より小さい。
 - GDN Metal は品質の代金がある (KLD 0.00027) のに 17k で取り分が無い → **27B では既定 off が筋** (代金ゼロ規則の逆)。決定は第 1 段の着地後に主経路で測り直してから。
+
+### 2026-09-04 09:37 27B: 行タイルと qmm_wide の速度 A/B (`decode_ab_generic`、1 ケース、`bench/results/sdpa-rowtile-27b-*.json` / `qmm-wide-27b-17k-0904.json`)
+
+| 部品 | 4k prefill | 17k prefill | decode | 数値 |
+|---|---|---|---|---|
+| sdpa 行タイル (16 層) | **-0.7%** | **-0.5%** | ±0 (17k の +1.4% は揺れ、tok/round 同一) | head 一致、KLD 0.0000 (09:51 の compare で GDN Metal off のとき 0) |
+| qmm_wide (368 射影、MLP 込み) | +0.4% (08:55) | +0.2% | ±0 | ビット一致 |
+
+- 行タイル: 代金ゼロで両文脈とも負 → **27B でも on のまま** (取り分は小さい)。
+- qmm_wide: 27B では取り分なし (揺れの中)。ビット一致で害も無いので契約どおり当てたままにする (Flash-Next の形で勝っていた BM=64 は 27B の形では MLX の素と同等)。
+- GDN Metal (prefill): 09:15 の結果 (4k -1.4% / 17k +0.1%) と品質の代金 (KLD 0.00027) を合わせ、**27B (移植した族) では既定 off にする** (第 1 段の着地後に fused.py を触る。Flash-Next は従来どおり on)。
+- 27B の prefill の部品はこれで一巡: 取り分は合計 1% 未満。**27B の的は decode 経路** (round 82〜112 ms 対 下限 35 ms)。
