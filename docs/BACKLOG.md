@@ -1187,3 +1187,9 @@ BM16の楽観上限でも17k -4.93%で、新kernel費用を入れる前に採用
 
 未決はcold prefill最初のn-gram gatherをrequest到着時から重ねる案。既存prefetchを使い、
 warm restore候補とqueue競合を避ける最小実装に限定し、短文/17k順逆A/Bで採否を決める。
+
+## 棄却: n-gram first gather前倒し (2026-09-05 05:55 JST)
+
+request-local cacheと完全一致検査まで実装して測ったが、prefillは短文+4.1%、17k +1.5%。
+出力・hit/missは同一でも、tokenize後からprefillまでの短い区間ではworker/hash費用を隠せない。
+試作と測定knobは撤回し、現行の最初だけ同期、後続groupだけGPUへ重ねる方式を維持する。

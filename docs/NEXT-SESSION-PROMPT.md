@@ -1011,3 +1011,16 @@ git show --stat --oneline HEAD && rg -n "棄却|既定 off" docs/research/SESSIO
 ```bash
 rg -n "_prefetch_ngram_span|class StreamNGram|_resolve_runner_for_request|_probe_best_session_lcp" mlxturbo
 ```
+
+## 棄却: n-gram first gatherのrequest到着時前倒し (2026-09-05 05:55 JST)
+
+- request-local private cache、token/row ID完全一致、O(1)公開まで試作し、n-gram全28 testは合格。
+- 有効な同一process A/Bでは短文prefill +4.1%、17k +1.5%。出力とhit/missは条件間で一致した。
+- tokenize後からprefillまでに隠せるhost仕事がほぼ無く、worker/hash費用を回収できない。試作は撤回。
+- cold n-gramは、既定の「最初だけ同期、後続groupだけGPU実行へ重ねる」を維持する。
+
+再開の1コマンド:
+
+```bash
+git show --stat --oneline HEAD && rg -n "未決|保留|調査継続" docs/BACKLOG.md | tail -n 60
+```

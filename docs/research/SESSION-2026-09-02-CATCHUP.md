@@ -3981,3 +3981,22 @@ persistent streaming MoEは、成立する最小形をBM16・activation全保持
 session再利用が見込めないrequestの到着直後から始めること。既存prefetchを再利用し、並行request間で
 payloadを共有しない最小設計に限る。短文/17kの同一process順逆A/Bで非悪化と重なり量を確認してから
 既定化する。
+
+### 2026-09-05 05:55 n-gram first gather前倒しは短文+4.1%、17k +1.5%で棄却
+
+既存のpreadと行値を変えず、先頭groupの行をrequest-local workerで準備し、token列と行IDの完全一致後に
+cache世代をO(1)で公開する試作を行った。既存n-gram全28 testに合格。最初の17k試作は先頭行数ぴったりの
+cache世代が次groupの追記で入れ替わり、hit率96.7→90.1%へ落ちたため無効として中止した。現行と同じ
+通常容量へ直した再測定では、候補と対照のhit/missが完全に一致した。
+
+| 条件 | 前倒し | 現行 | 差 | 判定 |
+|---|---:|---:|---:|---|
+| 短文3 prompt prefill | 0.275秒 | 0.264秒 | **+4.1%** | 悪化 |
+| 17k 1 prompt ABBA prefill | 30.097秒 | 29.644秒 | **+1.5%** | 悪化 |
+
+生成列は全条件で一致。短文のn-gram fetch自体は-4.4%だったが、NumPy hash、専用worker、世代準備が
+上回った。17kも現行の前景wait約1.09秒を背景へ移しただけで、requestのtokenize完了後からprefill開始までに
+重ねられるhost仕事がほぼ無く、壁時計は減らなかった。外部実装の「request arrival」はsession bank処理や
+別sidecar構造を含み、このserverへ同じ利得を外挿できない。製品配線・実験knob・専用testはすべて撤回し、
+現行の最初だけ同期、後続だけGPUへ重ねる方式を維持する。結果は
+`bench/results/ngram-first-gather-{short,17k-1prompt}-0905.json`（gitignore）。
