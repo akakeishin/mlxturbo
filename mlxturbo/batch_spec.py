@@ -1876,6 +1876,10 @@ class SpecAdmission:
     # 退避された回数。退避のたびに「プロンプト + 生成済み」で prefill を
     # やり直すので、TTFT の意味が変わることを /health 等から見えるようにする
     preempted: int = 0
+    # 復帰prefillが実際に完了した分だけ数える。退避直後やcancelされたままの
+    # admissionは加算しない。
+    preemption_recomputed_tokens: int = 0
+    recompute_events: int = 0
 
 
 # 1 ステップのトークン予算。decode の矩形と prefill のチャンクで分け合う
@@ -1927,6 +1931,7 @@ class BatchSpecCoordinator:
         # 観測用 (bench / tools/verify_batch_spec.py が見る)
         self.joins = 0
         self.preemptions = 0
+        self.preemption_recomputed_tokens = 0
         self.solo_runs = 0
         # 以下は駆動スレッドだけが触るスケジューラの状態
         self._waiting: list[SpecAdmission] = []
@@ -1984,6 +1989,8 @@ class BatchSpecCoordinator:
             # 定義は mlxturbo.spec.SpecEngine / FlashSpecSession と同じ
             # (n_decode / この行が参加したラウンド数)
             "tokens_per_step": (n_decode / adm.steps) if adm.steps else 0.0,
+            "preemptions": adm.preempted,
+            "preemption_recomputed_tokens": adm.preemption_recomputed_tokens,
         }
 
     def _cancelled(self, adm: SpecAdmission) -> bool:
@@ -2225,6 +2232,16 @@ class BatchSpecCoordinator:
     def _remaining(self, adm: SpecAdmission) -> int:
         return max(0, adm.max_tokens - len(adm.tokens))
 
+    def _record_completed_recompute(self, adm: SpecAdmission) -> None:
+        """退避行の復帰prefillが完了した時点で、再計算token数を加算する。"""
+
+        if adm.preempted <= adm.recompute_events:
+            return
+        n_tokens = len(self._effective_prompt(adm))
+        adm.preemption_recomputed_tokens += n_tokens
+        adm.recompute_events = adm.preempted
+        self.preemption_recomputed_tokens += n_tokens
+
     def _batch_key(self):
         """いまのバッチが決めているサンプリング設定 (無ければ None)。
 
@@ -2283,6 +2300,7 @@ class BatchSpecCoordinator:
         """prefill を終えた行を走行中のバッチに入れる。"""
         row = self._lane.result()
         adm = self._lane_adm
+        self._record_completed_recompute(adm)
         self._lane = None
         self._lane_adm = None
         if self._gen is None:
@@ -2366,11 +2384,16 @@ class BatchSpecCoordinator:
             else:
                 self._complete(adm, error=exc)
             return
+        self._record_completed_recompute(adm)
         if adm.tokens:
             # 退避から戻ってきた行。単独経路が返す列は続きぶんだけなので、
             # 既に配った分の後ろに足して 1 本の結果に見せる
             res = dict(res)
             res["tokens"] = list(adm.tokens) + list(res.get("tokens") or [])
+        else:
+            res = dict(res)
+        res["preemptions"] = adm.preempted
+        res["preemption_recomputed_tokens"] = adm.preemption_recomputed_tokens
         self._complete(adm, res=res)
 
     # ---- ラウンドの後始末 -------------------------------------------------

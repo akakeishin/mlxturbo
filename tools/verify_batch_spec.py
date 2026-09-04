@@ -572,6 +572,10 @@ def check_preemption(model) -> bool:
 
     ok = coord.preemptions > 0
     print(f"  {'OK' if ok else 'NG'} 退避が起きた: {coord.preemptions} 回")
+    recomputed = coord.preemption_recomputed_tokens
+    counted = recomputed > 0
+    ok &= counted
+    print(f"  {'OK' if counted else 'NG'} 復帰prefill再計算: {recomputed} tokens")
     for b in range(2):
         same = got[b] == ref[b]
         ok &= same

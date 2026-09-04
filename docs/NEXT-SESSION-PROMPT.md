@@ -839,3 +839,23 @@ rg -n "capture|rollback|cache_offset|state|_verify|_staged_forward" mlxturbo/spe
 ```bash
 rg -n "def _group_prefill_forward|class SparseMoeBlock|def _moe_fold_block|def qmm_segmented" mlxturbo/spec_flash.py mlxturbo/_vendor/qwen4_exp.py mlxturbo/fused.py mlxturbo/kernels/moe_grouped_gemm.py
 ```
+
+## hot prefill P0の段階時間・batch損失・preemption再計算を実装 (2026-09-04 21:46 JST)
+
+- debug時だけtemplate/tokenize、LCP走査、trim/checkpoint restoreを個別計時する。通常経路には
+  `perf_counter`、pool probe、追加同期を入れない。
+- batchを選んだため失うsession LCPをread-only probeし、request結果・ログ・累積telemetryへ記録する。
+  投機primaryからFallbackRunnerへ降格した要求はcache型が非互換なので`probe=incompatible`、LCP 0。
+- spec batchのrecompute型preemptionは、復帰prefillが完了したときだけ実入力token数を加算し、
+  request結果、生成ログ、`/api/status`へ出す。
+- 独立レビューの2指摘を修正後、対象8 testと`bench/test_server.py`全**448 test**がMetal実機で合格。
+
+残るP0は固定suffix 0/16/64/256の反復によるbyte実測と、Flash以外のrunnerで分割不能なTTFT区間の
+明示。MTPLX専用packは公称115.1GB（ローカル107GiB）を取得済みで、`mtplx inspect`は
+`can_run=true`、native qwen4_exp、MTP対応を返した。
+
+再開の1コマンド:
+
+```bash
+BIGLOCK_PRIO=1 tools/biglock.sh .venv/bin/python bench/hot_prefill_bench.py --help
+```

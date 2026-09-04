@@ -1074,3 +1074,13 @@ GDN 29.3%、attention 21.3%、HC read 10.5%だった。先読みはcold全体tok
 中間だけをpersistent kernel内でstreamする。weight複製は約45GBになるため禁止。まず全48層の
 出力をarray equalで比較し、丸め差が出る場合はそこで止める。速度採用線は同じ常用冷却ABBAで
 17k wall 27.215→25.854秒以下（-5%）。MTPLX 2.11.1のexact部品監査より後の研究レーンとする。
+
+## 完了: hot prefill P0の段階時間・batch損失・preemption再計算 (2026-09-04 21:46)
+
+debug requestにtokenize/LCP探索/restore時間を追加し、batchで失う再利用可能LCPとspec batchの
+preemption復帰時再計算tokenをrequest単位・累積の両方で観測できるようにした。cache型が合わない
+投機primary→fallback降格は`incompatible`としてLCP 0にし、偽の節約量を出さない。通常requestは
+時計・probeとも追加せず、追加Metal同期もない。独立レビュー後のserver全回帰は448 passed。
+
+残件は固定suffix反復でのpool allocated bytes照合（差5%以内）と、Flash以外のrunnerで分割不能な
+TTFT区間の明示。その後にbyte-budget LRU比較へ進む。

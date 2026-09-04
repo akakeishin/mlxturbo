@@ -3552,3 +3552,20 @@ HC read 2.873秒 (9.9%)。
 中間をpersistent kernel内でstreamする試作へ進めてよい。最初のgateは全48層array equal。
 速度採用線は同じ常用冷却のABBAで17k wall **25.854秒以下**（27.215秒から-5%）。
 結果は`bench/results/prefill-anatomy-current-sub-17k-0904.json`（gitignore）。
+
+### 2026-09-04 21:46 hot prefill P0の段階時間とbatch再計算を可視化
+
+debug requestだけでchat template/tokenize、session poolのLCP走査、trim/checkpoint restoreを
+個別に計時する。batch routeではpoolのtoken ID列だけをread-onlyでprobeし、batchを選んだため
+失うLCPをrequest結果と累積telemetryへ記録する。投機primaryからFallbackRunnerへの降格では
+ChatSessionを利用できないため、独立レビューで見つかった偽陽性を`probe=incompatible`、LCP 0へ
+修正した。降格したserial/stream requestでもtokenize時間を失わないよう結果への伝播を追加した。
+
+spec batchのrecompute型preemptionは、退避した時点ではなく復帰prefillが完了した時点で
+`prompt + 生成済みtoken`の長さを加算する。request結果、生成ログ、`/api/status`から確認でき、
+未完了やcancelされたままのadmissionは数えない。通常requestでは時計もpool probeも走らず、
+追加`mx.eval`はない。対象8 testとserver全**448 test**がMetal実機で合格した。
+
+同時にMTPLX 2.11.1用Flash-Next Optimized Speed packを取得した。公称115.1GB、ローカル表示107GiB、
+19 shardと30GiB n-gram sidecarが揃い、`mtplx inspect`は`can_run=true`、native qwen4_exp、
+MTP対応を返した。次は強冷却枠で起動確認と短い比較を行う。

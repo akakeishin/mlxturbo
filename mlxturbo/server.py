@@ -372,6 +372,12 @@ class ModelState:
         "evicted_processed_tokens": 0,
         "evicted_allocated_bytes": 0,
         "evicted_allocated_bytes_unknown": 0,
+        "timed_requests": 0,
+        "template_tokenize_s": 0.0,
+        "lcp_scan_s": 0.0,
+        "restore_s": 0.0,
+        "batch_forfeited_requests": 0,
+        "batch_forfeited_lcp_tokens": 0,
     })
     last_session_selection: dict[str, Any] | None = None
     last_session_selection_session: object | None = None
@@ -671,8 +677,11 @@ def _session_selection_info(
     evicted: bool = False,
     evicted_processed_tokens: int = 0,
     evicted_allocated_bytes: int | None = 0,
+    request_telemetry: dict[str, float] | None = None,
+    batch_forfeited_lcp: int = 0,
+    batch_probe_status: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    info = {
         "match_kind": match_kind,
         "lcp": max(int(lcp), 0),
         "checkpoint_position": checkpoint_position,
@@ -681,7 +690,16 @@ def _session_selection_info(
         "new_tokens": max(int(new_tokens), 0),
         "evicted_processed_tokens": evicted_processed_tokens,
         "evicted_allocated_bytes": evicted_allocated_bytes,
+        "batch_forfeited_lcp": max(int(batch_forfeited_lcp), 0),
     }
+    if batch_probe_status is not None:
+        info["batch_probe_status"] = batch_probe_status
+    if request_telemetry is not None:
+        for key in ("template_tokenize_s", "lcp_scan_s", "restore_s"):
+            value = request_telemetry.get(key)
+            if value is not None:
+                info[key] = max(float(value), 0.0)
+    return info
 
 
 def _record_session_selection(sess, info: dict[str, Any]) -> None:
@@ -707,6 +725,14 @@ def _record_session_selection(sess, info: dict[str, Any]) -> None:
         telemetry["checkpoint_tokens"] += info["checkpoint_position"]
     telemetry["reused_tokens"] += info["reused_tokens"]
     telemetry["new_tokens"] += info["new_tokens"]
+    if any(key in info for key in ("template_tokenize_s", "lcp_scan_s", "restore_s")):
+        telemetry["timed_requests"] += 1
+        for key in ("template_tokenize_s", "lcp_scan_s", "restore_s"):
+            telemetry[key] += float(info.get(key, 0.0))
+    forfeited = int(info.get("batch_forfeited_lcp", 0))
+    if forfeited:
+        telemetry["batch_forfeited_requests"] += 1
+        telemetry["batch_forfeited_lcp_tokens"] += forfeited
     if info["evicted"]:
         telemetry["evictions"] += 1
         telemetry["evicted_processed_tokens"] += info["evicted_processed_tokens"]
@@ -718,7 +744,11 @@ def _record_session_selection(sess, info: dict[str, Any]) -> None:
             telemetry["evicted_allocated_bytes"] += evicted_bytes
 
 
-def _selection_for_result(prompt_ids: list[int], session) -> dict[str, Any]:
+def _selection_for_result(
+    prompt_ids: list[int],
+    session,
+    request_telemetry: dict[str, float] | None = None,
+) -> dict[str, Any]:
     if session is not None:
         info = getattr(session, _SESSION_SELECTION_ATTR, None)
         if not isinstance(info, dict):
@@ -727,18 +757,33 @@ def _selection_for_result(prompt_ids: list[int], session) -> dict[str, Any]:
         if isinstance(info, dict):
             return dict(info)
     return _session_selection_info(
-        "miss", 0, 0, len(prompt_ids), evicted_processed_tokens=0,
+        "miss",
+        0,
+        0,
+        len(prompt_ids),
+        evicted_processed_tokens=0,
+        request_telemetry=request_telemetry,
     )
 
 
-def _attach_selection_to_result(result: dict | object, prompt_ids: list[int], session):
+def _attach_selection_to_result(
+    result: dict | object,
+    prompt_ids: list[int],
+    session,
+    selection_override: dict[str, Any] | None = None,
+    request_telemetry: dict[str, float] | None = None,
+):
     """Add internal selection metadata to a runner result and count misses."""
 
     if not isinstance(result, dict):
         return result
     if "_session_selection" in result:
         return result
-    info = _selection_for_result(prompt_ids, session)
+    info = (
+        dict(selection_override)
+        if isinstance(selection_override, dict)
+        else _selection_for_result(prompt_ids, session, request_telemetry)
+    )
     if session is None:
         # Batched and downgraded requests intentionally do not use the pool.
         _record_session_selection(None, info)
@@ -775,6 +820,12 @@ def _session_telemetry_snapshot() -> dict[str, Any]:
         "evicted_processed_tokens": telemetry["evicted_processed_tokens"],
         "evicted_allocated_bytes": telemetry["evicted_allocated_bytes"],
         "evicted_allocated_bytes_unknown": telemetry["evicted_allocated_bytes_unknown"],
+        "timed_requests": telemetry["timed_requests"],
+        "template_tokenize_s": telemetry["template_tokenize_s"],
+        "lcp_scan_s": telemetry["lcp_scan_s"],
+        "restore_s": telemetry["restore_s"],
+        "batch_forfeited_requests": telemetry["batch_forfeited_requests"],
+        "batch_forfeited_lcp_tokens": telemetry["batch_forfeited_lcp_tokens"],
         # Computed only when /api/status is polled, not on the request hot path.
         # ``known`` remains useful while ``allocated`` is None because one
         # custom/unsupported cache object could not be inspected.
@@ -788,7 +839,9 @@ def _session_telemetry_snapshot() -> dict[str, Any]:
     }
 
 
-def _select_session(prompt_ids: list[int]):
+def _select_session(
+    prompt_ids: list[int], request_telemetry: dict[str, float] | None = None
+):
     """Pick the session (ChatSession/FallbackSession) to use for a new prompt
     out of ``STATE.session_pool``.
 
@@ -851,6 +904,8 @@ def _select_session(prompt_ids: list[int]):
     """
 
     pool = STATE.session_pool
+    trace = request_telemetry if STATE.debug_log else None
+    lcp_started = time.perf_counter() if trace is not None else None
     # The generate paths need at least one token left to prefill: with a
     # zero-length delta, generate_stream never enters its chunk loop and the
     # hyper state it reads right after stays unset. So reuse is capped one
@@ -901,6 +956,9 @@ def _select_session(prompt_ids: list[int]):
             best_key = key
 
     if best_key is not None:
+        if trace is not None:
+            trace["lcp_scan_s"] = time.perf_counter() - lcp_started
+            trace.setdefault("restore_s", 0.0)
         pool.move_to_end(best_key)
         sess = pool[best_key]
         match_kind = "exact" if best_lcp == len(prompt_ids) else "append"
@@ -909,6 +967,7 @@ def _select_session(prompt_ids: list[int]):
             best_lcp,
             best_lcp,
             len(prompt_ids) - best_lcp,
+            request_telemetry=trace,
         )
         _record_session_selection(sess, info)
         return sess
@@ -924,9 +983,16 @@ def _select_session(prompt_ids: list[int]):
         if 0 < lcp < len(pl):
             partial.append((lcp, key, sess))
     partial.sort(key=lambda c: -c[0])
+    if trace is not None:
+        trace["lcp_scan_s"] = time.perf_counter() - lcp_started
+        trace.setdefault("restore_s", 0.0)
 
     for lcp, key, sess in partial:
-        if _try_trim_session_cache(sess, len(sess.processed) - lcp):
+        restore_started = time.perf_counter() if trace is not None else None
+        trimmed = _try_trim_session_cache(sess, len(sess.processed) - lcp)
+        if trace is not None:
+            trace["restore_s"] += time.perf_counter() - restore_started
+        if trimmed:
             sess.processed = sess.processed[:lcp]
             if hasattr(sess, "mtp_cache"):
                 sess.mtp_cache = None
@@ -937,11 +1003,15 @@ def _select_session(prompt_ids: list[int]):
             pool.move_to_end(key)
             info = _session_selection_info(
                 "trim", lcp, lcp, len(prompt_ids) - lcp,
+                request_telemetry=trace,
             )
             _record_session_selection(sess, info)
             return sess
 
+        restore_started = time.perf_counter() if trace is not None else None
         cp_pos = _try_checkpoint_restore_session_cache(sess, lcp)
+        if trace is not None:
+            trace["restore_s"] += time.perf_counter() - restore_started
         if cp_pos is not None:
             sess.processed = sess.processed[:cp_pos]
             if hasattr(sess, "checkpoints"):
@@ -958,6 +1028,7 @@ def _select_session(prompt_ids: list[int]):
             info = _session_selection_info(
                 "checkpoint", lcp, cp_pos, len(prompt_ids) - cp_pos,
                 checkpoint_position=cp_pos,
+                request_telemetry=trace,
             )
             _record_session_selection(sess, info)
             return sess
@@ -984,12 +1055,15 @@ def _select_session(prompt_ids: list[int]):
         evicted=was_evicted,
         evicted_processed_tokens=evicted_processed_tokens,
         evicted_allocated_bytes=evicted_allocated_bytes,
+        request_telemetry=trace,
     )
     _record_session_selection(session, info)
     return session
 
 
-async def _select_session_on_executor(prompt_ids: list[int]):
+async def _select_session_on_executor(
+    prompt_ids: list[int], request_telemetry: dict[str, float] | None = None
+):
     """Run ``_select_session`` on ``STATE.executor`` (the same dedicated worker
     thread that loaded the model).
 
@@ -1016,7 +1090,9 @@ async def _select_session_on_executor(prompt_ids: list[int]):
     """
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(STATE.executor, _select_session, prompt_ids)
+    return await loop.run_in_executor(
+        STATE.executor, _select_session, prompt_ids, request_telemetry
+    )
 
 
 def _try_reserve_queue_slot() -> bool:
@@ -1425,7 +1501,10 @@ def _naive_prompt_ids(messages: list[dict]):
 
 
 def _apply_template(
-    messages: list[dict], enable_thinking: bool | None = None, tools: list | None = None
+    messages: list[dict],
+    enable_thinking: bool | None = None,
+    tools: list | None = None,
+    request_telemetry: dict[str, float] | None = None,
 ):
     """``enable_thinking`` is the value already resolved from the standard
     fields (reasoning_effort/thinking). When omitted (None) the template's own
@@ -1453,22 +1532,27 @@ def _apply_template(
     up, and making that determination is the caller's responsibility).
     """
 
-    kwargs = {"add_generation_prompt": True}
-    if enable_thinking is not None:
-        kwargs["enable_thinking"] = enable_thinking
-    if tools is not None:
-        kwargs["tools"] = tools
+    started = time.perf_counter() if request_telemetry is not None else None
     try:
-        return STATE.tokenizer.apply_chat_template(messages, **kwargs)
-    except TypeError:
-        kwargs.pop("enable_thinking", None)
+        kwargs = {"add_generation_prompt": True}
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = enable_thinking
+        if tools is not None:
+            kwargs["tools"] = tools
         try:
             return STATE.tokenizer.apply_chat_template(messages, **kwargs)
+        except TypeError:
+            kwargs.pop("enable_thinking", None)
+            try:
+                return STATE.tokenizer.apply_chat_template(messages, **kwargs)
+            except ValueError:
+                return _naive_prompt_ids(messages)
         except ValueError:
+            # A model with no chat template (chat_template is unset).
             return _naive_prompt_ids(messages)
-    except ValueError:
-        # A model with no chat template (chat_template is unset).
-        return _naive_prompt_ids(messages)
+    finally:
+        if request_telemetry is not None:
+            request_telemetry["template_tokenize_s"] = time.perf_counter() - started
 
 
 # Rough mapping from reasoning_effort to a thinking token budget. mlxturbo
@@ -3003,6 +3087,23 @@ def _log_gen_stats(res: dict) -> None:
             f" evicted_processed={selection.get('evicted_processed_tokens', 0)}"
             f" evicted_bytes={evicted_bytes_text}"
         )
+        timing_parts = " ".join(
+            f"{key.removesuffix('_s')}={float(selection[key]) * 1000:.2f}ms"
+            for key in ("template_tokenize_s", "lcp_scan_s", "restore_s")
+            if key in selection
+        )
+        if timing_parts:
+            line += f" | session-timing {timing_parts}"
+        if "batch_probe_status" in selection:
+            line += (
+                f" | batch-forfeited lcp={selection.get('batch_forfeited_lcp', 0)}"
+                f" probe={selection['batch_probe_status']}"
+            )
+    if "preemptions" in res or "preemption_recomputed_tokens" in res:
+        line += (
+            f" | batch-preemptions={int(res.get('preemptions', 0))}"
+            f" recomputed={int(res.get('preemption_recomputed_tokens', 0))}"
+        )
     print(line)
 
 
@@ -3094,6 +3195,8 @@ def _resolve_batch_route(
     max_tokens: int,
     logprobs_requested: bool = False,
     sampling_kwargs: dict | None = None,
+    request_telemetry: dict[str, float] | None = None,
+    session_compatible: bool = True,
 ):
     """``None`` means "not batch-eligible — route through STATE.lock exactly
     as before" (this is also what makes --max-batch/--max-batch-spec's default
@@ -3101,8 +3204,10 @@ def _resolve_batch_route(
     these changes: both coordinators are None, so every call short-circuits
     here).
 
-    Otherwise a ``(coordinator, tier)`` pair. Two mechanisms can answer, and
-    they cover disjoint request classes, so at most one ever matches:
+    Otherwise a ``(coordinator, tier)`` pair. In debug mode only, a third
+    element records the best session LCP that this batch route gives up. Two
+    mechanisms can answer, and they cover disjoint request classes, so at most
+    one ever matches:
 
     - ``STATE.batch_coordinator`` (--max-batch, mlxturbo/batch.py): continuous
       batching for requests resolved to a plain ``FallbackRunner``. ``tier`` is
@@ -3120,14 +3225,74 @@ def _resolve_batch_route(
 
     if logprobs_requested:
         return None
+
+    def with_probe(coordinator, tier):
+        if not STATE.debug_log:
+            return coordinator, tier
+        if session_compatible:
+            lcp, status = _probe_best_session_lcp(prompt_ids)
+        else:
+            # A request downgraded from a speculative primary to FallbackRunner
+            # cannot consume the primary's ChatSession objects.  Reporting their
+            # LCP as forfeited reuse would claim savings that were never legal.
+            lcp, status = 0, "incompatible"
+        info = _session_selection_info(
+            "miss",
+            lcp,
+            0,
+            len(prompt_ids),
+            request_telemetry=request_telemetry,
+            batch_forfeited_lcp=lcp,
+            batch_probe_status=status,
+        )
+        return coordinator, tier, info
+
     coordinator = STATE.batch_coordinator
     if coordinator is not None and can_batch(gen_runner):
-        return coordinator, _runner_batch_tier(coordinator, prompt_ids, max_tokens)
+        return with_probe(
+            coordinator, _runner_batch_tier(coordinator, prompt_ids, max_tokens)
+        )
     spec = STATE.spec_batch_coordinator
     if spec is not None and can_batch_spec(gen_runner):
         if spec_batch_eligible(spec, prompt_ids, max_tokens, sampling_kwargs or {}) and not _spec_batch_would_be_alone(spec):
-            return spec, "spec"
+            return with_probe(spec, "spec")
     return None
+
+
+def _probe_best_session_lcp(prompt_ids: list[int]) -> tuple[int, str]:
+    """Read-only estimate of reusable tokens forfeited by a batch route.
+
+    The serial generation path owns ``STATE.lock`` while it mutates or
+    publishes a session.  A batch decision happens on the event-loop thread,
+    before taking that lock, so probing is safe only while it is currently
+    free.  If it is held, report ``busy`` and zero rather than waiting or
+    changing queue order.  Only Python token lists and tail positions are
+    inspected; no MLX cache object is touched.
+    """
+
+    if STATE.lock.locked():
+        return 0, "busy"
+    best = 0
+    for sess in tuple(STATE.session_pool.values()):
+        try:
+            processed = tuple(sess.processed)
+        except Exception:
+            continue
+        if not processed:
+            continue
+        cap = max(len(prompt_ids) - 1, 0)
+        try:
+            tail = sess.tail
+        except Exception:
+            tail = None
+        if tail is not None and tail[0] == len(prompt_ids):
+            cap = len(prompt_ids)
+        n = min(len(processed), len(prompt_ids), cap)
+        i = 0
+        while i < n and processed[i] == prompt_ids[i]:
+            i += 1
+        best = max(best, i)
+    return best, "ok"
 
 
 def _spec_batch_would_be_alone(spec) -> bool:
@@ -3200,7 +3365,8 @@ async def _run_generate_batched(
     ``CancelledError`` is allowed to propagate until the Future is done.
     """
 
-    coordinator, tier = route
+    coordinator, tier = route[:2]
+    selection = route[2] if len(route) > 2 else None
     if tier == "spec":
         future = start_batched_spec_generation(
             coordinator, prompt_ids, max_tokens, temp, STATE.eos_ids,
@@ -3227,7 +3393,9 @@ async def _run_generate_batched(
             raise
         if cancelled is not None:
             raise cancelled
-        return _attach_selection_to_result(result, prompt_ids, None)
+        return _attach_selection_to_result(
+            result, prompt_ids, None, selection_override=selection
+        )
 
 
 def _start_batched_generation(
@@ -3255,10 +3423,13 @@ def _start_batched_generation(
 
     def on_done_with_telemetry(kind, value):
         if kind == "done":
-            value = _attach_selection_to_result(value, prompt_ids, None)
+            selection = route[2] if len(route) > 2 else None
+            value = _attach_selection_to_result(
+                value, prompt_ids, None, selection_override=selection
+            )
         on_done(kind, value)
 
-    coordinator, tier = route
+    coordinator, tier = route[:2]
     if tier == "spec":
         future = start_batched_spec_generation(
             coordinator,
@@ -3289,7 +3460,15 @@ def _start_batched_generation(
 
 
 async def _run_generate(
-    prompt_ids, max_tokens, temp, eos_ids, on_tokens, session, runner=None, **sampling_kwargs
+    prompt_ids,
+    max_tokens,
+    temp,
+    eos_ids,
+    on_tokens,
+    session,
+    runner=None,
+    request_telemetry: dict[str, float] | None = None,
+    **sampling_kwargs,
 ):
     """Omitting ``runner`` means ``STATE.runner`` (the normal path). For a
     request that was downgraded per request (item 7; see
@@ -3334,7 +3513,12 @@ async def _run_generate(
             raise
         if cancelled is not None:
             raise cancelled
-        return _attach_selection_to_result(result, prompt_ids, session)
+        return _attach_selection_to_result(
+            result,
+            prompt_ids,
+            session,
+            request_telemetry=request_telemetry,
+        )
 
 
 def _chunk_string(s: str, size: int = 24) -> list[str]:
@@ -3474,6 +3658,7 @@ def _start_generation(
     session=None,
     runner=None,
     t_trace: dict | None = None,
+    request_telemetry: dict[str, float] | None = None,
     eos_ids: set | None = None,
     **sampling_kwargs,
 ):
@@ -3554,7 +3739,12 @@ def _start_generation(
                 **trace_kwargs,
                 **sampling_kwargs,
             )
-            res = _attach_selection_to_result(res, prompt_ids, session)
+            res = _attach_selection_to_result(
+                res,
+                prompt_ids,
+                session,
+                request_telemetry=request_telemetry,
+            )
             on_done("done", res)
         except _GenerationCancelled:
             # Cancelling the asyncio Task around ``to_thread(q.get)`` cannot
@@ -3854,6 +4044,7 @@ async def health():
             "solo_runs": spec.solo_runs,
             "joins": spec.joins,
             "preemptions": spec.preemptions,
+            "preemption_recomputed_tokens": spec.preemption_recomputed_tokens,
             "wait_ms": spec.wait_ms,
             "token_budget": spec.token_budget,
             "prefill_chunk": spec.prefill_chunk,
@@ -4027,7 +4218,12 @@ async def chat_completions(request: Request):
     if err is not None:
         return _openai_error(err)
     try:
-        prompt_ids = _apply_template(norm_messages, enable_thinking, tools=resolved_tools)
+        prompt_ids = _apply_template(
+            norm_messages,
+            enable_thinking,
+            tools=resolved_tools,
+            request_telemetry=t_trace if STATE.debug_log else None,
+        )
     except Exception as exc:
         return _openai_error(f"failed to render chat template: {exc}")
     # [ttft-trace]: (b) after template rendering/tokenize.
@@ -4149,6 +4345,8 @@ async def chat_completions(request: Request):
     batch_route = None if ignore_eos else _resolve_batch_route(
         gen_runner, prompt_ids, max_tokens, logprobs_requested=logprobs_requested,
         sampling_kwargs=sampling_params,
+        request_telemetry=t_trace,
+        session_compatible=downgrade_reason is None,
     )
     try:
         if batch_route is not None:
@@ -4169,7 +4367,7 @@ async def chat_completions(request: Request):
                 # it simply builds a fresh prompt_cache every time (see the
                 # _resolve_runner_for_request docstring).
                 session = None if downgrade_reason is not None else await _select_session_on_executor(
-                    prompt_ids
+                    prompt_ids, t_trace
                 )
                 res = await _run_generate(
                     prompt_ids,
@@ -4179,6 +4377,7 @@ async def chat_completions(request: Request):
                     None,
                     session,
                     runner=gen_runner,
+                    request_telemetry=t_trace,
                     **sampling_params,
                 )
     except Exception as exc:
@@ -4317,6 +4516,8 @@ async def _openai_stream(
             prompt_ids,
             max_tokens,
             sampling_kwargs=sampling_params or {},
+            request_telemetry=t_trace,
+            session_compatible=runner is None or runner is STATE.runner,
         )
     )
     try:
@@ -4359,7 +4560,9 @@ async def _openai_stream(
             # STATE.downgrade_runner) does not touch the session pool — the types
             # do not match (see the _resolve_runner_for_request docstring).
             downgraded = runner is not None and runner is not STATE.runner
-            session = None if downgraded else await _select_session_on_executor(prompt_ids)
+            session = None if downgraded else await _select_session_on_executor(
+                prompt_ids, t_trace
+            )
             # [ttft-trace]: (c) after session matching.
             t_trace["c_select"] = time.perf_counter()
             # By the time ``_select_session`` has chosen a slot it has already
@@ -4385,6 +4588,7 @@ async def _openai_stream(
                 session=session,
                 runner=runner,
                 t_trace=t_trace,
+                request_telemetry=t_trace,
                 eos_ids=effective_eos_ids,
                 **(sampling_params or {}),
             )
@@ -4630,6 +4834,7 @@ async def anthropic_messages(request: Request):
         return _anthropic_error("request body must be valid JSON")
     if not isinstance(body, dict):
         return _anthropic_error("request body must be a JSON object")
+    request_telemetry = {} if STATE.debug_log else None
 
     model_err = _check_model_anthropic(body)
     if model_err is not None:
@@ -4687,7 +4892,12 @@ async def anthropic_messages(request: Request):
     if err is not None:
         return _anthropic_error(err)
     try:
-        prompt_ids = _apply_template(norm_messages, enable_thinking, tools=resolved_tools)
+        prompt_ids = _apply_template(
+            norm_messages,
+            enable_thinking,
+            tools=resolved_tools,
+            request_telemetry=request_telemetry,
+        )
     except Exception as exc:
         return _anthropic_error(f"failed to render chat template: {exc}")
     ctx_err = _check_context_length(prompt_ids, "anthropic")
@@ -4753,6 +4963,7 @@ async def anthropic_messages(request: Request):
                     tool_enabled,
                     resolved_tools,
                     runner=gen_runner,
+                    request_telemetry=request_telemetry,
                 )
             ),
             media_type="text/event-stream",
@@ -4761,6 +4972,8 @@ async def anthropic_messages(request: Request):
 
     batch_route = _resolve_batch_route(
         gen_runner, prompt_ids, max_tokens, sampling_kwargs=sampling_params,
+        request_telemetry=request_telemetry,
+        session_compatible=downgrade_reason is None,
     )
     try:
         if batch_route is not None:
@@ -4773,7 +4986,7 @@ async def anthropic_messages(request: Request):
                 # reason as chat_completions; see the _resolve_runner_for_request
                 # docstring).
                 session = None if downgrade_reason is not None else await _select_session_on_executor(
-                    prompt_ids
+                    prompt_ids, request_telemetry
                 )
                 res = await _run_generate(
                     prompt_ids,
@@ -4783,6 +4996,7 @@ async def anthropic_messages(request: Request):
                     None,
                     session,
                     runner=gen_runner,
+                    request_telemetry=request_telemetry,
                     **sampling_params,
                 )
     except Exception as exc:
@@ -4852,6 +5066,7 @@ async def _anthropic_stream(
     tool_enabled: bool = False,
     tools_for_parsing=None,
     runner=None,
+    request_telemetry: dict[str, float] | None = None,
 ):
     def sse(event, data):
         return f"event: {event}\ndata: {json.dumps(data)}\n\n"
@@ -4884,6 +5099,8 @@ async def _anthropic_stream(
     batch_route = _resolve_batch_route(
         runner or STATE.runner, prompt_ids, max_tokens,
         sampling_kwargs=sampling_params or {},
+        request_telemetry=request_telemetry,
+        session_compatible=runner is None or runner is STATE.runner,
     )
     try:
         if batch_route is not None:
@@ -4914,7 +5131,9 @@ async def _anthropic_stream(
                     yield keepalive
 
             downgraded = runner is not None and runner is not STATE.runner
-            session = None if downgraded else await _select_session_on_executor(prompt_ids)
+            session = None if downgraded else await _select_session_on_executor(
+                prompt_ids, request_telemetry
+            )
             reused_at_select = len(session.processed) if session is not None else 0
             q, future, cancel_event, raw_token_count = _start_generation(
                 prompt_ids,
@@ -4925,6 +5144,7 @@ async def _anthropic_stream(
                 tools_for_parsing,
                 session=session,
                 runner=runner,
+                request_telemetry=request_telemetry,
                 **(sampling_params or {}),
             )
         try:
@@ -5206,6 +5426,7 @@ async def completions(request: Request):
         return _openai_error("request body must be valid JSON")
     if not isinstance(body, dict):
         return _openai_error("request body must be a JSON object")
+    request_telemetry = {} if STATE.debug_log else None
 
     model_err = _check_model_openai(body)
     if model_err is not None:
@@ -5292,6 +5513,7 @@ async def completions(request: Request):
                     sampling_params,
                     runner=gen_runner,
                     eos_ids=request_eos_ids,
+                    request_telemetry=request_telemetry,
                 )
             ),
             media_type="text/event-stream",
@@ -5301,6 +5523,8 @@ async def completions(request: Request):
     batch_route = None if ignore_eos else _resolve_batch_route(
         gen_runner, prompt_ids, max_tokens, logprobs_requested=logprobs_requested,
         sampling_kwargs=sampling_params,
+        request_telemetry=request_telemetry,
+        session_compatible=downgrade_reason is None,
     )
     try:
         if batch_route is not None:
@@ -5310,7 +5534,7 @@ async def completions(request: Request):
         else:
             async with STATE.lock:
                 session = None if downgrade_reason is not None else await _select_session_on_executor(
-                    prompt_ids
+                    prompt_ids, request_telemetry
                 )
                 res = await _run_generate(
                     prompt_ids,
@@ -5320,6 +5544,7 @@ async def completions(request: Request):
                     None,
                     session,
                     runner=gen_runner,
+                    request_telemetry=request_telemetry,
                     **sampling_params,
                 )
     except Exception as exc:
@@ -5381,6 +5606,7 @@ async def _completions_stream(
     sampling_params: dict | None = None,
     runner=None,
     eos_ids: set | None = None,
+    request_telemetry: dict[str, float] | None = None,
 ):
     owned = [False]
     effective_eos_ids = STATE.eos_ids if eos_ids is None else eos_ids
@@ -5392,6 +5618,8 @@ async def _completions_stream(
             prompt_ids,
             max_tokens,
             sampling_kwargs=sampling_params or {},
+            request_telemetry=request_telemetry,
+            session_compatible=runner is None or runner is STATE.runner,
         )
     )
     try:
@@ -5419,12 +5647,15 @@ async def _completions_stream(
                     yield keepalive
 
             downgraded = runner is not None and runner is not STATE.runner
-            session = None if downgraded else await _select_session_on_executor(prompt_ids)
+            session = None if downgraded else await _select_session_on_executor(
+                prompt_ids, request_telemetry
+            )
             reused_at_select = len(session.processed) if session is not None else 0
             # thinking_budget=0 pins ThinkingRouter to content-only (regardless of
             # has_thinking), so reasoning_delta can never arrive.
             q, future, cancel_event, raw_token_count = _start_generation(
                 prompt_ids, max_tokens, temp, 0, session=session, runner=runner,
+                request_telemetry=request_telemetry,
                 eos_ids=effective_eos_ids, **(sampling_params or {})
             )
         try:
@@ -6064,6 +6295,7 @@ async def responses_endpoint(request: Request):
         return _openai_error("request body must be valid JSON")
     if not isinstance(body, dict):
         return _openai_error("request body must be a JSON object")
+    request_telemetry = {} if STATE.debug_log else None
 
     # previous_response_id/store (item 15): the server keeps an in-memory LRU
     # (STATE.response_store, main()'s --max-stored-responses; nothing is
@@ -6105,7 +6337,12 @@ async def responses_endpoint(request: Request):
     if err is not None:
         return _openai_error(err)
     try:
-        prompt_ids = _apply_template(norm_messages, enable_thinking, tools=resolved_tools)
+        prompt_ids = _apply_template(
+            norm_messages,
+            enable_thinking,
+            tools=resolved_tools,
+            request_telemetry=request_telemetry,
+        )
     except Exception as exc:
         return _openai_error(f"failed to render chat template: {exc}")
     ctx_err = _check_context_length(prompt_ids, "openai")
@@ -6157,6 +6394,7 @@ async def responses_endpoint(request: Request):
                     store=store,
                     combined_input=combined_input,
                     effective_instructions=effective_instructions,
+                    request_telemetry=request_telemetry,
                 )
             ),
             media_type="text/event-stream",
@@ -6165,6 +6403,8 @@ async def responses_endpoint(request: Request):
 
     batch_route = _resolve_batch_route(
         gen_runner, prompt_ids, max_tokens, sampling_kwargs=sampling_params,
+        request_telemetry=request_telemetry,
+        session_compatible=downgrade_reason is None,
     )
     try:
         if batch_route is not None:
@@ -6174,7 +6414,7 @@ async def responses_endpoint(request: Request):
         else:
             async with STATE.lock:
                 session = None if downgrade_reason is not None else await _select_session_on_executor(
-                    prompt_ids
+                    prompt_ids, request_telemetry
                 )
                 res = await _run_generate(
                     prompt_ids,
@@ -6184,6 +6424,7 @@ async def responses_endpoint(request: Request):
                     None,
                     session,
                     runner=gen_runner,
+                    request_telemetry=request_telemetry,
                     **sampling_params,
                 )
     except Exception as exc:
@@ -6237,6 +6478,7 @@ async def _responses_stream(
     store: bool = False,
     combined_input: list | None = None,
     effective_instructions: str | None = None,
+    request_telemetry: dict[str, float] | None = None,
 ):
     """Emit the Responses API's main lifecycle event sequence: response.created
     -> response.output_item.added -> response.output_text.delta /
@@ -6280,6 +6522,8 @@ async def _responses_stream(
     batch_route = _resolve_batch_route(
         runner or STATE.runner, prompt_ids, max_tokens,
         sampling_kwargs=sampling_params or {},
+        request_telemetry=request_telemetry,
+        session_compatible=runner is None or runner is STATE.runner,
     )
     try:
         if batch_route is not None:
@@ -6309,7 +6553,9 @@ async def _responses_stream(
                     yield keepalive
 
             downgraded = runner is not None and runner is not STATE.runner
-            session = None if downgraded else await _select_session_on_executor(prompt_ids)
+            session = None if downgraded else await _select_session_on_executor(
+                prompt_ids, request_telemetry
+            )
             q, future, cancel_event, raw_token_count = _start_generation(
                 prompt_ids,
                 max_tokens,
@@ -6319,6 +6565,7 @@ async def _responses_stream(
                 tools_for_parsing,
                 session=session,
                 runner=runner,
+                request_telemetry=request_telemetry,
                 **(sampling_params or {}),
             )
         try:

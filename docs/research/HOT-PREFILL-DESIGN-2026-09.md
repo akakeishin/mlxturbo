@@ -121,10 +121,15 @@ LCP、checkpoint位置、reused/new、追放token/allocated bytesを1 request 1�
 通常requestは計測フラグも結果キーも作らない。実Flash-Nextの60-token煙試験では、serverの
 `ttft=0.97s`に対してprefill 971.2ms、first-token 0.4msと対応した。server全回帰は443件通過。
 
-残るP0は、tokenize/LCP探索/restoreを個別の時間へ分けること、Flash以外のrunnerでは
-分割不能な区間を明示すること、batchを選んだため失ったLCP、preemption後の再計算tokenを
-記録すること、固定suffixの反復でallocated bytesとMLX active memoryの差を5%以内へ
-合わせることである。
+2026-09-04 21:46には、debug requestだけで`template_tokenize_s`、`lcp_scan_s`、
+`restore_s`を分離した。batch経路はsession poolを変更せずtoken ID列だけをprobeし、失ったLCPを
+request結果と累積値へ記録する。投機primaryからFallbackRunnerへ降格してcache型が一致しない場合は
+`probe=incompatible`、LCP 0として、存在しない再利用を計上しない。spec batchのrecompute型
+preemptionは、退避時ではなく復帰prefill完了時の実入力token数だけを数える。追加の`mx.eval`はなく、
+通常requestでは時計もLCP probeも実行しない。server全回帰は**448 passed**。
+
+残るP0は、Flash以外のrunnerでprefill/first-tokenを分割できない区間の明示と、固定suffix反復で
+allocated bytesとpool予測値の差を5%以内へ合わせることである。
 
 ### P1: byte-budget比較
 

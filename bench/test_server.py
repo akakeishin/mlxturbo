@@ -4509,6 +4509,36 @@ def test_session_selection_miss_reports_best_unusable_lcp(monkeypatch):
     assert state.last_session_selection["new_tokens"] == 3
 
 
+def test_session_phase_timings_exist_only_in_debug_mode():
+    state = _install_state(
+        FakeRunner(tokens_to_emit=[]),
+        session_factory=lambda: SimpleNamespace(processed=[]),
+    )
+    supplied = {"template_tokenize_s": 0.001}
+    server._select_session([1, 2], supplied)
+    assert "template_tokenize_s" not in state.last_session_selection
+
+    state.session_pool.clear()
+    state.debug_log = True
+    server._select_session([1, 2], supplied)
+    info = state.last_session_selection
+    assert info["template_tokenize_s"] == pytest.approx(0.001)
+    assert info["lcp_scan_s"] >= 0.0
+    assert info["restore_s"] == 0.0
+    assert state.session_telemetry["timed_requests"] == 1
+    assert state.session_telemetry["template_tokenize_s"] == pytest.approx(0.001)
+
+
+def test_apply_template_records_only_the_tokenizer_call_when_requested():
+    tok = FakeTokenizer(prompt_ids=[7, 8, 9])
+    _install_state(FakeRunner(tokens_to_emit=[]), tokenizer=tok)
+    trace = {}
+    assert server._apply_template(
+        [{"role": "user", "content": "x"}], request_telemetry=trace
+    ) == [7, 8, 9]
+    assert trace["template_tokenize_s"] >= 0.0
+
+
 def test_session_eviction_telemetry_deduplicates_nbytes_and_marks_unknown():
     class SizedLeaf:
         def __init__(self, nbytes):
@@ -4611,7 +4641,14 @@ def test_generation_log_includes_session_selection_fields():
             "new_tokens": 2,
             "evicted_processed_tokens": 0,
             "evicted_allocated_bytes": None,
+            "template_tokenize_s": 0.001,
+            "lcp_scan_s": 0.002,
+            "restore_s": 0.003,
+            "batch_forfeited_lcp": 7,
+            "batch_probe_status": "ok",
         },
+        "preemptions": 1,
+        "preemption_recomputed_tokens": 19,
     }
     with mock.patch("builtins.print") as emit:
         server._log_gen_stats(result)
@@ -4623,6 +4660,11 @@ def test_generation_log_includes_session_selection_fields():
     assert "new=2" in line
     assert "evicted_bytes=unknown" in line
     assert "ttft-phase: prefill=80.0ms first_token=20.0ms" in line
+    assert "template_tokenize=1.00ms" in line
+    assert "lcp_scan=2.00ms" in line
+    assert "restore=3.00ms" in line
+    assert "batch-forfeited lcp=7 probe=ok" in line
+    assert "batch-preemptions=1 recomputed=19" in line
 
 
 # ---------- 12b. バグ修正: チェックポイントによる部分一致からの復元 ----------
@@ -5905,9 +5947,9 @@ def test_select_session_on_executor_runs_on_state_executor_thread():
     seen_thread_id: dict[str, int] = {}
     orig = server._select_session
 
-    def spy(prompt_ids):
+    def spy(prompt_ids, request_telemetry=None):
         seen_thread_id["id"] = threading.get_ident()
-        return orig(prompt_ids)
+        return orig(prompt_ids, request_telemetry)
 
     with mock.patch.object(server, "_select_session", side_effect=spy):
         asyncio.run(server._select_session_on_executor([1, 2, 3]))
@@ -7916,7 +7958,8 @@ def test_spec_runner_downgrades_non_identity_sampling_params_instead_of_400(clie
     primary = FakeSpecRunner(tokens_to_emit=[10])
     downgrade = FakeRunner(tokens_to_emit=[11])
     tok = FakeTokenizer(vocab={10: "spec-out", 11: "fallback-out"})
-    _install_state(primary, tokenizer=tok, downgrade_runner=downgrade)
+    state = _install_state(primary, tokenizer=tok, downgrade_runner=downgrade)
+    state.debug_log = True
 
     resp = client.post(
         "/v1/chat/completions",
@@ -7930,6 +7973,8 @@ def test_spec_runner_downgrades_non_identity_sampling_params_instead_of_400(clie
     assert body["choices"][0]["message"]["content"] == "fallback-out"
     assert "downgrade_reason" in body
     assert "top_p" in body["downgrade_reason"]
+    assert state.session_telemetry["template_tokenize_s"] >= 0.0
+    assert state.session_telemetry["timed_requests"] == 1
 
 
 def test_spec_runner_identity_values_still_use_primary_runner_when_downgrade_available(client):
@@ -7999,7 +8044,8 @@ def test_spec_runner_downgrade_streaming_sets_response_header(client):
     primary = FakeSpecRunner(tokens_to_emit=[10])
     downgrade = FakeRunner(tokens_to_emit=[10, 999])
     tok = FakeTokenizer(vocab={10: "hi"}, eos_token_ids=(999,))
-    _install_state(primary, tokenizer=tok, downgrade_runner=downgrade)
+    state = _install_state(primary, tokenizer=tok, downgrade_runner=downgrade)
+    state.debug_log = True
 
     resp = client.post(
         "/v1/chat/completions",
@@ -8013,6 +8059,8 @@ def test_spec_runner_downgrade_streaming_sets_response_header(client):
     assert "X-Mlxturbo-Downgrade-Reason" in resp.headers
     assert not primary.calls
     assert downgrade.calls
+    assert state.session_telemetry["template_tokenize_s"] >= 0.0
+    assert state.session_telemetry["timed_requests"] == 1
 
 
 def test_spec_runner_downgrade_does_not_touch_session_pool(client):
@@ -9499,6 +9547,56 @@ def test_resolve_batch_route_pool_vs_solo(batch_env):
     assert server._resolve_batch_route(batch_env.runner, [1] * 6, 4)[1] == "solo"  # 6+4=10 > 8
 
 
+def test_debug_batch_route_reports_reuse_it_forfeits(batch_env):
+    state = _install_state(
+        batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4
+    )
+    state.debug_log = True
+    state.session_pool[0] = SimpleNamespace(processed=[1, 2, 3], tail=None)
+
+    route = server._resolve_batch_route(
+        batch_env.runner,
+        [1, 2, 3, 4],
+        4,
+        request_telemetry={"template_tokenize_s": 0.001},
+    )
+    assert route[:2] == (batch_env.coordinator, "pool")
+    assert route[2]["batch_probe_status"] == "ok"
+    assert route[2]["batch_forfeited_lcp"] == 3
+    assert route[2]["template_tokenize_s"] == pytest.approx(0.001)
+
+    result = asyncio.run(
+        server._run_generate_batched(route, [1, 2, 3, 4], 2, 0.0)
+    )
+    assert result["_session_selection"]["batch_forfeited_lcp"] == 3
+    assert state.session_telemetry["batch_forfeited_requests"] == 1
+    assert state.session_telemetry["batch_forfeited_lcp_tokens"] == 3
+
+
+def test_debug_batch_route_does_not_claim_incompatible_primary_reuse(batch_env):
+    primary = FakeSpecRunner(tokens_to_emit=[10])
+    state = _install_state(
+        primary,
+        downgrade_runner=batch_env.runner,
+        batch_coordinator=batch_env.coordinator,
+        max_batch=4,
+    )
+    state.debug_log = True
+    state.session_pool[0] = SimpleNamespace(processed=[1, 2, 3], tail=None)
+
+    route = server._resolve_batch_route(
+        batch_env.runner,
+        [1, 2, 3, 4],
+        4,
+        request_telemetry={"template_tokenize_s": 0.001},
+        session_compatible=False,
+    )
+    assert route[:2] == (batch_env.coordinator, "pool")
+    assert route[2]["batch_probe_status"] == "incompatible"
+    assert route[2]["batch_forfeited_lcp"] == 0
+    assert route[2]["template_tokenize_s"] == pytest.approx(0.001)
+
+
 def test_maybe_build_batch_coordinator_gating(batch_env):
     from mlxturbo.runner import maybe_build_batch_coordinator
 
@@ -9858,6 +9956,36 @@ def test_spec_preempt_keeps_length_condition():
     assert coord._remaining(adm) == 52
     assert len(prompt) + coord._remaining(adm) == 97  # 退避前と同じ
     assert spec_batchable(model, len(prompt), coord._remaining(adm), depth=2)
+
+
+def test_spec_preempt_recompute_counts_only_completed_prefills():
+    """退避だけでは数えず、復帰prefillの完了ごとに実入力長を1回数える。"""
+
+    from mlxturbo.batch_spec import BatchSpecCoordinator, SpecAdmission
+
+    adm = SpecAdmission(
+        prompt_ids=list(range(40)), max_tokens=57, temp=0.0, sampling={},
+        eos_ids=set(), on_tokens=None, on_done=None, cancel_event=None, future=None,
+    )
+    adm.tokens = [101, 102, 103, 104, 105]
+    adm.preempted = 1
+    coord = BatchSpecCoordinator.__new__(BatchSpecCoordinator)
+    coord.preemption_recomputed_tokens = 0
+
+    # 退避しただけの時点ではゼロ。復帰prefillが完了して初めて40+5を数える。
+    assert adm.preemption_recomputed_tokens == 0
+    coord._record_completed_recompute(adm)
+    assert adm.preemption_recomputed_tokens == 45
+    assert coord.preemption_recomputed_tokens == 45
+
+    # 同じ完了を二重に数えず、次の退避後はその時点の実入力長を加算する。
+    coord._record_completed_recompute(adm)
+    assert coord.preemption_recomputed_tokens == 45
+    adm.tokens.append(106)
+    adm.preempted = 2
+    coord._record_completed_recompute(adm)
+    assert adm.preemption_recomputed_tokens == 91
+    assert coord.preemption_recomputed_tokens == 91
 
 
 def test_spec_batch_sampling_key_isolates_seeded_and_differing_requests():
