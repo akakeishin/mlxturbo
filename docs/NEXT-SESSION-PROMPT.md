@@ -645,3 +645,6 @@ rg -n "pre_feedforward_layernorm|pre_feedforward_layernorm_2|class Router|RMSNor
 1日最大2回、各数時間の強冷却を用意できる。常時運用は設備上行わない。通常条件の同一process A/Bで
 候補が生き残った後、原則Flash-Next研究候補に1枠、その日の別モデル候補に1枠を使う。開始前に
 対象モデル・固定条件・所要時間をユーザーへ明示する。候補が弱い日は使わない。
+
+18:07の強冷却直後診断はFlash-Next短文59.5 tok/s、固定GEMM 12.05 TFLOPS。通常条件53.6 tok/s比
+約+11%だが、十分冷えた既往上限13.05 TFLOPSには未到達。冷却継続後に同じ`null`短文を再測する。
