@@ -2928,3 +2928,43 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - in-model (27B、`bench/results/ab-smallm-kernel-short-0904.json`): 短 case 0 **ms/tok 32.88 対 33.40 (-1.6%)**、case 1 **28.39 対 29.07 (-2.3%)**。ms/round は tok/round が動く (素は幅ごとに丸めが違い、自前は変わらない) ので比較にならず、ms/tok で見る。残り (case 2、4k) は走行中。
 - 冷 micro (`tools/qmv_small_m_micro.py`): 1 forward 合計 M=4 で stock 46.5 対 自前 47.9 = **負け** (lm_head だけ 0.78〜0.87x)。**micro と in-model が逆** (孤立では M カーブ 1.14〜1.32x、実機 1.72x)。仮説は forward 全体で多数の qmv が重なったときの ALU / 発行率の飽和。**この的はカーネル単体の micro では判定できない。**
 - 判定は残りの A/B (複数プロンプト × 512 の ms/tok 平均) の後。「同じ挙動の保証」は取れているので、遅くならなければ既定 on の候補 (代金: bits 8 と gs≠64 は委譲、Flash-Next には未配線)。次の手: M=2..5 に `mma` (8 行に水増し) / `nocap` の経路も同じ A/B で比べる。
+
+### 2026-09-04 13:05 小 M (M=2..5) の量子化行列積の 3 経路を 27B in-model で比較 → `small_m` を既定 auto に (`MLXTURBO_SMALL_M_ROUTE`)
+
+512 トークン × 短 3 本 × 2 回文 + 4k `--prefill-once`、1 プロセス内で 4 変種を交互に (`bench/results/ab-smallm-3way-{short,4k}-0904.json`)。fp32 参照距離は `bench/results/qmv-small-m-accuracy-0904.json` (K=5120/17408/6144/2560 × M=1..8)。
+
+| 経路 | short ms/tok (3 本平均) | 対素 | 4k ms/tok | 対素 | tok/round (short) | fp32 距離 (RMS 相対) |
+|---|---|---|---|---|---|---|
+| small_m | 29.53 | 0.981x | 33.04 | 0.954x | 2.988 | 1.65e-3 (素と同じ) |
+| nocap | 29.54 | 0.981x | 34.90 | 1.008x | 3.097 | 1.65e-3 (素と同じ) |
+| 素 | 30.10 | 1.000x | 34.63 | 1.000x | 2.936 | 1.65e-3 |
+| mma | 31.05 | 1.031x | 36.43 | 1.052x | 3.049 | 2.0〜2.9e-3 (素の 1.3〜1.7 倍) |
+
+- mma (`fast_qmm`) は速さでも品質でも負け。split-K の部分和が bf16 を経由するので fp32 から遠い。simdgroup matrix で ALU の壁を越える案はこの帯では否。
+- small_m と nocap は fp32 距離が素と区別できない (品質の代金ゼロ)。短文脈は同着 (-1.9%)、4k で small_m だけ -4.6% (理由は未特定)。
+- 方針 (ユーザー 12:40) どおり順位はビット一致では付けていない。small_m が各行で qmv と一致するのは計測が楽になる性質として記録。
+- 既定 auto = 非 NAX 機で small_m (自前カーネルは NAX 機で auto=off の方針と同じ判定)。`=off` で素。Flash-Next は `dispatch_scope` を通らないので未接続。
+- `_load_kernels()` は 2 タプルに戻し、小 M の実体は `_load_small_m()` に分離 (`bench/test_dispatch_static.py` の契約テストはそのまま通る。偽 mx のテストは fixture で経路を off に固定)。テスト: test_qmm_smallm 37 + dispatch 系 = 41 passed、エージェントの広い走行 503 passed。
+- 既定の経路が本番の engine で発火することの確認 (`--knob MLXTURBO_SMALL_M_ROUTE=auto,off`、短 3 本 × 256) は GPU の順番待ち → 結果は下に追記。
+
+### 2026-09-04 13:08 Gemma 4 (26B) の 5 者と 27B の「投機なし / 推奨設定」の行 (相手 4 エンジン、`docs/research/COMPARE-QUEUE.md`、`scratchpad/agent-gemma4-smoke.md`)
+
+Gemma 4 26B (MoE、A4B) の decode tok/s (`--ctxs 0,4000 --tokens 64 --reps 1`、冷却無し):
+
+| エンジン | draft | 冷 TTFT (0) | dec (0) | 冷 TTFT (4k) | 温 TTFT (4k) | dec (4k) |
+|---|---|---|---|---|---|---|
+| mlx-lm | なし | 0.22 | 86.8 | 3.10 | 0.37 | 75.1 |
+| oMLX | なし | 0.32 | 122.2 | 0.92 | 0.93 | 107.0 |
+| oMLX | あり | 0.34 | 84.4 | 3.51 | 3.48 | 76.3 |
+| mlx-serve | なし | 0.06 | 109.2 | 2.56 | 0.18 | 95.0 |
+| mlx-serve | あり | 0.14 | 61.6 | 2.68 | 0.27 | 66.7 |
+| MTPLX | — | 起動しない (dense 31B しか受けない) | | | | |
+
+- **公式 draft (`gemma4_assistant`) は 26B では 2 者とも遅くなる** (oMLX 122 → 84、mlx-serve 109 → 62)。MoE の検証フォワードの専門家ルーティングの代金が draft の利得を上回る。mlx-serve は起動時に警告し、受理率が落ちるとランタイムが drafter を切る (`avg_per_round 3.00 → 0.60`)。
+  → **mlxturbo に assistant drafter のエンジンを作る動機は 26B には無い。**dense 31B なら別 (MTPLX は 31B だけ受ける。bundle `~/models/mtplx-gemma4-31b` は作ってある)。Gemma レーンの順は「norm 331 本の削減 → KV 量子化 第 1 段 → TurboQuant」に詰める (drafter は 31B を測ってから)。
+- mlxturbo と mlx-lm は draft なしのみ (`gemma4_assistant` を読めない)。mlxturbo の行 (Gemma 4 draft なし、27B 投機なし / あり) は 1・3 の着地後に `scratchpad/gemma4_smoke_runs3.sh` で取る。
+- 27B の相手の推奨設定: **MTPLX の 28.4 はうちの設定のせいではない** (quickstart 既定で 28.2)。`--profile turbo` で 4k 31.5 (+12%)、depth の上限は 3。**oMLX の depth は上げられない** (block_size 3 → 6 で受理は変わらず検証幅だけ倍、33.7 → 16.0)。
+  **oMLX の 4k 温 TTFT ≈ 冷 は接頭辞キャッシュのブロックが 4096 トークン**のため (3821 トークンのプロンプトでは完成ブロック 0 個。hot cache / paged-ssd を有効にしても 18.67 s)。
+- `--no-mtp` は「投機なし」ではない (mlx-serve は PLD が既定 on、mlxturbo も lookup が残る)。投機ゼロの行は `--no-pld` も付ける。harness に `--extra-body` を足した (mlx-serve の `enable_drafter` のようにリクエスト側にスイッチがあるエンジン用)。
+- 追記 (13:11): 既定 auto の発火確認 (`--knob MLXTURBO_SMALL_M_ROUTE=auto,off`、短 3 本 × 256、`ab-smallm-auto-short-0904.json`): ms/tok **-1.6%**、ms/round -2.0%、tok/round +0.2% (3 経路の A/B の -1.9% と同じ帯)。
+  生成列は 3 本とも途中で分岐 (位置 37 / 14 / 151)。M=2..5 の行が「幅 1 の丸め」になるぶんの丸め差で、方針 (12:40) どおり不採用の理由にしない。

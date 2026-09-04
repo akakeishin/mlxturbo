@@ -1,5 +1,6 @@
 """Metal-free route, fallback, reshape, and enable tests for Phase A3."""
 
+import pytest
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -40,6 +41,18 @@ def test_shape_by_m_table_and_unknown_fallback():
     assert dispatch.select_route(5120, 17408, 5) == dispatch.MMA
     assert dispatch.select_route(17408, 5120, 5) == dispatch.STOCK
     assert dispatch.select_route(5120, 17408, 17) == dispatch.STOCK
+
+
+@pytest.fixture(autouse=True)
+def _small_m_off(monkeypatch):
+    """この file は偽の mx で素の契約を見る。小 M の既定 (auto = 非 NAX で
+    small_m) が入ると M=2..5 が自前カーネルの形検査 (実 mx 前提) に流れるので、
+    経路を off に固定しておく。"""
+    monkeypatch.setenv("MLXTURBO_SMALL_M_ROUTE", "off")
+    dispatch.refresh_small_m_route()
+    yield
+    monkeypatch.delenv("MLXTURBO_SMALL_M_ROUTE", raising=False)
+    dispatch.refresh_small_m_route()
 
 
 def test_stock_path_preserves_full_contract():

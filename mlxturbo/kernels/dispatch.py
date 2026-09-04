@@ -5,6 +5,7 @@ kernels.  Unknown shapes and unsupported quantization modes always retain the
 MLX implementation.
 """
 
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar
 from math import prod
@@ -13,7 +14,8 @@ from typing import Any
 STOCK = "stock"
 NOCAP = "nocap"
 MMA = "mma"
-_ROUTES = frozenset((STOCK, NOCAP, MMA))
+SMALLM = "small_m"
+_ROUTES = frozenset((STOCK, NOCAP, MMA, SMALLM))
 
 
 def _routes(overrides: dict[int, str] | None = None) -> tuple[str, ...]:
@@ -87,6 +89,7 @@ def _load_nn():
 
 
 _KERNELS = None
+_SMALL_M_KERNEL = None
 
 
 def _load_kernels():
@@ -118,6 +121,113 @@ def _load_kernels():
 
     _KERNELS = (qmv_wide_nocap, mma)
     return _KERNELS
+
+
+def _load_small_m():
+    """小 M 経路 (`SMALLM`) の実体。
+
+    **`_load_kernels()` の戻り値には混ぜない。**あちらは
+    `bench/test_dispatch_static.py` が `(nocap, mma)` の 2 タプルに差し替えて
+    経路の振り分けだけを検査する口で、要素を増やすと偽物側が壊れる
+    (2026-09-04 に実際に落とした)。既定 off の経路をわざわざ既定の口に
+    背負わせない。
+    """
+    global _SMALL_M_KERNEL
+    if _SMALL_M_KERNEL is not None:
+        return _SMALL_M_KERNEL
+
+    from .qmv_small_m import qmv_small_m
+
+    def small_m(flat, w, scales, biases, *, group_size, bits):
+        return qmv_small_m(flat, w, scales, biases,
+                           group_size=group_size, bits=bits)
+
+    _SMALL_M_KERNEL = small_m
+    return _SMALL_M_KERNEL
+
+
+# --------------------------------------------------------------------------
+# 検証幅 M=2..5 の経路 (MLXTURBO_SMALL_M_ROUTE、既定 auto = 非 NAX で small_m、2026-09-04)
+# --------------------------------------------------------------------------
+#
+# 上の `DEFAULT_ROUTE_TABLE` は M=6..8 を MMA、M=9..11 を nocap にしてあり、
+# **M=2..5 は stock のまま**。理由は 2026-08-27 の較正 (「M=2..4 は stock 維持
+# (qmv が優位)」) だが、あれは Flash-Next の形での依存チェーンの判定だった。
+#
+# 27B (qwen3_5) の投機デコードでは検証幅 S の 98% が 3/4/5 に入る (S=4 65%、
+# S=3 24%、S=5 9%) うえ、実機の内訳 (`tools/verify_width_cost_27b.py`、
+# `bench/results/width-cost-27b-0904.json`) で **超線形の出所がこの帯の
+# 量子化 dense 行列積そのもの**だと分かった:
+#
+#   mlp_all (64 層の MLP): M=1 25.8 / M=2 30.8 / M=3 44.1 / M=4 44.4 ms
+#   行列積でない部品 (conv, rms, layernorm) は M に対して平坦
+#
+# ここはその帯だけを別のカーネルに回す口。**既定は auto** (値が空・auto なら
+# 非 NAX 機で `small_m`、NAX 機では素のまま。自前カーネルは NAX 機で auto=off の
+# 方針)。`0` / `off` / `stock` で切り、`small_m` / `nocap` / `mma` で経路を固定する。
+# 2026-09-04 の 27B in-model (512 × 短 3 本 × 2 回文 + 4k、`bench/results/
+# ab-smallm-3way-{short,4k}-0904.json`): small_m 短 -1.9% / 4k -4.6%、nocap 短 -1.9%
+# / 4k +0.8%、mma 短 +3.1% / 4k +5.2%。fp32 参照への距離は small_m / nocap が素と
+# 同じ (RMS 相対 1.65e-3)、mma は素の 1.3〜1.7 倍遠い → 既定は small_m。
+# 形は `_SMALL_M_N_MIN` / `_SMALL_M_K_MIN` 以上のものだけ (GDN の
+# in_proj_a/b のような N=48 の射影は自前カーネルの並列度に届かない)。
+#
+# 数値: `small_m` は **行ごとに幅 1 の素とビット一致**する (mlx の qmv_fast の
+# 縮約順そのもの。`bench/test_qmm_smallm.py`)。`nocap` は mlx の `qmv_wide` の
+# 移植で M<=5 なら素とビット一致する (mlx 側も 1 タイル = 同じ縮約順)。`mma` は
+# MMA の別の縮約順なのでビット一致しない -- そちらを採るなら tok/round と KLD で
+# 判定すること。
+_SMALL_M_ENV = "MLXTURBO_SMALL_M_ROUTE"
+_SMALL_M_MIN = 2
+_SMALL_M_MAX = 5
+_SMALL_M_N_MIN = 1024
+_SMALL_M_K_MIN = 1024
+_SMALL_M_ROUTE: str | None = None       # 現在有効な上書き (None = 素のまま)
+_SMALL_M_ROWS: dict[tuple[int, int], tuple[str, ...]] = {}
+_MMA_M_MIN = 5                          # `mlxturbo/fast_qmm.py` の M_MIN
+
+
+def refresh_small_m_route() -> str | None:
+    """`MLXTURBO_SMALL_M_ROUTE` を読み直す。
+
+    行列積 1 本ごとに `os.environ` を引くと 1 round で 500 回になるので、
+    読むのは `dispatch_scope()` の入口 (検証フォワードと lm_head で 1 回ずつ)
+    だけにする。1 プロセス内 A/B (`tools/decode_ab_generic.py`) は round を
+    またいで env を振るので、これで追従できる。
+    """
+    global _SMALL_M_ROUTE, _SMALL_M_ROWS
+
+    val = os.environ.get(_SMALL_M_ENV, "").strip().lower()
+    if val in ("", "auto"):
+        from .moe_grouped_gemm import is_nax_device
+        val = None if is_nax_device() else SMALLM
+    elif val in ("0", "off", "stock"):
+        val = None
+    elif val not in (NOCAP, MMA, SMALLM):
+        raise ValueError(
+            f"{_SMALL_M_ENV}={val!r} は不明 ("
+            f"auto / {SMALLM!r} / {NOCAP!r} / {MMA!r} / off のいずれか)")
+    if val != _SMALL_M_ROUTE:
+        _SMALL_M_ROUTE = val
+        _SMALL_M_ROWS = {}
+    return _SMALL_M_ROUTE
+
+
+def _small_m_row(k: int, n: int) -> tuple[str, ...] | None:
+    """小 M の上書き込みの経路行 (上書きが無い形なら None)。"""
+
+    row = _SMALL_M_ROWS.get((k, n))
+    if row is not None:
+        return row
+    if n < _SMALL_M_N_MIN or k < _SMALL_M_K_MIN:
+        return None
+    base = DEFAULT_ROUTE_TABLE.get((k, n))
+    new = list(base) if base is not None else [STOCK] * 17
+    for mm in range(_SMALL_M_MIN, _SMALL_M_MAX + 1):
+        new[mm] = _SMALL_M_ROUTE
+    row = tuple(new)
+    _SMALL_M_ROWS[(k, n)] = row
+    return row
 
 
 def quantized_matmul(
@@ -153,14 +263,42 @@ def quantized_matmul(
     k = x.shape[-1]
     n = w.shape[0]
     m = prod(x.shape[:-1])
-    route = select_route(k, n, m, table)
+    route = None
+    if (
+        _SMALL_M_ROUTE is not None
+        and table is None
+        and _SMALL_M_MIN <= m <= _SMALL_M_MAX
+    ):
+        row = _small_m_row(k, n)
+        if row is not None:
+            route = row[m]
+    if route is None:
+        route = select_route(k, n, m, table)
     if route == STOCK:
         return stock()
 
     flat = x if x.ndim == 2 else x.reshape((m, k))
+    if route == SMALLM:
+        # 行ごとに幅 1 の素とビット一致する (kernels/qmv_small_m.py)。
+        # 形が外れたら関数の中で `mx.quantized_matmul` に落ちる。
+        out = _load_small_m()(flat, w, scales, biases,
+                              group_size=group_size, bits=bits)
+        return out if x.ndim == 2 else out.reshape((*x.shape[:-1], n))
+
     nocap, mma = _load_kernels()
     if route == NOCAP:
-        out = nocap(flat, w, scales, biases, group_size=group_size, bits=bits)
+        # 既定の窓は M=6..12。小 M の上書きのときだけ下限を開ける
+        # (カーネルは 1 タイル = M 全体なので M=2..5 でも正しく動く)。
+        out = nocap(flat, w, scales, biases, group_size=group_size, bits=bits,
+                    m_min=_SMALL_M_MIN)
+    elif m < _MMA_M_MIN:
+        # fast_qmm の窓は M=5..16。M=2..4 をそのまま渡すと**黙って stock に
+        # 落ちる**ので、5 行に 0 詰めしてから渡して戻りを切る。カーネルは
+        # 内部でどのみち 8 行の MMA タイルに詰めるので費用は M=5 と同じ
+        # (`mlxturbo/fast_qmm.py` は Flash-Next と共有なので触らない)。
+        pad = mx.zeros((_MMA_M_MIN - m, k), dtype=flat.dtype)
+        out = mma(mx.concatenate([flat, pad], axis=0), w, scales, biases,
+                  group_size=group_size, bits=bits)[:m]
     else:
         out = mma(flat, w, scales, biases, group_size=group_size, bits=bits)
     if x.ndim == 2:
@@ -213,6 +351,7 @@ def _get_dispatched_class():
 def dispatch_scope():
     """Temporarily activate verification-only dispatched layers."""
 
+    refresh_small_m_route()
     token = _DISPATCH_ACTIVE.set(True)
     try:
         yield
@@ -245,9 +384,11 @@ __all__ = [
     "DEFAULT_ROUTE_TABLE",
     "MMA",
     "NOCAP",
+    "SMALLM",
     "STOCK",
     "dispatch_scope",
     "enable",
     "quantized_matmul",
+    "refresh_small_m_route",
     "select_route",
 ]

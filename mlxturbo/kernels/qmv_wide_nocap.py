@@ -208,6 +208,7 @@ def _eligible(
     biases: mx.array,
     group_size: int,
     bits: int,
+    m_min: int = M_MIN,
 ) -> bool:
     if mx.default_device() != mx.gpu or not mx.metal.is_available():
         return False
@@ -224,7 +225,7 @@ def _eligible(
 
     M, K = x.shape
     N = w.shape[0]
-    if not (M_MIN <= M <= M_MAX):
+    if not (m_min <= M <= M_MAX):
         return False
     if K % GROUP_SIZE != 0:
         return False
@@ -243,6 +244,7 @@ def qmv_wide_nocap(
     biases: mx.array,
     group_size: int = 64,
     bits: int = 4,
+    m_min: int = M_MIN,
 ) -> mx.array:
     """`mx.quantized_matmul(x, w, scales, biases, transpose=True, ...)` の drop-in。
 
@@ -257,8 +259,15 @@ def qmv_wide_nocap(
       - scales, biases: [N, K / group_size]
     Returns:
       - out: [M, N]、dtype は x と同じ
+
+    ``m_min`` は下限の上書き (既定は :data:`M_MIN` = 6 = mlx が重みを 2 回
+    以上読む窓の下端)。カーネル自体は 1 タイル = M 全体なので M=1..5 でも
+    正しく動く -- そちらは mlx も 1 タイル (`qmv_wide` の nv=M) なので重みの
+    読みでは勝てないが、**アキュムレータを配列でなく展開済みスカラーで持つ**
+    ぶんの差だけが出る。27B の検証幅 (S=3..5) を測るために口だけ開けてある
+    (`tools/qmv_small_m_micro.py`)。既定を下げるのは実測で決める。
     """
-    if not _eligible(x, w, scales, biases, group_size, bits):
+    if not _eligible(x, w, scales, biases, group_size, bits, m_min):
         return mx.quantized_matmul(
             x, w, scales, biases, transpose=True, group_size=group_size, bits=bits
         )
