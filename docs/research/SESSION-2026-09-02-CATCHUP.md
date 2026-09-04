@@ -2790,3 +2790,14 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 
   → 0.00027 は全部 prefill の GDN Metal 再帰 (積和順の差) で、他の部品はビット一致。Flash-Next での GDN Metal (+0.00014、対 bf16) と同じ性質、受け入れ幅 +0.0005 の中。**27B の以後の KLD の基準はこの 3 本** (参照が素の 4bit なので「bf16 との距離」ではなく「素からのずれ」を測っている点に注意)。
 - 煙試験 (冷却なし、64 トークン、MTP 写しあり): decode 4k = mlx-serve 43.2 / oMLX 32.8 / MTPLX 28.4 / mlxturbo 27.3 / mlx-lm 20.9。同じ MTP 頭で mlxturbo が投機組の最下位 = 27B の decode 経路 (SpecEngine + staged、spec_flash の段階投入と融合が無い) が最大の的。
+
+### 2026-09-04 09:15 27B: GDN 部品の速度 A/B (`decode_ab_generic`、1 ケース、`bench/results/gdn-*-27b-*-0904.json`)
+
+| 部品 | 文脈 | 差 | 備考 |
+|---|---|---|---|
+| GDN Metal (prefill 再帰) | 4k | prefill_s **-1.4%** (18.86 → 18.59) | head 一致 |
+| 〃 | 17k | prefill_s +0.1% (86.15 → 86.22) | head / tok/round 一致。取り分なし |
+| GDN decode 融合 (前処理 + norm) | 短 3 本 × 2 | ms/round -1.1% (+0.2 / -1.4 / -1.8)、ms/tok -0.1% | head 一致だが tok/round が case 0/1 で微差 (+0.9 / -3.3%) = 1 ulp 級のずれが残る |
+
+- 読み: **27B では GDN 部品の取り分がほぼ無い**。理由の候補 2 つ: (1) `spec.py` の S>1 verify (主経路) が `_linear_capture` の写しを通り、移植した部品が当たっていない (advisor の指摘、第 1 段で是正中)、(2) 27B は dense の MLP と attention が重く、GDN の scan の比重が Flash-Next より小さい。
+- GDN Metal は品質の代金がある (KLD 0.00027) のに 17k で取り分が無い → **27B では既定 off が筋** (代金ゼロ規則の逆)。決定は第 1 段の着地後に主経路で測り直してから。
