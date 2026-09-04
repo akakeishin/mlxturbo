@@ -5,6 +5,7 @@ import pytest
 from bench.hot_prefill_bench import (
     _byte_acceptance,
     _expected_selection,
+    _expected_pool_lcp,
     _flash_expected_core_components,
     _input_tps,
     _lcp,
@@ -70,11 +71,14 @@ def test_reset_lcp_uses_the_previous_measured_prompt():
 
     pure_prompt, _ = _next_prompt(base, 16, [8, 9], "pure_append", 2, 0)
     assert _lcp(pure_prompt, base) == len(base)
+    assert _expected_pool_lcp(pure_prompt, base) == len(base) - 1
+    assert _expected_pool_lcp(base, base) == len(base)
 
     synthetic_prompt, _ = _next_prompt(
         base, 16, [8, 9], "synthetic_tail_rewrite", 2, 0
     )
     assert _lcp(synthetic_prompt, base) == len(base) - 2
+    assert _expected_pool_lcp(synthetic_prompt, base) == len(base) - 2
 
 
 def test_synthetic_tail_rewrite_rewrites_fixed_tail_then_appends():

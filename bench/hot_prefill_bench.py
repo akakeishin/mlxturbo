@@ -90,6 +90,16 @@ def _lcp(a: list[int], b: list[int]) -> int:
     return i
 
 
+def _expected_pool_lcp(previous: list[int], prompt: list[int]) -> int:
+    """serverのzero-delta保護と保存tail位置を含めた選択時LCP。"""
+
+    raw = _lcp(previous, prompt)
+    # 保存tailは直前requestのprompt末尾にだけ対応する。長いsuffixからbaseへ
+    # 戻すrequestではtail位置が違うため、serverは必ず1 token残してprefillする。
+    cap = len(prompt) if len(previous) == len(prompt) else max(len(prompt) - 1, 0)
+    return min(raw, cap)
+
+
 def _replacement_tail(current: list[int], width: int, palette: list[int]) -> list[int]:
     if width < 1 or width >= len(current):
         raise ValueError("rewrite tailは1以上、prompt長未満が必要")
@@ -488,7 +498,9 @@ def main() -> int:
                                     f"reset usageにcached_tokensが無い: ctx={ctx} "
                                     f"rep={rep} mode={mode} suffix={suffix}"
                                 )
-                            expected_reset_lcp = _lcp(previous_prompt, base)
+                            expected_reset_lcp = _expected_pool_lcp(
+                                previous_prompt, base
+                            )
                             expected_reset = _expected_selection(
                                 base, expected_reset_lcp, reset_cached
                             )
