@@ -293,3 +293,5 @@ Flash-Next のフルベンチは後回し (ユーザーの指示があるまで�
   パック (HF、未ダウンロード): `mlx-community/Qwen3.6-35B-A3B-4bit`、MTP は `mlx-community/Qwen3.6-35B-A3B-MTP-5bit` (4bit の MTP は無し。mtp.py は scales から bits を推定するので 5bit のまま読める見込み)。
   補足 (09:15): 4bit の MTP サイドカーは mlx-community に無い (本体 `Qwen3.6-35B-A3B-4bit` は 2090 テンソルに `mtp.*` 無し、MoE の gate は 8bit の混合)。MLX 形式で MTP を持つのは `…-MTP-5bit` (qwen3_5_mtp、1 層、46 テンソル) と、第三者の OptiQ 系 (`oQ4e-mtp` 等、別レシピ) だけ。5bit の頭をそのまま使う (bits は scales から推定、1 層なので速度差は無視できる)。
 - **順序 (ユーザー 09:14)**: 27B の移植 (decode 経路の (B)) が着地したら、**qwen4_exp (Flash-Next) も同じ分岐ルート (契約で部品を当てる汎用経路) に載せる** → その後 **35B-A3B (Qwen3.6、MoE)**。Flash-Next を載せ替えるときは 17k A/B と fingerprint を毎回のゲートに (数字を落とさない)。
+- **融合もどき (ユーザー 09:50「先にそれをやる。27B にも生きる考え方」)**: カーネルを書かずに「動かすバイトと同期」を減らす。種類は (1) 重みへの畳み込み (norm の (1+w) や scale を読み込み時に)、(2) 余計なデータ移動 (型変換 copy、contiguous 化、添字・マスクの毎回生成、入力の複製)、(3) MLX 組み込みの融合 op、(4) グラフの形 (同期を減らす)。
+  根拠: 勝った融合 2 本の取り分はバイトと同期の削減で、dispatch の本数は稼働率 96% で値段ゼロ。第 1 段 = 両モデルの decode で一覧と順位付け (エージェント走行中、`scratchpad/agent-pseudo-fusion-audit.md`)。27B の decode 経路 (B) と並行。
