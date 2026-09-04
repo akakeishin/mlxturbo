@@ -19,6 +19,7 @@ def test_reset_fusions_disables_generic_sdpa_split(monkeypatch):
         "disable_moe_grouped_gemm",
         "disable_moe_down_epilogue",
         "disable_moe_route",
+        "disable_moe_block_compile",
         "disable_rms_norm_gated",
         "disable_gdn_prework_kernel",
         "disable_gdn_decode_fused",

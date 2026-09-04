@@ -149,6 +149,7 @@ def _reset_fusions(model, guard: _OrigGuard, warned: set) -> None:
         ("moe_grouped_gemm", lambda: fused.disable_moe_grouped_gemm()),
         ("moe_down_epilogue", lambda: fused.disable_moe_down_epilogue()),
         ("moe_route", lambda: fused.disable_moe_route()),
+        ("moe_block_compile", lambda: fused.disable_moe_block_compile(model)),
         ("rms_norm_gated", lambda: fused.disable_rms_norm_gated()),
         ("gdn_prework", lambda: fused.disable_gdn_prework_kernel()),
         ("gdn_decode_fused", lambda: fused.disable_gdn_decode_fused()),
@@ -292,14 +293,18 @@ def _result_row(res: dict, wall: float, resumed: bool) -> dict:
     )
 
 
-def run_once(eng, ids, n_tokens, eos_ids, n_draft, max_draft) -> dict:
+def run_once(eng, ids, n_tokens, eos_ids, n_draft, max_draft,
+             lookup_len=None) -> dict:
     """まっさらな状態から prefill + decode を 1 本流す。"""
     import mlx.core as mx
 
     mx.clear_cache()
     t0 = time.perf_counter()
-    res = eng.generate(ids, max_tokens=n_tokens, n_draft=n_draft,
-                       max_draft=max_draft, temp=0.0, eos_ids=eos_ids)
+    kwargs = dict(max_tokens=n_tokens, n_draft=n_draft,
+                  max_draft=max_draft, temp=0.0, eos_ids=eos_ids)
+    if lookup_len is not None:
+        kwargs["lookup_len"] = lookup_len
+    res = eng.generate(ids, **kwargs)
     return _result_row(res, time.perf_counter() - t0, resumed=False)
 
 
@@ -333,13 +338,17 @@ def prefill_once(eng, ids, n_draft, max_draft):
     return sess, _snapshot_session(sess), took
 
 
-def run_resumed(eng, ids, sess, snap, n_tokens, eos_ids, n_draft, max_draft) -> dict:
+def run_resumed(eng, ids, sess, snap, n_tokens, eos_ids, n_draft, max_draft,
+                lookup_len=None) -> dict:
     """控えた prefill 状態から decode だけを流す。返り値は run_once と同じ形。"""
     _restore_session(sess, snap)
     t0 = time.perf_counter()
-    res = eng.generate(ids, max_tokens=n_tokens, n_draft=n_draft,
-                       max_draft=max_draft, temp=0.0, eos_ids=eos_ids,
-                       session=sess)
+    kwargs = dict(max_tokens=n_tokens, n_draft=n_draft,
+                  max_draft=max_draft, temp=0.0, eos_ids=eos_ids,
+                  session=sess)
+    if lookup_len is not None:
+        kwargs["lookup_len"] = lookup_len
+    res = eng.generate(ids, **kwargs)
     row = _result_row(res, time.perf_counter() - t0, resumed=True)
     if res["prefill_new"] != 0:
         raise RuntimeError(
@@ -461,7 +470,7 @@ def parse_args(argv=None):
     return args, name.strip(), variants, baseline
 
 
-def build_cases(tok, ctx: int):
+def build_cases(tok, ctx: int, long_count: int = 1):
     """(kind, prompt_ids) の列を作る。thinking は落とす (self_snapshot と同じ)。"""
     from _bench_text import long_prompts
     from decode_ab import LONG_QUESTIONS, SHORT_PROMPTS
@@ -478,7 +487,7 @@ def build_cases(tok, ctx: int):
     if ctx <= 0:
         return [("short", to_ids(p)) for p in SHORT_PROMPTS]
     return [("long", to_ids(p))
-            for p in long_prompts(tok, ctx, LONG_QUESTIONS[:1])]
+            for p in long_prompts(tok, ctx, LONG_QUESTIONS[:long_count])]
 
 
 def summarize(rows, variants, baseline) -> None:
