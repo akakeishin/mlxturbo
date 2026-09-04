@@ -112,7 +112,7 @@ wall -7.5%、約535→578 tok/s (+8.1%)、出力3/3一致で既定onを確定し
 | Flash FR-Spec Q8 head | 棄却 | 手元trace coverage 89.02%、宣言線99.9%未達 |
 | ANE coarse head | 依存あり | FR-Spec成立が開始条件だったため停止。新しい小headができた場合だけ再評価 |
 | Qwen3.6 MTP読込 / warm checkpoint | 完了 | 短/4k decode +51〜57%、4k温TTFT -73.5% |
-| Qwen3.6最終full/quality | 一部完了 | 強冷却fullは0/4k/17k/25k/32k/50kで117.98/120.16/104.68/86.64/82.54/65.56 tok/s。残りは品質/KLDと50k attention A/B |
+| Qwen3.6最終full/quality | 一部完了 | 強冷却fullは0/4k/17k/25k/32k/50kで117.98/120.16/104.68/86.64/82.54/65.56 tok/s。50k SDPA幅分割はms/token -19.1%。残りは品質/KLDとround anatomy |
 | 27B controller / MTP cache / q2 rerank | 完了 | 採否と品質をCATCHUPへ記録済み |
 | 27B state_out skip | 実行可・低 | Flash側は実測±0.0%だが別族なので未決。27B固有のtraceで占有が見えた場合だけA/B |
 | 27B NOSYNC recall追加確認 | 実行可・任意 | 速度採用済み。公開品質表を厚くするときだけ追加 |

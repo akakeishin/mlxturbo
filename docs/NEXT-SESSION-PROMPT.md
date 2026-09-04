@@ -885,17 +885,20 @@ jq '.depths[0].summary | {mean_decode_tok_s,mean_end_to_end_tok_s,mean_speedup_v
   2.4〜5.0%低く出ていた。
 - 正式decodeは0/4k/17k/25k/32k/50kで117.98/120.16/104.68/86.64/82.54/65.56 tok/s。
   50kは短文比-44.4%。cold TTFTは52.886秒、warm TTFTは0.691秒。
-- tok/stepは大崩れしておらず、10個のfull-attention層が長いKVを読むround費用が主因。次は
-  50kだけを同一process ABBAで`MLXTURBO_SDPA_SPLIT_GENERIC=auto,0`、`--prefill-once`、
-  `--round-trace`なしで測る。速度測定後、別走行のround anatomyで内訳を取る。
+- tok/stepは大崩れしておらず、本体10個 + MTP側1個のfull-attention層が長いKVを読むround費用が主因。
+- 50k同一process ABBAは、汎用SDPA幅分割autoがoff比でms/token **-19.1%**、ms/round
+  **-19.9%**、tok/round -0.9%。現行autoを維持する。headは一致、生成列は37 token目から
+  既知の丸め級分岐。fp32距離が素の0.53倍という既存品質判定は変わらない。
+- 次は`decode_round_anatomy_generic.py`をctx0/50kで流し、verify相とGPU側SDPAの増分を確定する。
 - 連続GPU走行後は5〜10分休止し、再びGEMMが12.78 TFLOPSの±1.5%なら次へ進む。
 
 再開の1コマンド:
 
 ```bash
-BIGLOCK_NO_WORKER=1 BIGLOCK_PRIO=0 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py \
+MLXTURBO_MOE_COMPILE=0 BIGLOCK_NO_WORKER=1 BIGLOCK_PRIO=0 tools/biglock.sh \
+  .venv/bin/python tools/decode_round_anatomy_generic.py \
   --model /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46 \
   --mtp /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-MTP-5bit/snapshots/998d26dc27cc06baf60ff6e27d673b15f877f0b3 \
-  --mtp-bits 5 --knob MLXTURBO_SDPA_SPLIT_GENERIC=auto,0 --ctx 50000 --prefill-once \
-  --tokens 256 --reps 2 --out bench/results/qwen36-sdpa-split-50k-strongcool-0904.json
+  --mtp-bits 5 --ctx-list 0,50000 --tokens 160 --no-ablate --no-nospec --no-s-cost \
+  --out bench/results/qwen36-round-anatomy-0-50k-strongcool-0904.json
 ```

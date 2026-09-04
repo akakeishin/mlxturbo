@@ -1030,10 +1030,11 @@ PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスク�
   117.98/120.16/104.68/86.64/82.54/65.56 tok/s。50kは短文比-44.4%。cold TTFTは
   0.082/2.310/13.490/21.155/28.216/52.886秒、warmは0.254〜0.691秒。
 - **原因の切り分け**: tok/stepは短2.36〜2.38、50k 2.20〜3.00で、採択率だけの崩壊ではない。
-  full-attention 10層のKV走査を含む1 roundの費用増が主。50k汎用SDPA幅分割A/Bとround anatomyを
-  次に行う。SSE chunk分母は2.4〜5.0%過小評価するため今後使わない。
-- **判定**: MTP読込、8-token checkpoint、full速度表を採用。残りは品質/KLDの最終表と、50kの
-  attention A/Bである。
+  本体full-attention 10層とMTP側1層のKV走査を含む1 roundの費用増が主。50k汎用SDPA幅分割は
+  同一process ABBAでms/token -19.1%、ms/round -19.9%、tok/round -0.9%。現行autoを維持する。
+  SSE chunk分母は2.4〜5.0%過小評価するため今後使わない。
+- **判定**: MTP読込、8-token checkpoint、full速度表、汎用SDPA幅分割を採用。残りは品質/KLDの
+  最終表、50k round anatomy、AR対MTPの履歴依存費用分離である。
 
 ## 完了: 常時冷却Flash-NextフルベンチとGuideLLM導入 (2026-09-04 19:12)
 

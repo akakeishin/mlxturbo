@@ -209,5 +209,6 @@ p50/p95、実output token数、冷却、server側reused/newを併記する。
 SSE deltaの個数ではなく、結合した本文を同じtokenizerで数え直した値をdecodeの分母にした。
 旧chunk方式は条件ごとに2.4〜5.0%過小評価していた。修正後も長文脈低下は残り、サーバー内部値とも
 概ね一致する。tok/stepは短2.36〜2.38、50k 2.20〜3.00で採択率だけの崩壊ではなく、40層中
-10個のfull-attention層が長いKVを読むverify stepの費用増が主因。次は50k同一processで
-汎用SDPA幅分割on/offを測り、round時間とtok/roundを分けて判定する。
+10個のfull-attention層とMTP側1層が長いKVを読むverify/draft/repair stepの費用増が主因。
+50k同一process ABBAでは汎用SDPA幅分割autoがoff比でms/token -19.1%、ms/round -19.9%、
+tok/round -0.9%。正式fullはauto込みであり、offなら概算57 tok/sまで落ちる。

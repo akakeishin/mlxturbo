@@ -119,7 +119,7 @@
   `MLXTURBO_SDPA_ROWTILE` (既定 256、`=0` で off) も本番の既定値: head_dim 256 の sdpa は MLX の fallback でタイルを飛ばさないので、
   prefill の dense 経路で q を 256 行ずつに割り前方の K/V だけ渡す (4k -1.1% / 8k -1.2% / 17k -1.0%、KLD 差 0.0、2026-09-03)。
   `MLXTURBO_SDPA_SPLIT_GENERIC` (既定 auto = 非 NAX 機で on、`=0` で off) は 2026-09-04 13:15 に入れた本番の既定値: qwen4_exp 以外の族 (27B など) の decode / verify 幅 (1 < S ≤ 16) で
-  S×gqa > 32 のとき sdpa をクエリ幅で割って MLX の vector カーネル (走査和が fp32) に戻す。27B 短 -1.6% / 17k -1.2% (幅 6 の round だけ -17%) / 4k は発火せず同一、fp32 参照への距離は素の 0.53 倍 (壁の向こうの fallback は中間が bf16)。
+  S×gqa > 32 のとき sdpa をクエリ幅で割って MLX の vector カーネル (走査和が fp32) に戻す。27B 短 -1.6% / 17k -1.2% (幅 6 の round だけ -17%) / 4k は発火せず同一、Qwen3.6-35B-A3B 50kはms/token -19.1%・ms/round -19.9%。fp32 参照への距離は素の 0.53 倍 (壁の向こうの fallback は中間が bf16)。
   qwen4_exp は従来のシーム `enable_sdpa_split` の担当 (bool マスクを実体化する変種。K/V を切る変種の方が冷 micro で 13〜18% 速い → BACKLOG)。
   `MLXTURBO_MOE_COMPILE` (既定 auto = qwen4_exp の `SparseMoeBlock` があるときだけ on、`=0` で off、行数 ≤ `MLXTURBO_MOE_COMPILE_MAX_ROWS`=16 の decode / verify 幅だけ) は 2026-09-04 13:25 に入れた本番の既定値:
   MoE ブロックまるごと (router の f32 化 → argpartition → softmax → take → 共有専門家のゲート → combine) を `mx.compile` で 1 グラフに。行列積は境界のまま、op の並べ替えは無いので**ビット一致**。

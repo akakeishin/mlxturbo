@@ -3608,3 +3608,26 @@ temperature 1、D3、128 tokenでAR 28.38、MTP 52.79 tok/s（1.86倍）、end-t
 full attentionであり、後者が各verify roundで長いKVを読む帯域費用が主因と判断する。次は50kの
 同一process ABBAで汎用SDPA幅分割on/offを測り、その後に別走行のround anatomyで相別内訳を取る。
 結果は`bench/results/qwen36-full-strongcool-tokenfix-0904.json`（gitignore）。
+
+### 2026-09-04 22:33 Qwen3.6 50kの汎用SDPA幅分割はms/round -19.9%
+
+強冷却、開始前GEMM 12.74 TFLOPS、49,832 tokenを1回だけprefillし、生成256 tokenを
+`auto,off,off,auto`の回文2本で測った。未採用のMoE compile配線変更を含む作業ツリーだったため、
+`MLXTURBO_MOE_COMPILE=0`を固定して直前の正式fullと同じ実動作にした。
+
+| 指標 | auto | off | off比 |
+|---|---:|---:|---:|
+| ms/token | 14.198 | 17.558 | **-19.1%** |
+| ms/round | 33.970 | 42.405 | **-19.9%** |
+| tok/round | 2.393 | 2.415 | -0.9% |
+| 概算tok/s | 70.43 | 56.95 | +23.7% |
+
+全8 armでoffは42.38〜42.45 ms/round、autoは初回35.23、その後33.45〜33.71で差は安定した。
+headは一致し、生成列は37 token目から既知の丸め級分岐。既存検査では分割側のfp32参照距離が
+素の0.53倍なので品質判定は変えない。現行autoを維持する。正式fullの50k 65.56 tok/sは
+この最適化込みで、offなら約57 tok/sまで下がる。
+
+長文脈の傾きは本体10個のfull-attentionだけでなく、MTP側の1層もdraft各リンクと
+`_repair_mtp_cache`で履歴KVを読む。GDNとMoEは現在幅だけなので定数項は下げられても傾きは作らない。
+次はctx0/50k round anatomyでverify相とGPU SDPA費用を比較する。結果は
+`bench/results/qwen36-sdpa-split-50k-strongcool-0904.json`（gitignore）。
