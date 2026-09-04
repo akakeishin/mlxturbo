@@ -883,12 +883,12 @@ off-by-oneがあり、その高速値は採択根拠から除外した。optimis
 短 ms/tok **+6.0%**、ms/round +6.7%、tok/round +1.6%。本番は現行を維持し、このレーンを閉じる。
 再現wrapperとsource hash付き結果を残した。数字はCATCHUP末尾。
 
-## テスト基盤: `test_ngram_stream` の collection 時CPU固定を局所化する (2026-09-04 15:38、未着手)
+## 完了: `test_ngram_stream` の collection 時CPU固定を局所化 (2026-09-04 16:27)
 
 `bench/test_ngram_stream.py:25` の `mx.set_default_device(mx.cpu)` がmodule import時にprocess全体へ残り、
 同じpytest invocationで後からcollectionされるGDN / qmm GPUテストがGPUを無効と誤判定する。
-拡大実行は526 passed / 10 failedだが、失敗3ファイルは個別processで5 / 12 / 13 passed。
-CPU固定をfixture内で保存・復元し、CPUテストとGPUテストを同一processで再実行する。
+CPU固定をautouse fixture内で保存・復元した。n-gram 23本の後にcapture / attention+MLP / GDNの
+GPU 30本を同一processで並べ、53 passed。collection時のGPU判定と実行時のdeviceを両立した。
 
 ## 完了・採用: 27B の MTP cache repair は rejection の先頭1行を再利用 (2026-09-04 16:25)
 

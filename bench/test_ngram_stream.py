@@ -4,7 +4,7 @@
 モデルは読まない。合成サイドカー (rows=10000, dim=160, bits=4, group_size=32,
 interleaved) を tmp_path に焼き、StreamNGram.__call__ の出力を
 `_RefStreamNGram` (変更前の実装の写し。行ごとの pread、キャッシュ無し) と
-比較する。GPU は使わない (mx.set_default_device(mx.cpu))。
+比較する。このファイルの各テストだけ既定 device を CPU に切り替える。
 """
 
 from __future__ import annotations
@@ -22,7 +22,16 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-mx.set_default_device(mx.cpu)
+
+@pytest.fixture(autouse=True)
+def _cpu_device():
+    """このファイルだけCPUで実行し、後続GPUテストへ設定を漏らさない。"""
+    prev = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(prev)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 for _p in (REPO_ROOT, REPO_ROOT / "tools"):

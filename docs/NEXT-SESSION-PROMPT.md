@@ -543,7 +543,7 @@ rg -n "mtp_off0|mtp_cache.trim|_mtp_append\(window|chain_head" mlxturbo/spec.py 
 - **完了・採用**: rejection roundだけ先頭MTP cache行を保持。短ms/tok -0.9%、3/3非悪化、bit一致。
 - **次**: 27B proposal-only q2 top-32は、exact proposalを変えないrecall traceから始める。
 - **並行しない後続**: qwen4_expの汎用分岐とK/V slice SDPA、Qwen3.6-35B、Gemma温TTFT、製品P0。
-- **テスト基盤**: `test_ngram_stream` のcollection時CPU固定をfixtureへ局所化する。
+- **テスト基盤は完了**: `test_ngram_stream` のCPU固定をfixtureへ局所化。CPU→GPU同一processで53 passed。
 
 再開の1コマンド:
 

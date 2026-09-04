@@ -3143,3 +3143,10 @@ ms/roundも124.300対125.462で-0.9%。tok/round、受理数、round数は両側
 符号は一部揺れたが、prompt別平均は3/3で非悪化。品質・メモリの代金がなく、実装も既存repairの
 局所methodだけなので、1%未満の代金ゼロ改善の規則に従い採用する。A/B専用wrapperとmeta JSONの
 source SHA256を残した。
+
+### 2026-09-04 16:27 `test_ngram_stream` のCPU固定を局所化。CPU→GPU同一processで53 passed
+
+module import時の `mx.set_default_device(mx.cpu)` をautouse fixtureへ移し、各テストの前にCPUへ、
+終了時に元のdeviceへ戻すようにした。n-gram 23本を先頭に置き、その後ろへcontroller拡大実行で
+誤skipしたcapture 5本 / attention+MLP 12本 / GDN 13本を同一pytest processで並べて53 passed。
+既存の526 passed / 10 failedは実装故障ではなく、このcollection時のprocess-global設定漏れだった。
