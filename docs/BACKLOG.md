@@ -833,9 +833,9 @@ MLX の `quantized_matmul` は M=1 (qmv) で 400 GB/s 級なのに M=2〜8 (fast
 
 ## Qwen3.6-35B-A3B の取得状態 (2026-09-04 18:15)
 
-本体`mlx-community/Qwen3.6-35B-A3B-4bit`は4 shard・約19GBを取得済み。MTP-5bitは
-config/indexだけ取得済みで、index記載の`model.safetensors`は580,704,640 bytes、未取得。
-モデル取得は追加権限項目なので、許可後にGPU計測と重ならない時間帯でMTPだけ取得する。
+本体`mlx-community/Qwen3.6-35B-A3B-4bit`は4 shard・約19GBを取得済み。MTP-5bitも
+ユーザー許可後の18:17に取得完了し、`model.safetensors`は580,709,585 bytes (572 MiB)。
+本体とMTPの実モデル比較を開始できる。
 
 ## 畳んだ: Flash-Next の「飛ばす / 積む」(2026-09-04 11:43、`scratchpad/agent-fn-skip-stack.md`)
 
