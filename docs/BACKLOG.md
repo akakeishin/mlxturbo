@@ -807,3 +807,9 @@ Mirai / uzu (`docs/research/EXTERNAL-MIRAI-UZU-2026-09.md`) の 105 tok/s の半
 (1) 学習データは特定領域に寄せない (teacher の rollout を広い池から)、(2) 受理率が落ちる入力でも素の decode より遅くならない設計 (depth 適応は既にある)、
 (3) 品質は draft に依らない (検証は本体なので出力は同じ。速度だけの話)。MTP 頭の学習 (方針で無し) とは別物で、本体を触らない小モデルの学習。
 着手時期はユーザーの判断。先に 27B レーンの基準測定。
+
+## そのうち: qwen4_exp のベタ書き (spec_flash の写しとシーム) も剥がす (ユーザー 2026-09-04 09:12)
+
+27B の decode 経路 (spec.py) から同期と写しを剥がす (B) を先に。それが着地したら、`spec_flash.py` の qwen4_exp 依存 (`capture()` の `__call__` 差し替え、`_staged_forward` の層呼び出し規約、
+HC 型の MTP 頭、QSA cache、`_arch()` の決め打ち) も同じ形 (モジュール呼び出し + 状態の取り出し口 + `arch.py` の duck typing) に寄せていく。
+順序はユーザー: 27B → そのうち Flash-Next。Flash-Next 側は 17k の A/B と fingerprint を毎回のゲートに。
