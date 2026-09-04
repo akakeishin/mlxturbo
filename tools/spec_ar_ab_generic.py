@@ -47,17 +47,28 @@ def build_parser():
         "--warmup-tokens", type=int, default=32,
         help="各context・promptで両variantを捨て走行する長さ",
     )
+    ap.add_argument("--temp", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--ignore-eos", action="store_true",
+        help="速度比較の生成長を揃えるためEOSで停止しない",
+    )
     ap.add_argument("--out", required=True)
     ap.set_defaults(no_mtp=False)
     return ap
 
 
-def _run(eng, ids, session, snapshot, n_tokens, eos_ids, variant):
+def _run(eng, ids, session, snapshot, n_tokens, eos_ids, variant, temp=0.0,
+         seed=None):
+    if seed is not None:
+        import mlx.core as mx
+
+        mx.random.seed(seed)
     cfg = SETTINGS[variant]
     row = G.run_resumed(
         eng, ids, session, snapshot, n_tokens, eos_ids,
         cfg["n_draft"], cfg["max_draft"], lookup_len=cfg["lookup_len"],
+        temp=temp,
     )
     row["variant"] = variant
     return row
@@ -132,17 +143,21 @@ def main() -> int:
         raise SystemExit("--prompts は1〜3にする")
     if args.warmup_tokens <= 0:
         raise SystemExit("--warmup-tokens は正の整数にする")
+    if args.temp < 0:
+        raise SystemExit("--temp は0以上にする")
 
     import mlx.core as mx
 
     model, tok, eng, eos_ids, _guard = G.load_model(args)
+    if args.ignore_eos:
+        eos_ids = ()
     mx.random.seed(args.seed)
     short_ids = G.build_cases(tok, 0)[0][1]
     for variant in variants:
         cfg = SETTINGS[variant]
         G.run_once(
             eng, short_ids, 32, eos_ids, cfg["n_draft"], cfg["max_draft"],
-            lookup_len=cfg["lookup_len"],
+            lookup_len=cfg["lookup_len"], temp=args.temp,
         )
 
     rows = []
@@ -160,14 +175,16 @@ def main() -> int:
             for variant in variants:
                 _run(
                     eng, ids, session, snapshot, args.warmup_tokens,
-                    eos_ids, variant,
+                    eos_ids, variant, temp=args.temp,
+                    seed=args.seed + case_idx,
                 )
 
             forward = variants if case_idx % 2 == 0 else list(reversed(variants))
             palindrome = forward + list(reversed(forward))
             for variant in (palindrome * args.reps):
                 row = _run(
-                    eng, ids, session, snapshot, args.tokens, eos_ids, variant
+                    eng, ids, session, snapshot, args.tokens, eos_ids, variant,
+                    temp=args.temp, seed=args.seed + case_idx,
                 )
                 row.update(
                     ctx=len(ids), requested_ctx=requested_ctx,
@@ -213,6 +230,8 @@ def main() -> int:
             "prompts": args.prompts,
             "warmup_tokens": args.warmup_tokens,
             "variants": variants,
+            "temp": args.temp,
+            "ignore_eos": args.ignore_eos,
             "settings": SETTINGS,
             "source_sha256": {
                 str(path.relative_to(REPO_ROOT)): hashlib.sha256(

@@ -294,14 +294,14 @@ def _result_row(res: dict, wall: float, resumed: bool) -> dict:
 
 
 def run_once(eng, ids, n_tokens, eos_ids, n_draft, max_draft,
-             lookup_len=None) -> dict:
+             lookup_len=None, temp=0.0) -> dict:
     """まっさらな状態から prefill + decode を 1 本流す。"""
     import mlx.core as mx
 
     mx.clear_cache()
     t0 = time.perf_counter()
     kwargs = dict(max_tokens=n_tokens, n_draft=n_draft,
-                  max_draft=max_draft, temp=0.0, eos_ids=eos_ids)
+                  max_draft=max_draft, temp=temp, eos_ids=eos_ids)
     if lookup_len is not None:
         kwargs["lookup_len"] = lookup_len
     res = eng.generate(ids, **kwargs)
@@ -339,12 +339,12 @@ def prefill_once(eng, ids, n_draft, max_draft):
 
 
 def run_resumed(eng, ids, sess, snap, n_tokens, eos_ids, n_draft, max_draft,
-                lookup_len=None) -> dict:
+                lookup_len=None, temp=0.0) -> dict:
     """控えた prefill 状態から decode だけを流す。返り値は run_once と同じ形。"""
     _restore_session(sess, snap)
     t0 = time.perf_counter()
     kwargs = dict(max_tokens=n_tokens, n_draft=n_draft,
-                  max_draft=max_draft, temp=0.0, eos_ids=eos_ids,
+                  max_draft=max_draft, temp=temp, eos_ids=eos_ids,
                   session=sess)
     if lookup_len is not None:
         kwargs["lookup_len"] = lookup_len

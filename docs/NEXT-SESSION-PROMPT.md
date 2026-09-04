@@ -892,16 +892,33 @@ jq '.depths[0].summary | {mean_decode_tok_s,mean_end_to_end_tok_s,mean_speedup_v
 - round anatomyは短文3本平均20.10→50k 39.03 ms/round。verifyが17.49→34.53 msで総増分の
   約90%、draft 2.34→3.23、maint 0.26→0.31 ms。Metal dispatchは約2,132→2,167回だけだが、
   GPU和集合は17.81→34.39 ms、平均kernelは8.3→15.9 us。SDPA/KV帯域が原因と確定した。
-- 次は、起動ログだけ40層と表示され実際にはqwen4_expクラスしか包んでいなかったMoE compileの
-  汎用配線を、Qwen3.6短文の`MLXTURBO_MOE_COMPILE=1,0` ABBAで判定する。
+- MoE compileをQwen3.6実クラスへ配線したABBAは出力完全一致。短ms/round -0.6%に対して50k
+  **+0.9%**で不採用。未空焼き幅の初回trace税もあり、汎用配線は残さない。起動ログの偽40層だけ、
+  qwen4_exp実instanceを数えるよう修正した（CPU契約3件）。
+- 最初のAR比較で出た50k MTP +4.7%は、32-token捨て走行では不十分だったアーティファクト。
+  256-token捨て走行では現行MTP 13.972、AR 14.073 ms/tokenで、MTPが0.7%速いへ訂正した。
+- 50kの`cap3`（幅4以下、lookupなし）は13.236 ms/tokenで現行MTP比**-5.3%**、AR比-6.0%。
+  tok/roundは2.626→2.427だがms/roundが36.69→32.12となり、幅5以上のKV再走査を避ける方が勝った。
+- `cap3`の現行MTP比は25k -3.6%、32k -7.4%、40k -6.5%、50k -5.0%で全点勝ち。
+  50k現行MTPはAR比+0.3%（同着）、`cap3`だけAR比-4.6%。適用境界は25kより下にある。
+- 低い側も現行比で短文-0.4%（同着）、4k -8.1%、8k -2.1%、17k -2.7%、25k -3.6%。
+  25k〜50kと合わせ0〜50kの全測定点で非退行のため、文脈長閾値なしのQwen3.6専用既定候補。
+- 非重複3 promptの短文/4k/17kも9/9で非退行。平均ms/tokenは現行→`cap3`で
+  7.301→6.879（-5.8%）、7.985→7.364（-7.8%）、9.641→8.548（-11.3%）。
+  50kも3/3で非退行、平均13.477→12.108 ms/token（-10.2%、74.2→82.6 tok/s）。
+  greedy速度は全ゲートを通過した。次はtemp>0と品質を通して`max_draft=3 / lookup=0`を
+  Qwen3.6だけの既定にする。
+- temp=0.7の固定AR継続を実verify幅1/4/9/17へ流したtop-4096 KLDは、幅4 0.003980、
+  幅9 0.003936、現行比**+0.000043**（受け入れ幅+0.0005）。最大裾質量0.000768で品質合格。
+  temp=0.7実生成は4k/17kが6/6改善（平均-10.4/-9.4%）だが、短文1件が+8.9%悪化。
+  全域適用は棄却し、入力長3,830 token以上だけ`cap3`、未満は現行3/8/16を維持する候補へ変更。
+  50k temp=0.7も3/3改善し、平均15.952→14.525 ms/token（-8.9%、62.7→68.8 tok/s）。
+  1 promptはARが`cap3`より10.0%速い一方、他2 promptは`cap3`がAR比-9.3/-15.1%なので、
+  静的なAR切替は置かない。残るのは条件付き既定配線と再full。
 - 連続GPU走行後は5〜10分休止し、再びGEMMが12.78 TFLOPSの±1.5%なら次へ進む。
 
 再開の1コマンド:
 
 ```bash
-BIGLOCK_NO_WORKER=1 BIGLOCK_PRIO=0 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py \
-  --model /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46 \
-  --mtp /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-MTP-5bit/snapshots/998d26dc27cc06baf60ff6e27d673b15f877f0b3 \
-  --mtp-bits 5 --knob MLXTURBO_MOE_COMPILE=1,0 --ctx 0 --tokens 256 --reps 2 \
-  --out bench/results/qwen36-moe-compile-short-strongcool-0904.json
+.venv/bin/python -m pytest -q bench/test_server.py
 ```
