@@ -212,3 +212,9 @@ SSE deltaの個数ではなく、結合した本文を同じtokenizerで数え�
 10個のfull-attention層とMTP側1層が長いKVを読むverify/draft/repair stepの費用増が主因。
 50k同一process ABBAでは汎用SDPA幅分割autoがoff比でms/token -19.1%、ms/round -19.9%、
 tok/round -0.9%。正式fullはauto込みであり、offなら概算57 tok/sまで落ちる。
+
+同じ既定でround anatomyを取ると、短文3本平均20.10 ms/roundに対して50kは39.03 ms。
+内蔵phaseのverifyは17.49→34.53 msで、総増分18.93 msの約90%を占めた。draftは
+2.34→3.23 ms、maintは0.26→0.31 ms。Metal probeでもdispatchは約2,132→2,167回/roundと
+ほぼ同じだが、GPU和集合は17.81→34.39 ms、平均kernelは8.3→15.9 usへ増えた。したがって
+長文脈低下はPython糊やdispatch増ではなく、主にfull-attention verifyのKV帯域費用である。

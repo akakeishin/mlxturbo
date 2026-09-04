@@ -889,16 +889,19 @@ jq '.depths[0].summary | {mean_decode_tok_s,mean_end_to_end_tok_s,mean_speedup_v
 - 50k同一process ABBAは、汎用SDPA幅分割autoがoff比でms/token **-19.1%**、ms/round
   **-19.9%**、tok/round -0.9%。現行autoを維持する。headは一致、生成列は37 token目から
   既知の丸め級分岐。fp32距離が素の0.53倍という既存品質判定は変わらない。
-- 次は`decode_round_anatomy_generic.py`をctx0/50kで流し、verify相とGPU側SDPAの増分を確定する。
+- round anatomyは短文3本平均20.10→50k 39.03 ms/round。verifyが17.49→34.53 msで総増分の
+  約90%、draft 2.34→3.23、maint 0.26→0.31 ms。Metal dispatchは約2,132→2,167回だけだが、
+  GPU和集合は17.81→34.39 ms、平均kernelは8.3→15.9 us。SDPA/KV帯域が原因と確定した。
+- 次は、起動ログだけ40層と表示され実際にはqwen4_expクラスしか包んでいなかったMoE compileの
+  汎用配線を、Qwen3.6短文の`MLXTURBO_MOE_COMPILE=1,0` ABBAで判定する。
 - 連続GPU走行後は5〜10分休止し、再びGEMMが12.78 TFLOPSの±1.5%なら次へ進む。
 
 再開の1コマンド:
 
 ```bash
-MLXTURBO_MOE_COMPILE=0 BIGLOCK_NO_WORKER=1 BIGLOCK_PRIO=0 tools/biglock.sh \
-  .venv/bin/python tools/decode_round_anatomy_generic.py \
+BIGLOCK_NO_WORKER=1 BIGLOCK_PRIO=0 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py \
   --model /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46 \
   --mtp /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-MTP-5bit/snapshots/998d26dc27cc06baf60ff6e27d673b15f877f0b3 \
-  --mtp-bits 5 --ctx-list 0,50000 --tokens 160 --no-ablate --no-nospec --no-s-cost \
-  --out bench/results/qwen36-round-anatomy-0-50k-strongcool-0904.json
+  --mtp-bits 5 --knob MLXTURBO_MOE_COMPILE=1,0 --ctx 0 --tokens 256 --reps 2 \
+  --out bench/results/qwen36-moe-compile-short-strongcool-0904.json
 ```

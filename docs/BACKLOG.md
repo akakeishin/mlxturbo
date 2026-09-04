@@ -1034,7 +1034,8 @@ PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスク�
   同一process ABBAでms/token -19.1%、ms/round -19.9%、tok/round -0.9%。現行autoを維持する。
   SSE chunk分母は2.4〜5.0%過小評価するため今後使わない。
 - **判定**: MTP読込、8-token checkpoint、full速度表、汎用SDPA幅分割を採用。残りは品質/KLDの
-  最終表、50k round anatomy、AR対MTPの履歴依存費用分離である。
+  最終表とAR対MTPの履歴依存費用分離である。round anatomyは短20.10→50k 39.03 ms/roundの
+  増分約90%がverify（17.49→34.53 ms）と確定した。dispatch数は+1.6%だけでGPU時間が約2倍。
 
 ## 完了: 常時冷却Flash-NextフルベンチとGuideLLM導入 (2026-09-04 19:12)
 

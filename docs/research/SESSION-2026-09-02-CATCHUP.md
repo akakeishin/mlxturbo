@@ -3631,3 +3631,28 @@ headは一致し、生成列は37 token目から既知の丸め級分岐。既�
 `_repair_mtp_cache`で履歴KVを読む。GDNとMoEは現在幅だけなので定数項は下げられても傾きは作らない。
 次はctx0/50k round anatomyでverify相とGPU SDPA費用を比較する。結果は
 `bench/results/qwen36-sdpa-split-50k-strongcool-0904.json`（gitignore）。
+
+### 2026-09-04 22:47 Qwen3.6の長文脈増分はverifyが約90%
+
+既定の汎用SDPA幅分割を有効、未採用のMoE compile配線はoff固定にして、同じ解剖器で短文3本と
+49,832 tokenを測った。生成160 token、clean、相別計装、Metal probeを分けている。
+
+| 指標 | 短文3本平均 | 50k | 増分 |
+|---|---:|---:|---:|
+| clean ms/round | 20.10 | 39.03 | +18.93 |
+| draft ms/round | 2.34 | 3.23 | +0.89 |
+| verify ms/round | 17.49 | 34.53 | **+17.04** |
+| maint ms/round | 0.26 | 0.31 | +0.05 |
+| Metal dispatch/round | 2,132 | 2,167 | +1.6% |
+| GPU和集合 ms/round | 17.81 | 34.39 | +16.58 |
+| 平均kernel | 8.3 us | 15.9 us | +91% |
+
+総増分の約90%がverifyで、Metal dispatch数はほぼ増えず、同じ本数のkernelが長いKVを読んで
+約2倍掛かっている。50kの上位kernelは`sdpa_vector_2pass`群で、Python glueやcommand buffer数が
+主因ではない。draftの増分はMTP側full-attention 1層の履歴依存費用と整合するが、0.89 msなので
+本体10 attention層のverifyが支配する。結果は
+`bench/results/qwen36-round-anatomy-0-50k-strongcool-0904.json`（gitignore）。
+
+別件として、Qwen3.6起動ログのMoE compile 40層は構造上のblock数だけを返し、実際の差し替え先は
+qwen4_expの`SparseMoeBlock.__call__`だけだった。実クラスごとの元関数を保持して配線する修正を
+CPUスタブ3件で検査済み。次は短文ABBAの実機ゲートを通し、速度が出る場合だけ50kへ進む。
