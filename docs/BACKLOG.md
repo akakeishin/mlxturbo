@@ -890,3 +890,11 @@ exact q4 lm_head の matvec は帯域天井の97〜99%なので、カーネル�
 proposal-only call は1リンク約1.88 msで、Flash と vendored Swift には q2 coarse top-32 + exact
 row rerank の先例がある。まず exact proposal に対する top-32 recall trace だけを取る。recall が
 十分でなければ実装しない。十分でも追加の常駐重み、warm-up、品質、net ms/tok を別々に審査する。
+
+## 畳んだ: Flash-Next の小M射影 (2026-09-04 14:48)
+
+全135射影は短3本 + 17k 3本の6/6で ms/round +0.26〜+0.70%。N=2560 の48射影を
+外した C (`N>=6144`) も、短の集計が ms/round +0.1%、ms/tok +1.2%で非改善。17kは
+ms/round -0.1% / ms/tok -2.4%だったが、「測った全条件で遅くならない」に届かない。
+N=2560 の低並列度だけが原因ではない。branch `worktree-agent-ae05b9756c852f071` の実験 commit
+`6553991` は main へ入れず、このレーンを閉じる。

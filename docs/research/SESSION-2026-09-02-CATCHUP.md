@@ -3065,3 +3065,26 @@ head4、depth 2 固定、回文順、burn-in 済み。A = compile / B = 素 (`be
   ただし proposal-only の MTP head まで全語彙 q4 を読む必然はない。Flash と vendored Swift にある
   q2 coarse top-32 + exact rerank を、まず exact proposal の top-32 recall を変えずに測る。
   recall が十分な場合だけ速度 A/Bへ進む。追加重み・warm-up・品質の代金があるため既定化は別判定。
+
+### 2026-09-04 14:48 Flash-Next 小Mは N=2560 を外しても短 +0.1% ms/round。レーンを閉じる
+
+全135射影の A は短3本 + 17k 3本の6/6で ms/round +0.26〜+0.70%。最後の切り分けとして、
+`out_proj / o_proj / value_proj` など N=2560 を外す C (`N>=6144`、86射影) と素 B を、
+短3本 + 17k 3本 × 512、1プロセス回文、長文は prefill-once で取り直した。
+
+| 集計 | C | B | 差 |
+|---|---:|---:|---:|
+| short ms/tok | 16.403 | 16.207 | **+1.2%** |
+| short ms/round | 35.147 | 35.120 | **+0.1%** |
+| short tok/round | 2.153 | 2.186 | -1.5% |
+| 17k ms/tok | 18.170 | 18.617 | -2.4% |
+| 17k ms/round | 30.752 | 30.795 | -0.1% |
+| 17k tok/round | 1.694 | 1.657 | +2.2% |
+
+- 短文で遅く、「測った全条件で遅くならない」を満たさない。N=2560 の低並列度だけが負けの
+  原因ではなかった。全射影版・部分集合版とも**不採用**。branch `worktree-agent-ae05b9756c852f071`
+  の実験 commit `6553991` は main へ入れない。
+- 全走行と集計表示の後、worktree に `bench/results/` が無かったため JSON の書き出しだけ
+  `FileNotFoundError` で終了した。上の値は harness が書き出し直前に表示した集計。終了コード1を
+  成功扱いにはせず、保存事故込みで記録するが、不採用判定は short の非改善だけで決まるため
+  再走しない。

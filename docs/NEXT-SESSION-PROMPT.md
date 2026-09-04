@@ -463,6 +463,14 @@ sed -n '1,180p' docs/research/PRODUCT-DIRECTION-2026-09.md
 - 既定は `h=0.19` のまま。ただし controller 自体の意味不整合が見つかったので、27Bレーンは
   閉じず、次の P0 を先に行う。`MLXTURBO_SPEC_GATE_H` の口はその A/B 用に当面残す。
 
+### 完了・不採用: Flash-Next の小M接続
+
+- 全135射影は6/6で ms/round +0.26〜+0.70%。
+- N=2560 を外した C (`N>=6144`) も short ms/round +0.1%、ms/tok +1.2%。17kは
+  ms/round -0.1%、ms/tok -2.4%だが、全条件非悪化を満たさない。
+- branch `worktree-agent-ae05b9756c852f071` の `6553991` は main へ入れない。worktree は
+  記録を確認するまで残してある。削除は別の明示作業として扱う。
+
 ### 新 P0-A: 27B controller の semantics を直して短 A/B
 
 現在の `_gate_depth` / `_plan_depth` は、vendored Swift と Flash の `DepthController` に対し、
