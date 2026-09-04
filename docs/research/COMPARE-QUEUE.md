@@ -410,6 +410,55 @@ mlx-serve は 4k の decode が 25.3 -> 43.2 tok/s。
   本番では `--warm-long` を入れて重みのページインを分離すること。
 
 
+## 投機なし / あり / 推奨設定 (2026-09-04 10:41-13:05 の追加測定)
+
+同じ harness・同じプロンプト・`--ctxs 0,4000 --tokens 64 --reps 1`、冷却なし・1 本ずつ。
+**煙試験であって比較ではない** (上の表と同じ断り)。decode は tok/s、TTFT は秒。
+
+| エンジン | 設定 | 冷 TTFT (0) | decode (0) | 冷 TTFT (4k) | 温 TTFT (4k) | decode (4k) | 結果 JSON |
+|---|---|---|---|---|---|---|---|
+| mlxturbo | 投機なし / あり | — | — | — | — | — | **未実施** (「1・3 着地」待ち) |
+| mlx-lm | 投機なし (`qwen3_5_mtp` を読めない) | 0.43 | 21.8 | 18.92 | 0.44 | 20.9 | `smoke-27b-mlx-lm-0904` |
+| oMLX | 投機なし (ペア付けを外す) | 0.49 | 24.5 | 17.74 | 19.92 | 23.2 | `smoke-27b-omlx-nospec-0904` |
+| oMLX | 投機あり (縛った設定) | 0.45 | **33.7** | 18.98 | 20.24 | **32.8** | `smoke-27b-omlx-0904` |
+| oMLX | 推奨: キャッシュの旗のみ | 0.45 | 30.8 | 17.67 | 18.67 | 28.6 | `smoke-27b-omlx-cache-0904` |
+| oMLX | 推奨: 旗 + `draft_block_size=6` | 0.45 | 16.0 | 17.76 | 18.93 | 18.2 | `smoke-27b-omlx-rec-0904` |
+| MTPLX | 投機なし (AR、頭を読めない状態) | 0.29 | 21.4 | 18.54 | 21.40 | 20.6 | `smoke-27b-mtplx-0904` |
+| MTPLX | 投機あり (縛った設定 = `--chat-template-profile tokenizer`) | 0.28 | 31.3 | 17.72 | 0.60 | 28.4 | `smoke-27b-mtplx-mtp-0904` |
+| MTPLX | 推奨: quickstart のまま (`local_qwen36`) | 0.28 | 30.1 | 18.01 | 0.60 | 28.2 | `smoke-27b-mtplx-qs-0904` |
+| MTPLX | 推奨 + `--profile turbo` | 0.30 | **31.7** | 17.90 | 0.61 | **31.5** | `smoke-27b-mtplx-turbo-0904` |
+| mlx-serve | 投機なし (`--no-mtp --no-pld`) | 0.32 | 24.4 | 15.94 | 0.77 | 23.7 | `smoke-27b-mlx-serve-nospec-0904` |
+| mlx-serve | 投機あり (MTP、PLD も既定 on) | 0.26 | 28.9 | 15.87 | 0.75 | **43.2** | `smoke-27b-mlx-serve-mtp-0904` |
+
+### 読み取り
+
+- **`--no-mtp` は「投機なし」ではない。**mlx-serve は PLD (n-gram 投機) が既定 on なので、
+  投機ゼロにするには `--no-pld` も要る (上の行はどちらも切ってある)。
+  mlxturbo の `--no-mtp` も「lookup (SAM) のみで投機する」意味なので同様。
+- **MTPLX の 28.4 tok/s は「うちが縛ったせい」ではない。**`mtplx quickstart --mtp --dry-run` の
+  既定は profile=sustained / depth=3 / scheduler=serial / batching=latency / warmup 16 /
+  ssd-session-cache on / fan=default / **`--chat-template-profile local_qwen36`**。
+  うちが縛ったのは最後の 1 点だけで、それを戻しても 28.2 tok/s (差 -0.7%)。
+  効いたのは **profile turbo** で、4k が 28.2 -> 31.5 tok/s (+12%)。
+  depth の上限は 3 (`backends/descriptors.py:435`、「depth 4 は daemon を無音で落とした」の注記)。
+  README (dist-info METADATA) の「M5 Max で 2.24x」に profile / fan / cache の前提の記載は無い。
+  同じ harness の mlx-lm 比では turbo で 31.7/21.8 = **1.45x**、4k で 31.5/20.9 = **1.51x**。
+- **oMLX の depth は上げられない。**27B の `vlm_mtp_draft_block_size` の既定は 3
+  (`mtp_num_hidden_layers + 2`、頭は 1 層)。6 にすると受理は
+  `tokens_per_round 1.75 -> 1.75〜2.10` とほぼ変わらず、検証の幅だけ倍になって
+  decode が 33.7 -> 16.0 tok/s に落ちる。**既定が最適。**
+- **oMLX の 4k 温 TTFT が冷とほぼ同じなのは旗の不足ではない。**
+  `--hot-cache-max-size 8GB --paged-ssd-cache-dir ... --paged-ssd-cache-max-size 40GB` を
+  渡してログで有効化を確認しても 18.67s のまま (投機なしの行でも 19.92s)。
+  ログに `Enlarging paged cache block_size=256 to 4096 for ArraysCache hybrid model` とあり、
+  **接頭辞キャッシュのブロックが 4096 トークン**なので、3821 トークンのプロンプトでは
+  完成ブロックが 1 つも無く再利用が起きない。4k での温 TTFT の比較は
+  「機能の有無」ではなく「ブロック粒度」を見ていることになる。
+- **思考 off の掛け方は出力を歪めていない。**5 者の 1 本目の本文を目視した限り、
+  どれも同じ質問に 64 トークン / 117〜138 字で、thinking の漏れも stats footer も無い
+  (MTPLX の `--no-stats-footer` は quickstart の既定で、footer は MTPLX 製 UI の
+  ヒントがあるときだけ出る: `server/openai.py:21741`)。
+
 ## 本番パス `bench/run_27b_baseline.sh`
 
 ```bash
@@ -455,3 +504,133 @@ BIGLOCK_NO_WORKER=1 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py
     --out bench/results/qmm-wide-27b-short-0904.json
 # 長文脈: --ctx 4000 --prefill-once (prefill に効く knob には使わない)
 ```
+
+# Gemma 4 (26B) の 5 者 (2026-09-04)
+
+対象は `~/models/gemma4-26b-4bit` (`mlx-community` の gemma-4-26B-A4B-it 4bit、
+`model_type=gemma4` / `Gemma4ForConditionalGeneration`、MoE 30 層・hidden 2816・
+head_dim 256・128 専門家 top-8・vocab 262144、15.3 GB) と公式の draft
+`~/models/gemma4-26b-assistant` (`model_type=gemma4_assistant` /
+`Gemma4AssistantForCausalLM`、4 層・hidden 1024・`backbone_hidden_size` 2816・
+`num_kv_shared_layers` 4 = 全層が target の KV を読む cross-attention drafter、
+`num_centroids` 2048 の centroid lm_head、236 MB)。計測は 27B と同じ
+`bench/bench_http_engine.py` (`--ctxs 0,4000 --tokens 64 --reps 1`、thinking off)。
+
+## 対応状況 (ソースで確かめたもの)
+
+| エンジン | 本体 | 公式 draft | 根拠 |
+|---|---|---|---|
+| mlxturbo | 読める (FallbackRunner) | **無い** | `mlx_lm.models.gemma4` は import できるが `gemma4_assistant` は `ModuleNotFoundError`。`mlx_lm.utils._get_classes({"model_type":"gemma4_assistant"})` が `ValueError: Model type gemma4_assistant not supported.`。`--draft-model` は `mlx_lm.load` 経由なので同じ理由で使えない |
+| mlx-lm 0.31.3 | 読める | **無い** | 同上 (`models/gemma4.py` + `gemma4_text.py` はあるが assistant は無い) |
+| oMLX 0.6.4 | 読める | **効く** | `mlx_vlm/speculative/drafters/gemma4_assistant/`、`omlx/model_settings.py:311`。ペア付けは `~/.omlx/model_settings.json` の `vlm_mtp_*` |
+| MTPLX 2.9.2 | **読めない** | 読めない | `mtplx/backends/gemma4_assistant.py:249 validate_gemma4_31b_pair_configs` が **dense Gemma 4 31B (hidden 5376 / 60 層 / MoE 無し) しか受けない**。26B は MoE なので拒否 |
+| mlx-serve 26.9.1-dev | 読める | **読み込むが既定 off** | `--drafter <dir>` が `gemma4_assistant` を受ける (`src/drafter.zig:408`)。ただし target が MoE のときリクエストの既定が off (下記) |
+
+**MTPLX は 26B を投機なしでも起動できない。**素の本体ディレクトリを渡すと
+`can_run=false, exit_code=2`「target-only and assistant-only MLX folders are not
+runnable」。assistant-pair bundle (`mtplx_pair.json` + `target/` + `assistant/`) を
+自作して渡すと `Gemma4AssistantUnsupported: Gemma MTP target must be dense Gemma 4
+31B text config (hidden_size=5376, num_hidden_layers=60, no MoE, ...)` で起動時に落ちる。
+**31B (`~/models/gemma4-31b-4bit` + `-assistant`) の bundle なら `can_run=true` /
+`architecture=Gemma4AssistantPair` / `support_level=runtime_runnable_qa_pending`** なので、
+MTPLX を表に載せるなら 31B レーンで。
+
+## 起動コマンド
+
+```bash
+# 1) mlxturbo  (port 8161) -- draft なしのみ
+.venv/bin/python -m mlxturbo.server --model ~/models/gemma4-26b-4bit \
+    --host 127.0.0.1 --port 8161
+# thinking: --thinking-how reasoning_effort
+
+# 2) mlx-lm  (port 8162) -- draft なしのみ
+HF_HUB_OFFLINE=1 .venv/bin/mlx_lm.server --model ~/models/gemma4-26b-4bit \
+    --host 127.0.0.1 --port 8162
+# --model-id ~/models/gemma4-26b-4bit が要る (27B と同じ理由)
+# thinking: --thinking-how chat_template_kwargs
+
+# 3) oMLX  (port 8163)
+omlx serve --model-dir ~/models/omlx-gemma4-26b --host 127.0.0.1 --port 8163 \
+    --no-hf-cache --log-level info
+#   ~/models/omlx-gemma4-26b/gemma4-26b-4bit      -> ~/models/gemma4-26b-4bit
+#   ~/models/omlx-gemma4-26b/gemma4-26b-assistant -> ~/models/gemma4-26b-assistant
+# draft なしは assistant を置かない別ディレクトリ ~/models/omlx-gemma4-26b-nodraft/ で。
+# --model-id gemma4-26b-4bit、thinking: --thinking-how chat_template_kwargs
+
+# 4) MTPLX  (port 8164) -- 26B では起動しない (上記)
+
+# 5) mlx-serve  (port 8165)
+~/dev/mlx-serve/zig-out/bin/mlx-serve --serve --model ~/models/mlxserve-gemma4-26b \
+    --drafter ~/models/gemma4-26b-assistant --no-pld \
+    --host 127.0.0.1 --port 8165 --log-level debug
+# **MoE の target ではリクエストの既定が drafter off。**本体に
+# `{"enable_drafter": true}` を載せないとドラフタは動かない (下記)。
+# 投機ゼロは --no-drafter --no-pld。thinking: --thinking-how reasoning_effort
+```
+
+oMLX のペア付け (**サーバー起動前**に書く):
+
+```json
+{"version": 1, "models": {"gemma4-26b-4bit": {
+    "vlm_mtp_enabled": true, "vlm_mtp_draft_model": "gemma4-26b-assistant"}}}
+```
+
+## draft が効いていることの証拠
+
+- **oMLX**: `mlx_vlm.speculative.drafters - Auto-detected --draft-kind='mtp' for drafter
+  '...gemma4-26b-assistant' (model_type='gemma4_assistant')` →
+  `omlx.engine_pool - VLM MTP enabled for gemma4-26b-4bit, drafter=gemma4-26b-assistant`。
+  受理率は 1 リクエストごとに
+  `omlx.scheduler - vlm_mtp stats: ... rounds=31 accepted=33/93 (35.5%)
+  tokens_per_round=2.06 emitted=64 block_size=4` (block_size は checkpoint から自動で 4)。
+  ペア付けに失敗しても warning だけで本体は起動するので、ログを見ないと気付けない。
+- **mlx-serve**: `[drafter] loaded 4 layers, vocab=262144, hidden=1024 → backbone 2816` /
+  `Drafter ready (block_size=4, auto-detected for gemma4/30-layer,moe).` まではロード。
+  そのすぐ後に
+  `Drafter loaded but target is MoE (gemma4); per-request enable_drafter defaults to OFF
+   — drafter+MoE regresses at single-stream batch=1 (verify forward expert-routing
+   penalty). Pass enable_drafter:true per request to opt-in.`
+  **ロードのログだけ見て「効いている」と読むと間違う。**リクエスト側の
+  `enable_drafter: true` (`src/server.zig:5444-5463`) が要る。harness には
+  `--extra-body '{"enable_drafter": true}'` を足した。
+- **mlxturbo**: `投機デコード有効` の行が出ない = FallbackRunner (投機なし)。
+
+## 煙試験 (2026-09-04 10:39-12:13、`--ctxs 0,4000 --tokens 64 --reps 1`、冷却なし)
+
+**煙試験であって比較ではない** (1 本ずつ、冷却なし、`--warm-long` 無し、プロセス起動直後の
+段差も消していない)。判定に使わないこと。decode は tok/s、TTFT は秒。
+
+| エンジン | draft | 冷 TTFT (0) | decode (0) | 冷 TTFT (4k) | 温 TTFT (4k) | decode (4k) |
+|---|---|---|---|---|---|---|
+| mlxturbo | なし | — | — | — | — | — |
+| mlx-lm | なし (対応せず) | 0.22 | 86.8 | 3.10 | 0.37 | 75.1 |
+| oMLX | なし | 0.32 | **122.2** | 0.92 | 0.93 | **107.0** |
+| oMLX | あり (発火した) | 0.34 | 84.4 | 3.51 | 3.48 | 76.3 |
+| mlx-serve | なし (`--no-drafter --no-pld`) | 0.06 | 109.2 | 2.56 | 0.18 | 95.0 |
+| mlx-serve | drafter 読込 + PLD (drafter は未発火) | 0.06 | 109.4 | 2.56 | 0.17 | 86.9 |
+| mlx-serve | あり (`--no-pld` + `enable_drafter:true`) | 0.14 | 61.6 | 2.68 | 0.27 | 66.7 |
+| MTPLX | — | 起動しない | | | | |
+
+結果 JSON: `bench/results/smoke-gemma4-26b-<tag>-0904.json`
+(`mlx-lm-nodraft` / `omlx-nodraft` / `omlx-draft` / `mlx-serve-nodraft` /
+`mlx-serve-draft` / `mlx-serve-drafter-on`)。
+mlxturbo の行は「1・3 着地」待ちで未実施。
+
+### 読み取り
+
+- **公式 draft を効かせた 2 者はどちらも遅くなった。**26B は MoE (A4B) で、
+  1 本のストリームでは検証フォワードの専門家ルーティングの代金がドラフトの利得を上回る。
+  - oMLX: 122.2 -> 84.4 tok/s (ctx0)、107.0 -> 76.3 (4k)。受理は出ている
+    (`tokens_per_round=2.06〜2.37`、`accepted 35〜46%`、block_size=4)。
+  - mlx-serve: 109.2 -> 61.6 tok/s (ctx0)、95.0 -> 66.7 (4k)。
+    `[spec-stats] mode=drafter` の受理は生成が進むと落ち
+    (`avg_per_round 3.00 -> 1.42 -> 0.60`)、**ランタイムが途中でドラフタを切る**
+    (`runtime_disabled=true`)。mlx-serve は起動時にこれを明示して警告している
+    (「drafter+MoE regresses at single-stream batch=1」)。
+- **mlx-serve の PLD も 4k では損。**drafter を読み込んだだけの行 (PLD 有効) が 86.9 tok/s、
+  投機を全部切った行が 95.0 tok/s。
+- **oMLX は Gemma 4 でも接頭辞を再利用しない。**draft なしで 4k の冷 0.92 / 温 0.93 s。
+  ただし 26B は prefill 自体が速い (3821 トークンを 0.92 s = 4100 tok/s) ので、
+  27B ほど目立たない。draft を入れると 3.51 / 3.48 s に悪化する。
+- **26B (アクティブ 3.8B) の decode は 27B (dense) の 3〜4 倍。**素の decode で
+  oMLX 122 / mlx-serve 109 / mlx-lm 87 tok/s。投機の余地はそもそも小さい。

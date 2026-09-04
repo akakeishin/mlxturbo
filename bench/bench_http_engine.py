@@ -126,6 +126,13 @@ def main() -> int:
                              "prompt", "none"),
                     default="reasoning_effort",
                     help="thinking を off にする経路 (モジュール docstring 参照)")
+    ap.add_argument("--extra-body", default=None,
+                    help="リクエスト本体に足す JSON オブジェクト (文字列)。"
+                         " --thinking-how の分に上書きで混ぜる。投機のスイッチが"
+                         " リクエスト側にあるエンジン向け (mlx-serve の"
+                         " `{\"enable_drafter\": true}` など。MoE の target では"
+                         " drafter の既定が off なので、これを送らないと"
+                         " ドラフタは動かない)")
     args = ap.parse_args()
 
     extra_body = None
@@ -136,6 +143,9 @@ def main() -> int:
         extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
     elif args.thinking_how == "prompt":
         prompt_suffix = " /no_think"
+    if args.extra_body:
+        extra_body = dict(extra_body or {})
+        extra_body.update(json.loads(args.extra_body))
 
     from transformers import AutoTokenizer
     from _bench_text import long_prompts
@@ -255,6 +265,7 @@ def main() -> int:
                        thinking="off" if args.thinking_how != "none" else "default",
                        thinking_how=args.thinking_how,
                        thinking_extra_body=extra_body,
+                       extra_body_arg=args.extra_body,
                        thinking_prompt_suffix=prompt_suffix,
                        ts=time.strftime("%Y-%m-%dT%H:%M:%S")), f,
                   ensure_ascii=False, indent=2)
