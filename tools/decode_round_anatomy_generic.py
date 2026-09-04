@@ -217,13 +217,17 @@ def install(tracer):
     import mlx.core as mx
 
     from mlxturbo import spec as spec_mod
-    from mlxturbo import staged as staged_mod
+    try:  # staged.py は 2026-09-04 の第 1 段で spec.py に畳まれて無くなる
+        from mlxturbo import staged as staged_mod
+    except ImportError:
+        staged_mod = None
 
     proxy = _MxProxy(mx, tracer)
     orig_spec_mx = spec_mod.mx
-    orig_staged_mx = staged_mod.mx
+    orig_staged_mx = staged_mod.mx if staged_mod is not None else None
     spec_mod.mx = proxy
-    staged_mod.mx = proxy
+    if staged_mod is not None:
+        staged_mod.mx = proxy
 
     Eng = spec_mod.SpecEngine
     orig = {
@@ -293,7 +297,8 @@ def install(tracer):
 
     def uninstall():
         spec_mod.mx = orig_spec_mx
-        staged_mod.mx = orig_staged_mx
+        if staged_mod is not None:
+            staged_mod.mx = orig_staged_mx
         for n, f in orig.items():
             setattr(Eng, n, f)
 
