@@ -1024,3 +1024,16 @@ rg -n "_prefetch_ngram_span|class StreamNGram|_resolve_runner_for_request|_probe
 ```bash
 git show --stat --oneline HEAD && rg -n "未決|保留|調査継続" docs/BACKLOG.md | tail -n 60
 ```
+
+## 棄却: 27B context-SAMの最小一致長5 (2026-09-05 06:40 JST)
+
+- 旧D3の「K2後に再計算」を現行27B経路で実施した。17kはms/token -0.1%で同着。
+- 50kはms/round -3.5%でもtok/round -5.9%、総合ms/token +2.5%。43 token目で軌道も分岐。
+- 旧見積もりは別モデルの生成列と旧費用表に基づいていた。測定口は撤回し、既定4を維持する。
+- 過去の5%線だけで落とした案の再監査は完了。無償で復活する未採用案は残っていない。
+
+再開の1コマンド:
+
+```bash
+git show --stat --oneline HEAD && rg -n "保留|未決" docs/BACKLOG.md | tail -n 60
+```

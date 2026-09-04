@@ -848,11 +848,12 @@ MLX の `quantized_matmul` は M=1 (qmv) で 400 GB/s 級なのに M=2〜8 (fast
 `_group_prefill_forward` は G チャンクを concat して `layer.mlp(xcat)` を 1 回で呼ぶ (`spec_flash.py:1017-1019`): 既定 `MLXTURBO_PREFILL_GROUP=4` × 2048 × top_k 10 = 81,920 行。NAX 機では `MLXTURBO_MOE_GEMM=auto` が自前 GEMM を off にするので素の `mx.gather_qmm(sorted_indices=True)` が走り、0.32.2 の NAX カーネルは 32,768 行超で出力行が未書き込みになる (main の #3922 で修正)。M3 Max では再現できない。
 **NAX 機で最初にやること**: 0.32.3 が出るまで `MLXTURBO_PREFILL_GROUP=1` (2048 × 10 = 20,480 行 < 32K) にするか、群の行数が 32K を超えるときだけ分割する門を `_group_prefill_forward` に置く。そのうえで `tools/verify_prefill_bitident.py` の checkpoints=[] ゲート。
 
-## qwen4_exp (Flash-Next) の sdpa 幅分割のシームを K/V を切る変種に (2026-09-04 13:15、未着手)
+## 棄却: qwen4_exp (Flash-Next) sdpa幅分割のK/V prefix trim (2026-09-04 17:23)
 
-27B 用の汎用版 (`enable_sdpa_split_generic`、`fused.py`) は K/V をクエリ幅で切って MLX の vector カーネルに戻す。既存の qwen4_exp のシーム (`enable_sdpa_split`) は bool マスクを実体化する変種で、
-冷 micro では K/V を切る変種が 13〜18% 速く、fp32 参照への距離は同じ。17k S=3 で 0.256 → 0.221 ms/層の余地 (`scratchpad/agent-27b-sdpa-split.md` → `docs/research/AGENT-LEDGERS-DIGEST-2026-09-04.md`)。
-ゲートは 17k A/B と `tools/vendor_fingerprint.py`。qwen4_exp を汎用の分岐ルートに載せるときに一緒に。
+冷microはbool mask実体化より13〜18%速かったが、実モデル短文3本で
+ms/tok +5.2% / ms/round +5.0%。17kは既定QSA decodeが通常attentionを迂回するため
+発火しない。同じ案の重複試作を2026-09-05の再監査中に検出して撤回した。
+現行のbool mask変種を維持する。
 
 ## 完了: Gemma 4 (FallbackRunner 経路) の温 TTFT が冷と同じ (2026-09-04 17:56)
 
@@ -1193,3 +1194,10 @@ warm restore候補とqueue競合を避ける最小実装に限定し、短文/17
 request-local cacheと完全一致検査まで実装して測ったが、prefillは短文+4.1%、17k +1.5%。
 出力・hit/missは同一でも、tokenize後からprefillまでの短い区間ではworker/hash費用を隠せない。
 試作と測定knobは撤回し、現行の最初だけ同期、後続groupだけGPUへ重ねる方式を維持する。
+
+## 棄却: 27B context-SAMの最小一致長 5 (2026-09-05 06:40 JST)
+
+過去の「K2後に再計算」を現行経路で実施。17kはms/token -0.1%・
+tok/round同一の同着だが、50kはround -3.5%に対しtok/round -5.9%で、
+ms/token **+2.5%**。一致長4の有用なSAM draftを捨てる代償があり、無償変更ではない。
+測定口は撤回して既定4を維持。代償ゼロの過去棄却案に未採用の残件はない。

@@ -127,7 +127,9 @@
   9/9 promptで現行比非退行（平均ms/token -10.4/-9.4/-8.9%）、短文は1/3が+8.9%なので
   lookupを残す。幅4の現行幅9比ΔKLDは+0.000043。CLIの3値または
   `MLXTURBO_SPEC_MAX_DRAFT`を明示した場合は族既定を使わない。
-  qwen4_exp は従来のシーム `enable_sdpa_split` の担当 (bool マスクを実体化する変種。K/V を切る変種の方が冷 micro で 13〜18% 速い → BACKLOG)。
+  qwen4_exp は従来のシーム `enable_sdpa_split` の担当 (bool マスクを実体化する変種)。
+  K/V を切る変種は冷 micro で 13〜18% 速かったが、実モデル短文で ms/tok +5.2%、
+  17k は QSA decode が迂回するため不採用 (CATCHUP 2026-09-04 17:23)。
   `MLXTURBO_MOE_COMPILE` (既定 auto = qwen4_exp の `SparseMoeBlock` があるときだけ on、`=0` で off、行数 ≤ `MLXTURBO_MOE_COMPILE_MAX_ROWS`=16 の decode / verify 幅だけ) は 2026-09-04 13:25 に入れた本番の既定値:
   MoE ブロックまるごと (router の f32 化 → argpartition → softmax → take → 共有専門家のゲート → combine) を `mx.compile` で 1 グラフに。行列積は境界のまま、op の並べ替えは無いので**ビット一致**。
   短 -1.1% / 17k -0.6% (dispatch -7.7%)、起動時に 48 層 × S=1..4 の 192 グラフを空焼き (0.22 s、`MLXTURBO_MOE_COMPILE_WARMUP=0` で切る)。prefill 幅は取り分が無く (17k ±0、短 +26%) 端数チャンクの形が要求ごとに変わって Compiled が溜まるので包まない。
