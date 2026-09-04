@@ -3303,3 +3303,22 @@ prompt別のB平均は57.4 / 54.7 / 67.9 tok/s。直近の通常条件の小ベ�
 (12.43〜12.83)へ上がり、十分冷えた13.05の97.5%に達した。数分の持続負荷後も性能低下はなく、
 現在の設定を普段の常時冷却として合格とする。残りの演算上限は約2.6%なので、設備負担の大きい追加冷却は
 正式ベンチと最終A/Bだけに使う。
+
+### 2026-09-04 18:20 Gemma 4の3本RMS統計共有は+21.1%かつ生成分岐で不採用
+
+Gemma 4 26Bの各MoE層では、attention後の同じhiddenへdense MLP前、Router内、Experts前の
+RMSNormを3回掛ける。分母は共有でき、各weightだけが異なる。全`RMSNorm`のglobal monkeypatchや
+cacheを含むDecoderLayerの写しは避け、30層だけをsource hashで固定したcoordinatorと、fp32縮約を
+1回行ってbf16の3出力を書くMetal kernelを合成した。合成7 testは通り、実モデルでも30/30層が発火した。
+
+128 token、短文3本、off/on/on/offの結果:
+
+| arm | ms/token | tok/s換算 |
+|---|---:|---:|
+| 標準3回 (off) | **11.454** | 87.3 |
+| 共通統計Metal (on) | **13.871** | 72.1 |
+
+onは+21.1%遅い。off側同士、on側同士の生成列は一致したが、off対onは3/3 promptで分岐した。
+`mx.fast.rms_norm`と自前simd縮約の順序差がRouterのtop-kへ入り、expert選択以降を変えたと考えられる。
+標準3 dispatchを1 dispatchへ減らしても自前kernelの固定費が上回り、品質側の代金もある。512 tokenや
+強冷却へ進む事前線を満たさないため不採用。実験コード、knob、harnessは削除し、記録だけ残す。

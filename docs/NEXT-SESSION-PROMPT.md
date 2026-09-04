@@ -633,13 +633,15 @@ rg -n "Gemma|warm TTFT|QuantizedKVCache|TurboQuant|assistant" docs/BACKLOG.md do
 - **速度**: 4k温TTFT 2.76→0.382 s (-86.1%、7.2倍)、17k温TTFT 0.415 s。
 - **正しさ**: 実Gemmaサーバーでcheckpoint復元と全量再構築の64-token出力が完全一致。
   `bench/test_server.py` + `bench/test_fusions_other_family.py` は437 passed。
-- **次**: Gemma 4の同じhiddenに対するpre-feedforward norm 2本とRouter normの共通統計化を、
-  生成経路の同一process A/Bで判定する。その後に組み込み`QuantizedKVCache`、TurboQuant。
+- **normは完了・不採用**: 30層で共通統計Metalを発火したが、128-token短文3本で
+  off 11.454対on 13.871 ms/token (**+21.1%**)かつ生成列3/3分岐。実装は残さない。
+- **次**: 組み込み`QuantizedKVCache`のGemma混成cacheへの適用可否と実メモリ効果を再計算し、
+  速度/KLD/長文正答率を測る。その後TurboQuant。
 
 再開の1コマンド:
 
 ```bash
-rg -n "pre_feedforward_layernorm|pre_feedforward_layernorm_2|class Router|RMSNorm" .venv/lib/python*/site-packages/mlx_lm/models/gemma4_text.py mlxturbo
+rg -n "QuantizedKVCache|RotatingKVCache|to_quantized|make_cache" .venv/lib/python*/site-packages/mlx_lm/models/{base,cache,gemma4_text}.py mlxturbo
 ```
 
 ## 強冷却の運用 (ユーザー 2026-09-04 18時台)
