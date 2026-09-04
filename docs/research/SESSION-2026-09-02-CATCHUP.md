@@ -2870,3 +2870,8 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - `SpecEngine.__init__` (`spec.py:314`) の `enable_quantized_dispatch(self.text, active=False)` が全 `nn.QuantizedLinear` の `__class__` を `DispatchedQuantizedLinear` に上書きし、自前の `__call__` が `enable_qmm_wide` の差し替え (`_qmm_wide_dispatch`) をシャドーする。`dispatch_scope()` の外では常に STOCK。**起動ログの「qmm_wide 有効 (368 射影)」は印を付けただけで、27B の A/B が ±0 だったのはこれ** (今朝の移植の取り分の評価は取り直し)。Flash-Next は `enable_quantized_dispatch` を通らないので無関係。修正をエージェントに (`scratchpad/agent-27b-dispatch-fix.md`)。
 - lm_head (M=1、0.64 GB、4.6 ms = 139 GB/s): 自前カーネルは通らず stock の qmv。Flash-Next でも常駐時の孤立計測は 109 GB/s (KERNEL-BRIEF-MOE-GDN.md 2026-08-28、原因は直前の重みトラフィック、N の分割やカーネル選択では直らない)。CATCHUP 21:10 の「lm_head 0.83 ms」はバイト按分の推定値で孤立計測ではない。27B での切り分け (非常駐 / 常駐 / decode 直後) は同じエージェントに。
 - 追記 (11:02): 段階投入の粒度 (`MLXTURBO_STAGE_EVERY` 2 / 4 / 8 / 16) の掃引 (27B、`bench/results/stage-every-27b-*.json`): 短 ms/tok ±0 / -0.0 / **-1.0** / -0.0%、4k +0.3 / +0.8 / +1.9%。head と tok/round は全て一致。**取り分なし、既定 2 のまま** (CB 168 本/round は費用の正体ではない)。
+
+### 2026-09-04 11:43 Flash-Next の「飛ばす / 積む」: 的なし → 畳む (`bench/results/gdn-state-out-0904.json`)
+
+- 唯一実在した「使わない仕事」= GDN の `state_out` の二度書き (113 MB/forward) を消しても短 ±0.0% / 17k +0.1% (ビット一致、peak メモリ -12.6 MB で配線は効いている)。**バイトを消しても壁時計が動かない直接の例** (隣の行列積と重なって隠れる)。代金 (カーネル変種 4 本) があるので畳んだ (コードは戻した)。
+- 「積む」に新しい的は無し (router 18→4 は +0.05%、HC は既に 3 本/層、q/k norm 統合は期待値 0、dtype cast 260 本は 0.010 ms)。IDEAS の D6 (indexer 228 us/層) は長文脈で疎化が働くときの値で短文脈には掛からない。

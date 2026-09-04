@@ -823,3 +823,15 @@ HC 型の MTP 頭、QSA cache、`_arch()` の決め打ち) も同じ形 (モジ�
 MLX の `quantized_matmul` は M=1 (qmv) で 400 GB/s 級なのに M=2〜8 (fast_qmm) で 209 GB/s。投機デコードの verify 幅が全部ここを踏む (27B の S=4 で +32 ms/round)。
 自前の multi-row qmv (同じ重みタイルに M 行を同時に掛けて重みを 1 回だけ読む)。**数値の目標は各行が qmv (M=1) とビット一致** = verify 幅で丸めが変わらない「同じ挙動の保証」。
 いろんな族で使い回せるので、**MLX 本体に issue / PR を出す候補** (qmv の作法に寄せて書く)。PoL は `scratchpad/agent-27b-verify-width.md`、micro は `tools/qmm_smallm_micro.py`、テストは `bench/test_qmm_smallm.py`。
+
+## Gemma レーン: KV cache の量子化 (TurboQuant 含む) (ユーザー 2026-09-04 11:43「Gemma を扱いたいから TurboQuant を入れたいかも」)
+
+- Gemma 4 26B の形: 30 層、Hq 16 / Hk 8、head_dim 256、sliding window 1024 (6 層に 1 回 full attention)。KV は full 層 (5 層) だけ文脈長で伸びる: 1 トークン 41 KB → 128k で 5.2 GB。sliding 層は 1024 トークンで頭打ち。**KV の帯域と容量が効くのは 100k 級の文脈と多セッション。**
+- 第 1 段 (安い): mlx-lm 組み込みの `QuantizedKVCache` (affine 4 / 8 bit、g64) + `quantized_scaled_dot_product_attention` (`mlx_lm/models/base.py:64`、`cache.py:232`) を Gemma 4 で測る (速度、KLD、長文脈の正答率)。カーネルを書かずに済む。
+- 第 2 段: TurboQuant (ランダム回転 + Lloyd-Max 3 bit + QJL の残差補正、学習不要、ICLR 2026、llama.cpp / ollama に実装あり)。量子化そのものは MLX の op で書けるが、**取り分は packed 3 bit の KV を直接読む decode 用 attention カーネル (S ≤ 8、qmv 型)** に懸かる (K2b の QSA decode カーネルと同型)。品質は KLD (対 bf16 KV) で審査。
+- Flash-Next / 27B は GDN 混成で KV が小さい (50k で 0.6 / 1.6 GB) ので優先度は低い。順序: Gemma 4 の drafter エンジン → norm の本数削減 → KV 量子化 (第 1 段 → 第 2 段)。
+
+## 畳んだ: Flash-Next の「飛ばす / 積む」(2026-09-04 11:43、`scratchpad/agent-fn-skip-stack.md`)
+
+- 「結果を使わない仕事」で実在したのは GDN の `state_out` の二度書き (113 MB/forward) だけで、in-model ±0.0% (隣の行列積と重なって隠れている = **バイトを消しても壁時計が動かない**直接の例)。indexer の q 側 512 列は 8.8 MB / 0.017 ms。他 (prime の MTP 層、pooled / top-k、mask、未受理行の lm_head) は MLX の遅延で既に飛んでいる。「積む」に新しい的は無し。
+- 27B でも同じ死んだ書き出しが `spec.py:566` の `_linear_capture` 経由で起きる (48 層 × 3.1 MB = 150 MB/verify)。稼働率 98.7% の 27B なら 1:1 で効く可能性 (≈0.4 ms、1% 未満) があるが、代金 (カーネル変種 4 本) があるので保留。
