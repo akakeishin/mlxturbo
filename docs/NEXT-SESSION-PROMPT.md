@@ -733,3 +733,15 @@ FASTMLX_NGRAM_NOCACHE=1 BIGLOCK_PRIO=0 tools/biglock.sh .venv/bin/python tools/d
 ```bash
 git show --stat --oneline HEAD && rg -n "ignore_eos" mlxturbo/server.py docs/GUIDELLM-BENCHMARK.md
 ```
+
+## HC書き戻しの直接呼出しガード (2026-09-04 20:01 JST)
+
+`enable_hc_write()`自身が`MLXTURBO_HC_WRITE=0`を解釈するようにし、runnerを迂回した
+道具から呼んでも無条件に`DecoderLayer._combine`を差し替えない。通常の既定onは維持。
+`bench/test_fusions_other_family.py`は10 passed。BACKLOG C14を閉じた。
+
+再開の1コマンド:
+
+```bash
+.venv/bin/python -m pytest bench/test_fusions_other_family.py -q
+```

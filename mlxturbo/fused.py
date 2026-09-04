@@ -2010,6 +2010,11 @@ def enable_hc_write() -> None:
     shape ごとに自分でキャッシュする)。
     """
 
+    import os
+
+    if os.environ.get("MLXTURBO_HC_WRITE", "1") == "0":
+        return
+
     global _ORIG_HC_COMBINE
     import mlx_lm.models.qwen4_exp as Q
 

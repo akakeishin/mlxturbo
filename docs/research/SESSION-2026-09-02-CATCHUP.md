@@ -3435,3 +3435,9 @@ batchを迂回することを追加し、`bench/test_server.py`は**441 passed**
 GuideLLMで32-token synthetic / 8 output tokenを2 request送り、2/2がHTTP 200、両方とも
 8 output token、JSON/CSV/HTML生成を確認した。明示stop文字列などは別に短縮し得るため、
 公開時は要求長だけでなく実`output_tokens`も併記する。
+
+### 2026-09-04 20:01 `enable_hc_write`の関数内envゲートを追加
+
+runner側だけでなく`enable_hc_write()`自身でも`MLXTURBO_HC_WRITE=0`を見て、直接呼出しで
+無条件に`DecoderLayer._combine`が差し替わる穴を閉じた。既定onの挙動は変えず、
+他モデル族を含む合成検査は**10 passed**。BACKLOG C14を完了扱いにした。

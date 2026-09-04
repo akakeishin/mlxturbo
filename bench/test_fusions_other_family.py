@@ -256,6 +256,18 @@ def test_enable_default_fusions_qwen4_exp_still_runs():
     assert hit > 0
 
 
+def test_enable_hc_write_honors_direct_env_disable(monkeypatch):
+    """runnerを経由しない直接呼出しでも明示offなら差し替えない。"""
+    import mlx_lm.models.qwen4_exp as Q4
+
+    fused.disable_hc_write()
+    original = Q4.DecoderLayer._combine
+    monkeypatch.setenv("MLXTURBO_HC_WRITE", "0")
+    fused.enable_hc_write()
+    assert Q4.DecoderLayer._combine is original
+    assert fused._ORIG_HC_COMBINE is None
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     ok = True
