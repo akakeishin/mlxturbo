@@ -1089,3 +1089,16 @@ rg -n "LookupSpecRunner|_safe_draft_cap|async_eval" mlxturbo/lookup_spec.py docs
 ```bash
 tools/biglock.sh .venv/bin/python tools/qwen4_state_adapter_poc.py
 ```
+
+## 棄却: Flash prefill最終logitsのhost同期除去 (2026-09-05 07:32 JST)
+
+- 最終1行の全語彙logitsを`mx.eval`せず`mx.async_eval`だけにし、MTP primingのgraph構築を
+  host側で先行させる案を4k・3 promptの同一process回文順で測った。
+- prefillは6.337→6.335秒（-0.03%、同着）、decodeは+0.2%。出力・tok/roundは全条件一致。
+- GPU上では同じ依存列に並び、隠せるhost仕事が小さい。製品helperとA/B knobは撤回した。
+
+再開の1コマンド:
+
+```bash
+git show --stat --oneline HEAD && rg -n "実行可|未決|保留" docs/BACKLOG-AUDIT-2026-09-04.md docs/BACKLOG.md | tail -n 80
+```

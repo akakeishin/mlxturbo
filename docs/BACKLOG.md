@@ -1024,6 +1024,12 @@ keep=1/3/4でも5葉すべてとshapeが一致した。対照のPython整数offs
 eager経路のlogits/cacheを一致させる。ここを通るまでgraphbank本体は実装しない。検査器は
 `tools/qwen4_state_adapter_poc.py`。
 
+実QSA 1層の接続点も追跡したが、現行`Attention`はPython整数offset、可変長の
+`_IndexerCache._buf/_pooled`、`KVCache.update_and_fetch`の副作用を内部で使う。
+2回目も同じgraphを再生するにはAttention/indexer/rope/KV書込みを機能置換する必要があり、
+1層だけの最小patchにはならない。134葉graphbankへ直行せず、component replacementを
+独立した製品設計として扱う。
+
 ## 畳んだ: PR同梱FR-Spec Q8 65,536-row head (2026-09-04 17:36)
 
 公式sidecar（commit `a5e38bb7`、SHA-256 `950adf…c1fba`）を、既存Flash top-k traceの本走行

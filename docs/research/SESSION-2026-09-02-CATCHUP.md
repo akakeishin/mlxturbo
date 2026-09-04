@@ -4095,3 +4095,23 @@ graphbankへ入れる案は棄却し、tensor state境界を前提にする。
 この結果は合成配列の更新規約だけを検証しており、実QSA Attention、GDN/PLEを含む134 state leaves、
 hyper出力、MTP cache、速度は未検証である。次のgateは実QSA 1層でeagerとadapterの
 logits/cache一致。そこを通る前にgraphbank本体は作らない。
+
+実QSA 1層まで接続点を追跡すると、現行`Attention`はPython整数offsetをrope・QSA可視判定・
+KV sliceへ渡し、raw/pooled indexも可変shapeのcache objectへ副作用で書く。合成5葉を
+実層へ差すにはAttention/indexer/rope/KV書込みの機能置換が必要で、1層だけの小patchにはならない。
+したがって現行`Attention.__call__`の直接compileは行わず、134葉graphbankへも直行しない。
+
+### 2026-09-05 07:32 Flash prefill最終logitsの非同期submitは4k同着で棄却
+
+最終1行の全語彙logitsに対する`mx.eval`を`mx.async_eval`へ変え、argmax同期までの間に
+MTP priming graphをhostで組む案を、4k・64 token・3 promptで`A,B,B,A`測定した。
+
+| 指標 | 非同期submit | 従来同期 | 差 |
+|---|---:|---:|---:|
+| prefill | 6.335秒 | 6.337秒 | -0.03% |
+| decode | 17.567 ms/token | 17.527 ms/token | +0.2% |
+| tok/round | 2.184 | 2.184 | 0.0% |
+
+3ケースとも生成列一致。GPU上の依存列は変わらず、隠せるhost構築も小さいため壁時計は動かなかった。
+製品helperと測定knobは撤回した。結果は
+`bench/results/prefill-logits-async-4k-0905.json`（gitignore）。
