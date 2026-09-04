@@ -3014,7 +3014,7 @@ head4、depth 2 固定、回文順、burn-in 済み。A = compile / B = 素 (`be
 - **A/B を投げた後は `mlxturbo/*.py` を触らない** (worker の code fingerprint が変わって読み直し 290 s。今日 2 回踏んだ)。
 - 検査: pytest 4 ファイル 436 passed、`vendor_fingerprint` 全一致。
 
-### 2026-09-04 13:38 27B の投機ゼロの行 (`MLXTURBO_RUNNER=fallback`、99ba892、`smoke-27b-mlxturbo-nospec-forced-0904.json`): 素の効率は相手と同着、差は投機の取り分
+### 2026-09-04 13:30 27B の投機ゼロの行 (`MLXTURBO_RUNNER=fallback`、99ba892、`smoke-27b-mlxturbo-nospec-forced-0904.json`): 素の効率は相手と同着、差は投機の取り分
 
 | 設定 | dec (0) | dec (4k) | 対 mlx-lm |
 |---|---|---|---|
