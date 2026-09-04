@@ -2896,3 +2896,10 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - 死んだ的 (確認): prefill 幅の dense 射影 (98〜104%)、27B decode S=1 の qmm (96〜103%)、語彙 248k の softmax / argmax / logsumexp (占有 < 0.1 ms)、router の argpartition / argsort (起動の床だけ)。
 - **次の手 (出した)**: 27B の sdpa 幅分割 (S×gqa ≤ 32 に割る、Flash-Next のシームと同じ手、ビット一致のはず、17k で -3% が線)。小 M qmv (別途 PoL 中) は M ≤ 8 を第 1 目標にし、M=12〜31 の谷はバッチ × 投機のレーンで。QSA の argpartition (prefill 1%) と HC の束 (1 ms) は後。
 - 追記 (12:08、監査の最終版、mask あり / 冷の gather_qmm 込み): 27B sdpa S=4 は **mask ありで達成率 18.3%、15.3 ms/round、差 11 ms** (S≥6 で 41 ms)。mask は崖を動かさない (1.0〜1.4 倍)。**MoE gather の谷**: 専門家あたり 2.5〜10 行 (1280〜5120 行のチャンク) で 30〜50% (1 行/専門家 64〜96%、40 行 62% の間が最悪) = prefill の端数チャンクと 35B-A3B 級の幅の的。`bench/results/ceiling-{sdpa-mask,gqmm-cold}-0904.json`。
+
+### 2026-09-04 12:15 MLX の更新の試験 (`scratchpad/agent-mlx-upgrade.md`): 上げ先が無い (PyPI 最新 = 本番と同じ 0.32.2 / mlx-lm 0.31.3)。main (0.32.3.dev) を source build して比較 → 非 NAX では**差なし** (短 -0.05%、生成列 4 走行一致、指紋一致、テスト全緑)。**NAX 機で踏む正しさの修正 (#3922) がある**
+
+- 0.32.3 の中身で効くもの: **#3922 sorted `gather_qmm` の NAX カーネルが 32K 行超で行数を short に落として負に折り返し、出力行が未書き込みになる**。本番既定 `MLXTURBO_PREFILL_GROUP=4` × 2048 × top_k 10 = **81,920 行 > 32,768** で、NAX 機では `MLXTURBO_MOE_GEMM=auto` が自前 GEMM を off にするので素の sorted gather_qmm (当のカーネル) が走る → **NAX 機 (本番の対象機) では 0.32.2 のままだと prefill の MoE が壊れる疑い** (M3 Max では再現も反証もできない)。BACKLOG に。
+- #4416 (hd256 + array mask の prefill を NAX 融合 attention へ、`MLXTURBO_SDPA_ROWTILE` と的が重なる、NAX 限定)、#4380 (sdpa_vector の GQA 12/16 化は head_dim 128 限定 = うちには当たらない)。
+- 速度: Flash-Next 短 512 (プロセスを分けた A,B,B,A) 16.08 対 16.08 ms/tok、ms/round 34.84 対 34.85 → **差なし**。17k は depth 適応の controller が混んだ機体で別の深さを選んで比較にならず打ち切り (`--depth 2` 固定が要る)。ユーザーの判断で速度 A/B はスキップ。
+- 判定: いま上げるものは無い。0.32.3 が出たら上げる価値は速度ではなく NAX の正しさ。mlx-lm の次版 0.32.0 は `_mlx_compat` の上限外で import 時に落ちる (設計どおり): そのときの作業は `spec_flash._staged_forward` の写しの PipelineMixin 追随、`layers`→`pipeline_layers`、`BatchKVCache.state` の 3 タプル化、上流の packed gated delta kernel (Dk=128) と自前 GDN の取り直し。

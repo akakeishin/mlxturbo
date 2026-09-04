@@ -835,3 +835,8 @@ MLX の `quantized_matmul` は M=1 (qmv) で 400 GB/s 級なのに M=2〜8 (fast
 
 - 「結果を使わない仕事」で実在したのは GDN の `state_out` の二度書き (113 MB/forward) だけで、in-model ±0.0% (隣の行列積と重なって隠れている = **バイトを消しても壁時計が動かない**直接の例)。indexer の q 側 512 列は 8.8 MB / 0.017 ms。他 (prime の MTP 層、pooled / top-k、mask、未受理行の lm_head) は MLX の遅延で既に飛んでいる。「積む」に新しい的は無し。
 - 27B でも同じ死んだ書き出しが `spec.py:566` の `_linear_capture` 経由で起きる (48 層 × 3.1 MB = 150 MB/verify)。稼働率 98.7% の 27B なら 1:1 で効く可能性 (≈0.4 ms、1% 未満) があるが、代金 (カーネル変種 4 本) があるので保留。
+
+## NAX 機の本番で踏む疑い: MLX 0.32.2 の sorted gather_qmm が 32K 行超で壊れる (#3922、2026-09-04 12:15)
+
+`_group_prefill_forward` は G チャンクを concat して `layer.mlp(xcat)` を 1 回で呼ぶ (`spec_flash.py:1017-1019`): 既定 `MLXTURBO_PREFILL_GROUP=4` × 2048 × top_k 10 = 81,920 行。NAX 機では `MLXTURBO_MOE_GEMM=auto` が自前 GEMM を off にするので素の `mx.gather_qmm(sorted_indices=True)` が走り、0.32.2 の NAX カーネルは 32,768 行超で出力行が未書き込みになる (main の #3922 で修正)。M3 Max では再現できない。
+**NAX 機で最初にやること**: 0.32.3 が出るまで `MLXTURBO_PREFILL_GROUP=1` (2048 × 10 = 20,480 行 < 32K) にするか、群の行数が 32K を超えるときだけ分割する門を `_group_prefill_forward` に置く。そのうえで `tools/verify_prefill_bitident.py` の checkpoints=[] ゲート。
