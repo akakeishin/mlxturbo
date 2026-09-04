@@ -817,3 +817,9 @@ HC 型の MTP 頭、QSA cache、`_arch()` の決め打ち) も同じ形 (モジ�
 ## そのうち: 看板の架け替え (ユーザー 2026-09-04 11:17「多分普通に掛け替える」)
 
 位置づけを「皆が使う推論エンジン (製品が中に入れるバックエンド)」に寄せるのに合わせて、名前と看板を掛け替える。対象: パッケージ名 (PyPI `mlxturbo`)、モジュール名、HF のパック名 (`ddalcu/…`)、README の位置づけ、docs の自称。決めるときは一括で。時期はユーザーの判断。
+
+## 小 M (2〜8) の量子化行列積の自前カーネル (ユーザー 2026-09-04 11:32「実装する。まず micro で徹底検証」)
+
+MLX の `quantized_matmul` は M=1 (qmv) で 400 GB/s 級なのに M=2〜8 (fast_qmm) で 209 GB/s。投機デコードの verify 幅が全部ここを踏む (27B の S=4 で +32 ms/round)。
+自前の multi-row qmv (同じ重みタイルに M 行を同時に掛けて重みを 1 回だけ読む)。**数値の目標は各行が qmv (M=1) とビット一致** = verify 幅で丸めが変わらない「同じ挙動の保証」。
+いろんな族で使い回せるので、**MLX 本体に issue / PR を出す候補** (qmv の作法に寄せて書く)。PoL は `scratchpad/agent-27b-verify-width.md`、micro は `tools/qmm_smallm_micro.py`、テストは `bench/test_qmm_smallm.py`。
