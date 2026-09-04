@@ -29,7 +29,7 @@
 
 判断は advisor の返答と round の内訳 (別途測定) を見て親が決める。判定は `decode_ab_generic` の ms/round・tok/round・head 一致、KLD (参照 = 素 4bit)、Flash-Next 側の fingerprint と A/B の不変。
 
-## 判断 (advisor 2026-09-04 09:20、親が採用): **(B)。「spec_flash の最適化を持ち込む」ではなく「spec.py の round から同期と写しを剥がす」。(A) は今やらない**
+## 判断 (advisor 2026-09-04 09:09、親が採用): **(B)。「spec_flash の最適化を持ち込む」ではなく「spec.py の round から同期と写しを剥がす」。(A) は今やらない**
 
 - 汎用性が要るのは round のループではなくモデル側のシーム (capture / 状態スナップショット / 層呼び出し / MTP 頭)。`arch.py` の duck typing を族で揃えればエンジンが 2 本でも「8〜9 割ついていく」は満たせる。統合は 3 族目が同じ工数窓に入ったときに、動いている 2 実装から抽出する。
 - 数字はエンジンの糊を指している: 4k で 99 ms/round = 素 48 + 51。相手 (23 ms/tok) の round は ≈ 48 + 17。**差の本体 30〜35 ms/round は同期点と写し**で、骨格の汎用化では減らない。
