@@ -124,6 +124,7 @@
   `MLXTURBO_MOE_COMPILE` (既定 auto = qwen4_exp の `SparseMoeBlock` があるときだけ on、`=0` で off、行数 ≤ `MLXTURBO_MOE_COMPILE_MAX_ROWS`=16 の decode / verify 幅だけ) は 2026-09-04 13:25 に入れた本番の既定値:
   MoE ブロックまるごと (router の f32 化 → argpartition → softmax → take → 共有専門家のゲート → combine) を `mx.compile` で 1 グラフに。行列積は境界のまま、op の並べ替えは無いので**ビット一致**。
   短 -1.1% / 17k -0.6% (dispatch -7.7%)、起動時に 48 層 × S=1..4 の 192 グラフを空焼き (0.22 s、`MLXTURBO_MOE_COMPILE_WARMUP=0` で切る)。prefill 幅は取り分が無く (17k ±0、短 +26%) 端数チャンクの形が要求ごとに変わって Compiled が溜まるので包まない。
+  構造が同じ別クラスは対象外。Qwen3.6へ汎用化した実測は短 -0.6%だが50k +0.9%かつ未空焼き幅の初回trace税があり、2026-09-04 23:14に不採用。対象block数はqwen4_expの実instanceだけを数える。
   層まるごと / GDN / attention の compile は原理的に不可 (closure の配列を定数に焼き、python の副作用はトレース時の 1 回だけ。`shapeless` はこのモデルでは全滅)。
 - 品質を売って速度を買わない。fake を実物より緩くしない。KLD の受け入れ幅は
   現行比 +0.0005 (bench/quant_eval.py compare)。

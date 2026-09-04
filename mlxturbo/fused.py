@@ -3775,7 +3775,7 @@ def disable_ple_hoist(model) -> int:
 # 払わないと最初の要求の TTFT に 48 層 x 形数ぶん (S=1..4 で ~0.6 s) 乗る。
 
 _MOE_COMPILE_ON = False
-_MOE_COMPILE_ORIG = None            # 素の SparseMoeBlock.__call__
+_MOE_COMPILE_ORIG = None            # 素の qwen4_exp SparseMoeBlock.__call__
 _MOE_COMPILE_MAX_ROWS = 16          # 0 = 上限なし
 _MOE_COMPILE_COUNT = 0              # 作った Compiled の個数 (ログ / warm-up 用)
 
@@ -3880,15 +3880,15 @@ def enable_moe_block_compile(model=None, mode: str | None = None,
                              max_rows: int | None = None) -> int:
     """`SparseMoeBlock.__call__` まるごとを `mx.compile` で包む (既定 on)。
 
-    ``mode``: ``"auto"`` (既定、MoE ブロックを持つ族 = qwen4_exp だけ on) /
+    ``mode``: ``"auto"`` (既定、qwen4_exp の MoE ブロックを持つ族だけ on) /
     ``"1"`` / ``"0"``。``None`` なら環境変数 `MLXTURBO_MOE_COMPILE` を読む
     (`enable_moe_decode_fused` と同じ作法 -- 呼び出し側が env を忘れても
     既定が保たれる)。``max_rows`` は `MLXTURBO_MOE_COMPILE_MAX_ROWS`
     (既定 16、0 で上限なし)。
 
-    差し替えるのはクラスの属性 1 つだけなので、`SparseMoeBlock` を持たない族
-    (qwen3_5 = Qwen3.8-27B など) には最初から届かない。``auto`` では
-    `model` に MoE ブロックが 1 つも無ければ差し替え自体を入れない。
+    差し替えるのはqwen4_expの`SparseMoeBlock.__call__` 1つだけ。構造だけが
+    同じ別族のMoEブロックは数にも入れない。これをしないとQwen3.6のような
+    別クラスへ実際には届かないのに、ログだけ「40層有効」と表示してしまう。
 
     `enable_moe_route` / `enable_moe_route_nofuse` (どちらも既定 off、
     `--knob moe-route` 専用) と**同じ `Q.SparseMoeBlock.__call__` を取り合う**。
@@ -3907,7 +3907,8 @@ def enable_moe_block_compile(model=None, mode: str | None = None,
 
     行数の上限と効き目の実測はこの節の冒頭のコメントに書いた。
 
-    戻り値は当たった MoE ブロックの数 (Flash-Next で 48、off なら 0)。
+    戻り値は実際に当たったqwen4_exp MoEブロックの数 (Flash-Nextで48、
+    別クラスだけなら0、offなら0)。
     """
     global _MOE_COMPILE_ON, _MOE_COMPILE_ORIG, _MOE_COMPILE_MAX_ROWS
     import os
@@ -3924,8 +3925,16 @@ def enable_moe_block_compile(model=None, mode: str | None = None,
     if mode == "off":
         _MOE_COMPILE_ON = False
         return 0
-    blocks = _moe_blocks(model) if model is not None else []
-    if mode == "auto" and not blocks:
+    try:
+        from mlx_lm.models import qwen4_exp as Q
+    except Exception:  # noqa: BLE001  族が無い環境でも起動は続ける
+        _MOE_COMPILE_ON = False
+        return 0
+    blocks = [
+        block for block in (_moe_blocks(model) if model is not None else [])
+        if isinstance(block, Q.SparseMoeBlock)
+    ]
+    if not blocks:
         # MoE ブロックを持たない族。差し替えを入れる意味が無い
         _MOE_COMPILE_ON = False
         return 0
@@ -3933,10 +3942,6 @@ def enable_moe_block_compile(model=None, mode: str | None = None,
         max_rows = int(os.environ.get("MLXTURBO_MOE_COMPILE_MAX_ROWS", "16"))
     _MOE_COMPILE_MAX_ROWS = max_rows
     if _MOE_COMPILE_ORIG is None:
-        try:
-            from mlx_lm.models import qwen4_exp as Q
-        except Exception:  # noqa: BLE001  族が無い環境でも起動は続ける
-            return 0
         _MOE_COMPILE_ORIG = Q.SparseMoeBlock.__call__
         Q.SparseMoeBlock.__call__ = _moe_compile_call
     _MOE_COMPILE_ON = True
