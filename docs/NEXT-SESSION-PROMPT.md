@@ -289,3 +289,4 @@ Flash-Next のフルベンチは後回し (ユーザーの指示があるまで�
 - **27B 移植の現在地 (08:58、commit 3788945)**: GDN 部品 (48 層)、sdpa 行タイル (16 層)、qmm_wide (368 射影、MLP 込み) が契約で当たる。KLD は既定 0.00027 (参照 = 素の 4bit、全部 GDN Metal)。
   速度 A/B は走行中 (GDN Metal 4k/17k、GDN decode 融合 短 ×2、行タイル 4k/17k、qmm_wide 17k)。qmm_wide は 4k で取り分なし (+0.4%)。
   **最大の的は decode 経路**: 27B の round は 82〜112 ms (重み読みの下限 35 ms) で、mlx-serve は同じ MTP 頭で 4k 43 tok/s 対 27。round の内訳を測定中 → 設計 (spec_flash の仕組みを族 adapter で汎用化するか) を advisor と決める。
+- **35B-A3B (ユーザー 09:07)**: 35B-A3B は **Qwen3.6** (3.8 ではない)。MTP もあるはず。27B 最優先で、35B-A3B は参考までに後で (MoE 部品の契約の試験台。ダウンロードは計測の合間に、パック名は要確認)。
