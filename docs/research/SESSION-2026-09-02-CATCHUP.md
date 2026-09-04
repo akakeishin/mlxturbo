@@ -3421,3 +3421,17 @@ MoEは中間/末尾で計算下限の68.9/70.8%、GDNは80.3/80.4%、HCは66.0/6
 
 hot/coldを同じ成果物で追えるよう、`bench/hot_prefill_bench.py`にcold行と
 `input_tokens_per_ttft_s`を保存するようにした。5/5 testと実Flash-Next煙試験を通した。
+
+### 2026-09-04 19:58 GuideLLMの`ignore_eos`を全4経路へ接続
+
+GuideLLM 0.7.3は固定出力長scenarioで`ignore_eos: true`を送る。従来はこのvLLM拡張を
+無視していたため、EOSが出たrequestだけ要求長より短くなり、厳密な同一output token比較を
+主張できなかった。OpenAI chat/completionsのstream・non-stream全4経路でrequest単位の
+EOS集合を渡し、`true`のときだけ空集合にした。起動時にEOS方針を固定する既存batch
+coordinatorへは流さず、直列経路へ戻す。通常requestのbatch経路は変えていない。
+
+EOSを生成列の途中に置くfake runnerで4経路とも要求長まで進むこと、非boolを400にすること、
+batchを迂回することを追加し、`bench/test_server.py`は**441 passed**。実Flash-Nextにも
+GuideLLMで32-token synthetic / 8 output tokenを2 request送り、2/2がHTTP 200、両方とも
+8 output token、JSON/CSV/HTML生成を確認した。明示stop文字列などは別に短縮し得るため、
+公開時は要求長だけでなく実`output_tokens`も併記する。

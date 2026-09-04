@@ -246,6 +246,7 @@ class FakeRunner:
                 "prompt_ids": list(prompt_ids),
                 "max_tokens": max_tokens,
                 "temp": temp,
+                "eos_ids": set(eos_ids),
                 **extra,
             }
         )
@@ -1329,6 +1330,59 @@ def test_completions_stream(client):
     assert usage_events[-1]["usage"]["completion_tokens"] == 2
 
 
+def test_completions_ignore_eos_runs_to_max_tokens(client):
+    runner = FakeRunner(tokens_to_emit=[10, 999, 11])
+    _install_state(
+        runner,
+        tokenizer=FakeTokenizer(vocab={10: "a", 999: "<eos>", 11: "b"}),
+    )
+
+    resp = client.post(
+        "/v1/completions",
+        json={"prompt": "hi", "max_tokens": 3, "ignore_eos": True},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["choices"][0]["text"] == "a<eos>b"
+    assert resp.json()["choices"][0]["finish_reason"] == "length"
+    assert runner.calls[0]["eos_ids"] == set()
+
+
+def test_completions_ignore_eos_stream_runs_to_max_tokens(client):
+    runner = FakeRunner(tokens_to_emit=[10, 999, 11])
+    _install_state(
+        runner,
+        tokenizer=FakeTokenizer(vocab={10: "a", 999: "<eos>", 11: "b"}),
+    )
+
+    resp = client.post(
+        "/v1/completions",
+        json={"prompt": "hi", "max_tokens": 3, "ignore_eos": True, "stream": True},
+    )
+    assert resp.status_code == 200, resp.text
+    events = _sse_events(resp.text)
+    assert "".join(
+        event["choices"][0]["text"]
+        for event in events
+        if event.get("choices") and event["choices"][0].get("text")
+    ) == "a<eos>b"
+    assert [
+        event["choices"][0]["finish_reason"]
+        for event in events
+        if event.get("choices") and event["choices"][0].get("finish_reason")
+    ] == ["length"]
+
+
+def test_ignore_eos_requires_boolean(client):
+    runner = FakeRunner(tokens_to_emit=[10])
+    _install_state(runner)
+    resp = client.post(
+        "/v1/completions", json={"prompt": "hi", "ignore_eos": 1}
+    )
+    assert resp.status_code == 400
+    assert "must be a boolean" in resp.json()["error"]["message"]
+    assert runner.calls == []
+
+
 # ---------- cached_tokens on OpenAI chat completions ----------
 
 
@@ -1341,6 +1395,64 @@ def test_cached_tokens_reflects_prefill_reused_non_stream(client):
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["usage"]["prompt_tokens_details"]["cached_tokens"] == 7
+
+
+def test_chat_completions_ignore_eos_bypasses_eos_and_batch_route(client):
+    runner = FakeRunner(tokens_to_emit=[10, 999, 11])
+    _install_state(
+        runner,
+        tokenizer=FakeTokenizer(vocab={10: "a", 999: "<eos>", 11: "b"}),
+    )
+
+    with mock.patch.object(
+        server,
+        "_resolve_batch_route",
+        side_effect=AssertionError("ignore_eos must stay on the serial path"),
+    ):
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 3,
+                "ignore_eos": True,
+            },
+        )
+    assert resp.status_code == 200, resp.text
+    choice = resp.json()["choices"][0]
+    assert choice["message"]["content"] == "a<eos>b"
+    assert choice["finish_reason"] == "length"
+    assert runner.calls[0]["eos_ids"] == set()
+
+
+def test_chat_completions_ignore_eos_stream_runs_to_max_tokens(client):
+    runner = FakeRunner(tokens_to_emit=[10, 999, 11])
+    _install_state(
+        runner,
+        tokenizer=FakeTokenizer(vocab={10: "a", 999: "<eos>", 11: "b"}),
+    )
+
+    resp = client.post(
+        "/v1/chat/completions",
+        json={
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 3,
+            "ignore_eos": True,
+            "stream": True,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    events = _sse_events(resp.text)
+    assert "".join(
+        event["choices"][0]["delta"].get("content", "")
+        for event in events
+        if event.get("choices")
+    ) == "a<eos>b"
+    assert [
+        event["choices"][0]["finish_reason"]
+        for event in events
+        if event.get("choices") and event["choices"][0].get("finish_reason")
+    ] == ["length"]
+    assert runner.calls[0]["eos_ids"] == set()
 
 
 def test_cached_tokens_reflects_prefill_reused_stream(client):

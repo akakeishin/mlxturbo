@@ -2863,8 +2863,9 @@ def _check_context_length(prompt_ids: list[int], protocol: str):
     )
 
 
-def _finish_reason_openai(tokens: list[int]) -> str:
-    return "stop" if tokens and tokens[-1] in STATE.eos_ids else "length"
+def _finish_reason_openai(tokens: list[int], eos_ids: set | None = None) -> str:
+    effective_eos = STATE.eos_ids if eos_ids is None else eos_ids
+    return "stop" if tokens and tokens[-1] in effective_eos else "length"
 
 
 def _stop_reason_anthropic(tokens: list[int]) -> str:
@@ -3457,6 +3458,7 @@ def _start_generation(
     session=None,
     runner=None,
     t_trace: dict | None = None,
+    eos_ids: set | None = None,
     **sampling_kwargs,
 ):
     """Submit the worker to STATE.executor and return (queue, Future, stop
@@ -3505,8 +3507,10 @@ def _start_generation(
     session at once.
     """
 
+    effective_eos_ids = STATE.eos_ids if eos_ids is None else eos_ids
     q, cancel_event, raw_token_count, on_tokens, on_done = _build_streaming_pipeline(
-        prompt_ids, thinking_budget, tool_calling_enabled, tools_for_parsing
+        prompt_ids, thinking_budget, tool_calling_enabled, tools_for_parsing,
+        eos_ids=effective_eos_ids,
     )
 
     def worker():
@@ -3521,7 +3525,7 @@ def _start_generation(
                 prompt_ids,
                 max_tokens=max_tokens,
                 temp=temp,
-                eos_ids=STATE.eos_ids,
+                eos_ids=effective_eos_ids,
                 on_tokens=on_tokens,
                 session=session,
                 **sampling_kwargs,
@@ -3549,7 +3553,8 @@ def _start_generation(
 
 
 def _build_streaming_pipeline(
-    prompt_ids, thinking_budget, tool_calling_enabled, tools_for_parsing
+    prompt_ids, thinking_budget, tool_calling_enabled, tools_for_parsing,
+    eos_ids: set | None = None,
 ):
     """The part of ``_start_generation`` that has nothing to do with *how*
     generation actually runs: the queue, the cancellation flag, the raw token
@@ -3574,7 +3579,7 @@ def _build_streaming_pipeline(
 
     q: queue.Queue = queue.Queue()
     cancel_event = threading.Event()
-    eos_ids = STATE.eos_ids
+    eos_ids = STATE.eos_ids if eos_ids is None else eos_ids
     router = ThinkingRouter(
         STATE.tokenizer,
         thinking_budget,
@@ -3650,6 +3655,7 @@ def _collect_events(
     budget: int | None,
     tool_calling_enabled: bool,
     tools_for_parsing,
+    eos_ids: set | None = None,
 ) -> tuple[list[tuple[str, object]], bool]:
     """For the non-streaming case: run the final token sequence through
     ThinkingRouter + SegmentAssembler in one go and return the order-preserving
@@ -3668,7 +3674,7 @@ def _collect_events(
     router = ThinkingRouter(
         STATE.tokenizer,
         budget,
-        STATE.eos_ids,
+        STATE.eos_ids if eos_ids is None else eos_ids,
         tool_calling_enabled=tool_calling_enabled,
         already_thinking=_prompt_already_thinking(prompt_ids),
     )
@@ -3686,6 +3692,7 @@ def _split_response_final(
     budget: int | None,
     tool_calling_enabled: bool = False,
     tools_for_parsing=None,
+    eos_ids: set | None = None,
 ) -> tuple[str, str, list[dict], bool]:
     """For the OpenAI non-streaming case: return (reasoning_text,
     content_text, tool_calls, budget_exceeded). tool_calls contains only the
@@ -3695,7 +3702,8 @@ def _split_response_final(
     through to ``_collect_events`` (for the already_thinking decision)."""
 
     events, budget_exceeded = _collect_events(
-        prompt_ids, tokens, budget, tool_calling_enabled, tools_for_parsing
+        prompt_ids, tokens, budget, tool_calling_enabled, tools_for_parsing,
+        eos_ids=eos_ids,
     )
     reasoning_text = "".join(v for k, v in events if k == "reasoning_delta")
     content_text = "".join(v for k, v in events if k == "content_delta")
@@ -4027,6 +4035,10 @@ async def chat_completions(request: Request):
     stream, stream_err = _parse_bool_field(body, "stream")
     if stream_err is not None:
         return _openai_error(stream_err)
+    ignore_eos, ignore_eos_err = _parse_bool_field(body, "ignore_eos")
+    if ignore_eos_err is not None:
+        return _openai_error(ignore_eos_err)
+    request_eos_ids = set() if ignore_eos else STATE.eos_ids
     if logprobs_requested and stream:
         # Item 17 (Kimi K3 review): logprobs is not implemented for streaming
         # (correlating per-chunk incremental logprobs token by token with
@@ -4100,13 +4112,17 @@ async def chat_completions(request: Request):
                     resolved_tools,
                     runner=gen_runner,
                     t_trace=t_trace,
+                    eos_ids=request_eos_ids,
                 )
             ),
             media_type="text/event-stream",
             headers=_downgrade_headers(downgrade_reason),
         )
 
-    batch_route = _resolve_batch_route(
+    # Existing batch coordinators capture EOS policy at construction time.
+    # An explicit per-request override must therefore stay on the serial path;
+    # silently routing it to a coordinator would stop at EOS despite the flag.
+    batch_route = None if ignore_eos else _resolve_batch_route(
         gen_runner, prompt_ids, max_tokens, logprobs_requested=logprobs_requested,
         sampling_kwargs=sampling_params,
     )
@@ -4135,7 +4151,7 @@ async def chat_completions(request: Request):
                     prompt_ids,
                     max_tokens,
                     temp,
-                    STATE.eos_ids,
+                    request_eos_ids,
                     None,
                     session,
                     runner=gen_runner,
@@ -4148,9 +4164,10 @@ async def chat_completions(request: Request):
     _log_gen_stats(res)
 
     reasoning_text, content_text, tool_calls, budget_exceeded = _split_response_final(
-        prompt_ids, res["tokens"], thinking_budget, tool_enabled, resolved_tools
+        prompt_ids, res["tokens"], thinking_budget, tool_enabled, resolved_tools,
+        eos_ids=request_eos_ids,
     )
-    finish_reason = _finish_reason_openai(res["tokens"])
+    finish_reason = _finish_reason_openai(res["tokens"], request_eos_ids)
     content_truncated_by_stop = False
     if budget_exceeded:
         finish_reason = "length"
@@ -4232,6 +4249,7 @@ async def _openai_stream(
     tools_for_parsing=None,
     runner=None,
     t_trace: dict | None = None,
+    eos_ids: set | None = None,
 ):
     # [ttft-trace]: caller (chat_completions) seeds t_trace with a_start/
     # b_template; normalize to a dict here so the rest of this function can
@@ -4266,9 +4284,16 @@ async def _openai_stream(
     # first token"). Ownership of the queue slot is centralized in
     # _queue_owned_stream, and ownership of the lock in the owned flag below.
     owned = [False]
-    batch_route = _resolve_batch_route(
-        runner or STATE.runner, prompt_ids, max_tokens,
-        sampling_kwargs=sampling_params or {},
+    effective_eos_ids = STATE.eos_ids if eos_ids is None else eos_ids
+    batch_route = (
+        None
+        if not effective_eos_ids and STATE.eos_ids
+        else _resolve_batch_route(
+            runner or STATE.runner,
+            prompt_ids,
+            max_tokens,
+            sampling_kwargs=sampling_params or {},
+        )
     )
     try:
         if batch_route is not None:
@@ -4336,6 +4361,7 @@ async def _openai_stream(
                 session=session,
                 runner=runner,
                 t_trace=t_trace,
+                eos_ids=effective_eos_ids,
                 **(sampling_params or {}),
             )
         try:
@@ -4495,7 +4521,9 @@ async def _openai_stream(
                     elif made_tool_call:
                         finish_reason = "tool_calls"
                     else:
-                        finish_reason = "stop" if stopped else _finish_reason_openai(payload["tokens"])
+                        finish_reason = "stop" if stopped else _finish_reason_openai(
+                            payload["tokens"], effective_eos_ids
+                        )
                     n_completion = len(payload["tokens"])
                     cached_tokens = payload.get("prefill_reused", 0)
                     _log_gen_stats(payload)
@@ -5186,6 +5214,10 @@ async def completions(request: Request):
     stream, stream_err = _parse_bool_field(body, "stream")
     if stream_err is not None:
         return _openai_error(stream_err)
+    ignore_eos, ignore_eos_err = _parse_bool_field(body, "ignore_eos")
+    if ignore_eos_err is not None:
+        return _openai_error(ignore_eos_err)
+    request_eos_ids = set() if ignore_eos else STATE.eos_ids
     if logprobs_requested and stream:
         # The same reason as chat_completions (see the item 17 docstring):
         # per-chunk logprobs support for streaming was deferred this time.
@@ -5235,13 +5267,14 @@ async def completions(request: Request):
                     include_usage,
                     sampling_params,
                     runner=gen_runner,
+                    eos_ids=request_eos_ids,
                 )
             ),
             media_type="text/event-stream",
             headers=_downgrade_headers(downgrade_reason),
         )
 
-    batch_route = _resolve_batch_route(
+    batch_route = None if ignore_eos else _resolve_batch_route(
         gen_runner, prompt_ids, max_tokens, logprobs_requested=logprobs_requested,
         sampling_kwargs=sampling_params,
     )
@@ -5259,7 +5292,7 @@ async def completions(request: Request):
                     prompt_ids,
                     max_tokens,
                     temp,
-                    STATE.eos_ids,
+                    request_eos_ids,
                     None,
                     session,
                     runner=gen_runner,
@@ -5272,9 +5305,9 @@ async def completions(request: Request):
     _log_gen_stats(res)
 
     reasoning_text, text, tool_calls, _budget_exceeded = _split_response_final(
-        prompt_ids, res["tokens"], 0
+        prompt_ids, res["tokens"], 0, eos_ids=request_eos_ids
     )
-    finish_reason = _finish_reason_openai(res["tokens"])
+    finish_reason = _finish_reason_openai(res["tokens"], request_eos_ids)
     content_truncated_by_stop = False
     if stops:
         hit = _find_stop(text, stops)
@@ -5323,11 +5356,19 @@ async def _completions_stream(
     include_usage,
     sampling_params: dict | None = None,
     runner=None,
+    eos_ids: set | None = None,
 ):
     owned = [False]
-    batch_route = _resolve_batch_route(
-        runner or STATE.runner, prompt_ids, max_tokens,
-        sampling_kwargs=sampling_params or {},
+    effective_eos_ids = STATE.eos_ids if eos_ids is None else eos_ids
+    batch_route = (
+        None
+        if not effective_eos_ids and STATE.eos_ids
+        else _resolve_batch_route(
+            runner or STATE.runner,
+            prompt_ids,
+            max_tokens,
+            sampling_kwargs=sampling_params or {},
+        )
     )
     try:
         if batch_route is not None:
@@ -5359,7 +5400,8 @@ async def _completions_stream(
             # thinking_budget=0 pins ThinkingRouter to content-only (regardless of
             # has_thinking), so reasoning_delta can never arrive.
             q, future, cancel_event, raw_token_count = _start_generation(
-                prompt_ids, max_tokens, temp, 0, session=session, runner=runner, **(sampling_params or {})
+                prompt_ids, max_tokens, temp, 0, session=session, runner=runner,
+                eos_ids=effective_eos_ids, **(sampling_params or {})
             )
         try:
             first_item = None
@@ -5415,7 +5457,9 @@ async def _completions_stream(
                     # case we only ignore them (safer than crashing).
                     continue
                 elif kind == "done":
-                    finish_reason = "stop" if stopped else _finish_reason_openai(payload["tokens"])
+                    finish_reason = "stop" if stopped else _finish_reason_openai(
+                        payload["tokens"], effective_eos_ids
+                    )
                     n_completion = len(payload["tokens"])
                     cached_tokens = payload.get("prefill_reused", 0)
                     _log_gen_stats(payload)

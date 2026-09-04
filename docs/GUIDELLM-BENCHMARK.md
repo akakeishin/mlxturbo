@@ -22,10 +22,11 @@ mlxturboの実エンドポイントへ2 requestを送り、JSON出力まで確�
 で包む。比較対象も同じモデル名、thinking off、temperature 0、streaming SSE、
 同じtokenizer、同じ冷却条件に揃える。
 
-GuideLLMは固定出力長のため`ignore_eos: true`も送るが、mlxturbo 0.1.0はこの
-vLLM拡張をまだ解釈せず、EOSで短く終わる場合がある。公開表は要求長ではなく
-GuideLLM JSONの実`output_tokens`で集計する。全エンジンを厳密に同じ512 tokenまで
-走らせる主張は、`ignore_eos`対応を別途入れてからにする。
+GuideLLMが固定出力長のため送る`ignore_eos: true`は、chat/completionsのstream・
+non-stream全4経路で解釈する。これを明示したrequestはEOSで止めず、指定した
+`max_completion_tokens`まで生成する。起動時にEOS方針を固定するbatch coordinatorへは
+流さず、request単位の直列経路を使う。明示的なstop文字列、context上限、エラーは別なので、
+公開表には要求長に加えてGuideLLM JSONの実`output_tokens`も必ず載せる。
 
 ```bash
 BIGLOCK_PRIO=0 BIGLOCK_NO_WORKER=1 tools/biglock.sh \

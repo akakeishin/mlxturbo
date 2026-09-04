@@ -1025,8 +1025,9 @@ PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスク�
   25k/50kの反復差をcache速度の分布とは呼ばない。
 - **外部ベンチ採用**: GuideLLM 0.7.3を隔離導入し、macOSではspawn + data loader
   worker 0へ固定。実mlxturbo 2/2成功、JSON/CSV/HTMLを生成した。
-- **未決**: GuideLLMが送る`ignore_eos`は未対応。公開表は実output token数を使い、
-  固定512 token比較は対応後にだけ主張する。
+- **完了**: GuideLLMが送る`ignore_eos`をchat/completionsのstream・non-stream全4経路で
+  request単位に解釈する。441 testと実Flash-Nextへの2/2 requestで、両方が要求8 tokenを
+  返すことを確認した。公開表には引き続き実output token数も載せる。
 
 hot prefillのsession選択種別、LCP、reused/new、pool/追放byte、MLX memoryの観測は追加済み。
 次は段階時間とbatchで捨てたreuseを追加し、suffix 0/16/64/256、pure append/retokenizedで

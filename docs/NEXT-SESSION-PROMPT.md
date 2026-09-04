@@ -719,3 +719,17 @@ FASTMLX_NGRAM_NOCACHE=1 BIGLOCK_PRIO=0 tools/biglock.sh .venv/bin/python tools/d
   --knob ngram-prefetch --model ~/models/ddalcu-mlxlm-head4 --ngram ~/models/ddalcu-ngram \
   --only long --ctx 50000 --tokens 32 --out bench/results/ngram-prefetch-50k-cold-0904.json
 ```
+
+## GuideLLM固定出力長の対応 (2026-09-04 19:58 JST)
+
+- `ignore_eos: true`をOpenAI chat/completionsのstream・non-stream全4経路へ追加した。
+- requestごとのEOS上書きを扱えない既存batch coordinatorは迂回し、通常requestの経路は変えない。
+- `bench/test_server.py`は441 passed。実Flash-NextへGuideLLM 0.7.3で2 requestを送り、
+  2/2成功、両方とも要求どおり8 output token、JSON/CSV/HTML生成を確認した。
+- GuideLLMの未決は閉じた。cold prefillの次は上記50k n-gram A/Bで、強冷却確認後にだけ開始する。
+
+再開の1コマンド:
+
+```bash
+git show --stat --oneline HEAD && rg -n "ignore_eos" mlxturbo/server.py docs/GUIDELLM-BENCHMARK.md
+```
