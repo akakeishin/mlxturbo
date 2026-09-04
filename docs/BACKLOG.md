@@ -840,3 +840,24 @@ MLX の `quantized_matmul` は M=1 (qmv) で 400 GB/s 級なのに M=2〜8 (fast
 
 `_group_prefill_forward` は G チャンクを concat して `layer.mlp(xcat)` を 1 回で呼ぶ (`spec_flash.py:1017-1019`): 既定 `MLXTURBO_PREFILL_GROUP=4` × 2048 × top_k 10 = 81,920 行。NAX 機では `MLXTURBO_MOE_GEMM=auto` が自前 GEMM を off にするので素の `mx.gather_qmm(sorted_indices=True)` が走り、0.32.2 の NAX カーネルは 32,768 行超で出力行が未書き込みになる (main の #3922 で修正)。M3 Max では再現できない。
 **NAX 機で最初にやること**: 0.32.3 が出るまで `MLXTURBO_PREFILL_GROUP=1` (2048 × 10 = 20,480 行 < 32K) にするか、群の行数が 32K を超えるときだけ分割する門を `_group_prefill_forward` に置く。そのうえで `tools/verify_prefill_bitident.py` の checkpoints=[] ゲート。
+
+## qwen4_exp (Flash-Next) の sdpa 幅分割のシームを K/V を切る変種に (2026-09-04 13:15、未着手)
+
+27B 用の汎用版 (`enable_sdpa_split_generic`、`fused.py`) は K/V をクエリ幅で切って MLX の vector カーネルに戻す。既存の qwen4_exp のシーム (`enable_sdpa_split`) は bool マスクを実体化する変種で、
+冷 micro では K/V を切る変種が 13〜18% 速く、fp32 参照への距離は同じ。17k S=3 で 0.256 → 0.221 ms/層の余地 (`scratchpad/agent-27b-sdpa-split.md` → `docs/research/AGENT-LEDGERS-DIGEST-2026-09-04.md`)。
+ゲートは 17k A/B と `tools/vendor_fingerprint.py`。qwen4_exp を汎用の分岐ルートに載せるときに一緒に。
+
+## Gemma 4 (FallbackRunner 経路) の温 TTFT が冷と同じ (2026-09-04 13:22、未着手)
+
+煙試験 (`smoke-gemma4-26b-mlxturbo-nodraft-0904.json`) で 4k の温 TTFT 2.76 s 対 冷 2.69 s。mlx-lm は 0.37、mlx-serve は 0.18。FallbackRunner の session (接頭辞の再利用) が gemma4 では効いていない
+(KV の形が違う、あるいは cache のスナップショットが gemma4 の cache 型に対応していない疑い)。27B の spec 経路は 0.27 で効いている。Gemma レーンの最初の直し。
+
+## 27B の capture のモジュール呼び出し (`MLXTURBO_SPEC_CAPTURE_MODULE=1`) が幅 5/7/8/9 の verify だけ数 ulp ずれる (2026-09-04、原因未特定、既定は写しのまま)
+
+`spec.py` の `_linear_capture` (GDN 層本体の写し) をモジュール呼び出しに替えると、27B 実機で検証幅 5/7/8/9 だけ素と数 ulp 違う (6 は一致)。合成テスト (`bench/test_spec_capture_module_qwen3_5.py`) は一致する。
+速度の取り分は無いので既定は写しのまま。mlx_lm を更新して写しを直すときに、この差の出所 (幅依存の縮約順か、状態の控えの型か) を見る。台帳: `docs/research/AGENT-LEDGERS-DIGEST-2026-09-04.md` の agent-27b-decode-b1。
+
+## NOSYNC (`MLXTURBO_SPEC_DRAFT_NOSYNC`、27B の draft chain、既定 on) の品質の根拠 (2026-09-04 13:30、記録の補い)
+
+NOSYNC は draft を「引いてから捨てる」のをやめて同期ゼロで引く = **提案する draft が変わるだけで、採否は target の verify が決める**。貪欲の verify では出力は target の argmax の列で、draft は速さにしか効かない。
+生成列が素と分岐するのは検証幅が変わる分の丸め (方針 12:40 の「丸め級」) で、品質ゲート (KLD) の対象ではない。安価な裏取りとして 17k の recall (12/12 型) を 1 回取っておくとよい (未実施)。

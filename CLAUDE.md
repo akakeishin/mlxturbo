@@ -107,6 +107,13 @@
   Flash-Next は `dispatch_scope` を通らないので未接続 (当てるなら fused.py に enable が 1 つ要る)。bits=8 / group_size≠64 は素に委譲。
   `MLXTURBO_SDPA_ROWTILE` (既定 256、`=0` で off) も本番の既定値: head_dim 256 の sdpa は MLX の fallback でタイルを飛ばさないので、
   prefill の dense 経路で q を 256 行ずつに割り前方の K/V だけ渡す (4k -1.1% / 8k -1.2% / 17k -1.0%、KLD 差 0.0、2026-09-03)。
+  `MLXTURBO_SDPA_SPLIT_GENERIC` (既定 auto = 非 NAX 機で on、`=0` で off) は 2026-09-04 13:15 に入れた本番の既定値: qwen4_exp 以外の族 (27B など) の decode / verify 幅 (1 < S ≤ 16) で
+  S×gqa > 32 のとき sdpa をクエリ幅で割って MLX の vector カーネル (走査和が fp32) に戻す。27B 短 -1.6% / 17k -1.2% (幅 6 の round だけ -17%) / 4k は発火せず同一、fp32 参照への距離は素の 0.53 倍 (壁の向こうの fallback は中間が bf16)。
+  qwen4_exp は従来のシーム `enable_sdpa_split` の担当 (bool マスクを実体化する変種。K/V を切る変種の方が冷 micro で 13〜18% 速い → BACKLOG)。
+  `MLXTURBO_MOE_COMPILE` (既定 auto = qwen4_exp の `SparseMoeBlock` があるときだけ on、`=0` で off、行数 ≤ `MLXTURBO_MOE_COMPILE_MAX_ROWS`=16 の decode / verify 幅だけ) は 2026-09-04 13:25 に入れた本番の既定値:
+  MoE ブロックまるごと (router の f32 化 → argpartition → softmax → take → 共有専門家のゲート → combine) を `mx.compile` で 1 グラフに。行列積は境界のまま、op の並べ替えは無いので**ビット一致**。
+  短 -1.1% / 17k -0.6% (dispatch -7.7%)、起動時に 48 層 × S=1..4 の 192 グラフを空焼き (0.22 s、`MLXTURBO_MOE_COMPILE_WARMUP=0` で切る)。prefill 幅は取り分が無く (17k ±0、短 +26%) 端数チャンクの形が要求ごとに変わって Compiled が溜まるので包まない。
+  層まるごと / GDN / attention の compile は原理的に不可 (closure の配列を定数に焼き、python の副作用はトレース時の 1 回だけ。`shapeless` はこのモデルでは全滅)。
 - 品質を売って速度を買わない。fake を実物より緩くしない。KLD の受け入れ幅は
   現行比 +0.0005 (bench/quant_eval.py compare)。
   **decode 幅 (行数 ≤ 8) にしか発火しない非ビット一致のカーネル**は、prefill 幅で走る通常の compare では数値が 1 度も通らない。既定に入れる条件は 3 つ

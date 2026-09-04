@@ -2968,3 +2968,48 @@ Gemma 4 26B (MoE、A4B) の decode tok/s (`--ctxs 0,4000 --tokens 64 --reps 1`�
 - `--no-mtp` は「投機なし」ではない (mlx-serve は PLD が既定 on、mlxturbo も lookup が残る)。投機ゼロの行は `--no-pld` も付ける。harness に `--extra-body` を足した (mlx-serve の `enable_drafter` のようにリクエスト側にスイッチがあるエンジン用)。
 - 追記 (13:11): 既定 auto の発火確認 (`--knob MLXTURBO_SMALL_M_ROUTE=auto,off`、短 3 本 × 256、`ab-smallm-auto-short-0904.json`): ms/tok **-1.6%**、ms/round -2.0%、tok/round +0.2% (3 経路の A/B の -1.9% と同じ帯)。
   生成列は 3 本とも途中で分岐 (位置 37 / 14 / 151)。M=2..5 の行が「幅 1 の丸め」になるぶんの丸め差で、方針 (12:40) どおり不採用の理由にしない。
+
+### 2026-09-04 13:15 27B の sdpa 幅分割 (`MLXTURBO_SDPA_SPLIT_GENERIC`、`scratchpad/agent-27b-sdpa-split.md`) → 既定 auto に
+
+27B (qwen3_5) には幅分割のシームが無かった (runner のログは族に依らず「有効」と刷っていた)。行タイルと同じ名前空間差し替え口に汎用版を足し、1 < S ≤ 16 で S×gqa > 32 のとき K/V をクエリ幅で切って MLX の vector カーネルに戻す。
+
+| 文脈 | ms/tok | ms/round | tok/round | 発火率 | fp32 距離 (分割 / 素) |
+|---|---|---|---|---|---|
+| 短 3 本 × 256 | -1.6% | +2.0% | +4.0% | 発火あり | 0.53 |
+| 4k × 256 | +0.4% (雑音、256 トークン完全一致) | +0.4% | ±0 | 0% | 1.000 (発火せず) |
+| 17k × 256 | -1.2% | -0.2% | +1.1% | 7.1% (98 round 中 7) | 0.53 |
+| 17k、幅 6 の round だけ | — | -17% (109.5 対 132.0) | — | — | 0.536 |
+| 冷 micro kv 17408、S=6 / 8 | — | -61% / -55% (1 層 2704→1041 / 3000→1354 us) | — | — | 0.535 |
+
+- 判定線 (17k -3%) には届かないが、**fp32 参照に素より近く (40 draw で悪化 0)、遅くなる文脈が無い**ので代金ゼロの規則で既定 auto (非 NAX 機で on)。壁の向こうの MLX fallback は中間を bf16 で回し、壁の手前の vector カーネルは走査和を fp32 で持つ。分割は精度の良い方に戻している。
+- head の分岐 (位置 60 / 14) はこの丸め由来。方針 (12:40) どおり不採用の理由にしない。
+- 残った不明点: 幅 9/10 の round が 1 走行に 2 回しか出ず、micro の -55% は in-model で未確認。50k は未測 (kv が伸びるほど 1 回の取り分は大きい)。速度の A/B では `MLXTURBO_SDPA_SPLIT_GENERIC_TRACE=1` を立てないこと (発火した側だけ 16 回/round の bump が乗る)。
+- 副産物: qwen4_exp の既存シームは bool マスク実体化の変種で、K/V を切る変種が冷 micro で 13〜18% 速い (BACKLOG)。
+- 検査: `bench/test_sdpa_split_generic.py` 9 本、`vendor_fingerprint` 全一致。commit は MoE compile (同じ fused.py / runner.py を編集中) の着地と一緒に。
+
+### 2026-09-04 13:22 mlxturbo の煙試験 3 行 (fdc06e1 + sdpa 分割 auto、`scratchpad/gemma4_smoke_runs3.sh`、`--ctxs 0,4000 --tokens 64 --reps 1`、冷却無し)
+
+| 行 | 冷 TTFT (0) | dec (0) | 冷 TTFT (4k) | 温 TTFT (4k) | dec (4k) | 08:16 の同じ行 |
+|---|---|---|---|---|---|---|
+| 27B MTP あり | 0.23 | **33.8** | 16.10 | 0.27 | **32.1** | 28.1 / 17.52 / 0.27 / 27.3 |
+| 27B lookup のみ (`--no-mtp`、投機ゼロではない) | 0.22 | 23.4 | 16.11 | 0.26 | 22.3 | — |
+| Gemma 4 26B draft なし | 0.18 | 104.3 | 2.69 | **2.76** | 93.9 | — |
+
+- 27B は移植 (段階投入 S>1、NOSYNC、qmm_wide のシャドー修正、小 M、sdpa 分割) で decode +20% (27.3 → 32.1)。相手: mlx-serve 43.2、oMLX 32.8、MTPLX 28.4 (turbo 31.5)、mlx-lm 20.9。**oMLX と同着圏、mlx-serve にはまだ 1.35 倍の差。**冷 TTFT 4k は 16.1 (mlx-serve 15.9、oMLX 19.0)。
+- Gemma 4 は draft なしで mlx-lm (86.8 / 75.1) より速く、mlx-serve (109 / 95) に近い。oMLX (122 / 107) が最速。
+- **Gemma 4 の温 TTFT が冷と同じ (2.76 対 2.69)。**FallbackRunner の経路で接頭辞キャッシュが効いていない (27B の spec 経路は 0.27)。mlx-lm ですら 0.37。→ BACKLOG (Gemma レーンの最初の直し)。
+
+### 2026-09-04 13:25 MoE ブロックの `mx.compile` を本番に配線 → 既定 auto (`MLXTURBO_MOE_COMPILE`、`scratchpad/agent-fn-moe-compile.md`)
+
+head4、depth 2 固定、回文順、burn-in 済み。A = compile / B = 素 (`bench/results/moe-compile-{short,17k}-0904.json`)。
+
+| | ms/round A | B | 差 | tok/round | head |
+|---|---|---|---|---|---|
+| 短 3 本 × 512 | 34.485 | 34.880 | -1.1% | 2.186 / 2.186 | 3 本とも出力一致 |
+| 17k 3 本 × 512 (`--prefill-once`) | 37.878 | 38.120 | -0.6% | 1.961 / 1.961 | 3 本とも出力一致 |
+
+- PoL からの逸脱 1 つ: 包む幅に上限 (`MLXTURBO_MOE_COMPILE_MAX_ROWS`=16)。prefill 幅は取り分が無く (17k ±0、短 +26%)、端数チャンクの長さが要求ごとに変わるので Compiled が際限なく溜まる。decode 幅の取り分は全部残る。
+- 起動時の warm-up は 48 層 × S=1..4 の 192 グラフで 0.22 s。1 要求目の TTFT: warm 0.304 / nowarm 0.320 / off 0.345 s (2 要求目は 0.237 で同じ)。`発火 {'moe_decode_fused': 192}` = 192 個すべてに fused:1 が入っている。
+- 17k が PoL の -1.3% に対して -0.6% (符号は 6 本とも負)。`--prefill-once` の有無か熱。バッチ検証 (B>1) と MTP の draft ブロックは warm-up に入れていない (初回に 1 回、≈0.05 s / 5 ms)。
+- **A/B を投げた後は `mlxturbo/*.py` を触らない** (worker の code fingerprint が変わって読み直し 290 s。今日 2 回踏んだ)。
+- 検査: pytest 4 ファイル 436 passed、`vendor_fingerprint` 全一致。

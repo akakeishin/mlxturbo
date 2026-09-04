@@ -1509,7 +1509,7 @@ def disable_gdn_port(model=None) -> dict:
     return counts
 
 
-def enable_sdpa_split() -> None:
+def enable_sdpa_split(model=None) -> int:
     """decode/verify 幅の sdpa を、vector カーネルの適格幅 (S * gqa_factor <= 32)
     に収まる幅で S 軸に分割して呼ぶ (docs/research/SDPA-WIDTH-WALL.md,
     docs/research/KERNEL-BRIEF-DECODE-BW.md)。
@@ -1532,15 +1532,27 @@ def enable_sdpa_split() -> None:
     で無効化できる (`enable_gdn_metal_kernel` と同じ書き方)。採否確認は
     `tools/decode_ab.py --knob sdpa-split`。発火の確認は
     `mlxturbo.kernels._fire.snapshot()` の `sdpa_split`。
+
+    **このシームは qwen4_exp にしか無い。**他の族 (27B = qwen3_5 ->
+    `Qwen3NextAttention`) は `enable_sdpa_split_generic` が名前空間の
+    差し替えで同じことをする。戻り値は「このシームが当たる attention 層の
+    数」(`model` を渡したときだけ数える。`None` なら 0) --- ログで
+    「実際に当たった層数」を出すためだけの数で、有効/無効はこの関数の
+    中の knob が決める。
     """
     import os
 
     import mlx_lm.models.qwen4_exp as Q
 
-    if os.environ.get("MLXTURBO_SDPA_SPLIT") == "0":
-        Q.Attention._sdpa_split_width = False
-        return
-    Q.Attention._sdpa_split_width = True
+    on = os.environ.get("MLXTURBO_SDPA_SPLIT") != "0"
+    Q.Attention._sdpa_split_width = on
+    if not on or model is None:
+        return 0
+    return sum(
+        1
+        for layer in _model_layers(model)
+        if isinstance(getattr(layer, "self_attn", None), Q.Attention)
+    )
 
 
 def disable_sdpa_split() -> None:
@@ -1562,6 +1574,21 @@ _SDPA_ROWTILE_ORIGS: dict = {}
 # 計算しているので、そこだけを対象にする。
 _SDPA_ROWTILE_MIN_HEAD_DIM = 129
 _SDPA_ROWTILE_FN = "scaled_dot_product_attention"
+
+# ------------------------------------------------ 幅分割の汎用版 (族に依らない)
+#
+# `enable_sdpa_split` のシームは `_vendor/qwen4_exp.py` にしか無い。同じ壁は
+# 族に依らずある (MLX の速い vector カーネルは q 行数 `S * gqa_factor` が 32
+# までで、越えると全 KV にスコアを実体化する経路に落ちる) ので、行タイルと
+# 同じ差し替え口 (モジュール直下の `scaled_dot_product_attention`) に汎用版を
+# 置く。行タイル (S >= 64) と幅は重ならない (こちらは S <= 16)。
+_SDPA_SPLIT_GENERIC = False
+_SDPA_SPLIT_GENERIC_TRACE = False
+# vector カーネルの適格幅 (q 行数)。
+_SDPA_SPLIT_QROWS = 32
+# 分割を試す S の上限。prefill 幅は行タイル / gather 経路の担当なので、
+# decode / verify / MTP lookup で出る幅 (27B は最大 9 程度) だけを見る。
+_SDPA_SPLIT_MAX_S = 16
 
 
 def _sdpa_rowtile_call(orig, q, k, v, cache, scale, mask, sinks, rows):
@@ -1596,6 +1623,70 @@ def _sdpa_rowtile_call(orig, q, k, v, cache, scale, mask, sinks, rows):
     return mx.concatenate(outs, axis=2)
 
 
+def _sdpa_split_call(orig, q, k, v, cache, scale, mask, sinks, w):
+    """幅分割の本体。q を `w` 行ずつの塊に割って `orig` を複数回呼ぶ。
+
+    行タイル (`_sdpa_rowtile_call`) と違って**近似も切り捨ても入れない**。
+    マスクの形ごとに、そのマスクで可視だと保証できる列だけを渡す:
+
+    - ``mask == "causal"`` (27B の verify 幅はこれ。`mlxturbo/spec.py` の
+      `create_attention_mask` -> `KVCache.make_mask` は S>1 で必ず文字列を
+      返す): 塊 `[t0, t1)` から見える key は `[0, offset+t1)` に全部入るので
+      K/V をそこで切り、そのまま "causal" を渡す。MLX の fallback は
+      `offset = kL - qL` で対角を出すので、切った K/V に対して対角が
+      自動的に `offset+t0` になり正しい (行タイルと同じ理屈)。冷 micro では
+      K/V を切る方がマスクを実体化するより 10〜17% 速い
+      (`bench/results/sdpa-split-generic-0904.json`)。
+    - ``mask is None``: 何も隠さないので、K/V を丸ごと渡して q の行だけ割る。
+    - bool/加算マスクの配列: 列がどう並んでいるか (QSA の gather 経路のように
+      位置順でないことがある) を仮定できないので、**K/V は切らず**マスクの
+      行だけ切る。可視集合は行ごとに元のまま。
+
+    どの形でも「行ごとの attention は独立」なので数学的には同一だが、
+    分割が実際に起きる幅では MLX が別のカーネル (壁の向こうの fallback 対
+    vector) を選ぶため**ビット一致はしない** (bf16 で max|diff| 1e-3 = 1 ulp
+    級、`tools/sdpa_split_generic_micro.py` の `bitident` で確認)。
+    """
+    import mlx.core as mx
+
+    S = q.shape[2]
+    offset = k.shape[2] - S
+    causal = isinstance(mask, str)
+    outs = []
+    t0 = 0
+    while t0 < S:
+        t1 = min(t0 + w, S)
+        q_t = q[:, :, t0:t1, :]
+        if causal:
+            kv_end = offset + t1
+            outs.append(orig(q_t, k[:, :, :kv_end, :], v[:, :, :kv_end, :],
+                             cache=cache, scale=scale, mask=mask, sinks=sinks))
+        else:
+            m_t = None if mask is None else mask[..., t0:t1, :]
+            outs.append(orig(q_t, k, v, cache=cache, scale=scale, mask=m_t,
+                             sinks=sinks))
+        t0 = t1
+    return mx.concatenate(outs, axis=2)
+
+
+def _sdpa_caller_is_attention(modname: str) -> bool:
+    """呼び出し元が `modname` の `...Attention.__call__` かどうか。
+
+    身代わりを差した名前は族のモジュール直下にあるので、同じモジュールの
+    他の関数 (qwen4_exp の `_gather_tile_attn`: gather した位置順でない K/V を
+    渡す) からも呼ばれる。そちらに行タイルや幅分割の「前方だけ見ればよい」
+    前提を持ち込むと**サイレントに違う値**になるので、`__call__` からの
+    呼び出しだけを通す。
+    """
+    import sys
+
+    frame = sys._getframe(2)  # 0=この関数 / 1=_dispatch / 2=その呼び出し元
+    return (
+        frame.f_code.co_name == "__call__"
+        and frame.f_globals.get("__name__") == modname
+    )
+
+
 def _make_sdpa_rowtile_dispatch(modname: str, orig):
     """`modname` の `scaled_dot_product_attention` の身代わりを作る (段 P5)。
 
@@ -1625,30 +1716,32 @@ def _make_sdpa_rowtile_dispatch(modname: str, orig):
 
     def _dispatch(queries, keys, values, cache=None, scale=1.0, mask=None, sinks=None):
         rows = _SDPA_ROWTILE_ROWS
-        if (
-            rows > 0
-            and sinks is None
-            and not (cache is not None and hasattr(cache, "bits"))
-        ):
-            mask_ok = (mask == "causal") if isinstance(mask, str) else (mask is not None)
-            if (
-                mask_ok
-                and queries.shape[2] >= _SDPA_ROWTILE_MIN_S
-                and queries.shape[2] > rows
-            ):
-                import sys
-
-                frame = sys._getframe(1)
-                if (
-                    frame.f_code.co_name == "__call__"
-                    and frame.f_globals.get("__name__") == modname
-                ):
+        if sinks is None and not (cache is not None and hasattr(cache, "bits")):
+            S = queries.shape[2]
+            if rows > 0 and S >= _SDPA_ROWTILE_MIN_S and S > rows:
+                # 段 P5: prefill 幅の行タイル
+                mask_ok = (
+                    (mask == "causal") if isinstance(mask, str) else (mask is not None)
+                )
+                if mask_ok and _sdpa_caller_is_attention(modname):
                     if _SDPA_ROWTILE_TRACE:
                         from mlxturbo.kernels import _fire
 
                         _fire.bump("sdpa_rowtile")
                     return _sdpa_rowtile_call(
                         orig, queries, keys, values, cache, scale, mask, sinks, rows
+                    )
+            elif _SDPA_SPLIT_GENERIC and 1 < S <= _SDPA_SPLIT_MAX_S:
+                # 幅分割 (族に依らない版)。壁は q 行数 `S * gqa_factor` > 32。
+                gqa = queries.shape[1] // max(keys.shape[1], 1)
+                if S * gqa > _SDPA_SPLIT_QROWS and _sdpa_caller_is_attention(modname):
+                    if _SDPA_SPLIT_GENERIC_TRACE:
+                        from mlxturbo.kernels import _fire
+
+                        _fire.bump("sdpa_split_generic")
+                    return _sdpa_split_call(
+                        orig, queries, keys, values, cache, scale, mask, sinks,
+                        max(1, _SDPA_SPLIT_QROWS // gqa),
                     )
         return orig(queries, keys, values, cache=cache, scale=scale, mask=mask, sinks=sinks)
 
@@ -1675,21 +1768,26 @@ def _sdpa_rowtile_patch(ns: dict, modname: str) -> bool:
     return True
 
 
-def _sdpa_rowtile_attn_namespaces(model):
+def _sdpa_rowtile_attn_namespaces(model, min_head_dim: int = None):
     """行タイルを差せる attention の `__call__` の名前空間を列挙する。
 
     戻り値は `[(モジュール名, その `__call__` の globals, 層数), ...]`。
     契約 (`docs/BACKLOG.md` の「動的な構造の探索 (duck typing)」):
 
       1. 層が `self_attn` を持ち、そこに `q_proj` がある (attention 層)。
-      2. `head_dim` が :data:`_SDPA_ROWTILE_MIN_HEAD_DIM` 以上 --- MLX の
-         fast sdpa がタイルを飛ばさない (fallback に落ちる) 幅だけが的。
+      2. `head_dim` が `min_head_dim` 以上 (既定
+         :data:`_SDPA_ROWTILE_MIN_HEAD_DIM`) --- MLX の fast sdpa が
+         タイルを飛ばさない (fallback に落ちる) 幅だけが行タイルの的。
+         幅分割 (`enable_sdpa_split_generic`) の壁は head_dim に依らないので、
+         あちらは `min_head_dim=0` で呼ぶ。
       3. その `__call__` が Python 関数で、定義元の名前空間に
          `scaled_dot_product_attention` という呼べる名前がある。
 
     1 つでも欠ければその層は数えない。全部欠ければ空リストで、
     `enable_sdpa_rowtile` はその族に対して何もしない。
     """
+    if min_head_dim is None:
+        min_head_dim = _SDPA_ROWTILE_MIN_HEAD_DIM
     found: dict = {}
     for layer in _model_layers(model):
         attn = getattr(layer, "self_attn", None)
@@ -1698,7 +1796,7 @@ def _sdpa_rowtile_attn_namespaces(model):
         head_dim = getattr(attn, "head_dim", None)
         if not isinstance(head_dim, int) or isinstance(head_dim, bool):
             continue
-        if head_dim < _SDPA_ROWTILE_MIN_HEAD_DIM:
+        if head_dim < min_head_dim:
             continue
         call = getattr(type(attn), "__call__", None)
         ns = getattr(call, "__globals__", None)
@@ -1782,6 +1880,70 @@ def disable_sdpa_rowtile() -> None:
     global _SDPA_ROWTILE_ROWS
 
     _SDPA_ROWTILE_ROWS = 0
+
+
+def enable_sdpa_split_generic(model=None, mode: str = None) -> int:
+    """幅分割 (`enable_sdpa_split`) の族に依らない版。**既定 off。**
+
+    `enable_sdpa_split` のシームは `_vendor/qwen4_exp.py` にしか無いので、
+    27B (qwen3_5 -> `mlx_lm.models.qwen3_next.Qwen3NextAttention`) は壁を
+    そのまま踏んでいた (`scratchpad/agent-ceiling-audit.md` の [t14])。ここは
+    行タイル (`enable_sdpa_rowtile`) と同じ差し替え口 --- attention の
+    `__call__` が定義されている名前空間の `scaled_dot_product_attention` ---
+    に、decode/verify 幅 (`1 < S <= 16`) で `S * gqa_factor > 32` のときだけ
+    `w = 32 // gqa_factor` 行ずつに割る分岐を足す。qwen4_exp は従来のシームの
+    担当なので**除く** (二重には掛からない)。
+
+    行タイルとは幅で排他 (行タイルは `S >= 64`)。K/V の切り方と正しさの
+    根拠は `_sdpa_split_call` の docstring。
+
+    冷 micro (`tools/sdpa_split_generic_micro.py`、Hq 24 / Hk 4 / d 256、
+    K/V を 140 MB 巡回): kv=17408 で S=6 が 2704 -> 1041 us (0.385)、
+    S=8 が 3000 -> 1354 us (0.451)。S <= 4 (= S*gqa 24 <= 32) は発火せず
+    素の 1 回呼びのまま (対 plain 0.996〜1.012)。
+
+    ``mode``: ``"auto"`` (非 NAX 機だけ on) / ``"1"`` / ``"0"``。``None`` なら
+    環境変数 `MLXTURBO_SDPA_SPLIT_GENERIC` を読む (**未設定は auto** = 非 NAX 機で on。2026-09-04 13:15、
+    27B 短 -1.6% / 17k -1.2% / 4k は発火せず同一、fp32 参照への距離は素の 0.53 倍)。
+    `MLXTURBO_SDPA_SPLIT_GENERIC_TRACE=1` で発火のたびに
+    `mlxturbo.kernels._fire.bump("sdpa_split_generic")` が乗る。
+
+    戻り値は分割が当たる attention 層の数 (契約が合わなければ 0)。
+    """
+    global _SDPA_SPLIT_GENERIC, _SDPA_SPLIT_GENERIC_TRACE
+    import os
+
+    if mode is None:
+        mode = os.environ.get("MLXTURBO_SDPA_SPLIT_GENERIC", "auto")
+    mode = (mode or "auto").strip().lower()
+    _SDPA_SPLIT_GENERIC_TRACE = (
+        os.environ.get("MLXTURBO_SDPA_SPLIT_GENERIC_TRACE") == "1"
+    )
+    if mode == "auto":
+        from .kernels import moe_grouped_gemm as mgg
+
+        on = not mgg.is_nax_device()
+    else:
+        on = mode in ("1", "on", "true", "yes")
+    if not on:
+        _SDPA_SPLIT_GENERIC = False
+        return 0
+
+    n = 0
+    for modname, ns, count in _sdpa_rowtile_attn_namespaces(model, min_head_dim=0):
+        if modname == "mlx_lm.models.qwen4_exp":
+            continue  # 従来のシーム (`enable_sdpa_split`) の担当
+        _sdpa_rowtile_patch(ns, modname)
+        if modname in _SDPA_ROWTILE_ORIGS:
+            n += count
+    _SDPA_SPLIT_GENERIC = n > 0
+    return n
+
+
+def disable_sdpa_split_generic() -> None:
+    global _SDPA_SPLIT_GENERIC
+
+    _SDPA_SPLIT_GENERIC = False
 
 
 def disable_hyper_connection() -> None:
@@ -3570,6 +3732,301 @@ def disable_ple_hoist(model) -> int:
     return 0
 
 
+# --- MoE ブロックまるごとの mx.compile (レーン 9) -----------------------------
+#
+# `SparseMoeBlock.__call__` は **純関数** (キャッシュを 1 つも書かない) なので
+# `mx.compile` で包める。層まるごと (`DecoderLayer.__call__`) / GDN /
+# attention / forward まるごとは **原理的に不可**: キャッシュへの代入
+# (`cache[0] = ...` / `cache.advance` / `idx_cache.update`) が python レベルの
+# 副作用で、compile は 2 回目以降その python を走らせない。合成モデル (CPU)
+# でも実モデルでも同じ `[eval] Attempting to eval an array without a
+# primitive` で落ちる (`scratchpad/agent-fn-compile-poc.md` の段 1/段 2)。
+# PLE 層はさらに n-gram の host 同期 (`np.unique`) でトレース中に例外になる。
+#
+# 効き目 (PoL、head4 パック、depth 2 固定、burn-in 済み、回文順 A,B,B,A):
+#
+#   dispatch      3264.2 -> 3013.5 本/round (**-7.7%**、cb 数は不変)
+#   短 3 本 x 512  ms/round -1.01 / -1.23 / -1.33% (平均 **-1.2%**)
+#   17k 3 本 x 512 ms/round -1.34 / -1.23 / -1.45% (平均 **-1.3%**)
+#   head / tok/round は全条件で完全一致 = **ビット一致**
+#
+# compile は op を並べ替えないので数値は 1 ビットも動かない。減るのは
+# 「router の f32 化 copy -> argpartition -> softmax -> take_along_axis ->
+# shared のゲート -> combine の縮約」を行列積の間で 1 グラフにまとめたぶんの
+# **起動回数**だけ。判定線 (短 -3%) には届かないが、品質の代金がゼロで測った
+# 文脈のどれでも遅くならないので既定 on にした (CLAUDE.md の「代金ゼロの
+# 改善は取り分が 1% 未満でも入れる」、ユーザー 2026-09-03 17:20)。
+#
+# **行数の上限がある** (`MLXTURBO_MOE_COMPILE_MAX_ROWS`、既定 16)。包むのは
+# decode / verify 幅だけで、prefill 幅 (1 チャンク 2048 行) は素のまま通す。
+# 理由は 2 つあり、どちらも PoL の実測から出ている:
+#
+#   1. **prefill には取り分が無い。**17k の A/B で prefill 壁時計は -0.0%
+#      (26.608 対 26.614 s)。短文脈では逆に +26.1% (0.244 -> 0.308 s) で、
+#      増分はそのまま「形ごとの初回トレース」(98 グラフ ≈ 0.06 s)。
+#   2. **グラフが際限なく増える。**`shapeless=True` はこのモデルでは使えない
+#      (Slice が形を推論できず例外) ので、Compiled は「形 x 層」で 1 個ずつ
+#      要る。prefill の末尾チャンクの長さは要求ごとに変わる (ctx % 2048) ため、
+#      サーバーを回し続けると 48 x (見た端数の種類) だけ Compiled が溜まる
+#      (端数は 0..2047 の 2048 通り)。decode / verify 幅に限れば行数は
+#      16 以下の数種類しか出ないので、Compiled の総数は数百で頭打ちになる。
+#
+# `MLXTURBO_MOE_COMPILE_MAX_ROWS=0` で上限を外せる (PoL の再現用)。
+#
+# トレース費用は `warmup_moe_block_compile` で起動時に払う (`build_runner`)。
+# 払わないと最初の要求の TTFT に 48 層 x 形数ぶん (S=1..4 で ~0.6 s) 乗る。
+
+_MOE_COMPILE_ON = False
+_MOE_COMPILE_ORIG = None            # 素の SparseMoeBlock.__call__
+_MOE_COMPILE_MAX_ROWS = 16          # 0 = 上限なし
+_MOE_COMPILE_COUNT = 0              # 作った Compiled の個数 (ログ / warm-up 用)
+
+
+class _MoeCompileCache:
+    """ブロック 1 個ぶんの Compiled 置き場 (素の python オブジェクト)。
+
+    `nn.Module.__setattr__` は dict / list / tuple / mx.array を**モジュールの
+    中身**として登録する (`parameters()` / `update()` が舐める側に入る)。
+    Compiled の dict をそのまま属性にすると木の走査に混ざるので、こうして
+    素のオブジェクトに包む -- するとただの python 属性になり、モジュールの
+    中身からは見えない。
+    """
+
+    __slots__ = ("fns",)
+
+    def __init__(self):
+        self.fns = {}
+
+
+def _moe_blocks(model) -> list:
+    """`model` の中の MoE ブロック (`SparseMoeBlock` 相当) を並び順で返す。
+
+    族の判定はクラス名ではなく構造の契約 (`mlp.switch_mlp` と `mlp.gate` を
+    持つ) で行う (`docs/BACKLOG.md` の「動的な構造の探索 (duck typing)」)。
+    契約に合わない族では空リストになり、呼び手のループが 1 周も回らない。
+    """
+    out = []
+    for layer in _model_layers(model):
+        mlp = getattr(layer, "mlp", None)
+        if mlp is not None and getattr(mlp, "switch_mlp", None) is not None \
+                and getattr(mlp, "gate", None) is not None:
+            out.append(mlp)
+    return out
+
+
+def _moe_compile_sig():
+    """トレース時に焼き込まれる「MoE の中の分岐」の指紋。
+
+    compile したグラフは**記録した時点の python の分岐**を焼き込む。よって
+    `enable_moe_decode_fused` などを A/B で後から切り替えても、鍵が同じなら
+    古いグラフが再生されて**切り替えが無言で効かなくなる** (compile の中では
+    python が走らないので、分岐も `_fire` の counter も動かない)。それを
+    避けるために、MoE ブロックの中身を変えうるフラグを全部鍵に入れる。
+    """
+    return (
+        _MOE_DISPATCH_DEC_FUSED_ON,
+        _MOE_DISPATCH_DEC_FUSED_MAX_ROWS,
+        _MOE_DISPATCH_GLU_ON,
+        _MOE_DISPATCH_VERIFY_ON,
+        _MOE_DISPATCH_SORT_MIN,
+        _MOE_DISPATCH_WIDE_SORT_MIN,
+        _MOE_GEMM_MODE,
+        _MOE_GEMM_BM,
+        _MOE_GEMM_MIX,
+        _MOE_DOWN_EPI_ON,
+        _MOE_GATHER_FOLD_ON,
+        _MOE_FOLD_MODE,
+        _QMM_WIDE_ON,
+    )
+
+
+def _moe_compile_call(self, x):
+    """差し替えた `SparseMoeBlock.__call__`。
+
+    フラグが下りていれば素をそのまま呼ぶ (`disable_moe_grouped_gemm` と同じ
+    「差し替えは残してフラグで切る」形。A/B の対照が機構の費用まで揃う)。
+    """
+    global _MOE_COMPILE_COUNT
+
+    if _MOE_COMPILE_ORIG is None:
+        raise RuntimeError("_moe_compile_call が差し替え前に呼ばれた")
+    if not _MOE_COMPILE_ON:
+        return _MOE_COMPILE_ORIG(self, x)
+    shape = x.shape
+    rows = shape[0] * shape[1] if len(shape) >= 2 else shape[0]
+    if _MOE_COMPILE_MAX_ROWS and rows > _MOE_COMPILE_MAX_ROWS:
+        return _MOE_COMPILE_ORIG(self, x)
+    holder = getattr(self, "_moe_compile_cache", None)
+    if holder is None:
+        holder = _MoeCompileCache()
+        self._moe_compile_cache = holder
+    key = (
+        tuple(shape), x.dtype,
+        getattr(self, "_router513", None) is not None,
+        getattr(self, "_wide_shared", None) is not None,
+        getattr(self, "_combine_fold_min_s", None),
+        _moe_compile_sig(),
+    )
+    fn = holder.fns.get(key)
+    if fn is None:
+        import mlx.core as mx
+
+        orig = _MOE_COMPILE_ORIG
+        fn = mx.compile(lambda xx, _s=self: orig(_s, xx))
+        holder.fns[key] = fn
+        _MOE_COMPILE_COUNT += 1
+    return fn(x)
+
+
+def enable_moe_block_compile(model=None, mode: str | None = None,
+                             max_rows: int | None = None) -> int:
+    """`SparseMoeBlock.__call__` まるごとを `mx.compile` で包む (既定 on)。
+
+    ``mode``: ``"auto"`` (既定、MoE ブロックを持つ族 = qwen4_exp だけ on) /
+    ``"1"`` / ``"0"``。``None`` なら環境変数 `MLXTURBO_MOE_COMPILE` を読む
+    (`enable_moe_decode_fused` と同じ作法 -- 呼び出し側が env を忘れても
+    既定が保たれる)。``max_rows`` は `MLXTURBO_MOE_COMPILE_MAX_ROWS`
+    (既定 16、0 で上限なし)。
+
+    差し替えるのはクラスの属性 1 つだけなので、`SparseMoeBlock` を持たない族
+    (qwen3_5 = Qwen3.8-27B など) には最初から届かない。``auto`` では
+    `model` に MoE ブロックが 1 つも無ければ差し替え自体を入れない。
+
+    `enable_moe_route` / `enable_moe_route_nofuse` (どちらも既定 off、
+    `--knob moe-route` 専用) と**同じ `Q.SparseMoeBlock.__call__` を取り合う**。
+    あちらを後から当てると `_ORIG_MOE` にこちらの差し替えが入り、
+    `disable_moe_route` でこちらごと外れる。同時に使わないこと
+    (`enable_hyper_connection_*` の 4 種が `GatedResidual.__call__` を
+    取り合うのと同じ約束)。出荷経路では `enable_moe_route` を呼んでいない。
+
+    **P3 (grouped GEMM) / P7 (down epilogue) / fused:1 (moe_decode_fused) /
+    gather_sort といった自前の部品は compile の中でそのまま動く** (どれも
+    `SwitchGLU.__call__` / `QuantizedSwitchLinear.__call__` / `_moe_combine_fold`
+    の差し替えで、compile から見ればただの primitive)。ただし `_fire` の
+    counter は python の副作用なので**トレースの 1 回しか増えない** -- 発火の
+    確認は「1 グラフにつき 1 だけ増える」ことで行う (`warmup_moe_block_compile`
+    がその形で数える)。
+
+    行数の上限と効き目の実測はこの節の冒頭のコメントに書いた。
+
+    戻り値は当たった MoE ブロックの数 (Flash-Next で 48、off なら 0)。
+    """
+    global _MOE_COMPILE_ON, _MOE_COMPILE_ORIG, _MOE_COMPILE_MAX_ROWS
+    import os
+
+    if mode is None:
+        mode = (os.environ.get("MLXTURBO_MOE_COMPILE", "auto").strip().lower()
+                or "auto")
+    if mode in ("1", "on", "true"):
+        mode = "on"
+    elif mode in ("0", "off", "false"):
+        mode = "off"
+    if mode not in ("auto", "on", "off"):
+        raise ValueError(f"mode={mode!r} は auto / 1 / 0 のどれかにすること")
+    if mode == "off":
+        _MOE_COMPILE_ON = False
+        return 0
+    blocks = _moe_blocks(model) if model is not None else []
+    if mode == "auto" and not blocks:
+        # MoE ブロックを持たない族。差し替えを入れる意味が無い
+        _MOE_COMPILE_ON = False
+        return 0
+    if max_rows is None:
+        max_rows = int(os.environ.get("MLXTURBO_MOE_COMPILE_MAX_ROWS", "16"))
+    _MOE_COMPILE_MAX_ROWS = max_rows
+    if _MOE_COMPILE_ORIG is None:
+        try:
+            from mlx_lm.models import qwen4_exp as Q
+        except Exception:  # noqa: BLE001  族が無い環境でも起動は続ける
+            return 0
+        _MOE_COMPILE_ORIG = Q.SparseMoeBlock.__call__
+        Q.SparseMoeBlock.__call__ = _moe_compile_call
+    _MOE_COMPILE_ON = True
+    return len(blocks)
+
+
+def disable_moe_block_compile(model=None) -> None:
+    """`enable_moe_block_compile` を打ち消す (フラグを下ろすだけ)。
+
+    差し替え自体は残り、`_moe_compile_call` が素へ素通しする。A/B で交互に
+    測るためにこの形にしてある (`disable_moe_grouped_gemm` と同じ理屈で、
+    差し替えの機構そのものの費用は A と B の両方に等しく乗る)。作った
+    Compiled は捨てない -- 捨てると再有効化のたびにトレースを払い直す。
+    """
+    global _MOE_COMPILE_ON
+    _MOE_COMPILE_ON = False
+
+
+def warmup_moe_block_compile(model, widths=(1, 2, 3, 4),
+                             batch: int = 1) -> tuple:
+    """decode 幅のグラフを起動時に先にトレースする。戻り値は
+    ``(作ったグラフ数, 秒, 発火した自前カーネルの内訳)``。
+
+    `mx.compile` は形ごとに 1 回だけ python 本体を走らせてグラフを記録する
+    (1 グラフ 3〜6 ms)。払わずに置くと**最初の要求の TTFT に丸ごと乗る**
+    (短文脈 prefill の実測で +0.6 s)。ここで先に払えば起動時間に移る。
+
+    ``widths`` は decode / verify 幅の S。本番は `MLXTURBO_DEPTH_ADAPT` が
+    深さ 1〜3 を選ぶので verify は S=2..4、draft は S=1 で、この 4 つで
+    定常状態の全部が埋まる。**prefill 幅 (2048 と端数) はここに入れない**:
+    そもそも `_MOE_COMPILE_MAX_ROWS` で素の経路に落ちるので compile されず、
+    トレース費用が発生しない (上の節の理由 2)。バッチ検証 (B>1) の幅もここ
+    には入れない -- 出るかどうかが起動時には決まらないので、出たときに
+    1 回だけ払う。
+
+    MTP (draft) 側の MoE ブロック 1 個も同じ理由でここには入っていない
+    (`build_runner` がこの関数を呼ぶ時点ではまだ読み込まれていない)。
+    1 ブロック x 4 形 = 4 グラフ ≈ 20 ms を最初の要求で払う。
+    """
+    import time
+
+    import mlx.core as mx
+
+    from .kernels import _fire
+
+    if not _MOE_COMPILE_ON or _MOE_COMPILE_ORIG is None:
+        return (0, 0.0, {})
+    blocks = _moe_blocks(model)
+    if not blocks:
+        return (0, 0.0, {})
+    before_n = _MOE_COMPILE_COUNT
+    before_fire = _fire.snapshot()
+    t0 = time.perf_counter()
+    for s in widths:
+        rows = batch * s
+        if _MOE_COMPILE_MAX_ROWS and rows > _MOE_COMPILE_MAX_ROWS:
+            continue
+        for blk in blocks:
+            x = mx.zeros((batch, s, _moe_block_in_features(blk)),
+                         dtype=_moe_block_dtype(blk))
+            # eval まで通す: python のトレースだけでなく、融合された
+            # elementwise の Metal カーネルの JIT もここで焼いておく
+            mx.eval(blk(x))
+    took = time.perf_counter() - t0
+    after_fire = _fire.snapshot()
+    fired = {k: after_fire[k] - before_fire.get(k, 0)
+             for k in after_fire
+             if after_fire[k] - before_fire.get(k, 0) > 0}
+    return (_MOE_COMPILE_COUNT - before_n, took, fired)
+
+
+def _moe_block_in_features(mlp) -> int:
+    """MoE ブロックの入力次元 (量子化された `gate` からも取れる形で)。"""
+    lin = mlp.gate
+    scales = getattr(lin, "scales", None)
+    if scales is not None:
+        return int(scales.shape[-1]) * int(getattr(lin, "group_size", 64))
+    return int(lin.weight.shape[-1])
+
+
+def _moe_block_dtype(mlp):
+    """MoE ブロックが受ける活性の dtype (量子化なら scales の dtype)。"""
+    lin = mlp.gate
+    scales = getattr(lin, "scales", None)
+    return scales.dtype if scales is not None else lin.weight.dtype
+
+
+
 __all__ = [
     "enable_gather_sort",
     "enable_gdn_blocked_kernel",
@@ -3606,6 +4063,11 @@ __all__ = [
     "disable_fast_rope",
     "enable_sdpa_split",
     "disable_sdpa_split",
+    "enable_sdpa_split_generic",
+    "disable_sdpa_split_generic",
     "enable_ple_hoist",
     "disable_ple_hoist",
+    "enable_moe_block_compile",
+    "disable_moe_block_compile",
+    "warmup_moe_block_compile",
 ]

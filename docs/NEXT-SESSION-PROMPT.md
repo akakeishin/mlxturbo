@@ -308,3 +308,6 @@ Flash-Next のフルベンチは後回し (ユーザーの指示があるまで�
 - **製品の方向 (ユーザー 11:39、`docs/research/PRODUCT-DIRECTION-2026-09.md`)**: 中に入るエンジン。P0 = ExecutionPlan / explain / strict plan → Engine / Session API + mlx-lm アダプター → 配布 (3.11+, uvx, doctor) → 常設ベンチ + fast-path hit rate → README。着手は 27B の decode (小 M qmm) の着地後。
 - **TurboQuant: 実装確定 (ユーザー 11:48)**。計画は `docs/research/TURBOQUANT-PLAN.md` (Codex で実装する可能性が高いので、着手者が読めば足りる形)。順序は Gemma レーンの中 (drafter → norm → KV 量子化 第 1 段 → TurboQuant)。
 - **方針 (ユーザー 12:40)**: ビット一致 / 決定性は品質ゲートの条件にしない。「品質に影響が無ければよい」= 参照 (fp32) への距離が素以下 + Δ KLD ≤ +0.0005。決定性は計測の便利さとしてだけ。小 M の経路 (small_m / mma / nocap) は ms/tok の複数プロンプト平均 + KLD で選ぶ。ExecutionPlan の exactness は「丸め級」でよい。
+- **現在地 (2026-09-04 13:15、fdc06e1)**: 小 M (M=2..5) の量子化行列積を既定 auto に (27B 短 -1.9% / 4k -4.6%、fp32 距離は素と同じ)。Gemma 4 26B の 5 者は相手 4 行が揃い、公式 draft は MoE の 26B で 2 者とも遅い → Gemma レーンから drafter を外した。
+  **Codex への引き継ぎを書き始めた**: 入口 `AGENTS.md`、本体 `docs/HANDOFF-2026-09-04.md` (走行待ちの節を埋め中)、memory の写し `docs/research/NOTES-FROM-MEMORY-2026-09-04.md`。ユーザーは「どこかで完全に切り替える」意向。
+  走行中: mlxturbo の煙試験 3 行 (`scratchpad/gemma4_smoke_runs3.sh`)、sdpa 幅分割の再判定 (fp32 距離 + 短文脈)、MoE compile の in-model、台帳 27 件の要約 (`docs/research/AGENT-LEDGERS-DIGEST-2026-09-04.md` 予定)。

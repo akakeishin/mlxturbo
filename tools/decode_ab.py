@@ -493,6 +493,49 @@ def _knob_moe_dec_fused(ctx):
     return apply
 
 
+def _knob_moe_compile(ctx):
+    """MoE ブロックまるごとを `mx.compile` で 1 グラフに畳む (本番既定 on)。
+
+    - A = `fused.enable_moe_block_compile` (decode / verify 幅だけ、行数
+      <= `MLXTURBO_MOE_COMPILE_MAX_ROWS` 既定 16)
+    - B = 素の `SparseMoeBlock.__call__` (差し替えは残したままフラグを下ろす
+      ので、機構そのものの費用は A と B に等しく乗る)
+
+    `SparseMoeBlock.__call__` は純関数 (キャッシュを 1 つも書かない) なので
+    包める。層まるごと / GDN / attention は 2 回目以降 python が走らず
+    キャッシュが更新されないため**原理的に不可**
+    (`scratchpad/agent-fn-compile-poc.md` の段 1/段 2)。
+
+    畳まれるのは router の f32 化 copy -> argpartition -> softmax ->
+    take_along_axis -> shared のゲート -> combine の縮約で、行列積は境界の
+    まま。**compile は op を並べ替えないので数値は 1 ビットも動かない**
+    (`control_identical=True`)。PoL: dispatch 3264 -> 3013 本/round (-7.7%)、
+    短 3 本 -1.2% / 17k -1.3%、head と tok/round は完全一致。
+
+    prefill 幅は行数の上限で素の経路に落ちるので `DECODE_ONLY_KNOBS` に入れて
+    ある (`--prefill-once` が使える)。
+
+    **A に入るとき `warmup_moe_block_compile` を通す。**形ごとの初回トレース
+    (48 層 x 形数 ≈ 0.6 s) が計測の最初の数ラウンドに落ちると、-1.2% の
+    取り分より大きい下駄になる。
+
+    判定線 (親): 短文脈 3 本 x 512 の ms/round と 17k の ms/round が
+    どちらも負で、head / tok/round が完全一致すること。
+    """
+    from mlxturbo import fused
+
+    eng = ctx["eng"]
+
+    def apply(variant):
+        if variant == "B":
+            fused.disable_moe_block_compile()
+            return
+        fused.enable_moe_block_compile(eng.model, mode="1")
+        fused.warmup_moe_block_compile(eng.model)
+
+    return apply
+
+
 def _knob_gdn_prework(ctx):
     """A = GDN 前処理の融合カーネル on / B = off (既定)。
 
@@ -2771,6 +2814,10 @@ KNOBS = {
     # A = decode 幅の MoE を fused:1 (2 カーネル) / B = 素 (既定)。積和の丸め
     # 位置が違うのでビット一致はしない。判定は ms/round -1%
     "moe-dec-fused": (_knob_moe_dec_fused, ["A", "B"], False, "B"),
+    # A = MoE ブロックまるごとを mx.compile (本番既定) / B = 素。compile は
+    # op を並べ替えないのでビット一致する (control_identical=True)。
+    # 判定は ms/round (短 / 17k とも負で、head と tok/round が完全一致)
+    "moe-compile": (_knob_moe_compile, ["A", "B"], True, "B"),
     "gdn-blocked": (_knob_gdn_blocked, ["A", "B"], False, "B"),
     "gdn-metal": (_knob_gdn_metal, ["A", "B"], False, "B"),
     "hc-write": (_knob_hc_write, ["A", "C", "B"], True, "B"),
@@ -3284,6 +3331,10 @@ def run_with_model(argv, bundle) -> int:
         # _MOE_DISPATCH_DEC_FUSED_MAX_ROWS (既定 8) を超えたら None を返して
         # 素へ落ちる。prefill の 1 チャンクは 2048 行なので必ず素の経路。
         "moe-dec-fused",
+        # moe-compile は `fused._moe_compile_call` の先頭で行数 (B*S) が
+        # _MOE_COMPILE_MAX_ROWS (既定 16) を超えたら素へ落ちる。prefill の
+        # 1 チャンクは 2048 行なので必ず素の経路 = prefill_s は動かない。
+        "moe-compile",
         # depth-adapt は _effective_depth 経由でしか呼ばれず、それ自体
         # decode ループの中 (generate/generate_stream の while) でしか
         # 呼ばれない (prefill の forward は素の model(...) 呼び出しで、

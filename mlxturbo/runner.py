@@ -1487,9 +1487,18 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         # decode/verify 幅 (S<=8) の sdpa が vector カーネルの適格幅
         # (S*gqa_factor<=32) を越えるとき、q/mask を S 軸で分割して呼ぶ
         # (docs/research/SDPA-WIDTH-WALL.md)。prefill 幅 (S>8) は素通り。
-        fused.enable_sdpa_split()
-        if os.environ.get("MLXTURBO_SDPA_SPLIT") != "0":
-            print(f"{log_prefix} sdpa 幅分割有効 (S*gqa_factor>32 の decode/verify 幅、既定 on)")
+        #
+        # 2 つある: `enable_sdpa_split` は `_vendor/qwen4_exp.py` のシーム
+        # (Flash-Next だけ)、`enable_sdpa_split_generic` は attention の
+        # 名前空間差し替え (27B = qwen3_next など、**既定 off**、
+        # MLXTURBO_SDPA_SPLIT_GENERIC=auto|1|0)。ログは「当たった層数」を
+        # 出す -- 以前は族に依らず「有効」と刷っていたので、シームの無い
+        # 27B でも入っているように読めた (誤読の元だった)。
+        n_split = fused.enable_sdpa_split(model)
+        n_split_g = fused.enable_sdpa_split_generic(model)
+        if n_split or n_split_g:
+            print(f"{log_prefix} sdpa 幅分割有効 (S*gqa_factor>32 の decode/verify 幅、"
+                  f"シーム {n_split} 層 / 汎用 {n_split_g} 層)")
         if os.environ.get("MLXTURBO_FAST_QMM") == "1":
             # 検証フォワード (M=3..8) の密 qmm を 8x8 MMA タイルに通す。
             # stock qmv は M にほぼ比例して重みを読み直すが、MMA タイルは
@@ -1638,6 +1647,27 @@ def enable_default_fusions(model, log_prefix: str = "", no_fused: bool = False) 
         from . import qsa_decode
 
         qsa_decode.enable_qsa_decode_kernel_default(model, log_prefix=log_prefix)
+
+        # MoE ブロックまるごとを mx.compile で 1 グラフに畳む
+        # (`fused.enable_moe_block_compile`、**既定 on**、
+        # MLXTURBO_MOE_COMPILE=0 で off)。`SparseMoeBlock.__call__` は純関数
+        # なので包める (層 / GDN / attention はキャッシュの副作用で不可)。
+        # dispatch -7.7%、短 ms/round -1.2% / 17k -1.3%、head と tok/round は
+        # 完全一致 = ビット一致 (2026-09-04、PoL は
+        # `scratchpad/agent-fn-compile-poc.md`)。包むのは decode / verify 幅
+        # だけ (行数 <= MLXTURBO_MOE_COMPILE_MAX_ROWS、既定 16) -- prefill 幅は
+        # 取り分ゼロで、端数チャンクの長さぶんグラフが際限なく増えるため。
+        #
+        # **MoE の中身を変える enable_* を全部通した後に置く。**compile は
+        # 記録した時点の python の分岐を焼き込むので、後から
+        # enable_moe_grouped_gemm / enable_qmm_wide が入ると古いグラフが
+        # 残る (鍵にフラグの指紋を入れて守ってはあるが、順序で守るほうが安い)。
+        n_moe_compile = fused.enable_moe_block_compile(model)
+        if n_moe_compile:
+            print(f"{log_prefix} MoE ブロックの mx.compile 有効 (既定 on、"
+                  f"{n_moe_compile} 層、decode/verify 幅のみ 行数 <= "
+                  f"{fused._MOE_COMPILE_MAX_ROWS}、ビット一致。"
+                  "MLXTURBO_MOE_COMPILE=0 で off)")
 
 
 def set_wired_limit_default(log_prefix: str = "") -> int | None:
@@ -1954,6 +1984,7 @@ def _build_base_runner(
     ``fallback_reason`` is always None (see the Runner Protocol).
     """
 
+    from . import fused as fused_mod
     from .cli import load_cli_mtp
     from .ngram_stream import warn_if_not_installed
 
@@ -1963,6 +1994,23 @@ def _build_base_runner(
     warn_if_not_installed(model)
 
     enable_default_fusions(model, log_prefix, args.no_fused)
+
+    # MoE ブロックの mx.compile は形ごとに 1 回だけ python 本体を走らせて
+    # グラフを記録する (1 グラフ 3〜6 ms)。払わずに置くと **48 層 x 形数ぶんが
+    # 丸ごと最初の要求の TTFT に乗る** (短文脈 prefill の実測で +0.6 s)。
+    # ここで S=1..4 (draft が 1、depth-adapt の verify が 2..4) を先に通して
+    # 起動時間に移す。prefill 幅は `_MOE_COMPILE_MAX_ROWS` で素の経路に落ちる
+    # ので compile されず、トレース費用がそもそも無い (fused.py の節を参照)。
+    # `MLXTURBO_MOE_COMPILE_WARMUP=0` で温めだけ切れる (「温めが本当に初回の
+    # TTFT を下げているか」を同じバイナリで A/B するための口。融合そのものは
+    # MLXTURBO_MOE_COMPILE=0 で切る)。
+    if os.environ.get("MLXTURBO_MOE_COMPILE_WARMUP", "1") != "0":
+        _n_g, _warm_s, _warm_fire = fused_mod.warmup_moe_block_compile(model)
+    else:
+        _n_g, _warm_s, _warm_fire = 0, 0.0, {}
+    if _n_g:
+        print(f"{log_prefix} MoE compile の温め: {_n_g} グラフ / {_warm_s:.2f}s"
+              f" (発火 {_warm_fire})")
 
     # Qwen3.8-Flash-Next (qwen4_exp) + MTP (explicit or auto-discovered) ->
     # the FlashSpecEngine path (docs/MTP-FLASH.md). The 27B (qwen3_5) has a
