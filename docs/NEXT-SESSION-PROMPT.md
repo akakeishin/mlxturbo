@@ -292,3 +292,4 @@ Flash-Next のフルベンチは後回し (ユーザーの指示があるまで�
 - **35B-A3B (ユーザー 09:07)**: 35B-A3B は **Qwen3.6** (3.8 ではない)。MTP もあるはず。27B 最優先で、35B-A3B は参考までに後で (MoE 部品の契約の試験台。ダウンロードは計測の合間に、パック名は要確認)。
   パック (HF、未ダウンロード): `mlx-community/Qwen3.6-35B-A3B-4bit`、MTP は `mlx-community/Qwen3.6-35B-A3B-MTP-5bit` (4bit の MTP は無し。mtp.py は scales から bits を推定するので 5bit のまま読める見込み)。
   補足 (09:15): 4bit の MTP サイドカーは mlx-community に無い (本体 `Qwen3.6-35B-A3B-4bit` は 2090 テンソルに `mtp.*` 無し、MoE の gate は 8bit の混合)。MLX 形式で MTP を持つのは `…-MTP-5bit` (qwen3_5_mtp、1 層、46 テンソル) と、第三者の OptiQ 系 (`oQ4e-mtp` 等、別レシピ) だけ。5bit の頭をそのまま使う (bits は scales から推定、1 層なので速度差は無視できる)。
+- **順序 (ユーザー 09:14)**: 27B の移植 (decode 経路の (B)) が着地したら、**qwen4_exp (Flash-Next) も同じ分岐ルート (契約で部品を当てる汎用経路) に載せる** → その後 **35B-A3B (Qwen3.6、MoE)**。Flash-Next を載せ替えるときは 17k A/B と fingerprint を毎回のゲートに (数字を落とさない)。
