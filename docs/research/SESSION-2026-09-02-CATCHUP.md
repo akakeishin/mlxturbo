@@ -3478,3 +3478,30 @@ prefill完了は通常のcache更新・MTP prime後、first-token完了は既存
 `prefill=971.2ms / first_token=0.4ms`と出た。短い機能確認なので速度の採否には使わないが、
 cold入力ではserver固定費でなくrunner prefillが支配することを同じrequestで確認できた。
 残るP0はtokenize/LCP探索/restore、batch-forfeited reuse、preemption再計算tokenである。
+
+### 2026-09-04 21:03 n-gram先読みの50k cold A/Bは常用冷却でも採用線を通過
+
+ユーザー確認により今回の冷却条件は強冷却ではなく常用冷却。`FASTMLX_NGRAM_NOCACHE=1`で
+OSページキャッシュの持越しを避け、49,870〜49,873 tokenの3プロンプトをA,B,B,Aで測った。
+Aはprefetch on/early、Bはoff。
+
+| case | ctx | A on 中央値 | B off 中央値 | wall差 | input tok/s A / B |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 49,872 | 87.146秒 | 94.641秒 | **-7.9%** | 572.3 / 527.0 |
+| 1 | 49,873 | 85.993秒 | 92.846秒 | **-7.4%** | 580.0 / 537.2 |
+| 2 | 49,870 | 85.626秒 | 92.269秒 | **-7.2%** | 582.4 / 540.5 |
+
+ツールの全走行平均はA 86.255秒、B 93.252秒。B基準のwallは**-7.5%**、入力速度は
+約535→578 tok/s (**+8.1%**) 。出力は3/3ケース一致。Aは全4,791,232行のうち
+4,789,124行がhit、fetch 2,974ms、Bはhit 0、fetch 51,985msだった。背景先読みの総時間を
+wallから単純減算してはいけないが、I/O待ちをGPU forwardへ重ねた結果が全ケースで5%線を超えた。
+
+**判定: 既定onを確定し、50k未測定を閉じる。** 既に
+`MLXTURBO_NGRAM_PREFETCH=1` / `MLXTURBO_NGRAM_PREFETCH_AT=early`が既定なのでコード変更なし。
+これはcold prefill全体のtok/s改善だが、モデル本体の演算速度とは別レーンで記録する。
+結果は`bench/results/ngram-prefetch-50k-cold-0904.json`（gitignore）。
+
+直前に現行17k anatomyも常用冷却で取り直した。prefill wall 27.215秒（約620 tok/s）、
+MoE 9.483秒 (34.8%)、GDN 7.966秒 (29.3%)、attention 5.810秒 (21.3%)、
+HC read 2.862秒 (10.5%)。ngram lookaheadは1.058秒だがforwardと重なる段時間なので
+部品比と単純加算しない。モデル本体の次の候補はこの4項目から探す。

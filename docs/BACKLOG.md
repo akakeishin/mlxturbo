@@ -1034,3 +1034,16 @@ Flash-Nextのdebug時だけrunner prefill/first-token時間を追加済み（追
 suffix 0/16/64/256、pure append/retokenizedでbyte実測を合わせる。無制限cacheは入れない。
 設計判断、50kで下限2.189 GiB/sessionとなる容量見積もり、段階別の合格線は
 `docs/research/HOT-PREFILL-DESIGN-2026-09.md`を正本にする。
+
+## 完了: n-gram先読みの50k cold判定 (2026-09-04 21:03)
+
+常用冷却、`FASTMLX_NGRAM_NOCACHE=1`、3プロンプトを各ABBAで測定した。
+prefetch onは平均86.255秒、offは93.252秒で、wall **-7.5%**、入力速度は約535→578 tok/s
+(**+8.1%**) 。3ケースとも条件間の生成列が一致し、宣言済みの「wall -5%以上・出力一致」を
+通過した。既定onを確定し、50k未測定の項目を閉じる。結果は
+`bench/results/ngram-prefetch-50k-cold-0904.json`（gitignore、手元保存）。
+
+同日に現行17k anatomyも取り直し、cold wall 27.215秒（約620 tok/s）、内訳はMoE 34.8%、
+GDN 29.3%、attention 21.3%、HC read 10.5%だった。先読みはcold全体tok/sを上げるが、
+モデル本体の次の対象は引き続きMoE、GDN、attention。既棄却案を再開せず、新しい候補は
+各単独で全体5%以上を説明できる見込みを出してからA/Bする。

@@ -701,23 +701,26 @@ rg -n "MTP: あり|tok/step" scratchpad/log-qwen36-mtp-fixed-smoke-0904.txt && g
 rg -n "def _select_session|prefill_reused|ttft-trace|memory|session_pool" mlxturbo/server.py mlxturbo/{runner,spec,spec_flash}.py
 ```
 
-## Flash-Next cold prefill本体の次の判定 (2026-09-04 19:49 JST)
+## 完了: Flash-Next n-gram先読みの50k cold判定 (2026-09-04 21:03 JST)
 
 - 現行17k解剖を常時冷却で取り直した。中間2048 tokenは壁時3.530秒、MoE 1.410、
   GDN 0.950、attention 0.891、HC 0.355秒。部品和は壁時計+3.2%で整合。
 - 単純chunk 4096/8192、causal mask融合、small-kv QSA、K/V prefix trim、HC elem拡張、
   GDN state_out削減は棄却済みなので再開しない。
-- 新規に長文cold +5%を見込める確定候補は無い。残る最優先は既存n-gram prefetchの
-  50k未測定のみ。強冷却で50k ABBAを行い、出力一致かつprefill wall -5%以上なら
-  既定onの長文効果を確定、未満ならcold次候補を閉じる。所要は約25分。
+- 常用冷却、`FASTMLX_NGRAM_NOCACHE=1`、49,870〜49,873 token、3ケースのABBAを完走。
+  prefetch onは平均86.255秒、offは93.252秒で、wall **-7.5%**、入力速度は約535→578 tok/s
+  (**+8.1%**)。「5%以上かつ出力一致」の採用線を通り、3ケースすべて生成列が一致した。
+- `MLXTURBO_NGRAM_PREFETCH=1` / `AT=early`は既に既定onなのでコード変更は不要。
+  50kの未決を閉じる。これはI/O待ちの背景化であり、モデル行列演算そのものの高速化とは分ける。
 - `bench/hot_prefill_bench.py`はcold行とinput token/sも保存する。commit `b808ea0` / `f247729`。
 
-再開の1コマンド（強冷却の準備を確認してから）:
+次のcold本体調査の再開コマンド（採否用A/Bではなく構成比の確認）:
 
 ```bash
-FASTMLX_NGRAM_NOCACHE=1 BIGLOCK_PRIO=0 tools/biglock.sh .venv/bin/python tools/decode_ab.py \
-  --knob ngram-prefetch --model ~/models/ddalcu-mlxlm-head4 --ngram ~/models/ddalcu-ngram \
-  --only long --ctx 50000 --tokens 32 --out bench/results/ngram-prefetch-50k-cold-0904.json
+BIGLOCK_PRIO=1 tools/biglock.sh .venv/bin/python tools/prefill_ctx_anatomy.py \
+  --model ~/models/ddalcu-mlxlm-head4 --ngram ~/models/ddalcu-ngram \
+  --ctx 17000 --stage-warmup 1 --stage-reps 1 --reps 1 --no-sub \
+  --out bench/results/prefill-anatomy-current-17k-0904.json
 ```
 
 ## GuideLLM固定出力長の対応 (2026-09-04 19:58 JST)
@@ -726,7 +729,7 @@ FASTMLX_NGRAM_NOCACHE=1 BIGLOCK_PRIO=0 tools/biglock.sh .venv/bin/python tools/d
 - requestごとのEOS上書きを扱えない既存batch coordinatorは迂回し、通常requestの経路は変えない。
 - `bench/test_server.py`は441 passed。実Flash-NextへGuideLLM 0.7.3で2 requestを送り、
   2/2成功、両方とも要求どおり8 output token、JSON/CSV/HTML生成を確認した。
-- GuideLLMの未決は閉じた。cold prefillの次は上記50k n-gram A/Bで、強冷却確認後にだけ開始する。
+- GuideLLMの未決は閉じた。50k n-gram A/Bも上記のとおり常用冷却で採用線を通過し、未決を閉じた。
 
 再開の1コマンド:
 

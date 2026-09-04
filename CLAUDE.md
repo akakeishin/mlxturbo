@@ -89,7 +89,9 @@
   **I/O を含む経路の A/B は、同じ機体で続けて測るとページキャッシュを共有する** (プロセスを分けても同じ)。
   `MLXTURBO_NGRAM_PREFETCH` (既定 1、`=0` で off) と `MLXTURBO_NGRAM_PREFETCH_AT` (既定 early) は 2026-09-04 02:25 に入れた本番の既定値:
   pread では先読みが走っていなかった (既定 off だった) ので on にし、投入位置を group forward の前へ (最初の境界は前景で読み切る)。
-  17k 冷 -2.9% / 4k 冷 -1.0% / 17k 温 -1.8%、出力一致、行キャッシュは 1 prefill ぶん (≤ 70 MB)。`FASTMLX_NGRAM_NOCACHE=1` は計測専用 (`F_NOCACHE`) で、
+  17k 冷 -2.9% / 4k 冷 -1.0% / 17k 温 -1.8%。50k 冷は常用冷却のABBA 3ケースで
+  93.252→86.255秒 (**-7.5%、約535→578 input tok/s、出力3/3一致**) まで伸びた。行キャッシュは
+  1 prefill ぶん (≤ 70 MB)。`FASTMLX_NGRAM_NOCACHE=1` は計測専用 (`F_NOCACHE`) で、
   I/O を含む A/B の「冷」はこれで揃える。
   `MLXTURBO_QSA_TAIL` (既定 query、`=global` で旧規則) は QSA の端数 (tail) の可視範囲をクエリごと `[cr*floor((q+1)/cr), q]` にする本番の既定値
   (HF / mlx-serve / oMLX と同じ。global は prefill 幅の 3/4 の行が自分を見ていなかった。速度は中立、17k の正答率は recall 12/12、2026-09-03 17:25)。
