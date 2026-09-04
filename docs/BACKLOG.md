@@ -101,9 +101,10 @@ fastmlx/mlxturbo 側の現状:
    **実運用のエージェント文脈 (17k 級) はこの機構の恩恵を一切受けない。**
    直すには QSA のブロック境界を dead slot 込みで行ごとに組み直す必要がある
    (`mlxturbo/batch_spec.py` の既知の未対応)。**ここが本丸。**
-2. **バッチ経路ではセッションのプレフィックス再利用が効かない。**短い会話の
-   2 ターン目以降の TTFT が悪化しうる。**decode には出ないので
-   `bench/batch_b1_gate.py` には映らない。**有効化の判断はこれ込みで。
+2. **解消 (2026-09-05 08:05): バッチ経路でもセッションのプレフィックスを再利用する。**
+   fresh要求が完了時cacheをpoolへ公開し、append要求はclaimしてexecutor上で
+   `BatchGenerator`へ移す。Gemma 4 26B・約4kでTTFT 3.06→0.08秒、生成列はcold再計算と一致。
+   B=2のfresh→appendも各1,245/1,261 token再利用し、claim競合・失敗時解放はtestで固定した。
 3. **走行中のバッチに後から入れない (closed batch)。**次の編成は現バッチが
    空になった時点。直列キューよりは悪くないが、連続バッチングではない。
    途中参加には新入りの KV を走行中の物理列数へ左詰めで揃え、`ArraysCache`
@@ -706,6 +707,9 @@ mlx_lm の更新で写しが壊れる頻度が月 2 回を超えるなら、写�
   KV 共有型の drafter エンジンを新設**する (`docs/research/EXPANSION-BOTTLENECKS.md` の Gemma 4 の節)。
   **方針 (ユーザー 2026-09-03 14:50): 公式の MTP 頭 (drafter) が配られていない族は、基本的に投機に対応しない** (素の decode + 汎用カーネルまで)。
   lookup / 小モデル draft / 自前の頭の学習を代用にはしない。対応表の「draft の種類」は MTP 頭 / KV 共有 drafter / なし、の 3 値。
+  **2026-09-05の対象確定:** `/Users/ht/models/gemma4-31b-4bit` (dense q4/group64) と
+  `/Users/ht/models/gemma4-31b-assistant` (4層BF16、shared KV) を正式なGemma投機レーンにする。
+  26B MoE assistantの棄却を31Bへ外挿しない。31Bはblock size 2/4/6/8を短文・4k・17kで測る。
 - **vision / 音声も追従の対象に含める** (BACKLOG 1 節「マルチモーダル対応」と同じ話)。Gemma 4 と Qwen の VL 系は mlx_lm 側が VLM ラッパ (`gemma4.py` + `gemma4_text.py` の形) なので、
   8〜9 割の追従はまず text 側の経路で取り、vision / 音声の encoder は別の adapter として足す。投機 decode 側で要るのは「画像 / 音声トークンを含む prefix の prefill と、
   その KV を持ったままの draft / verify」で、text だけの前提を置いている箇所 (prime 窓、n-gram の文脈、checkpoint の位置) を洗うのが先。

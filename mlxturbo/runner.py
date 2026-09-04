@@ -1004,6 +1004,10 @@ def start_batched_generation(
     frequency_penalty: float | None = None,
     logit_bias: dict | None = None,
     seed: int | None = None,
+    session=None,
+    session_reused: int = 0,
+    release_session=None,
+    tier: str | None = None,
     **extra,
 ):
     """Build one ``mlxturbo.batch.Admission`` and submit it to ``coordinator``.
@@ -1051,7 +1055,7 @@ def start_batched_generation(
         presence_penalty=presence_penalty,
         frequency_penalty=frequency_penalty,
     )
-    tier = _batch.classify(coordinator.model, len(prompt_ids), max_tokens)
+    tier = tier or _batch.classify(coordinator.model, len(prompt_ids), max_tokens)
 
     future: "concurrent.futures.Future" = concurrent.futures.Future()
     admission = _batch.Admission(
@@ -1064,8 +1068,16 @@ def start_batched_generation(
         on_done=on_done,
         cancel_event=cancel_event,
         future=future,
+        session=session,
+        session_reused=session_reused,
+        release_session=release_session,
     )
-    coordinator.submit(admission)
+    try:
+        coordinator.submit(admission)
+    except BaseException:
+        if release_session is not None:
+            release_session()
+        raise
     return future
 
 

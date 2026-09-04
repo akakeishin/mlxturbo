@@ -28,10 +28,11 @@ now it remains the only mechanism that guarantees "one request = one
 generation", but because session ownership is now per-request, merely removing
 the lock would no longer let simultaneous generations for different
 conversations destroy each other's session (removing the lock itself is work
-for the next scheduler pass). Concurrent access to ``STATE.session_pool``
-itself (two requests selecting or evicting slots at the same time) is still
-assumed to be protected by this lock, so when the lock is removed the pool
-operations themselves will need separate mutual exclusion.
+for the next scheduler pass). Continuous-batch admission does select from
+``STATE.session_pool`` without the asyncio lock. A small non-blocking threading
+lock therefore protects only its Python selection/LRU bookkeeping, and a
+per-session claim marker keeps the serial and batch paths from handing the same
+mutable cache to two requests.
 
 For models SpecEngine does not accept (Llama/Gemma/dense Qwen, or GDN hybrids
 whose layout differs), mlxturbo.runner.build_runner automatically falls back at
@@ -162,6 +163,14 @@ _UNGATED_PATHS = frozenset({"/health", "/api/hello"})
 # stop accepting new ones — requests arriving over an existing keep-alive
 # connection cannot be turned away by uvicorn merely closing the socket).
 _SHUTTING_DOWN = False
+
+# A batch route is decided on the event-loop thread while the serial session
+# selector runs on the model executor.  The small threading lock protects only
+# Python pool selection/LRU bookkeeping; the event loop never waits for it.
+# The marker then reserves a matching session until the model worker publishes
+# or discards its cache.
+_BATCH_SESSION_CLAIMED = "_mlxturbo_batch_session_claimed"
+_SESSION_POOL_LOCK = threading.RLock()
 
 
 def _protocol_for_path(path: str) -> str:
@@ -817,7 +826,7 @@ def _attach_selection_to_result(
         else _selection_for_result(prompt_ids, session, request_telemetry)
     )
     if session is None:
-        # Batched and downgraded requests intentionally do not use the pool.
+        # Downgraded/spec-batched requests intentionally do not use the pool.
         _record_session_selection(None, info)
     result["_session_selection"] = info
     return result
@@ -888,6 +897,13 @@ def _session_telemetry_snapshot() -> dict[str, Any]:
 def _select_session(
     prompt_ids: list[int], request_telemetry: dict[str, float] | None = None
 ):
+    with _SESSION_POOL_LOCK:
+        return _select_session_unlocked(prompt_ids, request_telemetry)
+
+
+def _select_session_unlocked(
+    prompt_ids: list[int], request_telemetry: dict[str, float] | None = None
+):
     """Pick the session (ChatSession/FallbackSession) to use for a new prompt
     out of ``STATE.session_pool``.
 
@@ -942,11 +958,9 @@ def _select_session(
     below its limit, and when it is at the limit the least recently used slot
     (the head = LRU) is evicted first and then a new slot allocated.
 
-    The caller must invoke this while holding ``STATE.lock`` — neither this
-    function nor the session.publish/invalidate that follows performs any
-    mutual exclusion on reads and writes of the pool itself (the assumption is
-    that the serialization lock protects it). When the lock is removed (the
-    next scheduler pass), separate mutual exclusion will be needed here too.
+    The public wrapper protects the pool's Python selection/LRU operations with
+    ``_SESSION_POOL_LOCK``.  Cache mutation still stays on the single model
+    executor thread.
     """
 
     pool = STATE.session_pool
@@ -993,6 +1007,8 @@ def _select_session(
     best_key = None
     best_lcp = -1
     for key, sess in pool.items():
+        if getattr(sess, _BATCH_SESSION_CLAIMED, False):
+            continue
         pl = sess.processed
         if not pl:
             continue
@@ -1022,6 +1038,8 @@ def _select_session(
     # until a slot that can actually be rewound is found.
     partial = []
     for key, sess in pool.items():
+        if getattr(sess, _BATCH_SESSION_CLAIMED, False):
+            continue
         pl = sess.processed
         if not pl:
             continue
@@ -1079,19 +1097,28 @@ def _select_session(
             _record_session_selection(sess, info)
             return sess
 
-    was_evicted = len(pool) >= STATE.max_sessions
+    eviction_key = next(
+        (key for key, sess in pool.items()
+         if not getattr(sess, _BATCH_SESSION_CLAIMED, False)),
+        None,
+    )
+    was_evicted = eviction_key is not None and len(pool) >= STATE.max_sessions
     evicted_processed_tokens = 0
     evicted_allocated_bytes: int | None = 0
     if was_evicted:
-        _, evicted_sess = pool.popitem(last=False)
+        evicted_sess = pool.pop(eviction_key)
         try:
             evicted_processed_tokens = len(evicted_sess.processed)
         except Exception:
             evicted_processed_tokens = 0
         evicted_allocated_bytes = _session_allocated_bytes(evicted_sess)
-    key = next(STATE.session_key_seq)
     session = STATE.session_factory()
-    pool[key] = session
+    if was_evicted or len(pool) < STATE.max_sessions:
+        key = next(STATE.session_key_seq)
+        pool[key] = session
+    # All resident slots may be owned by live batch admissions.  Do not evict
+    # one of them while its cache is being mutated; this temporary serial
+    # session is deliberately not pooled and will be reclaimed by the caller.
     # Preserve the best unusable LCP as well: it is the amount of work a
     # future checkpoint/cache implementation could have saved, even though
     # this request correctly re-prefills from zero.
@@ -3299,7 +3326,11 @@ def _resolve_batch_route(
     # reusable by the different runner.
     session_compatible = session_compatible and gen_runner is STATE.runner
 
-    def with_probe(coordinator, tier):
+    def with_probe(coordinator, tier, allow_session=False):
+        if allow_session and session_compatible:
+            session, info = _claim_batch_session(prompt_ids, request_telemetry)
+            if session is not None:
+                return coordinator, tier, info, session
         if not STATE.debug_log:
             return coordinator, tier
         if session_compatible:
@@ -3323,7 +3354,9 @@ def _resolve_batch_route(
     coordinator = STATE.batch_coordinator
     if coordinator is not None and can_batch(gen_runner):
         return with_probe(
-            coordinator, _runner_batch_tier(coordinator, prompt_ids, max_tokens)
+            coordinator,
+            _runner_batch_tier(coordinator, prompt_ids, max_tokens),
+            allow_session=True,
         )
     spec = STATE.spec_batch_coordinator
     if spec is not None and can_batch_spec(gen_runner):
@@ -3347,6 +3380,8 @@ def _probe_best_session_lcp(prompt_ids: list[int]) -> tuple[int, str]:
         return 0, "busy"
     best = 0
     for sess in tuple(STATE.session_pool.values()):
+        if getattr(sess, _BATCH_SESSION_CLAIMED, False):
+            continue
         try:
             processed = tuple(sess.processed)
         except Exception:
@@ -3366,6 +3401,108 @@ def _probe_best_session_lcp(prompt_ids: list[int]) -> tuple[int, str]:
             i += 1
         best = max(best, i)
     return best, "ok"
+
+
+def _claim_batch_session(
+    prompt_ids: list[int], request_telemetry: dict[str, float] | None = None
+):
+    # A route decision runs on the asyncio event loop.  If the serial selector
+    # is inside its longer trim/restore pass, fall back to an unclaimed batch
+    # admission instead of blocking every connection on this lock.
+    if STATE.lock.locked() or not _SESSION_POOL_LOCK.acquire(blocking=False):
+        return None, None
+    try:
+        return _claim_batch_session_unlocked(prompt_ids, request_telemetry)
+    finally:
+        _SESSION_POOL_LOCK.release()
+
+
+def _claim_batch_session_unlocked(
+    prompt_ids: list[int], request_telemetry: dict[str, float] | None = None
+):
+    """Claim one append-only session, or reserve a slot for a batch miss.
+
+    This is intentionally a Python-only read/mark operation.  It is called
+    before a batch is submitted, while ``STATE.lock`` is free; sessions marked
+    here are skipped by the serial selector until the coordinator publishes or
+    discards the cache.  Reusing an LRU slot does not drop its MLX arrays here;
+    the coordinator invalidates it later on the model executor.
+    """
+
+    best_key = None
+    best_session = None
+    best_lcp = 0
+    for key, sess in STATE.session_pool.items():
+        if getattr(sess, _BATCH_SESSION_CLAIMED, False):
+            continue
+        processed = getattr(sess, "processed", None)
+        cache = getattr(sess, "cache", None)
+        if (
+            not isinstance(processed, list)
+            or not processed
+            or not isinstance(cache, list)
+            or not cache
+            or any(item is None for item in cache)
+            or len(processed) >= len(prompt_ids)
+            or prompt_ids[: len(processed)] != processed
+        ):
+            continue
+        if len(processed) > best_lcp:
+            best_key = key
+            best_session = sess
+            best_lcp = len(processed)
+    if best_session is None:
+        evicted = False
+        evicted_processed_tokens = 0
+        if len(STATE.session_pool) < STATE.max_sessions:
+            best_key = next(STATE.session_key_seq)
+            best_session = STATE.session_factory()
+            STATE.session_pool[best_key] = best_session
+        else:
+            reusable = next(
+                (
+                    (key, sess)
+                    for key, sess in STATE.session_pool.items()
+                    if not getattr(sess, _BATCH_SESSION_CLAIMED, False)
+                ),
+                None,
+            )
+            if reusable is None:
+                return None, None
+            best_key, best_session = reusable
+            evicted = True
+            try:
+                evicted_processed_tokens = len(best_session.processed)
+            except Exception:
+                pass
+        best_lcp = 0
+        match_kind = "miss"
+    else:
+        evicted = False
+        evicted_processed_tokens = 0
+        match_kind = "append"
+    setattr(best_session, _BATCH_SESSION_CLAIMED, True)
+    STATE.session_pool.move_to_end(best_key)
+    info = _session_selection_info(
+        match_kind,
+        best_lcp,
+        best_lcp,
+        len(prompt_ids) - best_lcp,
+        evicted=evicted,
+        evicted_processed_tokens=evicted_processed_tokens,
+        evicted_allocated_bytes=None if evicted else 0,
+        request_telemetry=request_telemetry,
+    )
+    _record_session_selection(best_session, info)
+    return best_session, info
+
+
+def _release_batch_session(session) -> None:
+    if session is not None:
+        try:
+            setattr(session, _BATCH_SESSION_CLAIMED, False)
+        except BaseException:
+            pass
 
 
 def _spec_batch_would_be_alone(spec) -> bool:
@@ -3422,14 +3559,11 @@ async def _run_generate_batched(
 ) -> dict:
     """The batched-path analogue of ``_run_generate`` — used instead of it
     (never both) whenever ``_resolve_batch_route`` returned non-``None``.
-    ``route`` is that function's ``(coordinator, tier)`` pair.
-
-    No session is passed (batched requests always do a fresh prefill; see
-    mlxturbo/batch.py's module docstring — the same simplification already
-    used for a per-request-downgraded request, see the callers'
-    ``session=None`` comment). No ``STATE.lock`` either: concurrency between
-    admissions is the entire point, and mutual exclusion around the model
-    forward pass now lives inside the coordinator itself.
+    ``route`` is that function's ``(coordinator, tier)`` pair, optionally
+    followed by selection metadata and a claimed FallbackSession. No
+    ``STATE.lock`` is held here: concurrency between admissions is the entire
+    point, and mutual exclusion around the model forward pass now lives inside
+    the coordinator itself.
 
     Cancellation: mirrors ``_run_generate``'s own shield/defer pattern. A
     non-streaming caller has no ``cancel_event`` to signal early, so — same
@@ -3440,16 +3574,35 @@ async def _run_generate_batched(
 
     coordinator, tier = route[:2]
     selection = route[2] if len(route) > 2 else None
+    session = route[3] if tier != "spec" and len(route) > 3 else None
     if tier == "spec":
         future = start_batched_spec_generation(
             coordinator, prompt_ids, max_tokens, temp, STATE.eos_ids,
             on_tokens, None, None, **sampling_kwargs,
         )
     else:
-        future = start_batched_generation(
-            coordinator, prompt_ids, max_tokens, temp, on_tokens, None, None,
-            **sampling_kwargs,
-        )
+        try:
+            future = start_batched_generation(
+                coordinator,
+                prompt_ids,
+                max_tokens,
+                temp,
+                on_tokens,
+                None,
+                None,
+                session=session,
+                session_reused=(selection.get("reused_tokens", 0) if selection else 0),
+                release_session=(
+                    (lambda: _release_batch_session(session))
+                    if session is not None
+                    else None
+                ),
+                tier=tier,
+                **sampling_kwargs,
+            )
+        except BaseException:
+            _release_batch_session(session)
+            raise
     wrapped = asyncio.wrap_future(future)
     cancelled: asyncio.CancelledError | None = None
     while True:
@@ -3467,10 +3620,8 @@ async def _run_generate_batched(
         if cancelled is not None:
             raise cancelled
         return _attach_selection_to_result(
-            result, prompt_ids, None, selection_override=selection
+            result, prompt_ids, session, selection_override=selection
         )
-
-
 def _start_batched_generation(
     route,
     prompt_ids,
@@ -3479,6 +3630,7 @@ def _start_batched_generation(
     thinking_budget,
     tool_calling_enabled: bool = False,
     tools_for_parsing=None,
+    session=None,
     **sampling_kwargs,
 ):
     """The batched-path analogue of ``_start_generation`` — same external
@@ -3490,19 +3642,25 @@ def _start_batched_generation(
     ``(coordinator, tier)`` pair.
     """
 
-    q, cancel_event, raw_token_count, on_tokens, on_done = _build_streaming_pipeline(
-        prompt_ids, thinking_budget, tool_calling_enabled, tools_for_parsing
-    )
+    coordinator, tier = route[:2]
+    if session is None and tier != "spec" and len(route) > 3:
+        session = route[3]
+    try:
+        q, cancel_event, raw_token_count, on_tokens, on_done = _build_streaming_pipeline(
+            prompt_ids, thinking_budget, tool_calling_enabled, tools_for_parsing
+        )
+    except BaseException:
+        _release_batch_session(session)
+        raise
 
     def on_done_with_telemetry(kind, value):
         if kind == "done":
             selection = route[2] if len(route) > 2 else None
             value = _attach_selection_to_result(
-                value, prompt_ids, None, selection_override=selection
+                value, prompt_ids, session, selection_override=selection
             )
         on_done(kind, value)
 
-    coordinator, tier = route[:2]
     if tier == "spec":
         future = start_batched_spec_generation(
             coordinator,
@@ -3516,16 +3674,32 @@ def _start_batched_generation(
             **sampling_kwargs,
         )
     else:
-        future = start_batched_generation(
-            coordinator,
-            prompt_ids,
-            max_tokens,
-            temp,
-            on_tokens,
-            on_done_with_telemetry,
-            cancel_event,
-            **sampling_kwargs,
-        )
+        try:
+            future = start_batched_generation(
+                coordinator,
+                prompt_ids,
+                max_tokens,
+                temp,
+                on_tokens,
+                on_done_with_telemetry,
+                cancel_event,
+                session=session,
+                session_reused=(
+                    route[2].get("reused_tokens", 0)
+                    if len(route) > 2 and isinstance(route[2], dict)
+                    else 0
+                ),
+                release_session=(
+                    (lambda: _release_batch_session(session))
+                    if session is not None
+                    else None
+                ),
+                tier=tier,
+                **sampling_kwargs,
+            )
+        except BaseException:
+            _release_batch_session(session)
+            raise
     # A plain concurrent.futures.Future, exactly like _start_generation's own
     # STATE.executor.submit(worker) return value — _await_worker wraps it
     # with asyncio.wrap_future itself.
@@ -4425,10 +4599,9 @@ async def chat_completions(request: Request):
     )
     try:
         if batch_route is not None:
-            # Batched path (--max-batch / --max-batch-spec): no STATE.lock, no
-            # session (see mlxturbo/batch.py's and mlxturbo/batch_spec.py's
-            # module docstrings) — concurrency with other in-flight requests is
-            # the entire point.
+            # Batched path (--max-batch / --max-batch-spec): no STATE.lock;
+            # the continuous-batch route may carry one claimed session, while
+            # the speculative route remains session-free.
             res = await _run_generate_batched(
                 batch_route, prompt_ids, max_tokens, temp, None, **sampling_params
             )
@@ -4599,13 +4772,17 @@ async def _openai_stream(
         if batch_route is not None:
             # Batched path (--max-batch / --max-batch-spec): no STATE.lock
             # (owned stays False, so the function's own final `if owned[0]:` is
-            # already a correct no-op), no session (batched requests always do a
-            # fresh prefill — see mlxturbo/batch.py's module docstring).
-            session = None
-            reused_at_select = 0
+            # already a correct no-op). A continuous-batch route may carry a
+            # claimed append-only session; the coordinator owns its cache
+            # handoff and publication.
+            session = batch_route[3] if len(batch_route) > 3 else None
+            reused_at_select = (
+                batch_route[2].get("reused_tokens", 0)
+                if len(batch_route) > 2 and isinstance(batch_route[2], dict)
+                else 0
+            )
             # [ttft-trace]: (c)/(d) collapse to the same instant on the batch
-            # route — there is no session lookup to separate them (see the
-            # comment above: batched requests always do a fresh prefill).
+            # route — selection has already happened at route time.
             t_trace["c_select"] = t_trace["d_gen"] = time.perf_counter()
             q, future, cancel_event, raw_token_count = _start_batched_generation(
                 batch_route,
@@ -5179,8 +5356,12 @@ async def _anthropic_stream(
     )
     try:
         if batch_route is not None:
-            session = None
-            reused_at_select = 0
+            session = batch_route[3] if len(batch_route) > 3 else None
+            reused_at_select = (
+                batch_route[2].get("reused_tokens", 0)
+                if len(batch_route) > 2 and isinstance(batch_route[2], dict)
+                else 0
+            )
             q, future, cancel_event, raw_token_count = _start_batched_generation(
                 batch_route,
                 prompt_ids,
@@ -5699,8 +5880,12 @@ async def _completions_stream(
     )
     try:
         if batch_route is not None:
-            session = None
-            reused_at_select = 0
+            session = batch_route[3] if len(batch_route) > 3 else None
+            reused_at_select = (
+                batch_route[2].get("reused_tokens", 0)
+                if len(batch_route) > 2 and isinstance(batch_route[2], dict)
+                else 0
+            )
             # thinking_budget=0 pins ThinkingRouter to content-only (regardless of
             # has_thinking), so reasoning_delta can never arrive.
             q, future, cancel_event, raw_token_count = _start_batched_generation(

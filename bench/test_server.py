@@ -9814,12 +9814,15 @@ def test_resolve_batch_route_pool_vs_solo(batch_env):
     assert server._resolve_batch_route(batch_env.runner, [1] * 6, 4)[1] == "solo"  # 6+4=10 > 8
 
 
-def test_debug_batch_route_reports_reuse_it_forfeits(batch_env):
+def test_debug_batch_route_claims_reusable_session(batch_env):
     state = _install_state(
         batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4
     )
     state.debug_log = True
-    state.session_pool[0] = SimpleNamespace(processed=[1, 2, 3], tail=None)
+    session = FallbackSession()
+    session.cache = [object()]
+    session.processed = [1, 2, 3]
+    state.session_pool[0] = session
 
     route = server._resolve_batch_route(
         batch_env.runner,
@@ -9828,16 +9831,13 @@ def test_debug_batch_route_reports_reuse_it_forfeits(batch_env):
         request_telemetry={"template_tokenize_s": 0.001},
     )
     assert route[:2] == (batch_env.coordinator, "pool")
-    assert route[2]["batch_probe_status"] == "ok"
-    assert route[2]["batch_forfeited_lcp"] == 3
+    assert route[2]["match_kind"] == "append"
+    assert route[2]["reused_tokens"] == 3
+    assert route[2]["batch_forfeited_lcp"] == 0
     assert route[2]["template_tokenize_s"] == pytest.approx(0.001)
-
-    result = asyncio.run(
-        server._run_generate_batched(route, [1, 2, 3, 4], 2, 0.0)
-    )
-    assert result["_session_selection"]["batch_forfeited_lcp"] == 3
-    assert state.session_telemetry["batch_forfeited_requests"] == 1
-    assert state.session_telemetry["batch_forfeited_lcp_tokens"] == 3
+    assert route[3] is session
+    assert state.session_telemetry["reused_tokens"] == 3
+    assert state.session_telemetry["batch_forfeited_requests"] == 0
 
 
 def test_debug_batch_route_does_not_claim_incompatible_primary_reuse(batch_env):
@@ -10001,6 +10001,308 @@ def test_batched_admission_cancelled_before_start_resolves_cleanly(batch_env):
     )
     batch_env.coordinator.submit(admission)
     assert fut.result(timeout=5) is None
+
+
+def _batch_admission_for_session(prompt_ids, session=None, session_reused=0):
+    import concurrent.futures as cf
+
+    from mlxturbo import batch as batch_module
+
+    return batch_module.Admission(
+        prompt_ids=list(prompt_ids),
+        max_tokens=2,
+        sampler=None,
+        logits_processors=[],
+        tier="pool",
+        on_tokens=None,
+        on_done=None,
+        cancel_event=None,
+        future=cf.Future(),
+        session=session,
+        session_reused=session_reused,
+    )
+
+
+def test_batch_reuses_only_a_proven_append_only_session(monkeypatch):
+    """A claimed session transfers only its suffix into the batch admission."""
+
+    from mlxturbo import batch as batch_module
+
+    state = _install_state(FakeRunner([]), session_pool=OrderedDict())
+    session = FallbackSession()
+    session.cache = [object()]
+    session.processed = [1, 2]
+    state.session_pool[4] = session
+    monkeypatch.setattr(server, "can_batch", lambda _runner: True)
+    monkeypatch.setattr(server, "_runner_batch_tier", lambda *_args: "pool")
+    state.batch_coordinator = object()
+
+    route = server._resolve_batch_route(state.runner, [1, 2, 3, 4], 2)
+    assert route[3] is session
+    assert getattr(session, server._BATCH_SESSION_CLAIMED) is True
+
+    coordinator = object.__new__(batch_module.BatchCoordinator)
+    admission = _batch_admission_for_session([1, 2, 3, 4], session, 2)
+    coordinator._prepare_session(admission)
+    assert admission.prefill_reused == 2
+    assert admission.prefill_prompt_ids == [3, 4]
+    assert admission.all_tokens == [1, 2]
+    assert session.cache is None
+    assert session.processed == []
+    state.executor.shutdown(wait=True)
+
+
+def test_batch_miss_seeds_session_for_following_append(monkeypatch):
+    from mlxturbo import batch as batch_module
+
+    state = _install_state(
+        FakeRunner([]), session_pool=OrderedDict(), max_sessions=2
+    )
+    monkeypatch.setattr(server, "can_batch", lambda _runner: True)
+    monkeypatch.setattr(server, "_runner_batch_tier", lambda *_args: "pool")
+    state.batch_coordinator = object()
+
+    first = server._resolve_batch_route(state.runner, [1, 2, 3], 2)
+    session = first[3]
+    assert first[2]["match_kind"] == "miss"
+    assert session in state.session_pool.values()
+
+    admission = _batch_admission_for_session([1, 2, 3], session)
+    coordinator = object.__new__(batch_module.BatchCoordinator)
+    coordinator._prepare_session(admission)
+    coordinator._publish_session(admission, ([object()], [1, 2, 3, 8]))
+    server._release_batch_session(session)
+
+    second = server._resolve_batch_route(state.runner, [1, 2, 3, 8, 4], 2)
+    assert second[3] is session
+    assert second[2]["match_kind"] == "append"
+    assert second[2]["reused_tokens"] == 4
+    state.executor.shutdown(wait=True)
+
+
+def test_batch_claim_excludes_same_session_from_concurrent_admission(monkeypatch):
+    state = _install_state(
+        FakeRunner([]), session_pool=OrderedDict(), max_sessions=2
+    )
+    session = FallbackSession()
+    session.cache = [object()]
+    session.processed = [1, 2]
+    state.session_pool[0] = session
+    monkeypatch.setattr(server, "can_batch", lambda _runner: True)
+    monkeypatch.setattr(server, "_runner_batch_tier", lambda *_args: "pool")
+    state.batch_coordinator = object()
+
+    first = server._resolve_batch_route(state.runner, [1, 2, 3], 2)
+    second = server._resolve_batch_route(state.runner, [1, 2, 4], 2)
+    assert first[3] is session
+    assert second[3] is not session
+    assert second[2]["match_kind"] == "miss"
+    server._release_batch_session(first[3])
+    server._release_batch_session(second[3])
+    state.executor.shutdown(wait=True)
+
+
+def test_batch_coordinator_handoff_reuses_prefix_and_publishes_copy(monkeypatch):
+    """The synthetic coordinator path consumes only the uncached suffix."""
+
+    import concurrent.futures as cf
+    import sys
+    import types
+
+    from mlxturbo import batch as batch_module
+
+    class Response:
+        def __init__(self, uid, token, prompt_cache, all_tokens):
+            self.uid = uid
+            self.token = token
+            self.finish_reason = "length"
+            self.prompt_cache = prompt_cache
+            self.all_tokens = all_tokens
+
+    class FakeBatchGenerator:
+        last = None
+
+        def __init__(self, *_args, **_kwargs):
+            self.inserted = []
+            self.remove_calls = []
+            self.done = False
+            FakeBatchGenerator.last = self
+
+        def insert(self, prompts, max_tokens, **kwargs):
+            self.inserted.append((prompts, max_tokens, kwargs))
+            return [0]
+
+        def next(self):
+            if self.done:
+                return [], []
+            self.done = True
+            return [], [Response(0, 8, [object()], [1, 2, 3, 4])]
+
+        def remove(self, uids, return_prompt_caches=False):
+            self.remove_calls.append((uids, return_prompt_caches))
+            return {}
+
+        def close(self):
+            pass
+
+    fake_pkg = types.ModuleType("mlx_lm")
+    fake_generate = types.ModuleType("mlx_lm.generate")
+    fake_generate.BatchGenerator = FakeBatchGenerator
+    fake_pkg.generate = fake_generate
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake_pkg)
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", fake_generate)
+    monkeypatch.setattr(batch_module, "_indexer_budget", lambda _model: None)
+
+    session = FallbackSession()
+    session.cache = ["old-cache"]
+    session.processed = [1, 2]
+    checkpoint = (2, object())
+    session.checkpoints = [checkpoint]
+    future = cf.Future()
+    admission = _batch_admission_for_session([1, 2, 3, 4], session, 2)
+    admission.future = future
+    executor = cf.ThreadPoolExecutor(max_workers=1)
+    coordinator = batch_module.BatchCoordinator(object(), executor, 1, 2, [99])
+    coordinator.submit(admission)
+    result = future.result(timeout=5)
+    executor.shutdown(wait=True)
+
+    prompts, _max_tokens, kwargs = FakeBatchGenerator.last.inserted[0]
+    assert prompts == [[3, 4]]
+    assert kwargs["caches"] == [["old-cache"]]
+    assert kwargs["all_tokens"] == [[1, 2]]
+    assert result["prefill_reused"] == 2
+    assert result["prefill_new"] == 2
+    assert session.processed == [1, 2, 3, 4]
+    assert session.checkpoints == [checkpoint]
+    assert FakeBatchGenerator.last.remove_calls == []
+
+
+def test_batch_stale_claim_falls_back_after_invalidating_old_session(monkeypatch):
+    """A claim that no longer matches cannot publish or retain stale state."""
+
+    from mlxturbo import batch as batch_module
+
+    state = _install_state(FakeRunner([]), session_pool=OrderedDict())
+    session = FallbackSession()
+    old_cache = [object()]
+    session.cache = old_cache
+    session.processed = [1, 99]
+    state.session_pool[4] = session
+    monkeypatch.setattr(server, "can_batch", lambda _runner: True)
+    monkeypatch.setattr(server, "_runner_batch_tier", lambda *_args: "pool")
+    state.batch_coordinator = object()
+
+    admission = _batch_admission_for_session([1, 2, 3], session, 2)
+    coordinator = object.__new__(batch_module.BatchCoordinator)
+    coordinator._prepare_session(admission)
+    assert admission.prefill_reused == 0
+    assert admission.prefill_prompt_ids is None
+    assert session.cache is None
+    assert session.processed == []
+    state.executor.shutdown(wait=True)
+
+
+def test_batch_published_session_does_not_alias_generator_outputs():
+    """Publishing copies the extracted token/cache containers before release."""
+
+    from mlxturbo import batch as batch_module
+
+    session = FallbackSession()
+    session.cache = None
+    session.processed = []
+    admission = _batch_admission_for_session([1, 2, 3], session)
+    admission.prefill_reused = 2
+    coordinator = object.__new__(batch_module.BatchCoordinator)
+    extracted_caches = [object()]
+    extracted_tokens = [1, 2, 3]
+    coordinator._publish_session(admission, (extracted_caches, extracted_tokens))
+    extracted_caches.append(object())
+    extracted_tokens.append(4)
+    assert session.cache is not extracted_caches
+    assert session.cache == [session.cache[0]]
+    assert session.processed == [1, 2, 3]
+    assert session.processed is not extracted_tokens
+
+
+def test_batch_no_session_result_reports_full_prefill():
+    from mlxturbo import batch as batch_module
+
+    admission = _batch_admission_for_session([1, 2, 3])
+    coordinator = object.__new__(batch_module.BatchCoordinator)
+    result = coordinator._build_res(admission)
+    assert result["prefill_reused"] == 0
+    assert result["prefill_new"] == 3
+
+
+@pytest.mark.parametrize("failure", ["insert", "next", "close", "callback_remove"])
+def test_batch_failure_releases_session_claim_and_scheduler(
+    monkeypatch, failure
+):
+    import concurrent.futures as cf
+    import sys
+    import types
+
+    from mlxturbo import batch as batch_module
+
+    class Response:
+        uid = 0
+        token = 8
+        finish_reason = "length"
+        prompt_cache = [object()]
+        all_tokens = [1, 2, 3, 8]
+
+    class FailingBatchGenerator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def insert(self, *_args, **_kwargs):
+            if failure == "insert":
+                raise RuntimeError("insert failed")
+            return [0]
+
+        def next(self):
+            if failure == "next":
+                raise RuntimeError("next failed")
+            return [], [Response()]
+
+        def remove(self, _uids):
+            if failure == "callback_remove":
+                raise RuntimeError("remove failed")
+
+        def close(self):
+            if failure == "close":
+                raise RuntimeError("close failed")
+
+    fake_pkg = types.ModuleType("mlx_lm")
+    fake_generate = types.ModuleType("mlx_lm.generate")
+    fake_generate.BatchGenerator = FailingBatchGenerator
+    fake_pkg.generate = fake_generate
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake_pkg)
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", fake_generate)
+    monkeypatch.setattr(batch_module, "_indexer_budget", lambda _model: None)
+
+    session = FallbackSession()
+    setattr(session, server._BATCH_SESSION_CLAIMED, True)
+    admission = _batch_admission_for_session([1, 2, 3], session)
+    if failure == "callback_remove":
+        def fail_on_tokens(_tokens):
+            raise RuntimeError("callback failed")
+
+        admission.on_tokens = fail_on_tokens
+    admission.release_session = lambda: server._release_batch_session(session)
+    executor = cf.ThreadPoolExecutor(max_workers=1)
+    coordinator = batch_module.BatchCoordinator(object(), executor, 1, 2, [99])
+    coordinator.submit(admission)
+    if failure == "close":
+        admission.future.result(timeout=5)
+    else:
+        expected = "remove" if failure == "callback_remove" else failure
+        with pytest.raises(RuntimeError, match=f"{expected} failed"):
+            admission.future.result(timeout=5)
+    executor.shutdown(wait=True)
+    assert getattr(session, server._BATCH_SESSION_CLAIMED) is False
+    assert coordinator._active is False
 
 
 # ---------------------------------------------------------- バッチ x 投機

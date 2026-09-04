@@ -1102,3 +1102,19 @@ tools/biglock.sh .venv/bin/python tools/qwen4_state_adapter_poc.py
 ```bash
 git show --stat --oneline HEAD && rg -n "実行可|未決|保留" docs/BACKLOG-AUDIT-2026-09-04.md docs/BACKLOG.md | tail -n 80
 ```
+
+## 採用: continuous batchのsession/prefix再利用 (2026-09-05 08:05 JST)
+
+- Gemma 4 26B 4bit・約4kのraw completionsで、append turnは4,014/4,022 tokenを再利用。
+  TTFT 3.06→0.08秒、要求壁時計3.16→0.166秒。8 tokenの生成列は空poolのcold再計算と一致した。
+- B=2の同時fresh→同時appendも1,245/1,261 tokenを別々のsessionから再利用し、pair壁時計は
+  2.43→0.67秒。route-time claim、executor-time cache移譲、完了時公開、失敗/cancel/close時解放を実装した。
+- mixed dtypeで既存qmm_wideがMetal compile errorになった問題も別commitで修正した。
+- 次は全モデル共通のHTTP aggregate throughputをGuideLLMで測るのと並行し、Gemma 4 dense 31B q4 +
+  4層BF16 assistantのshared-KV投機をB=1から配線する。26B MoEのassistant棄却は31Bへ外挿しない。
+
+再開の1コマンド:
+
+```bash
+rg -n "gemma4_assistant|shared.kv|DraftSpecRunner|BatchCoordinator" mlxturbo docs/BACKLOG.md /Users/ht/models/gemma4-31b-assistant/config.json
+```

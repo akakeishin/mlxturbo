@@ -4126,3 +4126,26 @@ float32へ昇格する一方、量子化scale/biasはbf16のままになった�
 dispatch時にactivationとscale/biasのdtypeが一致する場合だけ専用kernelへ入り、不一致時はMLX標準の
 quantized matmulへ戻すようにした。mixed-dtypeの出力は標準経路と完全一致し、既存qmm_wide検査を含む
 13 testが通過。修正後のGemma B=2 fresh/append実機要求も500なしで完走した。
+
+### 2026-09-05 08:05 continuous batchのhot prefixを3.06秒から0.08秒へ短縮
+
+`--max-batch`経路は毎要求fresh cacheを作り、完了したcacheをsession poolへ戻していなかった。
+route時にFallbackSessionをclaimし、cacheを触る処理はsingle model executorへ残したまま、
+`BatchGenerator.insert`へappend suffix、cache、正確なtoken履歴を渡すようにした。terminal responseから
+行ごとに抽出されたcacheをsessionへpublishし、error/cancel/closeを含む全終了経路でclaimを解放する。
+
+Gemma 4 26B 4bit、raw completions、temperature 0、約4k promptで確認した。
+
+| 条件 | reused / prompt | TTFT | 要求壁時計 | 生成8 token |
+|---|---:|---:|---:|---|
+| fresh | 0 / 4,006 | 3.06秒 | 3.16秒 | 基準 |
+| append | 4,014 / 4,022 | 0.08秒 | 0.166秒 | cold再計算と一致 |
+| 同一appendの空pool再計算 | 0 / 4,022 | 3.06秒 | 3.16秒 | appendと一致 |
+
+B=2の同時fresh→同時appendでは各1,245/1,261 tokenを再利用し、pair壁時計2.43→0.67秒。
+sessionの二重claim、freshから次turnへの公開、checkpoint継承、insert/next/close失敗時解放を含む
+`bench/test_server.py` 469件が通過した。正式なaggregate tok/s/p50/p95比較はGuideLLMレーンで後から行う。
+
+同時にGemma 4 dense 31Bの対象を確認した。`gemma4-31b-4bit`はq4/group64・60層・MoEなし、
+`gemma4-31b-assistant`は4層hidden 1024のBF16 shared-KV drafterで、ローカルMTPLX validatorはPASS。
+26B MoEのassistant回帰とは別レーンとして、block size 2/4/6/8を短文・4k・17kで測る。

@@ -821,6 +821,18 @@ class Admission:
     tokens: list = field(default_factory=list)
     t0: float | None = None
     ttft: float | None = None
+    # A claimed FallbackSession is prepared by the coordinator immediately
+    # before insertion.  ``caches``/``all_tokens`` are then the cache and the
+    # exact token history owned by this admission; they are deliberately not
+    # copied because the cache itself is handed to BatchGenerator.
+    session: Any | None = None
+    session_reused: int = 0
+    caches: list | None = None
+    all_tokens: list[int] | None = None
+    prefill_prompt_ids: list[int] | None = None
+    prefill_reused: int = 0
+    checkpoints: list = field(default_factory=list)
+    release_session: Callable[[], None] | None = None
 
 
 class BatchCoordinator:
@@ -855,6 +867,15 @@ class BatchCoordinator:
     # ---- runs on the single MLX worker thread ---------------------------
 
     def _complete(self, adm: "Admission", res=None, cancelled=False, error=None) -> None:
+        # Publication/invalidation is already complete when this is called.
+        # Release before waking the event loop so a following request can see
+        # the newly published session immediately.
+        if adm.release_session is not None:
+            try:
+                adm.release_session()
+            except BaseException:
+                pass
+            adm.release_session = None
         if adm.on_done is not None:
             # Streaming: errors/cancellation are reported through the queue
             # (mirroring _start_generation's worker() exactly), so the
@@ -878,6 +899,79 @@ class BatchCoordinator:
             else:
                 adm.future.set_result(res)
 
+    def _prepare_session(self, adm: "Admission") -> None:
+        """Move one proven append-only session into admission-owned state.
+
+        The session is invalidated before its cache can enter BatchGenerator,
+        which may merge and mutate the cache in place.  Any mismatch or
+        preparation failure leaves the admission on a fresh-cache path and
+        never publishes the old session again.
+        """
+
+        session = adm.session
+        if session is None:
+            return
+        try:
+            cache = getattr(session, "cache", None)
+            processed = list(getattr(session, "processed", ()))
+            checkpoints = list(getattr(session, "checkpoints", ()))
+            expected = adm.session_reused
+            if (
+                expected <= 0
+                or not isinstance(cache, list)
+                or not cache
+                or any(item is None for item in cache)
+                or len(processed) != expected
+                or expected >= len(adm.prompt_ids)
+                or adm.prompt_ids[: len(processed)] != processed
+                or not callable(getattr(session, "invalidate", None))
+            ):
+                # A miss may reserve an empty or evicted pool slot so that its
+                # terminal cache seeds the next turn.  The invalidation runs on
+                # the MLX executor, never on the event-loop thread.
+                session.invalidate()
+                return
+            session.invalidate()
+            adm.caches = cache
+            adm.all_tokens = processed
+            adm.prefill_prompt_ids = adm.prompt_ids[len(processed) :]
+            adm.prefill_reused = len(processed)
+            adm.checkpoints = checkpoints
+        except BaseException:
+            # A session which was invalidated (even partially) must not be
+            # republished from an uncertain cache.  The normal fresh path is
+            # still valid for this request.
+            adm.caches = None
+            adm.all_tokens = None
+            adm.prefill_prompt_ids = None
+            adm.prefill_reused = 0
+
+    def _publish_session(self, adm: "Admission", cache_info) -> None:
+        """Publish only a complete, independently extracted result cache."""
+
+        if adm.session is None or cache_info is None:
+            return
+        caches, all_tokens = cache_info
+        try:
+            if not isinstance(caches, list) or not caches:
+                return
+            processed = list(all_tokens)
+            if processed[: len(adm.prompt_ids)] != adm.prompt_ids:
+                return
+            publish = getattr(adm.session, "publish", None)
+            if not callable(publish):
+                return
+            # The token list belongs to BatchGenerator; give the session its
+            # own list so later response handling cannot mutate it by alias.
+            publish(list(caches), processed, checkpoints=adm.checkpoints)
+        except BaseException:
+            # Generation succeeded, but an uncertain publication is never
+            # preferable to returning a session that may hold stale state.
+            try:
+                adm.session.invalidate()
+            except BaseException:
+                pass
+
     def _build_res(self, adm: "Admission") -> dict:
         decode_time = 0.0
         if adm.t0 is not None and adm.ttft is not None:
@@ -899,8 +993,8 @@ class BatchCoordinator:
             "tokens": adm.tokens,
             "ttft_s": adm.ttft or 0.0,
             "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
-            "prefill_reused": 0,
-            "prefill_new": len(adm.prompt_ids),
+            "prefill_reused": adm.prefill_reused,
+            "prefill_new": len(adm.prompt_ids) - adm.prefill_reused,
             "tokens_per_step": tokens_per_step,
         }
 
@@ -927,23 +1021,36 @@ class BatchCoordinator:
                 prefill_step_size=self.prefill_step_size,
             )
 
-        def admit(adm: Admission, tier: str) -> None:
+        def admit(adm: Admission, tier: str) -> bool:
             nonlocal gen, mode
             if adm.cancel_event is not None and adm.cancel_event.is_set():
                 self._complete(adm, cancelled=True)
-                return
-            if gen is None:
-                gen = new_gen()
-            uid = gen.insert(
-                [adm.prompt_ids],
-                [adm.max_tokens],
-                samplers=[adm.sampler],
-                logits_processors=[adm.logits_processors],
-            )[0]
+                return False
+            try:
+                self._prepare_session(adm)
+                if gen is None:
+                    gen = new_gen()
+                insert_kwargs = {
+                    "samplers": [adm.sampler],
+                    "logits_processors": [adm.logits_processors],
+                }
+                prompt = adm.prefill_prompt_ids or adm.prompt_ids
+                if adm.caches is not None and adm.all_tokens is not None:
+                    insert_kwargs["caches"] = [adm.caches]
+                    insert_kwargs["all_tokens"] = [adm.all_tokens]
+                uid = gen.insert(
+                    [prompt],
+                    [adm.max_tokens],
+                    **insert_kwargs,
+                )[0]
+            except BaseException as exc:
+                self._complete(adm, error=exc)
+                return False
             adm.uid = uid
             adm.t0 = time.perf_counter()
             live[uid] = adm
             mode = tier
+            return True
 
         try:
             while True:
@@ -969,8 +1076,8 @@ class BatchCoordinator:
                         and _pool_admission_fits(pending_pool[0], resident, budget)
                     ):
                         adm = pending_pool.pop(0)
-                        admit(adm, "pool")
-                        resident.append(adm)
+                        if admit(adm, "pool"):
+                            resident.append(adm)
                 if mode is None and not live and pending_solo:
                     admit(pending_solo.pop(0), "solo")
 
@@ -1006,14 +1113,22 @@ class BatchCoordinator:
                         if r.finish_reason != "stop":
                             self._deliver_token(adm, r.token)
                     except BaseException as exc:  # noqa: BLE001 - isolate one uid's callback failure from the rest of the batch
-                        del live[r.uid]
                         gen.remove([r.uid])
+                        del live[r.uid]
                         cancelled = adm.cancel_event is not None and adm.cancel_event.is_set()
                         self._complete(adm, cancelled=cancelled, error=None if cancelled else exc)
                         continue
                     if r.finish_reason is not None:
                         del live[r.uid]
-                        self._complete(adm, res=self._build_res(adm))
+                        cache_info = (
+                            getattr(r, "prompt_cache", None),
+                            getattr(r, "all_tokens", None),
+                        )
+                        if cache_info[0] is None or cache_info[1] is None:
+                            cache_info = None
+                        result = self._build_res(adm)
+                        self._publish_session(adm, cache_info)
+                        self._complete(adm, res=result)
 
                 if not live:
                     mode = None
@@ -1021,18 +1136,20 @@ class BatchCoordinator:
             for adm in list(live.values()) + pending_solo + pending_pool:
                 self._complete(adm, error=exc)
         finally:
-            if gen is not None:
-                gen.close()
-            with self._guard:
-                self._active = False
-            # A late arrival could have landed between the last empty-check
-            # above and clearing _active; re-check under the lock so it is
-            # never stranded in the inbox with nothing to ever pick it up.
-            if not self._inbox.empty():
+            try:
+                if gen is not None:
+                    gen.close()
+            finally:
                 with self._guard:
-                    if not self._active:
-                        self._active = True
-                        self.executor.submit(self._drive)
+                    self._active = False
+                # A late arrival could have landed between the last empty-check
+                # above and clearing _active; re-check under the lock so it is
+                # never stranded in the inbox with nothing to ever pick it up.
+                if not self._inbox.empty():
+                    with self._guard:
+                        if not self._active:
+                            self._active = True
+                            self.executor.submit(self._drive)
 
 
 __all__ = [
