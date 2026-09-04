@@ -3026,4 +3026,4 @@ head4、depth 2 固定、回文順、burn-in 済み。A = compile / B = 素 (`be
 | mlx-lm | 21.8 | 20.9 | 1.00x |
 
 - `--no-mtp` (lookup のみ) は投機ゼロと同じ数字 = この文では lookup の取り分ゼロ。`MLXTURBO_RUNNER=fallback` は `_build_base_runner` の先頭で FallbackRunner に落とす計測用の口 (融合は有効のまま)。
-- **mlx-serve との差 (4k で 43.2 対 32.1) は素の効率ではなく投機の取り分** (相手は MTP で 1.71 倍、うち 1.40 倍。相手は depth 6 で per_draft 30%、うちは静的 depth 2)。同じ MTP 頭なので、draft の深さと chain の入力の質が的。小 M で verify 幅の代金が下がった今、depth 3〜4 を掃引し直す。
+- **mlx-serve との差 (4k で 43.2 対 32.1) は素の効率ではなく投機の取り分** (相手は MTP で 1.71 倍、うち 1.40 倍。相手は depth 6 で per_draft 30%、うちは max_draft 8 の gated chain で平均 3.3 本/round)。同じ MTP 頭なので、的は gated chain の閾値 (`GATE_ROLLBACK_COST`、EMA) と chain の入力の質。小 M で verify 幅の代金が下がった今、閾値を掃引し直す (深く引く方が償却しやすくなった)。
