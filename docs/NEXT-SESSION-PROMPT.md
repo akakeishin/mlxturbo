@@ -942,3 +942,27 @@ jq '.depths[0].summary | {mean_decode_tok_s,mean_end_to_end_tok_s,mean_speedup_v
 ```bash
 BIGLOCK_PRIO=1 tools/biglock.sh .venv/bin/python bench/hot_prefill_bench.py --help
 ```
+
+## 完了: hot prefill固定suffix 300行とFlash末尾checkpoint修復 (2026-09-05 04:01 JST)
+
+- 6文脈×2 mode×4 suffix×5回を常時冷却で完走。測定300行、reset 180件、compile warmup込み
+  481 POST、44分05秒。LCP/reused/newは全一致、capacity modelとの差は最大1.232%。
+- 50k p50はappend 0.020/0.193/0.505/0.910秒、合成末尾8 token書換え
+  0.109/0.330/0.432/0.930秒。p95最大0.964秒で、suffix 256まで全反復1秒未満。
+- Flashだけcheckpoint末尾幅が1だった穴をdenseと同じ8へ直し、4k末尾書換えを
+  全再計算6.46秒から3,992 token再利用・0.08秒へ戻した (`3904b9b`)。resetのserver cap整合は
+  `7713f23`。対象test 11、server全453 testを通過。
+- 50k pool総量p50は2.079 GiB/session、8本で約16.63 GiB。byte model差0.218%、最大1.232%。
+  cold 50kは長時間負荷で95.40〜105.53秒へ熱変動したため、冷却時のcold基準を置き換えない。
+- 次はFlash以外のrunnerで内部prefill/first-tokenを分割できないことをdebug出力へ明示してP0を閉じる。
+  その後、prospective admission、実tokenizer retemplate、固定multi-session traceを備えたP1で
+  count-8とbyte-budget LRUを比較する。value scoreは定義とhold-out勝利が得られるまで後段。
+
+結果は`bench/results/hot-prefill-full-0905.json`、ログは
+`scratchpad/log-hot-prefill-full-0905.txt`（gitignore、手元保存）。
+
+再開の1コマンド:
+
+```bash
+rg -n "SUPPORTS_TTFT_PHASES|trace_timing|_ttft_phase|ttft-phase" mlxturbo/runner.py mlxturbo/server.py
+```

@@ -3875,3 +3875,43 @@ cold TTFT 65.81秒・decode 54.05 tok/sへ同時に崩れた。cap3が触らな�
 条件付き既定の採用は、同一process回文A/Bでtemp=0.7の4k/17k/50kが9/9現行比非退行、平均
 ms/token -10.4/-9.4/-8.9%、かつ幅9比ΔKLD +0.000043という熱差を相殺した証拠に基づく。
 結果は`bench/results/qwen36-{full-cap3-strongcool,50k-cap3-cooled}-0905.{json,log}`（gitignore）。
+
+### 2026-09-05 04:01 hot prefill固定suffix 300行合格、Flash末尾8 token復元を修復
+
+`bench/hot_prefill_bench.py`を、各suffixが同じcold baseから分岐する形へ直した。測定前resetは
+別requestとして数え、合成token-ID書換えを実tokenizerのretokenizeと呼ばない。LCP、reused/new、
+unknown session、qwen4_expの配列形状から求めたallocated bytesを各行で検査し、5%を超えれば停止する。
+
+最初の4k校正で、pure appendは0.005秒なのに末尾8 token書換えが全量再計算6.457秒へ落ちた。
+dense `spec.py`は`CHECKPOINT_TAIL=8`を渡す一方、`spec_flash.py`だけ古い既定1 tokenを使い、
+tail-in-groupも3,999/4,000にしかcheckpointを置いていなかった。Flashも3,992/4,000へ揃えた後は
+3,992 tokenを再利用し、suffix 0が0.076秒、suffix 16が0.187秒へ戻った。対象6 test、server全453 test、
+実モデル4k校正を通過。実装は`3904b9b`、resetのserver 1-token cap対応は`7713f23`。
+
+常時冷却で0/4k/17k/25k/32k/50k、pure append / 合成末尾8 token書換え、suffix
+0/16/64/256を各5回測った。300測定、未計測reset 180、compile warmupを含むHTTP POST 481、
+44分05秒。表はTTFT p50。
+
+| 文脈 | cold | append 0 / 16 / 64 / 256 | 末尾8書換え 0 / 16 / 64 / 256 |
+|---:|---:|---:|---:|
+| 0 | 0.130秒 | 0.003 / 0.126 / 0.287 / 0.573秒 | 0.067 / 0.164 / 0.302 / 0.575秒 |
+| 4k | 6.834秒 | 0.004 / 0.146 / 0.322 / 0.705秒 | 0.077 / 0.188 / 0.348 / 0.716秒 |
+| 17k | 32.243秒 | 0.009 / 0.164 / 0.380 / 0.814秒 | 0.087 / 0.234 / 0.422 / 0.853秒 |
+| 25k | 50.904秒 | 0.010 / 0.170 / 0.442 / 0.914秒 | 0.093 / 0.262 / 0.458 / 0.911秒 |
+| 32k | 61.442秒 | 0.014 / 0.175 / 0.420 / 0.850秒 | 0.097 / 0.274 / 0.398 / 0.840秒 |
+| 50k | 101.816秒 | 0.020 / 0.193 / 0.505 / 0.910秒 | 0.109 / 0.330 / 0.432 / 0.930秒 |
+
+50k p95はappend 0.021/0.196/0.538/0.945秒、末尾書換え
+0.111/0.341/0.466/0.964秒。reuseはappend 50,000、末尾書換え49,992で全5回同一だった。
+coldは44分連続負荷で95.40〜105.53秒まで熱の影響を受けたため、冷却時cold基準を置き換えない。
+一方hotは50k suffix 256まで全反復1秒未満を維持した。
+
+50kのpool総量p50は2,231,993,400 bytes（2.079 GiB）。core内訳はsession cache
+1,344,442,376、indexer 192,000,000、古いcheckpoint 693,854,256 bytes。理論値との差は0.218%、
+全300行の最大でも1.232%で5%線を通過した。最新checkpointがlive stateをaliasし、50kでは
+entry 7個のうち追加割当が古い6組だけなので、実測前の粗い2.189 GiB/sessionは2.079 GiBへ訂正する。
+
+結果は`bench/results/hot-prefill-full-0905.json`、ログは
+`scratchpad/log-hot-prefill-full-0905.txt`（どちらもgitignore）。次はFlash以外のTTFT非分割区間を
+明示してP0を閉じる。その後、resetでLRU順位を動かさない別traceを作り、count-8とbyte-budgetを
+比較する。実tokenizer retemplate、開始前容量予約、10% scratch余白、OOM/swap 0がP1の前提。

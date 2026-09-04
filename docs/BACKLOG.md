@@ -1137,3 +1137,23 @@ preemption復帰時再計算tokenをrequest単位・累積の両方で観測で�
 
 残件は固定suffix反復でのpool allocated bytes照合（差5%以内）と、Flash以外のrunnerで分割不能な
 TTFT区間の明示。その後にbyte-budget LRU比較へ進む。
+
+## 完了: hot prefill固定suffix正式測定とFlash末尾8 token修復 (2026-09-05 04:01 JST)
+
+- 0/4k/17k/25k/32k/50k、pure append / 合成末尾8 token書換え、suffix
+  0/16/64/256を各5回、合計300行で測った。各suffixは同じbaseから独立させ、reset 180件は
+  測定行から分離した。LCP/reused/newは全行一致、capacity modelとの差は最大1.232%で5%線を通過。
+- 50k hot TTFTのp50はappendが0.020/0.193/0.505/0.910秒、末尾書換えが
+  0.109/0.330/0.432/0.930秒。p95はそれぞれ0.021/0.196/0.538/0.945秒と
+  0.111/0.341/0.466/0.964秒で、suffix 256まで全反復1秒未満だった。
+- Flashだけ末尾1 tokenのcheckpointを使っていたため、4k末尾書換えが全再計算6.46秒へ落ちる穴を
+  発見した。denseと同じ末尾8 tokenに揃え、3,992 token再利用・0.08秒へ修復した (`3904b9b`)。
+- 50kのpool総量はp50 2.079 GiB/session。最新checkpointがlive stateをaliasするため、8本の
+  worst caseは従来概算17.52 GiBでなく約16.63 GiB。無制限保持を不採用とする結論は変わらない。
+- 44分連続負荷のcold 50kは95.40〜105.53秒まで熱を含むので、冷却時のcold基準を置き換えない。
+  実測正本は`docs/research/HOT-PREFILL-DESIGN-2026-09.md`とCATCHUP。
+
+残るP0はFlash以外のrunner内でprefill/first-tokenを分割できない区間の明示だけ。P1はcount-8と
+byte-budgetを同じ固定multi-session traceで比較する。開始前の容量予約、実tokenizer retemplate、
+10% scratch余白、OOM/swap 0、予測差5%以内を前提とする。value scoreは式・減衰・tie-breakが
+未定義なので、byte-LRUよりhold-out traceで明確に勝てる定義ができるまで既定候補にしない。

@@ -31,19 +31,24 @@ byte 予算へ置き換える。
 
 実モデル設定は 48層（full attention 12、linear attention 36）、KV head 2、head dim 256、
 indexer head dim 128、linear value head 48、linear key/value dim 128、GDN state は float32、
-checkpoint retention は8である。50k token の1 sessionについて、KV/indexerの256-token単位の
-確保を50,176 tokenとして、配列形状から求めた下限は次のとおり。MTP、tail、graph cache、
-生成時 scratch は含まない。
+checkpoint retention は8である。実測前は50k tokenのKV/indexerを50,176 token確保し、
+checkpointを8個とも別配列として約2.189 GiB/sessionと見積もっていた。2026-09-05のP0実測で、
+group prefill後のKV/indexerは論理長に近い配列を持ち、checkpoint entryは7個、さらに最新entryは
+live stateと同じ配列を指すことが分かった。identity重複排除後の実測は次のとおり。MTP、tail、
+graph cache、生成時scratchはcore比較から除外する。
 
-| 保持物 | 50kあたり |
+| 保持物 | 50k実測 |
 |---|---:|
-| attention KV | 約1.148 GiB |
-| raw indexer | 約0.144 GiB |
-| pooled indexer | 約0.036 GiB |
-| GDN/PLE checkpoint 1個 | 約0.108 GiB |
-| GDN/PLE checkpoint 8個 | 約0.862 GiB |
-| **下限合計 / session** | **約2.189 GiB** |
-| **8 sessionすべてが50k** | **約17.52 GiB** |
+| attention KV + live GDN/PLE/ngram state | 1.252 GiB |
+| raw + pooled indexer | 0.179 GiB |
+| 古いGDN/PLE/ngram checkpoint 6組 | 0.646 GiB |
+| **modeled core / session** | **2.077 GiB** |
+| tailを含むpool総量の中央値 | **2.079 GiB** |
+| **8 sessionすべてが50kなら** | **約16.63 GiB** |
+
+理論capacity modelは2.082 GiB、実配列は2.077 GiBで差0.218%。全300測定で最大差1.232%となり、
+事前の5%線を通った。したがって以後は2.189 GiBという粗い下限でなく、statusが返す実allocated
+bytesを追放判断へ使う。
 
 現行の `--max-sessions 8` は個数だけを見る。4k と 50k が同じ1枠なので、実際のメモリ圧を
 表していない。また KV を論理的に trim しても、基礎 buffer の割当が縮まるとは限らない。
@@ -128,13 +133,31 @@ request結果と累積値へ記録する。投機primaryからFallbackRunnerへ�
 preemptionは、退避時ではなく復帰prefill完了時の実入力token数だけを数える。追加の`mx.eval`はなく、
 通常requestでは時計もLCP probeも実行しない。server全回帰は**448 passed**。
 
-残るP0は、Flash以外のrunnerでprefill/first-tokenを分割できない区間の明示と、固定suffix反復で
-allocated bytesとpool予測値の差を5%以内へ合わせることである。
+2026-09-05 04:01には固定suffix正式測定を完了した。0/4k/17k/25k/32k/50k、pure appendと
+合成token-IDによる末尾8 token書換え、suffix 0/16/64/256を各5回、合計300行。reset 180件を
+測定行から分離し、各suffixを同じbaseから独立させた。全行でLCP/reused/newが一致し、byte差は
+最大1.232%。途中でFlashだけ末尾1 tokenのcheckpointを残していた穴を見つけ、dense側と同じ
+末尾8 tokenへ修正した。4k末尾書換えは全再計算6.46秒から、3,992 token再利用の0.08秒へ戻った。
+
+| 文脈 | cold p50 | append suffix 0 / 16 / 64 / 256 p50 | 末尾8書換え suffix 0 / 16 / 64 / 256 p50 |
+|---:|---:|---:|---:|
+| 0 | 0.130秒 | 0.003 / 0.126 / 0.287 / 0.573秒 | 0.067 / 0.164 / 0.302 / 0.575秒 |
+| 4k | 6.834秒 | 0.004 / 0.146 / 0.322 / 0.705秒 | 0.077 / 0.188 / 0.348 / 0.716秒 |
+| 17k | 32.243秒 | 0.009 / 0.164 / 0.380 / 0.814秒 | 0.087 / 0.234 / 0.422 / 0.853秒 |
+| 25k | 50.904秒 | 0.010 / 0.170 / 0.442 / 0.914秒 | 0.093 / 0.262 / 0.458 / 0.911秒 |
+| 32k | 61.442秒 | 0.014 / 0.175 / 0.420 / 0.850秒 | 0.097 / 0.274 / 0.398 / 0.840秒 |
+| 50k | 101.816秒 | 0.020 / 0.193 / 0.505 / 0.910秒 | 0.109 / 0.330 / 0.432 / 0.930秒 |
+
+50kのp95はappendが0.021/0.196/0.538/0.945秒、末尾書換えが
+0.111/0.341/0.466/0.964秒。44分連続負荷のためcold絶対値は熱を含み、冷却時のcold基準を
+置き換えない。hot側は全反復で50k suffix 256まで1秒未満だった。実tokenizerでのretemplateと
+複数session競合はP1へ分ける。Flash以外でrunner内prefill/first-tokenを分割できない区間の明示だけが
+P0の残件である。
 
 ### P1: byte-budget比較
 
-固定suffix 0/16/64/256、pure append / retokenized、文脈 0/4k/17k/25k/32k/50kを各5回以上。
-会話を8/16/64本に増やし、現在のcount-8 LRU、byte-LRU、value scoreを比較する。worst-caseの
+P0の固定suffix結果を土台に、実tokenizerでretemplateしたtraceを使う。会話を8/16/64本に増やし、
+現在のcount-8 LRU、byte-LRU、value scoreを比較する。worst-caseの
 生成scratchに10%余白を残し、OOM/swap 0、cold退行は測定ノイズ内を合格線とする。
 
 ### P2: cache-aware concurrency

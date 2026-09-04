@@ -98,7 +98,8 @@
   decode の QSA カーネル `MLXTURBO_QSA_DECODE_KERNEL` (既定 on、`=0` で off) は query が前提。K2a 選択 + K2b attention で本番の並びとビット一致、
   17k で ms/round -4.1% (burn-in 付き、2026-09-03 18:15)。50k は確認中。MTP の draft 層には当たっていない (enable の順序、0.1 ms/round)。
   `MLXTURBO_PREFILL_TAIL_IN_GROUP` (既定 on、`=0` で off) は末尾 2048 チャンクを layer-major のグループに入れる本番の既定値
-  (4k -4.9% / 8k -3.4% / 17k -0.6%、サーバー経路はビット一致、2026-09-03 15:35)。checkpoint 無しの経路 (generate() / ベンチ) では末尾を 2047+1 に割るので丸めが動く。
+  (4k -4.9% / 8k -3.4% / 17k -0.6%、サーバー経路はビット一致、2026-09-03 15:35)。末尾書換えに備えるcheckpoint幅は8で、
+  checkpoint無しの経路 (generate() / ベンチ) では末尾を2040+8に割るので丸めが動く。Flashだけ1 tokenだった穴は2026-09-05に修正した。
   `MLXTURBO_MOE_GEMM_MIX` (既定 48、`=0` で off) と `MLXTURBO_QMM_WIDE` (既定 auto = 非 NAX で on、`=off`) は 2026-09-03 14:00 に
   8k の in-model (混合タイル -4.3%、BM=64 dense 射影 -2.6%、どちらも素とビット一致) で入れた本番の既定値。NAX 機では
   `MLXTURBO_MOE_GEMM=auto` の判定でどちらも off になる (自前カーネルは NAX 機で auto=off の方針)。

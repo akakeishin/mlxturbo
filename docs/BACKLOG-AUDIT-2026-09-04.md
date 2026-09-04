@@ -2,7 +2,7 @@
 
 `docs/BACKLOG.md` と `docs/NEXT-SESSION-PROMPT.md` は実験の時系列も残す正本なので、
 採用後や棄却後の古い記述が意図的に残っている。この文書は、その全項目を現行HEAD
-`42e601d`と突き合わせた**実行台帳**。速度・品質の数字そのものはCATCHUPを正本とし、
+`7713f23`と突き合わせた**実行台帳**。速度・品質の数字そのものはCATCHUPを正本とし、
 ここでは次に作業が要るかだけを判定する。
 
 状態は次の4つに限る。
@@ -16,7 +16,7 @@
 
 | 優先 | 項目 | 状態 | 完了条件 / 次の一手 |
 |---:|---|---|---|
-| 0 | hot prefill cache方針の実測 | 実行可 | P0段階時間・batch損失・preemption再計算は完了。固定suffix 0/16/64/256でpool bytesを照合し、byte-budget LRUの採否を決める |
+| 0 | hot prefill cache方針の実測 | 実行可 | 固定suffix 300行は完了し、50k p95最大0.964秒、byte差最大1.232%。Flash以外のTTFT非分割表示を閉じてから、開始前容量予約を持つbyte-budget LRUを固定traceで比較する |
 | 1 | Qwen3.6-35B-A3B MTP最終表 | 完了 | 3,830 token以上を条件付き幅4へ配線。temp=0.7の4k/17k/50k 9/9勝ち、ΔKLD +0.000043、server全452 test。絶対50k 69.06 tok/sは後GEMM -6.0%のため参考値 |
 | 2 | qwen4 state-pure adapter + fixed-M4 graphbank | 実行可 | MTPLX 2.11.1でexact経路の16k round -12%を確認。まず汎用component replacementで全状態とrollbackを明示し、その後だけ幅4 graphを試す |
 | 3 | 継続batchの残制限 A2/A4/A5 | 実行可 | prefix reuse、temperature 0.7分布、HTTP同時要求の3件。solo非退行、品質ゲート、実server throughput |
@@ -131,9 +131,12 @@ wall -7.5%、約535→578 tok/s (+8.1%)、出力3/3一致で既定onを確定し
 | tokenize/LCP/restore | 完了 | debug requestだけ各段を計時し、通常requestの時計・同期は増やさない。server全448 test合格（`7d967a3`） |
 | batch-forfeited reuse | 完了 | read-only LCP probeをrequest/累積へ接続。互換しないspec→fallback降格は偽LCPを0化（`8ec7c03`） |
 | preemption recomputed tokens | 完了 | 復帰prefill完了時だけrequest/累積へ加算。cancel/未完了を含めない（`7d967a3`） |
-| suffix 0/16/64/256反復 | 実行可 | `bench/hot_prefill_bench.py`でpure append/retokenizedを各5回以上 |
-| count-8→byte-budget LRU | 実行可・後続 | 上の実測後に比較。scratch 10%確保、OOM/swap 0、p95/保存prefill秒で判定 |
-| 無制限cache-all | 棄却 | 50kだけでも下限2.189GiB/session、8本17.52GiB。262kでは成立しない |
+| suffix 0/16/64/256反復 | 完了 | 6文脈×2 mode×4 suffix×5回=300行。LCP/reused/new全一致、byte差最大1.232%。50k hot p95最大0.964秒 |
+| Flash末尾checkpoint幅 | 完了 | denseと同じ8へ統一。4k末尾書換えの全再計算6.46秒を3,992 token再利用・0.08秒へ修復 (`3904b9b`) |
+| Flash以外のTTFT非分割区間 | 実行可 | runner内で分割できない場合をdebug telemetry/logへ明示してP0を閉じる |
+| count-8→byte-budget LRU | 実行可・後続 | prospective admission、固定multi-session trace、実tokenizer retemplateを先に実装。scratch 10%、OOM/swap 0、予測差5%以内、p95/保存prefill秒で判定 |
+| value score | 実行可・保留 | score/減衰/tie-breakが未定義。byte-LRUを先に通し、hold-out traceで明確に勝つ場合だけ既定候補へ進める |
+| 無制限cache-all | 棄却 | 50k実測2.079GiB/session、8本約16.63GiB。262kでは成立しない |
 | shared-prefix / COW / paging | 実行可・条件付 | exact-token重複が実測で多い場合だけ。先にimmutable anchor、pagingは最後 |
 
 ## 配布・公開・比較
@@ -147,7 +150,8 @@ wall -7.5%、約535→578 tok/s (+8.1%)、出力3/3一致で既定onを確定し
 
 ## 直近の再開順
 
-1. hot prefill P0後半を実装し、固定suffix harnessで計測を閉じる。
-2. qwen4汎用component replacementをstate-pure adapterへ進め、MTPLX 2.11.1のfixed-M4 graphbankを再検証する。
-3. batch A2/A4/A5、streaming logprobs、Gemma KVの順に、各1論点1commitで閉じる。
-4. モデル/artifact/NAX/公開権限が要る項目だけ、必要物と代替検証を具体化して確認する。
+1. Flash以外のrunnerでTTFTを内部二分できないことをdebug出力へ明示し、hot prefill P0を閉じる。
+2. prospective admissionと固定multi-session traceを作り、count-8とbyte-budget LRUを比較する。value scoreは定義と勝ち筋が固まるまで後段。
+3. qwen4汎用component replacementをstate-pure adapterへ進め、MTPLX 2.11.1のfixed-M4 graphbankを再検証する。
+4. batch A2/A4/A5、streaming logprobs、Gemma KVの順に、各1論点1commitで閉じる。
+5. モデル/artifact/NAX/公開権限が要る項目だけ、必要物と代替検証を具体化して確認する。
