@@ -67,3 +67,17 @@
 
 round ≒ **43 ms + 10 ms × draft 本数**。mlx-serve は draft 2 本で 52 ms (24.4 ms/tok)、うちは同じ 2 本で 73〜75 ms。差 20 ms/round のうち固定費 +8 (43 対 35)、リンク 1 本 +8 (10 対 下限 2)。段階投入 (S>1) は -1.9% で既定 on。capture の写しの素通しは前処理だけで、当てても -0.3% (幅 5+ で数 ulp ずれる穴あり)。
 第 2 段: draft chain の同期 (`mx.eval(*confidences)` と各リンクの `.item()`) の廃止、引いてから捨てる本数 (max_draft 8 → 幅表 / EMA で先に決める)、次 round の draft の先行投入、固定費 +8 の内訳。判定は複数プロンプト平均の tok/round と ms/tok、KLD (参照 = 素 4bit)。
+
+## 第 2 段の後の round の内訳 (2026-09-04 10:48、`bench/results/round-anatomy-27b-b2-0904.json`、短 case 0)
+
+| | 第 1 段前 | 第 2 段後 |
+|---|---|---|
+| round | 83.6 ms | **67.0 ms** (tok/round 2.27) |
+| draft | 21.5 | **3.3** |
+| verify | 61.9 | 63.4 |
+| 非投機 S=1 | 42.4 ms/token | 42.8 |
+| 投機の利得 | 1.12x | **1.45x** (29.5 ms/tok) |
+
+- S の費用 (trunk forward + lm_head + eval、中央値): S=1 43〜45 / S=2 48 (1.07x) / **S=4 74〜76 (1.7x)** / S=8 105 (capture) ・ **137 (staged、3.08x)**。S=1→2 は +4.7 ms なのに S=2→4 で +27 ms と**超線形**。S=8 では staged (2 層ごとの async_eval) のほうが 30% 遅い。
+- probe: dispatch 1,989/round、**command buffer 168/round**、稼働率 98.3%、カーネル平均 36 us (rms_looped 47 us、copy 33 us、Add 43 us = 小さい elementwise が 30〜50 us ずつ = CB の固定費の按分)。
+- 的の候補: (1) 段階投入の粒度 (`MLXTURBO_STAGE_EVERY`、既定 2 = 64 層で 32 回の async_eval = CB 168 本/round)。掃引 2 / 4 / 8 / 16 を投入 (10:50)。(2) S=2→4 の超線形 (GDN の行ごと逐次か、attention の S>2 の経路か)。(3) lm_head 139 GB/s (読み中)。

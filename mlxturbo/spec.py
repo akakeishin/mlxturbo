@@ -401,7 +401,9 @@ class SpecEngine:
         h = x
         via_module = capture and self._capture_via_module(x, ssm_mask, caches)
         if staged or (capture and _env_on("MLXTURBO_SPEC_STAGED_VERIFY", "1")):
-            every = _STAGE_EVERY
+            # 呼び出しのたびに env を読む (decode_ab_generic の 1 プロセス A/B で振れるように)。
+            # 既定 2 は Flash-Next と同じ。27B (64 層) は 2026-09-04 に掃引 (CATCHUP)。
+            every = int(os.environ.get("MLXTURBO_STAGE_EVERY", str(_STAGE_EVERY)) or 0)
         else:
             every = 0
         layers = self.inner.layers
