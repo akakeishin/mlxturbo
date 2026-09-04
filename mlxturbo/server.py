@@ -351,6 +351,30 @@ class ModelState:
     # ([ttft-trace] 行など) — 起動時に一度だけ決まるので、ホットパスで
     # getenv や argparse を読み直すことはない (_log_ttft_trace 参照)。
     debug_log: bool = False
+    # Per-request session-selection counters.  Selection itself remains a
+    # side-channel on the chosen session so the long-standing return value of
+    # _select_session (the session object) does not change.
+    session_telemetry: dict[str, Any] = field(default_factory=lambda: {
+        "requests": 0,
+        "match_kind_counts": {
+            "miss": 0,
+            "exact": 0,
+            "append": 0,
+            "trim": 0,
+            "checkpoint": 0,
+        },
+        "lcp_tokens": 0,
+        "checkpoint_positions": 0,
+        "checkpoint_tokens": 0,
+        "reused_tokens": 0,
+        "new_tokens": 0,
+        "evictions": 0,
+        "evicted_processed_tokens": 0,
+        "evicted_allocated_bytes": 0,
+        "evicted_allocated_bytes_unknown": 0,
+    })
+    last_session_selection: dict[str, Any] | None = None
+    last_session_selection_session: object | None = None
 
 
 STATE: ModelState | None = None
@@ -561,6 +585,207 @@ def _try_checkpoint_restore_session_cache(sess, lcp: int) -> int | None:
     return cp_pos
 
 
+_SESSION_SELECTION_ATTR = "_mlxturbo_session_selection"
+
+
+def _session_allocated_bytes(sess, _seen: set[int] | None = None) -> int | None:
+    """Best-effort byte count for a session being evicted.
+
+    Only already-materialized MLX arrays are inspected; reading ``nbytes``
+    does not evaluate a graph.  Cache/checkpoint structures are walked with an
+    identity set so aliases are counted once.  An unknown leaf makes the
+    result ``None`` rather than pretending the estimate is exact.
+    """
+
+    seen = _seen if _seen is not None else set()
+    total = 0
+    unknown = False
+
+    def visit(value) -> None:
+        nonlocal total, unknown
+        if value is None or isinstance(value, (str, bytes, bytearray, int, float, bool)):
+            return
+        ident = id(value)
+        if ident in seen:
+            return
+        seen.add(ident)
+
+        if isinstance(value, dict):
+            for key, item in value.items():
+                visit(key)
+                visit(item)
+            return
+        if isinstance(value, (list, tuple, set, frozenset)):
+            for item in value:
+                visit(item)
+            return
+
+        try:
+            attrs = getattr(value, "__dict__", None)
+        except Exception:
+            unknown = True
+            return
+        if attrs is not None:
+            before = total
+            for item in attrs.values():
+                visit(item)
+            # Cache wrappers often expose an aggregate ``nbytes`` property that
+            # omits extension state (Flash's attached indexer is one example).
+            # Prefer their concrete child arrays; the identity set also makes
+            # this correct for aliases and future shared-prefix state.
+            if total != before:
+                return
+
+        try:
+            nbytes = getattr(value, "nbytes", None)
+        except Exception:
+            unknown = True
+            return
+        if nbytes is None:
+            unknown = True
+            return
+        try:
+            total += int(nbytes)
+        except (TypeError, ValueError, OverflowError):
+            unknown = True
+
+    # Do not walk the session object wholesale: only the cache-bearing fields
+    # can contribute to this eviction estimate.
+    for attr in ("caches", "cache", "mtp_cache", "h_last", "tail", "checkpoints"):
+        try:
+            value = getattr(sess, attr, None)
+        except Exception:
+            unknown = True
+            continue
+        if value is not None:
+            visit(value)
+    return None if unknown else total
+
+
+def _session_selection_info(
+    match_kind: str,
+    lcp: int,
+    reused_tokens: int,
+    new_tokens: int,
+    checkpoint_position: int | None = None,
+    evicted: bool = False,
+    evicted_processed_tokens: int = 0,
+    evicted_allocated_bytes: int | None = 0,
+) -> dict[str, Any]:
+    return {
+        "match_kind": match_kind,
+        "lcp": max(int(lcp), 0),
+        "checkpoint_position": checkpoint_position,
+        "evicted": evicted,
+        "reused_tokens": max(int(reused_tokens), 0),
+        "new_tokens": max(int(new_tokens), 0),
+        "evicted_processed_tokens": evicted_processed_tokens,
+        "evicted_allocated_bytes": evicted_allocated_bytes,
+    }
+
+
+def _record_session_selection(sess, info: dict[str, Any]) -> None:
+    """Attach one request's selection result and update aggregate counters."""
+
+    if sess is not None:
+        try:
+            setattr(sess, _SESSION_SELECTION_ATTR, info)
+        except Exception:
+            # Sessions normally permit attributes.  Keep a state side-channel
+            # for unusual test/custom sessions without changing the selector API.
+            pass
+        STATE.last_session_selection = info
+        STATE.last_session_selection_session = sess
+
+    telemetry = STATE.session_telemetry
+    telemetry["requests"] += 1
+    kind = info["match_kind"]
+    telemetry["match_kind_counts"][kind] += 1
+    telemetry["lcp_tokens"] += info["lcp"]
+    if info["checkpoint_position"] is not None:
+        telemetry["checkpoint_positions"] += 1
+        telemetry["checkpoint_tokens"] += info["checkpoint_position"]
+    telemetry["reused_tokens"] += info["reused_tokens"]
+    telemetry["new_tokens"] += info["new_tokens"]
+    if info["evicted"]:
+        telemetry["evictions"] += 1
+        telemetry["evicted_processed_tokens"] += info["evicted_processed_tokens"]
+        evicted_bytes = info["evicted_allocated_bytes"]
+        if evicted_bytes is None:
+            telemetry["evicted_allocated_bytes"] = None
+            telemetry["evicted_allocated_bytes_unknown"] += 1
+        elif telemetry["evicted_allocated_bytes"] is not None:
+            telemetry["evicted_allocated_bytes"] += evicted_bytes
+
+
+def _selection_for_result(prompt_ids: list[int], session) -> dict[str, Any]:
+    if session is not None:
+        info = getattr(session, _SESSION_SELECTION_ATTR, None)
+        if not isinstance(info, dict):
+            if STATE.last_session_selection_session is session:
+                info = STATE.last_session_selection
+        if isinstance(info, dict):
+            return dict(info)
+    return _session_selection_info(
+        "miss", 0, 0, len(prompt_ids), evicted_processed_tokens=0,
+    )
+
+
+def _attach_selection_to_result(result: dict | object, prompt_ids: list[int], session):
+    """Add internal selection metadata to a runner result and count misses."""
+
+    if not isinstance(result, dict):
+        return result
+    if "_session_selection" in result:
+        return result
+    info = _selection_for_result(prompt_ids, session)
+    if session is None:
+        # Batched and downgraded requests intentionally do not use the pool.
+        _record_session_selection(None, info)
+    result["_session_selection"] = info
+    return result
+
+
+def _session_telemetry_snapshot() -> dict[str, Any]:
+    telemetry = STATE.session_telemetry
+    seen: set[int] = set()
+    pool_known_bytes = 0
+    pool_unknown_sessions = 0
+    pool_processed_tokens = 0
+    for sess in STATE.session_pool.values():
+        try:
+            pool_processed_tokens += len(sess.processed)
+        except Exception:
+            pass
+        nbytes = _session_allocated_bytes(sess, seen)
+        if nbytes is None:
+            pool_unknown_sessions += 1
+        else:
+            pool_known_bytes += nbytes
+    return {
+        "requests": telemetry["requests"],
+        "match_kind_counts": dict(telemetry["match_kind_counts"]),
+        "lcp_tokens": telemetry["lcp_tokens"],
+        "checkpoint_positions": telemetry["checkpoint_positions"],
+        "checkpoint_tokens": telemetry["checkpoint_tokens"],
+        "reused_tokens": telemetry["reused_tokens"],
+        "new_tokens": telemetry["new_tokens"],
+        "evictions": telemetry["evictions"],
+        "evicted_processed_tokens": telemetry["evicted_processed_tokens"],
+        "evicted_allocated_bytes": telemetry["evicted_allocated_bytes"],
+        "evicted_allocated_bytes_unknown": telemetry["evicted_allocated_bytes_unknown"],
+        # Computed only when /api/status is polled, not on the request hot path.
+        # ``known`` remains useful while ``allocated`` is None because one
+        # custom/unsupported cache object could not be inspected.
+        "pool_allocated_bytes": (
+            None if pool_unknown_sessions else pool_known_bytes
+        ),
+        "pool_known_allocated_bytes": pool_known_bytes,
+        "pool_unknown_sessions": pool_unknown_sessions,
+        "pool_processed_tokens": pool_processed_tokens,
+    }
+
+
 def _select_session(prompt_ids: list[int]):
     """Pick the session (ChatSession/FallbackSession) to use for a new prompt
     out of ``STATE.session_pool``.
@@ -675,7 +900,16 @@ def _select_session(prompt_ids: list[int]):
 
     if best_key is not None:
         pool.move_to_end(best_key)
-        return pool[best_key]
+        sess = pool[best_key]
+        match_kind = "exact" if best_lcp == len(prompt_ids) else "append"
+        info = _session_selection_info(
+            match_kind,
+            best_lcp,
+            best_lcp,
+            len(prompt_ids) - best_lcp,
+        )
+        _record_session_selection(sess, info)
+        return sess
 
     # 2nd pass: partial matches. Try candidates in order of decreasing LCP
     # until a slot that can actually be rewound is found.
@@ -699,6 +933,10 @@ def _select_session(prompt_ids: list[int]):
             if hasattr(sess, "tail") and (sess.tail is None or sess.tail[0] != lcp):
                 sess.tail = None
             pool.move_to_end(key)
+            info = _session_selection_info(
+                "trim", lcp, lcp, len(prompt_ids) - lcp,
+            )
+            _record_session_selection(sess, info)
             return sess
 
         cp_pos = _try_checkpoint_restore_session_cache(sess, lcp)
@@ -715,13 +953,37 @@ def _select_session(prompt_ids: list[int]):
             if hasattr(sess, "tail") and (sess.tail is None or sess.tail[0] != cp_pos):
                 sess.tail = None
             pool.move_to_end(key)
+            info = _session_selection_info(
+                "checkpoint", lcp, cp_pos, len(prompt_ids) - cp_pos,
+                checkpoint_position=cp_pos,
+            )
+            _record_session_selection(sess, info)
             return sess
 
-    if len(pool) >= STATE.max_sessions:
-        pool.popitem(last=False)
+    was_evicted = len(pool) >= STATE.max_sessions
+    evicted_processed_tokens = 0
+    evicted_allocated_bytes: int | None = 0
+    if was_evicted:
+        _, evicted_sess = pool.popitem(last=False)
+        try:
+            evicted_processed_tokens = len(evicted_sess.processed)
+        except Exception:
+            evicted_processed_tokens = 0
+        evicted_allocated_bytes = _session_allocated_bytes(evicted_sess)
     key = next(STATE.session_key_seq)
     session = STATE.session_factory()
     pool[key] = session
+    # Preserve the best unusable LCP as well: it is the amount of work a
+    # future checkpoint/cache implementation could have saved, even though
+    # this request correctly re-prefills from zero.
+    miss_lcp = partial[0][0] if partial else 0
+    info = _session_selection_info(
+        "miss", miss_lcp, 0, len(prompt_ids),
+        evicted=was_evicted,
+        evicted_processed_tokens=evicted_processed_tokens,
+        evicted_allocated_bytes=evicted_allocated_bytes,
+    )
+    _record_session_selection(session, info)
     return session
 
 
@@ -2715,6 +2977,20 @@ def _log_gen_stats(res: dict) -> None:
             for k in ("draft", "verify", "post", "rollback") if k in ph
         )
         line += f" | phase/round: {parts} (rounds={rounds})"
+    selection = res.get("_session_selection")
+    if isinstance(selection, dict):
+        checkpoint = selection.get("checkpoint_position")
+        checkpoint_text = "-" if checkpoint is None else str(checkpoint)
+        evicted_bytes = selection.get("evicted_allocated_bytes")
+        evicted_bytes_text = "unknown" if evicted_bytes is None else str(evicted_bytes)
+        line += (
+            f" | session match_kind={selection.get('match_kind', 'miss')}"
+            f" lcp={selection.get('lcp', 0)} checkpoint={checkpoint_text}"
+            f" reused={selection.get('reused_tokens', 0)}"
+            f" new={selection.get('new_tokens', 0)}"
+            f" evicted_processed={selection.get('evicted_processed_tokens', 0)}"
+            f" evicted_bytes={evicted_bytes_text}"
+        )
     print(line)
 
 
@@ -2939,7 +3215,7 @@ async def _run_generate_batched(
             raise
         if cancelled is not None:
             raise cancelled
-        return result
+        return _attach_selection_to_result(result, prompt_ids, None)
 
 
 def _start_batched_generation(
@@ -2964,6 +3240,12 @@ def _start_batched_generation(
     q, cancel_event, raw_token_count, on_tokens, on_done = _build_streaming_pipeline(
         prompt_ids, thinking_budget, tool_calling_enabled, tools_for_parsing
     )
+
+    def on_done_with_telemetry(kind, value):
+        if kind == "done":
+            value = _attach_selection_to_result(value, prompt_ids, None)
+        on_done(kind, value)
+
     coordinator, tier = route
     if tier == "spec":
         future = start_batched_spec_generation(
@@ -2973,7 +3255,7 @@ def _start_batched_generation(
             temp,
             STATE.eos_ids,
             on_tokens,
-            on_done,
+            on_done_with_telemetry,
             cancel_event,
             **sampling_kwargs,
         )
@@ -2984,7 +3266,7 @@ def _start_batched_generation(
             max_tokens,
             temp,
             on_tokens,
-            on_done,
+            on_done_with_telemetry,
             cancel_event,
             **sampling_kwargs,
         )
@@ -3033,7 +3315,7 @@ async def _run_generate(
             raise
         if cancelled is not None:
             raise cancelled
-        return result
+        return _attach_selection_to_result(result, prompt_ids, session)
 
 
 def _chunk_string(s: str, size: int = 24) -> list[str]:
@@ -3242,6 +3524,7 @@ def _start_generation(
                 session=session,
                 **sampling_kwargs,
             )
+            res = _attach_selection_to_result(res, prompt_ids, session)
             on_done("done", res)
         except _GenerationCancelled:
             # Cancelling the asyncio Task around ``to_thread(q.get)`` cannot
@@ -3565,6 +3848,21 @@ def _read_rss_bytes() -> int | None:
         return None
 
 
+def _read_mlx_memory_metric(name: str) -> int | None:
+    """Read an optional MLX memory metric without making a graph eval."""
+
+    fn = getattr(mx, name, None)
+    if not callable(fn):
+        return None
+    try:
+        value = fn()
+        return int(value) if value is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    except Exception:
+        return None
+
+
 @app.get("/api/status")
 async def api_status():
     """Polling target for the menu-bar app in app/.
@@ -3584,10 +3882,13 @@ async def api_status():
         "fallback_reason": getattr(STATE.runner, "fallback_reason", None),
         "rss_bytes": _read_rss_bytes(),
         "peak_memory_bytes": mx.get_peak_memory(),
+        "active_memory_bytes": _read_mlx_memory_metric("get_active_memory"),
+        "cache_memory_bytes": _read_mlx_memory_metric("get_cache_memory"),
         "uptime_s": time.time() - STATE.created_ts,
         "n_sessions": len(STATE.session_pool),
         "queue_depth": STATE.queue_depth,
         "max_context_tokens": STATE.max_context_tokens,
+        "session_telemetry": _session_telemetry_snapshot(),
     }
 
 

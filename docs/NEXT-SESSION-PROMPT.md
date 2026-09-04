@@ -689,8 +689,9 @@ rg -n "MTP: あり|tok/step" scratchpad/log-qwen36-mtp-fixed-smoke-0904.txt && g
 - 反復2かつwarm suffixが16〜274 tokenで混在するため、分布やcache policyの採否には使わない。
 - GuideLLM 0.7.3を公開ベンチに採用。`tools/guidellm.sh setup`、
   `bench/guidellm_bench.py`、`docs/GUIDELLM-BENCHMARK.md`を追加し、実serverで2/2成功。
-- 次はhot prefill telemetry。LCP、checkpoint位置、reused/new、各段階時間、sessionごとの
-  allocated bytes、eviction、batch-forfeited reuseを出してからbyte-budget LRUを比較する。
+- hot prefill telemetryの第1段は完了。LCP、checkpoint、reused/new、pool/追放byte、MLX memoryを
+  出した。次は各段階時間とbatch-forfeited reuseを足し、固定suffixでbyte実測を合わせてから
+  byte-budget LRUを比較する。
 - 無制限保持は不採用。50kは下限2.189 GiB/session、8本で17.52 GiBなので、観測と合格線は
   `docs/research/HOT-PREFILL-DESIGN-2026-09.md`を正本にする。
 

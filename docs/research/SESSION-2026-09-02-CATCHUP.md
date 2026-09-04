@@ -3386,3 +3386,19 @@ coldは0〜17kが±4.1%、25k以降はmlxturboが6.1〜7.9%速い。decodeは4k�
 公開ベンチはGuideLLM 0.7.3へ移す。隔離venv、macOSのspawn回避、固定scenario runnerを
 追加し、実mlxturboへ2/2 request、JSON/CSV/HTML出力を確認した。GuideLLMの
 `ignore_eos`は現行サーバーが未解釈なので、当面は実output token数を正本にする。
+
+### 2026-09-04 19:30 hot prefill観測の第1段: hit経路とpool/追放byteを可視化
+
+50k warm 0.60秒は約50k tokenの状態を保持した対価なので、個数8のLRUをそのまま増やさず、先に
+容量とhit経路を測ることにした。現行Flash設定を配列形状で再計算すると、50,176 token確保時の
+下限はattention KV 1.148 GiB、raw/pooled indexer 0.144/0.036 GiB、GDN/PLE checkpoint
+8個0.862 GiB、合計**2.189 GiB/session**。8本なら17.52 GiBで、MTP、tail、graph cache、
+生成scratchはまだ含まない。無制限保持は不採用とし、設計と合格線を
+`docs/research/HOT-PREFILL-DESIGN-2026-09.md`へ固定した。
+
+サーバーには、session選択の`miss/exact/append/trim/checkpoint`、LCP、checkpoint位置、
+reused/new token、追放時のprocessed token/allocated bytesを追加した。Flashのattention cacheは
+本体の`nbytes`にindexerを含めないため、cache wrapperの集計値は使わず、子の配列をidentityで
+重複排除して数える。`/api/status`では同じ方法でpool全体をpoll時だけ走査し、MLXのactive/cache
+memoryと並べて返す。通常requestではbyte走査を行わない。Metal実機で`bench/test_server.py`は
+**436 passed**。次は段階時間、batch-forfeited reuse、固定suffix反復を足す。

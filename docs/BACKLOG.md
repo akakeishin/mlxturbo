@@ -1028,7 +1028,8 @@ PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスク�
 - **未決**: GuideLLMが送る`ignore_eos`は未対応。公開表は実output token数を使い、
   固定512 token比較は対応後にだけ主張する。
 
-次はhot prefillの観測を先に直し、suffix 0/16/64/256、pure append/retokenized、
-byte実測、eviction、batchで捨てたreuseを分離する。無制限cacheは入れない。
+hot prefillのsession選択種別、LCP、reused/new、pool/追放byte、MLX memoryの観測は追加済み。
+次は段階時間とbatchで捨てたreuseを追加し、suffix 0/16/64/256、pure append/retokenizedで
+byte実測を合わせる。無制限cacheは入れない。
 設計判断、50kで下限2.189 GiB/sessionとなる容量見積もり、段階別の合格線は
 `docs/research/HOT-PREFILL-DESIGN-2026-09.md`を正本にする。

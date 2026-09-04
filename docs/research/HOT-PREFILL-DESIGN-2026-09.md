@@ -110,6 +110,16 @@ cache keyには token ID 列だけでなく、model revision、tokenizer/chat te
 
 計測自体の時間増は1%未満を目標とし、bytesの内訳と実測差は5%以内に合わせる。
 
+2026-09-04 19:30の最初の実装では、session選択の `miss/exact/append/trim/checkpoint`、
+LCP、checkpoint位置、reused/new、追放token/allocated bytesを1 request 1行の生成ログへ追加した。
+`/api/status`にはMLX active/cache memoryと、pool全体のallocated bytes（同一配列を重複排除）、
+未知session数、processed token、累積選択/追放統計を追加した。byte走査はstatus poll時と追放時だけで、
+通常requestでは行わない。436件のserver testがMetal実機で通った。
+
+残るP0は、tokenize/LCP探索/restore/prefill/first-tokenを個別の時間へ分けること、batchを選んだため
+失ったLCP、preemption後の再計算tokenを記録すること、固定suffixの反復でallocated bytesと
+MLX active memoryの差を5%以内へ合わせることである。
+
 ### P1: byte-budget比較
 
 固定suffix 0/16/64/256、pure append / retokenized、文脈 0/4k/17k/25k/32k/50kを各5回以上。

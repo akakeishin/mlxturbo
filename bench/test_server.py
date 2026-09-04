@@ -1159,6 +1159,17 @@ def test_api_status_reports_model_and_runner(client):
     assert body["max_context_tokens"] == 4096
     assert isinstance(body["rss_bytes"], int) or body["rss_bytes"] is None
     assert isinstance(body["peak_memory_bytes"], int)
+    assert "active_memory_bytes" in body
+    assert "cache_memory_bytes" in body
+    assert body["session_telemetry"]["match_kind_counts"] == {
+        "miss": 0,
+        "exact": 0,
+        "append": 0,
+        "trim": 0,
+        "checkpoint": 0,
+    }
+    assert body["session_telemetry"]["pool_allocated_bytes"] == 0
+    assert body["session_telemetry"]["pool_unknown_sessions"] == 0
     assert body["uptime_s"] >= 0
     assert body["n_sessions"] == 0
     assert body["queue_depth"] == 0
@@ -4275,6 +4286,175 @@ def test_select_session_full_match_still_preferred_over_partial(client):
 
     assert got is full
     assert got.processed == [1, 2, 3]  # 変更されていない (追記のみ)
+
+
+def test_session_selection_telemetry_covers_all_match_kinds(monkeypatch):
+    """Selection telemetry is additive and does not change the selector's
+    long-standing session return value."""
+
+    factory = lambda: SimpleNamespace(processed=[])
+    state = _install_state(
+        FakeRunner(tokens_to_emit=[]),
+        session_factory=factory,
+        max_sessions=8,
+    )
+
+    # miss: no candidate exists.
+    server._select_session([9, 9])
+
+    sess = SimpleNamespace(processed=[1, 2], tail=None)
+    state.session_pool.clear()
+    state.session_pool[0] = sess
+    assert server._select_session([1, 2, 3]) is sess  # append
+
+    sess.processed = [1, 2, 3]
+    sess.tail = (3, object())
+    assert server._select_session([1, 2, 3]) is sess  # exact
+
+    sess.processed = [1, 2, 3, 4]
+    sess.tail = None
+    monkeypatch.setattr(server, "_try_trim_session_cache", lambda *_: True)
+    assert server._select_session([1, 2, 9]) is sess  # trim
+
+    sess.processed = [1, 2, 3, 4]
+    monkeypatch.setattr(server, "_try_trim_session_cache", lambda *_: False)
+    monkeypatch.setattr(server, "_try_checkpoint_restore_session_cache", lambda *_: 2)
+    assert server._select_session([1, 2, 9]) is sess  # checkpoint
+
+    counts = state.session_telemetry["match_kind_counts"]
+    assert counts == {"miss": 1, "exact": 1, "append": 1, "trim": 1, "checkpoint": 1}
+    assert state.session_telemetry["reused_tokens"] == 2 + 3 + 2 + 2
+    assert state.session_telemetry["new_tokens"] == 2 + 1 + 0 + 1 + 1
+
+
+def test_session_selection_miss_reports_best_unusable_lcp(monkeypatch):
+    old = SimpleNamespace(processed=[1, 2, 3, 4], tail=None)
+    state = _install_state(
+        FakeRunner(tokens_to_emit=[]),
+        session_factory=lambda: SimpleNamespace(processed=[]),
+        session_pool=OrderedDict([(0, old)]),
+        max_sessions=2,
+    )
+    monkeypatch.setattr(server, "_try_trim_session_cache", lambda *_: False)
+    monkeypatch.setattr(server, "_try_checkpoint_restore_session_cache", lambda *_: None)
+
+    fresh = server._select_session([1, 2, 9])
+    assert fresh is not old
+    assert state.last_session_selection["match_kind"] == "miss"
+    assert state.last_session_selection["lcp"] == 2
+    assert state.last_session_selection["reused_tokens"] == 0
+    assert state.last_session_selection["new_tokens"] == 3
+
+
+def test_session_eviction_telemetry_deduplicates_nbytes_and_marks_unknown():
+    class SizedLeaf:
+        def __init__(self, nbytes):
+            self.nbytes = nbytes
+
+    shared = SizedLeaf(4)
+    evicted = SimpleNamespace(
+        processed=[1, 2, 3],
+        cache=[shared, {"alias": shared}, SizedLeaf(8)],
+    )
+    state = _install_state(
+        FakeRunner(tokens_to_emit=[]),
+        session_factory=lambda: SimpleNamespace(processed=[]),
+        session_pool=OrderedDict([(0, evicted)]),
+        max_sessions=1,
+    )
+
+    got = server._select_session([9, 9])
+    assert got is not evicted
+    info = state.last_session_selection
+    assert info["match_kind"] == "miss"
+    assert info["evicted_processed_tokens"] == 3
+    assert info["evicted_allocated_bytes"] == 12
+    assert state.session_telemetry["evictions"] == 1
+    assert state.session_telemetry["evicted_allocated_bytes"] == 12
+
+    unknown = SimpleNamespace(cache=[object()])
+    assert server._session_allocated_bytes(unknown) is None
+
+
+def test_session_pool_memory_counts_wrapper_children_and_cross_session_alias_once():
+    class SizedLeaf:
+        def __init__(self, nbytes):
+            self.nbytes = nbytes
+
+    class CacheWrapper:
+        def __init__(self, main, extension):
+            self.main = main
+            self.extension = extension
+
+        @property
+        def nbytes(self):
+            # Mirrors an aggregate cache property that does not know about an
+            # attached extension such as Flash's indexer.
+            return self.main.nbytes
+
+    shared = SizedLeaf(4)
+    first = SimpleNamespace(processed=[1, 2], cache=[CacheWrapper(shared, SizedLeaf(8))])
+    second = SimpleNamespace(processed=[3], cache=[shared])
+    state = _install_state(
+        FakeRunner(tokens_to_emit=[]),
+        session_factory=lambda: SimpleNamespace(processed=[]),
+        session_pool=OrderedDict([(0, first), (1, second)]),
+        max_sessions=2,
+    )
+
+    snapshot = server._session_telemetry_snapshot()
+    assert snapshot["pool_allocated_bytes"] == 12
+    assert snapshot["pool_known_allocated_bytes"] == 12
+    assert snapshot["pool_unknown_sessions"] == 0
+    assert snapshot["pool_processed_tokens"] == 3
+
+
+def test_session_allocated_bytes_includes_flash_indexer_extension():
+    from mlx_lm.models.qwen4_exp import _AttnCache
+
+    cache = _AttnCache()
+    cache.keys = mx.zeros((1, 2, 4, 8), dtype=mx.float16)
+    cache.values = mx.zeros((1, 2, 4, 8), dtype=mx.float16)
+    cache.offset = 4
+    cache.indexer.keys = mx.zeros((1, 4, 8), dtype=mx.float16)
+    cache.indexer._pooled = mx.zeros((1, 1, 8), dtype=mx.float16)
+    session = SimpleNamespace(caches=[cache])
+
+    expected = (
+        cache.keys.nbytes
+        + cache.values.nbytes
+        + cache.indexer.keys.nbytes
+        + cache.indexer._pooled.nbytes
+    )
+    assert server._session_allocated_bytes(session) == expected
+
+
+def test_generation_log_includes_session_selection_fields():
+    result = {
+        "prefill_reused": 2,
+        "prefill_new": 1,
+        "decode_tps": 10.0,
+        "tokens_per_step": 1.0,
+        "ttft_s": 0.1,
+        "_session_selection": {
+            "match_kind": "checkpoint",
+            "lcp": 8,
+            "checkpoint_position": 6,
+            "reused_tokens": 6,
+            "new_tokens": 2,
+            "evicted_processed_tokens": 0,
+            "evicted_allocated_bytes": None,
+        },
+    }
+    with mock.patch("builtins.print") as emit:
+        server._log_gen_stats(result)
+    line = emit.call_args.args[0]
+    assert "match_kind=checkpoint" in line
+    assert "lcp=8" in line
+    assert "checkpoint=6" in line
+    assert "reused=6" in line
+    assert "new=2" in line
+    assert "evicted_bytes=unknown" in line
 
 
 # ---------- 12b. バグ修正: チェックポイントによる部分一致からの復元 ----------
