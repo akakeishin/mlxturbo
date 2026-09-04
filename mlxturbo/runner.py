@@ -1472,6 +1472,7 @@ RUNNER_KINDS = frozenset(
         FallbackRunner.KIND,
         DraftSpecRunner.KIND,
         "lookup_spec",
+        "gemma4_assistant_spec",
     }
 )
 
@@ -1928,6 +1929,31 @@ def build_runner(
         )
 
     draft_model_path = getattr(args, "draft_model", None)
+    assistant_model_path = getattr(args, "assistant_model", None)
+    forced_runner = os.environ.get("MLXTURBO_RUNNER", "").strip().lower()
+    if (
+        assistant_model_path
+        and not draft_model_path
+        and forced_runner in ("", "auto")
+    ):
+        from .gemma4_mtp import build_gemma4_runner
+
+        assistant_runner = build_gemma4_runner(
+            model,
+            tokenizer,
+            assistant_model_path,
+            block_size=getattr(args, "draft_block_size", None),
+        )
+        if assistant_runner is not None:
+            # The assistant is only the proposer.  Target verification must
+            # keep using the same model-wide, bit-identical fast paths as AR
+            # and the other runners instead of escaping before the shared
+            # fusion setup in _build_base_runner().
+            enable_default_fusions(
+                model, log_prefix, getattr(args, "no_fused", False)
+            )
+            return assistant_runner
+
     if draft_model_path:
         from mlx_lm import load as mlx_lm_load
 

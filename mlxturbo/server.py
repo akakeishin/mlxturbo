@@ -7440,6 +7440,20 @@ def main() -> None:
     ap.add_argument("--model", required=True)
     ap.add_argument("--original", default="Qwen/Qwen3.8-27B")
     ap.add_argument(
+        "--assistant-model",
+        default=None,
+        metavar="PATH",
+        help="Gemma 4 dense 31B 用の gemma4_assistant サイドカーを明示して"
+        " B=1 MTP を有効化する。対象外または破損した組み合わせは起動を止める",
+    )
+    ap.add_argument(
+        "--draft-block-size",
+        type=int,
+        choices=(2, 4, 6, 8),
+        default=None,
+        help="Gemma 4 assistant MTP の 1 ラウンド総幅 (2/4/6/8、既定4)",
+    )
+    ap.add_argument(
         "--served-model-name",
         default=None,
         help="GET /v1/models とレスポンスの \"model\" 欄で名乗る id。既定は --model の"
@@ -7848,7 +7862,14 @@ def main() -> None:
     # (FallbackRunner) FallbackSession (for mlx_lm's prompt_cache) — both have
     # .processed, and _select_session looks only at that, so it does not care
     # about the rest.
-    session_factory = ChatSession if getattr(runner, "KIND", None) == "spec" else FallbackSession
+    if getattr(runner, "KIND", None) == "spec":
+        session_factory = ChatSession
+    elif getattr(runner, "KIND", None) == "gemma4_assistant_spec":
+        from .gemma4_mtp import Gemma4AssistantSession
+
+        session_factory = Gemma4AssistantSession
+    else:
+        session_factory = FallbackSession
 
     STATE = ModelState(
         runner=runner,

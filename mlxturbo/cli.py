@@ -89,6 +89,20 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="lmstudio-community/Qwen3.8-27B-MLX-4bit")
     ap.add_argument("--original", default="Qwen/Qwen3.8-27B")
+    ap.add_argument(
+        "--assistant-model",
+        default=None,
+        metavar="PATH",
+        help="Gemma 4 dense 31B 用の gemma4_assistant サイドカーを明示して"
+        " B=1 MTP を有効化する。対象外または破損した組み合わせは起動を止める",
+    )
+    ap.add_argument(
+        "--draft-block-size",
+        type=int,
+        choices=(2, 4, 6, 8),
+        default=None,
+        help="Gemma 4 assistant MTP の 1 ラウンド総幅 (2/4/6/8、既定4)",
+    )
     ap.add_argument("--temp", type=float, default=0.7)
     ap.add_argument("--max-tokens", type=int, default=2048)
     ap.add_argument(
@@ -169,7 +183,14 @@ def main() -> None:
     # (mlx_lm prompt_cache). Passing a ChatSession to both raises an
     # AttributeError on the FallbackRunner side because the `.cache` attribute is
     # missing (see FallbackRunner.generate).
-    session = ChatSession() if getattr(runner, "KIND", None) == "spec" else FallbackSession()
+    if getattr(runner, "KIND", None) == "spec":
+        session = ChatSession()
+    elif getattr(runner, "KIND", None) == "gemma4_assistant_spec":
+        from .gemma4_mtp import Gemma4AssistantSession
+
+        session = Gemma4AssistantSession()
+    else:
+        session = FallbackSession()
 
     def run_turn(messages):
         kwargs = {"add_generation_prompt": True}
@@ -183,7 +204,8 @@ def main() -> None:
         detok = tokenizer.detokenizer
         detok.reset()
 
-        def on_tokens(toks):
+        def on_tokens(toks, text=None):
+            del text
             for t in toks:
                 if t in eos_ids:
                     continue
