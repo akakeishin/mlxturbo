@@ -313,3 +313,140 @@ Flash-Next のフルベンチは後回し (ユーザーの指示があるまで�
   走行中: mlxturbo の煙試験 3 行 (`scratchpad/gemma4_smoke_runs3.sh`)、sdpa 幅分割の再判定 (fp32 距離 + 短文脈)、MoE compile の in-model、台帳 27 件の要約 (`docs/research/AGENT-LEDGERS-DIGEST-2026-09-04.md` 予定)。
 - **13:35**: sdpa 幅分割 (27B) と MoE compile (Flash-Next) を既定 auto に (12f861f)。煙試験 (13:22〜13:30): 27B MTP 33.8 / 32.1、投機ゼロ 23.8 / 22.9 (`MLXTURBO_RUNNER=fallback`、99ba892) → 素の効率は mlx-serve と同着、差は投機の取り分 (1.40 倍対 1.71 倍)。
   走行中 2 本 (判定線と再開コマンドは HANDOFF の「走行中」): 小 M を Flash-Next へ (worktree)、27B の gated chain の閾値の掃引 (`MLXTURBO_SPEC_GATE_H` / `MLXTURBO_SPEC_MAX_DRAFT`)。
+
+## Codex 引き継ぎ監査後の現在地 (2026-09-04 14:18 JST)
+
+ここから下を再開時の正本とする。`CLAUDE.md`、`docs/HANDOFF-2026-09-04.md`、
+このファイルの旧節、`docs/research/SESSION-2026-09-02-CATCHUP.md` の末尾と、実際の
+作業木・台帳・プロセスを照合した。監査開始時の HEAD は `5e4c381` で `main == origin/main`。
+GPU の `decode_ab` / `biglock` プロセスは動いていない。「走行中」ではなく、以下の 2 本が
+**途中成果を残して停止中**である。
+
+### まず保全するもの
+
+- 27B の `MLXTURBO_SPEC_GATE_H` / `MLXTURBO_SPEC_MAX_DRAFT` 掃引用のコードと直接テストは
+  `edebaea` に分離して commit 済み。関連する SpecEngine / qwen3_5 の 24 tests passed。
+  `scratchpad/agent-27b-gate-sweep.md` が計測台帳。
+- `.claude/worktrees/agent-ae05b9756c852f071` は Flash-Next の小 M 接続用 worktree。
+  実験差分は branch `worktree-agent-ae05b9756c852f071` の `6553991` に commit 済みで、
+  main には入れていない。関連 108 tests passed と `tools/vendor_fingerprint.py` 通過。
+  `scratchpad/agent-fn-small-m.md` が計測台帳。
+- `scratchpad/` と `.claude/` は未追跡だが、上の途中成果を含む。判定を記録して差分を
+  回収するまで削除・prune しない。`git worktree prune --dry-run` に出る `base` は消えた
+  Claude セッションの古いメタデータで、上の生きた worktree とは別物。
+
+### P0-A: 27B の gated chain の閾値を決着させる
+
+完了済みの第 1 段では、現行 `h=0.19` の 28.087 ms/tok に対し、深く引く側の
+`h=0.10 / 0.05 / 0.02` はそれぞれ +5.5% / +6.8% / +8.1% 遅かった。
+tok/round の増分より draft 側の ms/round の増分が大きい。したがって下方向は再試行せず、
+上方向だけを測る。
+
+再開の 1 コマンド:
+
+```bash
+BIGLOCK_PRIO=1 BIGLOCK_NO_WORKER=1 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py --model ~/models/qwen38-27b-4bit --mtp ~/models/qwen38-27b-mtp --knob MLXTURBO_SPEC_GATE_H=0.19,0.30,0.45,0.60 --baseline 0.19 --ctx 0 --tokens 512 --reps 2 --out bench/results/gate-h-up-27b-short-0904.json
+```
+
+判定と後処理:
+
+1. 短 3 本平均の ms/tok を主指標にする。現行比 -2% 以上の候補だけ 4k / 17k へ進め、
+   どちらも +0.5% を超えて遅くならないことを確認する。
+2. 候補が残ったときだけ `MLXTURBO_SPEC_MAX_DRAFT` を掃引する。tokens/round、round ms、
+   draft 幅の分布を mlx-serve の `[spec-stats]` と同じ表に置き、差が受理率か draft 費用かを分ける。
+3. 勝つ設定が無ければ現行 `GATE_ROLLBACK_COST=0.19` を維持し、掃引用 env の差分は本体へ
+   入れず畳む。どちらの判定でも数字を CATCHUP 末尾、棄却なら BACKLOG に記録する。
+
+### P0-B: Flash-Next の小 M 接続を決着させる
+
+全 135 射影へ当てた第 1 便は、短 3 本 + 17k 3 本の **6 / 6 で ms/round が
++0.26〜+0.70%**。測った全条件で遅くならないという「代金ゼロ」の条件を満たさないので、
+この形は既定に入れない。27B と違い、Flash-Next の N=2560 の out/o_proj は
+threadgroup が少ないという説明が台帳に残っている。追加で行うのは、N=2560 の 48 射影を
+外した部分集合の 1 回だけ。そこで符号が変わらなければレーンを閉じる。
+
+再開の 1 コマンド (まず差分と作業位置を復元する):
+
+```bash
+git -C .claude/worktrees/agent-ae05b9756c852f071 status --short
+```
+
+完了条件:
+
+1. 同じ worktree で対象集合を明示し、`bench/test_fn_small_m.py`、dispatch / fusion の既存テスト、
+   `tools/vendor_fingerprint.py` を通す。
+2. `tools/decode_ab.py --knob fn-small-m` を短 3 本 × 512 × 2 と 17k
+   `--prefill-once` で 1 プロセス交互測定する。ms/round が測った全条件で遅くならない場合だけ採る。
+3. 採るなら root の最新 `main` へ差分を移して再検査する。畳むなら worktree を消す前に、
+   全射影と部分集合の数字を CATCHUP / BACKLOG へ残す。worktree の削除は記録と回収の後。
+
+### P1: 27B のレーンを閉じ、qwen4_exp を汎用分岐ルートへ載せる
+
+P0-A の決着で 27B の decode レーンを閉じる。現在の 27B は MTP 33.8 / 32.1 tok/s
+(ctx0 / 4k)、投機ゼロ 23.8 / 22.9。mlx-serve との差は素の forward ではなく投機の取り分にある。
+閾値で差が縮まらなければ、次に見るのは draft chain の入力品質であり、素のカーネルを再探索しない。
+
+その後 `qwen4_exp` (Flash-Next) を `spec.py` 側と同じ「素の mlx_lm forward に契約の合う部品だけを
+当てる」分岐へ載せる。既存の 25 個の融合を一度に剥がさず、部品単位で移す。各段のゲートは
+`tools/vendor_fingerprint.py` と 17k の 1 プロセス A/B。現行の Flash-Next の数字を落とした段は戻す。
+
+再開の 1 コマンド:
+
+```bash
+rg -n "qwen4_exp|_staged_forward|_hidden_forward|enable_default_fusions" mlxturbo/spec.py mlxturbo/spec_flash.py mlxturbo/fused.py mlxturbo/runner.py
+```
+
+### P2: Qwen3.6-35B-A3B を 3 本目の試験台にする
+
+27B → qwen4_exp の汎用ルートが安定した後に着手する。対象は
+`mlx-community/Qwen3.6-35B-A3B-4bit` と `...-MTP-5bit`。まだ未ダウンロードなので、
+GPU 計測が無い時間に取得し、取得と計測を並走させない。最初に AR 対 MTP を測り、MoE 部品の
+契約がどこまで自動で当たるかを対応表にする。5bit MTP は 1 層なので、そのまま読む。
+
+再開の 1 コマンド:
+
+```bash
+du -sh ~/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit ~/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-MTP-5bit 2>/dev/null
+```
+
+### P3: Gemma 4 は温 TTFT の回帰から直す
+
+26B の公式 assistant drafter は oMLX と mlx-serve の両方で遅くなったので、mlxturbo 用 drafter の
+新設は 26B では行わない。Gemma レーンの最初は FallbackRunner で 4k の温 TTFT が冷と同じ
+(2.76 s 対 2.69 s) 問題。接頭辞 cache の型 / snapshot / restore を直し、mlx-lm の 0.37 s を
+少なくとも機能上の基準にする。その後、norm 331 本/step の削減 → mlx-lm 組み込み
+`QuantizedKVCache` の実測 → `docs/research/TURBOQUANT-PLAN.md` の TurboQuant 実装へ進む。
+dense 31B の assistant drafter は別の比較として、26B の結果から推測せず測って判断する。
+
+再開の 1 コマンド:
+
+```bash
+rg -n "Gemma 4|温 TTFT|FallbackRunner|snapshot|checkpoint" docs/research/COMPARE-QUEUE.md docs/BACKLOG.md mlxturbo/runner.py
+```
+
+### P4: 製品 P0
+
+モデルレーンの上記順序が落ち着いたら `docs/research/PRODUCT-DIRECTION-2026-09.md` の P0 に移る。
+順は ExecutionPlan / `mlxturbo explain` / strict plan と HTTP ヘッダ → Engine / Session API と
+mlx-lm アダプター → Python 3.11+ / `uvx` / `doctor` → 常設ベンチと fast-path hit rate → README と看板。
+速度値だけでなく、MTP の有無、fallback、exactness、cache reuse を公開契約にする。
+
+再開の 1 コマンド:
+
+```bash
+sed -n '1,180p' docs/research/PRODUCT-DIRECTION-2026-09.md
+```
+
+### 後段・機体待ち
+
+- continuous batching は製品採用には必要だが、単独レイテンシの現在レーンには混ぜない。
+- NAX 機では MLX 0.32.2 の sorted `gather_qmm` が 32K 行超で壊れる疑いが最優先。
+  0.32.3 が無ければ `MLXTURBO_PREFILL_GROUP=1` または 32K 行の分割ゲートから始める。
+- HF 公開パックの lm_head 4bit 化、27B の state_out スキップ、GQA 小幅 attention、
+  n-gram 先読みの 50k、sdpa 分割の幅 9/10 と 50k は、上の主線を止めず BACKLOG から拾う。
+
+### 今回は行わないこと
+
+- Flash-Next のフルベンチと overnight tier。フルベンチはユーザーの明示指示があるまで走らせない。
+- 畳んだ融合、疎 attention、計数ソート、層まるごとの compile、capture-module を再開しない。
+- 途中差分を混ぜて部分 commit しない。採否が出た論点ごとに、実経路のテスト後に扱う。
