@@ -58,6 +58,14 @@ def main() -> int:
     ap.add_argument("--serve-model", default=None)
     ap.add_argument("--port", type=int, default=8140)
     ap.add_argument("--ctxs", default="0,4000,17000,50000")
+    ap.add_argument(
+        "--offset-tokens", type=int, default=0,
+        help="長文prompt池の開始offset。fullの特定cellだけを同じ本文で再生するときに使う",
+    )
+    ap.add_argument(
+        "--question-index-base", type=int, default=0,
+        help="QUESTIONSの開始index。fullの特定cellだけを同じ質問で再生するときに使う",
+    )
     ap.add_argument("--tokens", type=int, default=256)
     ap.add_argument("--reps", type=int, default=2,
                     help="文脈ごとの繰り返し (中央値を取る)")
@@ -107,7 +115,7 @@ def main() -> int:
     # 1 本切るごとに窓幅ぶん進める。
     prompts: dict[int, list[str]] = {}
     prompt_meta: dict[int, list[dict]] = {}
-    offset = 0
+    offset = args.offset_tokens
     for i, c in enumerate(ctxs):
         if c == 0:
             # 短文脈は本文が固定なので、末尾に通し番号を足して別物にする
@@ -115,7 +123,7 @@ def main() -> int:
             prompt_meta[c] = [dict(offset=None, tokens=len(tok.encode(prompts[c][r])))
                               for r in range(args.reps)]
         else:
-            qs = [QUESTIONS[(i * args.reps + r) % len(QUESTIONS)]
+            qs = [QUESTIONS[(args.question_index_base + i * args.reps + r) % len(QUESTIONS)]
                   for r in range(args.reps)]
             win = max(c - 200, 16)
             base = offset
