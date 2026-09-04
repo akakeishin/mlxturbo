@@ -16,8 +16,8 @@
 
 | 優先 | 項目 | 状態 | 完了条件 / 次の一手 |
 |---:|---|---|---|
-| 0 | hot prefill P0後半 | 実行可 | tokenize、LCP探索、restore、batchで捨てたreuse、preemption再計算tokenをdebug時だけ記録。通常経路の同期を増やさず、server全testと実Flash煙試験 |
-| 1 | Qwen3.6-35B-A3B MTP最終表 | 実行可 | 現行常用冷却でfull、長文脈、KLD/課題品質をARとMTPで比較。MTP読込と4k温TTFT修復は完了済み |
+| 0 | hot prefill cache方針の実測 | 実行可 | P0段階時間・batch損失・preemption再計算は完了。固定suffix 0/16/64/256でpool bytesを照合し、byte-budget LRUの採否を決める |
+| 1 | Qwen3.6-35B-A3B MTP最終表 | 完了 | 3,830 token以上を条件付き幅4へ配線。temp=0.7の4k/17k/50k 9/9勝ち、ΔKLD +0.000043、server全452 test。絶対50k 69.06 tok/sは後GEMM -6.0%のため参考値 |
 | 2 | qwen4 state-pure adapter + fixed-M4 graphbank | 実行可 | MTPLX 2.11.1でexact経路の16k round -12%を確認。まず汎用component replacementで全状態とrollbackを明示し、その後だけ幅4 graphを試す |
 | 3 | 継続batchの残制限 A2/A4/A5 | 実行可 | prefix reuse、temperature 0.7分布、HTTP同時要求の3件。solo非退行、品質ゲート、実server throughput |
 | 4 | streaming logprobs / tool token対応 | 実行可 | 現在400で拒否するstream logprobsを実装し、ThinkingRouter/tool_callsのtoken対応を含め4 API経路を検証 |
@@ -112,7 +112,8 @@ wall -7.5%、約535→578 tok/s (+8.1%)、出力3/3一致で既定onを確定し
 | Flash FR-Spec Q8 head | 棄却 | 手元trace coverage 89.02%、宣言線99.9%未達 |
 | ANE coarse head | 依存あり | FR-Spec成立が開始条件だったため停止。新しい小headができた場合だけ再評価 |
 | Qwen3.6 MTP読込 / warm checkpoint | 完了 | 短/4k decode +51〜57%、4k温TTFT -73.5% |
-| Qwen3.6最終full/quality | 一部完了 | fullは117.98→50k 65.56 tok/s。SDPA幅分割は50k -19.1%。round増分の約90%がverifyと確定。残りは品質/KLDとAR対MTP |
+| Qwen3.6最終full/quality | 完了 | temp=0.7の4k/17k/50k 9/9勝ち、KLD +0.000043。短文1/3の+8.9%を避け、実測構造だけ3,830 token以上を3/3/0へ配線。452 testと実起動合格。50k参考69.06 tok/sは後GEMM -6.0%を併記 |
+| Qwen3.6 MoE compile汎用化 | 棄却 | 短ms/round -0.6%だが50k +0.9%、未空焼き幅のtrace税あり。偽40層ログだけ修正 |
 | 27B controller / MTP cache / q2 rerank | 完了 | 採否と品質をCATCHUPへ記録済み |
 | 27B state_out skip | 実行可・低 | Flash側は実測±0.0%だが別族なので未決。27B固有のtraceで占有が見えた場合だけA/B |
 | 27B NOSYNC recall追加確認 | 実行可・任意 | 速度採用済み。公開品質表を厚くするときだけ追加 |
@@ -127,9 +128,9 @@ wall -7.5%、約535→578 tok/s (+8.1%)、出力3/3一致で既定onを確定し
 |---|---|---|
 | session LCP/checkpoint/reused/new | 完了 | debug telemetryとpool/eviction byteを実装済み |
 | runner prefill/first-token | 完了 | `bbdc7ad`。追加同期なし、443 test、実モデル煙試験 |
-| tokenize/LCP/restore | 実行可 | debug時だけ各段を計時。通常requestで`perf_counter`も増やさない |
-| batch-forfeited reuse | 実行可 | route時のread-only LCP probe。cacheを変更せずrequest単位で相関 |
-| preemption recomputed tokens | 実行可 | 復帰prefill完了時だけ加算。cancel/未完了は数えない |
+| tokenize/LCP/restore | 完了 | debug requestだけ各段を計時し、通常requestの時計・同期は増やさない。server全448 test合格（`7d967a3`） |
+| batch-forfeited reuse | 完了 | read-only LCP probeをrequest/累積へ接続。互換しないspec→fallback降格は偽LCPを0化（`8ec7c03`） |
+| preemption recomputed tokens | 完了 | 復帰prefill完了時だけrequest/累積へ加算。cancel/未完了を含めない（`7d967a3`） |
 | suffix 0/16/64/256反復 | 実行可 | `bench/hot_prefill_bench.py`でpure append/retokenizedを各5回以上 |
 | count-8→byte-budget LRU | 実行可・後続 | 上の実測後に比較。scratch 10%確保、OOM/swap 0、p95/保存prefill秒で判定 |
 | 無制限cache-all | 棄却 | 50kだけでも下限2.189GiB/session、8本17.52GiB。262kでは成立しない |
@@ -147,7 +148,6 @@ wall -7.5%、約535→578 tok/s (+8.1%)、出力3/3一致で既定onを確定し
 ## 直近の再開順
 
 1. hot prefill P0後半を実装し、固定suffix harnessで計測を閉じる。
-2. Qwen3.6 50kの汎用SDPA幅分割A/Bとround anatomyを閉じ、品質/KLD表を確定する。
-3. qwen4汎用component replacementをstate-pure adapterへ進め、MTPLX 2.11.1のfixed-M4 graphbankを再検証する。
-4. batch A2/A4/A5、streaming logprobs、Gemma KVの順に、各1論点1commitで閉じる。
-5. モデル/artifact/NAX/公開権限が要る項目だけ、必要物と代替検証を具体化して確認する。
+2. qwen4汎用component replacementをstate-pure adapterへ進め、MTPLX 2.11.1のfixed-M4 graphbankを再検証する。
+3. batch A2/A4/A5、streaming logprobs、Gemma KVの順に、各1論点1commitで閉じる。
+4. モデル/artifact/NAX/公開権限が要る項目だけ、必要物と代替検証を具体化して確認する。
