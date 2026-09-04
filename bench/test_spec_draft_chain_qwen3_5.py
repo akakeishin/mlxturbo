@@ -1,0 +1,188 @@
+"""draft chain の同期を外す knob の検査 (``MLXTURBO_SPEC_DRAFT_NOSYNC``、
+2026-09-04 から既定 on、``=0`` で従来)。
+
+深さを **引く前に** 位置別受理率の EMA から決め (``_plan_depth``)、各リンクの
+argmax を ``.item()`` せず配列のまま次段へ渡す。confidence の ``mx.eval`` と
+語彙長の softmax/エントロピーごと無くなる。
+
+検査は 2 段:
+
+1. ``_plan_depth`` は純関数なので、**同じ受理率入力なら ``_gate_depth`` と
+   同じ本数**を返す (位置がよく観測されている = AdaEDL の項に重みが乗らない
+   領域で厳密に一致する)。
+2. 合成 qwen3_5 + 合成 MTP の貪欲生成で、**draft の作り方を変えても出力
+   トークン列が変わらない** (投機は速度と受理率だけを変える)。深さも本数も
+   変わるので、これが「変わってよいのは速度と受理率だけ」の固定になる。
+
+    tools/biglock.sh .venv/bin/python -m pytest \\
+        bench/test_spec_draft_chain_qwen3_5.py -q
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import mlx.core as mx  # noqa: E402
+import mlxturbo  # noqa: E402,F401 -- sys.meta_path フック
+from mlx_lm.models import qwen3_5 as Q35  # noqa: E402
+from mlxturbo._mlx_compat import TextModelArgs  # noqa: E402
+from mlxturbo.mtp import MTPModule  # noqa: E402
+from mlxturbo.spec import ChatSession, GATE_EMA_WARMUP, SpecEngine  # noqa: E402
+
+N_K, N_V, DK, DV, K = 2, 6, 128, 128, 4
+HIDDEN, VOCAB, N_LAYERS = 256, 64, 4
+
+
+def _env(**kw):
+    class _Ctx:
+        def __enter__(self):
+            self.old = {k: os.environ.get(k) for k in kw}
+            for k, v in kw.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        def __exit__(self, *a):
+            for k, v in self.old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            return False
+
+    return _Ctx()
+
+
+def _text_config() -> dict:
+    return dict(
+        model_type="qwen3_5",
+        hidden_size=HIDDEN,
+        intermediate_size=512,
+        num_hidden_layers=N_LAYERS,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=VOCAB,
+        linear_num_value_heads=N_V,
+        linear_num_key_heads=N_K,
+        linear_key_head_dim=DK,
+        linear_value_head_dim=DV,
+        linear_conv_kernel_dim=K,
+        head_dim=64,
+        full_attention_interval=4,
+    )
+
+
+def _build(dtype=mx.float32):
+    """合成の qwen3_5 と、その args で組んだ合成 MTP。
+
+    重みは乱数のままで良い (見たいのは「draft の作り方を変えても本体の
+    貪欲出力が変わらない」ことなので、draft の質は問わない)。dtype は
+    float32 -- bf16 だと検証幅ごとの丸めで本体側の argmax が割れうる。
+    """
+    mx.random.seed(0)
+    model = Q35.Model(Q35.ModelArgs(model_type="qwen3_5", text_config=_text_config()))
+    args = TextModelArgs.from_dict(_text_config())
+    mtp = MTPModule(args)
+    model.set_dtype(dtype)
+    mtp.set_dtype(dtype)
+    model.eval()
+    mtp.eval()
+    return model, mtp
+
+
+# ---------------------------------------------------------------- 1. 深さの決定
+
+def test_plan_depth_matches_gate_on_the_same_acceptance_rates():
+    """よく観測された位置 (w_ema -> 1) では、引く前の決定 (`_plan_depth`) と
+    引いた後の切り方 (`_gate_depth`) が同じ本数を返す。
+
+    `_gate_depth` の p_d は EMA と AdaEDL の下界の観測数重み付き平均なので、
+    観測数を十分に積むと下界の項が消えて EMA だけになる = `_plan_depth` の
+    定義そのものになる。エントロピーを 3 通り (完全に自信あり / 中間 /
+    自信なし) 振っても本数が動かないことで「同じ受理率入力」を確かめる。
+    """
+    n_obs = 100_000 * GATE_EMA_WARMUP  # w_ema = n/(n+warmup) ~ 1
+    cases = [
+        {},                                             # 事前値だけ
+        {1: 0.95, 2: 0.90, 3: 0.85, 4: 0.80, 5: 0.7},   # よく通る
+        {1: 0.60, 2: 0.10, 3: 0.01},                    # すぐ切れる
+        {1: 0.99, 2: 0.99, 3: 0.99, 4: 0.99, 5: 0.99, 6: 0.99, 7: 0.99, 8: 0.99},
+    ]
+    for ema in cases:
+        obs = {d: n_obs for d in range(1, 9)}
+        for cap in (1, 2, 3, 5, 8):
+            plan = SpecEngine._plan_depth(ema, obs, cap)
+            for h in (0.0, 1.0, 5.0):  # AdaEDL の下界を 1.0 / 0.55 / 0.0 にする
+                gate = SpecEngine._gate_depth([h] * cap, ema, obs)
+                assert plan == gate, (
+                    f"ema={ema} cap={cap} entropy={h}: plan={plan} gate={gate}")
+
+
+def test_plan_depth_cuts_the_chain_that_the_gate_would_have_thrown_away():
+    """事前値 (FastMTP の k=1 70% / k=2 11% / k=3 2%) のままなら、
+    cap=8 でも 2 本しか引かない (= 引いてから捨てる 6 本が消える)。"""
+    assert SpecEngine._plan_depth({}, {}, 8) == 2
+    assert SpecEngine._plan_depth({}, {}, 1) == 1
+    assert SpecEngine._plan_depth({}, {}, 0) == 0
+    # EMA が実際に答えを動かすこと (対照が死んでいない検査)。減衰の形が
+    # 事前値より緩ければ 1 本深くなる。
+    assert SpecEngine._plan_depth({1: 0.70, 2: 0.35, 3: 0.15, 4: 0.05}, {}, 8) == 3
+    # 注意: 深さは受理率に対して単調ではない -- 閾値
+    # h*(1+expected)/(1+d*h) が expected と一緒に上がるので、全位置の受理率が
+    # 一様に高いと 1 本で止まる。これは `_gate_depth` から受け継いだ性質
+    # (両者は同じ walk) で、この段で触る対象ではない。
+    assert SpecEngine._plan_depth({d: 0.95 for d in range(1, 9)}, {}, 8) == 1
+    assert SpecEngine._gate_depth(
+        [0.0] * 8, {d: 0.95 for d in range(1, 9)},
+        {d: 10 ** 6 for d in range(1, 9)}) == 1
+
+
+# ---------------------------------------------------- 2. 出力列は draft に依らない
+
+def _gen(model, mtp, prompt, *, nosync: str, max_tokens: int = 24):
+    engine = SpecEngine(model, mtp=mtp)
+    with _env(MLXTURBO_SPEC_DRAFT_NOSYNC=nosync):
+        return engine.generate(
+            prompt, max_tokens=max_tokens, n_draft=3, max_draft=8,
+            lookup_len=16, lookup_ngram=4, temp=0.0,
+        )
+
+
+def test_greedy_output_does_not_depend_on_the_draft():
+    """貪欲なら本体の出力は draft に依らない -- 変わるのは受理率と速度だけ。"""
+    model, mtp = _build()
+    prompt = [(i * 7 + 3) % VOCAB for i in range(32)]
+    base = _gen(model, mtp, prompt, nosync="0")
+    got = _gen(model, mtp, prompt, nosync="1")
+    assert got["tokens"] == base["tokens"], (
+        "NOSYNC=1 で出力列が変わった\n"
+        f"  base={base['tokens']}\n  got ={got['tokens']}")
+    # 「変わってよいところ」が実際に動いていること (対照が死んでいない検査)
+    assert got["steps"] > 0 and base["steps"] > 0
+
+
+def test_mtp_cache_length_does_not_depend_on_the_draft():
+    """draft が MTP キャッシュへ積んだ行は、そのラウンドの maint で必ず落ちる。
+
+    落ちなければ MTP の文脈が投機的なトークンで汚れて受理率が崩れる。
+    生成の最後のキャッシュ長が knob の両側で同じことで見る。
+    """
+    model, mtp = _build()
+    prompt = [(i * 5 + 1) % VOCAB for i in range(24)]
+    lens = []
+    for nosync in ("0", "1"):
+        engine = SpecEngine(model, mtp=mtp)
+        with _env(MLXTURBO_SPEC_DRAFT_NOSYNC=nosync):
+            session = ChatSession()
+            engine.generate(prompt, max_tokens=24, n_draft=3, max_draft=8,
+                            lookup_len=16, lookup_ngram=4, temp=0.0,
+                            session=session)
+            lens.append(session.mtp_cache.offset)
+    assert lens[0] == lens[1], f"MTP キャッシュの長さが knob で変わった: {lens}"

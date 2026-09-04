@@ -657,6 +657,44 @@ class SpecEngine:
         e = self.inner.embed_tokens(tok_ids[None])
         return self.mtp(e, hiddens, cache=mtp_cache)
 
+    def _draft_chain(self, y, h_last, mtp_cache, keep: int, first=None) -> list:
+        """Draw ``keep`` MTP links with no host sync at all
+        (MLXTURBO_SPEC_DRAFT_NOSYNC, on by default; the dense counterpart of
+        ``spec_flash._draft_chain``).
+
+        Each link's argmax stays an ``mx.array`` and is fed straight into the
+        next link, so nothing in the chain waits on the host. Every link but the
+        last is submitted with ``mx.async_eval`` the moment its graph is closed,
+        which lets the GPU run link i while the host builds link i+1; the caller
+        submits the whole window once more at the end, so no graph built here is
+        ever discarded.
+
+        The gated chain this replaces also computed a vocabulary-wide
+        softmax + entropy per link for the AdaEDL confidence. With the depth
+        chosen up front (``_plan_depth``) that signal has no consumer, so it is
+        not computed either.
+
+        ``first`` (optional): ``(tok, hidden)`` for a link the caller has already
+        drawn -- the D7 probe, whose SAM query forced a sync on the first link
+        anyway. Passing it reuses that link instead of redrawing it.
+        """
+        drafts = []
+        if first is not None:
+            d1, dh = first
+            drafts.append(d1)
+            dtok = d1
+        else:
+            dh, dtok = self._mtp_base(h_last), y
+        for i in range(len(drafts), keep):
+            h_mtp = self._mtp_append(dtok, dh, mtp_cache)
+            d_logits = self._head(h_mtp[:, -1:], self.mtp.norm)[0, -1]
+            d = mx.argmax(d_logits, axis=-1).reshape(1)
+            drafts.append(d)
+            dh, dtok = self.mtp.norm(h_mtp[:, -1:]), d
+            if i < keep - 1:
+                mx.async_eval(d)
+        return drafts
+
     # ---------- D1: confidence-gated chaining ----------
 
     @staticmethod
@@ -688,11 +726,12 @@ class SpecEngine:
     @classmethod
     def _gate_depth(
         cls,
-        entropies: list,
+        entropies: list | None,
         pos_accept_ema: dict,
         pos_obs_count: dict | None = None,
         gamma: float = ADAEDL_GAMMA,
         h: float = GATE_ROLLBACK_COST,
+        cap: int | None = None,
     ) -> int:
         """Decide, with a confidence gate, how much of the MTP chain is actually
         sent to verification.
@@ -713,17 +752,33 @@ class SpecEngine:
         shallow verdict". While observations are few we judge from AdaEDL's
         instantaneous confidence alone, and let the EMA take effect only once
         measurements have accumulated.
+
+        ``entropies=None`` (+ an explicit ``cap``) is the "decide before
+        drawing" mode used by ``_plan_depth``: there is no per-link confidence
+        signal yet, so p_d falls back to the EMA (or the prior where the EMA has
+        not been fed). Everything else -- reach, the expected-gain threshold, the
+        "keep the link that tripped the threshold" rule -- is the same walk, so
+        the two modes agree exactly whenever the AdaEDL term carries no weight
+        (w_ema == 1, i.e. a well-observed position); that identity is the unit
+        test that pins the port.
         """
         pos_obs_count = pos_obs_count or {}
-        cap = len(entropies)
+        if entropies is None:
+            if cap is None:
+                raise ValueError("_gate_depth needs a cap when entropies is None")
+        else:
+            cap = len(entropies)
         reach = 1.0
         keep = 0
         for d in range(1, cap + 1):
-            bound = cls._adaedl_bound(entropies[d - 1], gamma)
-            n_obs = pos_obs_count.get(d, 0)
-            w_ema = n_obs / (n_obs + GATE_EMA_WARMUP)
             ema = pos_accept_ema.get(d, _pos_accept_prior(d))
-            p_d = w_ema * ema + (1 - w_ema) * bound
+            if entropies is None:
+                p_d = ema
+            else:
+                bound = cls._adaedl_bound(entropies[d - 1], gamma)
+                n_obs = pos_obs_count.get(d, 0)
+                w_ema = n_obs / (n_obs + GATE_EMA_WARMUP)
+                p_d = w_ema * ema + (1 - w_ema) * bound
             reach *= max(0.0, min(1.0, p_d))
             keep = d
             expected = cls._expected_future_gain(pos_accept_ema, d, cap)
@@ -731,6 +786,45 @@ class SpecEngine:
             if reach <= threshold:
                 break
         return keep
+
+    @classmethod
+    def _plan_depth(
+        cls,
+        pos_accept_ema: dict,
+        pos_obs_count: dict | None = None,
+        cap: int = 1,
+        h: float = GATE_ROLLBACK_COST,
+    ) -> int:
+        """How many MTP links to actually draw this round, decided *before*
+        drawing any of them (MLXTURBO_SPEC_DRAFT_NOSYNC, on by default;
+        ``=0`` goes back to drawing ``max_draft`` and truncating afterwards).
+
+        The gated chain draws ``cap_base`` (= max_draft, 8 in production) links
+        and lets ``_gate_depth`` throw away the tail afterwards. Every drawn link
+        costs an lm_head projection (248,320 x 5120, 4-bit ~= 0.64 GB) plus a
+        vocabulary-wide softmax/entropy reduce, so the links that the gate
+        discards are paid for in full. Deciding first from the per-position
+        acceptance-rate EMA alone means the discarded links are never drawn, and
+        the AdaEDL confidence -- the only part that needs the drawn logits --
+        drops out together with its sync.
+
+        Same walk as ``_gate_depth`` (that is literally the callee), so it is
+        identical to the gate on any position whose EMA is well observed.
+
+        Measured in-model on the 27B (2026-09-04, decode_ab_generic, 1 process,
+        palindrome): ms/tok -12.5% on the short pool and -12.1% at 4k, at the
+        cost of tok/round -3.6% / -5.9% (deciding before drawing has only the
+        EMA to go on -- the AdaEDL bound does not exist until the link is
+        drawn). The saving is 8 - 3.3 = 4.8 links/round that used to be drawn
+        and thrown away, at 3.2 ms each; the sync itself is worth 0.1 ms/link.
+        The generated sequence changes even under greedy decoding: a different
+        draft means a different verification width, and 4-bit
+        ``quantized_matmul`` rounds differently with the row count -- the same
+        property the prefill-chunking note at the top of this module describes.
+        """
+        if cap <= 0:
+            return 0
+        return cls._gate_depth(None, pos_accept_ema, pos_obs_count, h=h, cap=cap)
 
     # ---------- D3: context lookup (SAM) + ReSpec arbitration ----------
 
@@ -1065,6 +1159,11 @@ class SpecEngine:
         # 分岐 1 つで済ませる。
         round_trace = [] if _env_on("MLXTURBO_ROUND_TRACE") else None
         self.last_round_trace = round_trace
+        # 深さを引く前に決めて、draft chain から同期を外す (既定 on、
+        # `=0` で従来の「8 本引いてから `_gate_depth` で捨てる」に戻る)。
+        # `generate()` の入口で 1 回だけ読む -- `tools/decode_ab_generic.py`
+        # は generate の外で env を書き換えるので、import 時では A/B できない。
+        nosync = _env_on("MLXTURBO_SPEC_DRAFT_NOSYNC", "1")
         while len(out_tokens) < max_tokens and out_tokens[-1] not in eos:
             ts = time.perf_counter()
             t_round = ts
@@ -1072,6 +1171,7 @@ class SpecEngine:
             lk = None
             lookup_bucket = None
             chain_head = None
+            n_drafts = 0
             proposal_cap = max_tokens - len(out_tokens) - 1
             cap = min(cap_base, proposal_cap)
             triggered = (
@@ -1103,8 +1203,13 @@ class SpecEngine:
                 dh, dtok = self._mtp_base(h_last), y
                 h_mtp = self._mtp_append(dtok, dh, mtp_cache)
                 d_logits = self._head(h_mtp[:, -1:], self.mtp.norm)[0, -1]
-                d_probs = mx.softmax(d_logits.astype(mx.float32), axis=-1)
-                conf1 = -mx.sum(d_probs * mx.log(mx.maximum(d_probs, 1e-12)))
+                # NOSYNC のときは AdaEDL の confidence に読み手がいない
+                # (深さは引く前に決まっている) ので、語彙長の softmax と
+                # エントロピーの reduce ごと組まない。
+                conf1 = None
+                if not nosync:
+                    d_probs = mx.softmax(d_logits.astype(mx.float32), axis=-1)
+                    conf1 = -mx.sum(d_probs * mx.log(mx.maximum(d_probs, 1e-12)))
                 d1 = mx.argmax(d_logits, axis=-1).reshape(1)
                 mx.eval(d1)
                 m1 = int(d1.item())
@@ -1128,6 +1233,19 @@ class SpecEngine:
             if lk:
                 source = "lookup"
                 window = mx.concatenate([y, mx.array(lk)])
+            elif nosync:
+                source = "mtp"
+                lookup_bucket = None
+                first = None
+                if chain_head is not None:
+                    _, d1, dh1 = chain_head
+                    first = (d1, dh1)
+                keep = self._plan_depth(pos_accept_ema, pos_obs_count, cap)
+                if first is not None:
+                    keep = max(keep, 1)  # D7 で既に引いた 1 本は捨てない
+                drafts = self._draft_chain(y, h_last, mtp_cache, keep, first=first)
+                n_drafts = len(drafts)
+                window = mx.concatenate([y] + drafts)
             else:
                 source = "mtp"
                 lookup_bucket = None
@@ -1161,6 +1279,7 @@ class SpecEngine:
                         pos_obs_count,
                     )
                     drafts = drafts[:keep]
+                n_drafts = len(drafts)
                 window = mx.concatenate([y] + drafts)
             mx.async_eval(window)
             phase["draft"] += time.perf_counter() - ts
@@ -1299,9 +1418,9 @@ class SpecEngine:
                 ) * quality_ema.get(
                     lookup_bucket, RESPEC_SCORE_PRIOR
                 ) + RESPEC_EMA_ALPHA * r
-            elif drafts:
+            elif n_drafts:
                 # D1: per-position acceptance-rate EMA feeding _gate_depth.
-                for d in range(1, len(drafts) + 1):
+                for d in range(1, n_drafts + 1):
                     observed = 1.0 if a >= d else 0.0
                     pos_accept_ema[d] = (
                         1 - GATE_EMA_ALPHA

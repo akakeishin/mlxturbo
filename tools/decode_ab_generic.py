@@ -283,6 +283,10 @@ def _result_row(res: dict, wall: float, resumed: bool) -> dict:
         rounds=rounds,
         tok_per_round=len(out) / max(rounds, 1),
         head=out[:24],
+        # 生成列そのもの。挙動が変わる knob (draft の作り方など) では
+        # 「head 一致」だけでは足りず、**何トークン目で分岐したか**が判定材料
+        # になる。512 トークン x 数十行なので JSON も大きくならない。
+        tokens=out,
     )
 
 
@@ -506,6 +510,30 @@ def summarize(rows, variants, baseline) -> None:
             print(f"  head 不一致: {kc[0]} case={kc[1]} ctx={sub[0]['ctx']}")
     print(f"  head: {n_same} ケース一致 / {n_diff} ケース不一致")
 
+    # 生成列そのものの一致 (分岐位置)。挙動が変わる knob の判定材料 --
+    # 「head は一致、512 トークンのどこかで分岐」を見逃さないため
+    print("  生成列 (基準からの分岐位置、n = 一致):")
+    for kc in sorted({(r["kind"], r["case_idx"]) for r in rows}):
+        sub = [r for r in rows if (r["kind"], r["case_idx"]) == kc]
+        base_toks = next((r.get("tokens") for r in sub
+                          if r["variant"] == baseline), None)
+        if base_toks is None:
+            continue
+        cells = []
+        for v in variants:
+            worst = None
+            for r in (x for x in sub if x["variant"] == v):
+                toks = r.get("tokens") or []
+                pos = next((i for i, (a, b) in enumerate(zip(base_toks, toks))
+                            if a != b), None)
+                if pos is None and len(toks) != len(base_toks):
+                    pos = min(len(toks), len(base_toks))
+                if pos is not None and (worst is None or pos < worst):
+                    worst = pos
+            cells.append(f"{v or '(未設定)'}="
+                         f"{'n=%d' % len(base_toks) if worst is None else worst}")
+        print(f"    {kc[0]:5s} case={kc[1]}  " + "  ".join(cells))
+
 
 def summarize_round_trace(rows: list) -> None:
     """`--round-trace` の集計: 検証幅 (= 1 + draft の本数) ごとの ms。
@@ -530,8 +558,10 @@ def summarize_round_trace(rows: list) -> None:
         base = median(by_w[1]) if 1 in by_w else None
         head = (f"ctx={row['ctx']} case={row['case_idx']} "
                 f"variant={row['variant'] or '(未設定)'}")
+        mean_w = sum(t[0] for t in trace) / len(trace)
         print(f"  {head}: rounds={len(trace)} "
-              f"ms/round(全体)={median(m for ms in by_w.values() for m in ms):.1f}")
+              f"ms/round(全体)={median(m for ms in by_w.values() for m in ms):.1f}"
+              f"  平均幅={mean_w:.2f} (draft {mean_w - 1:.2f} 本/round)")
         for w in sorted(by_w):
             ms_l = by_w[w]
             per_link = ""
