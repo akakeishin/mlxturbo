@@ -3923,3 +3923,14 @@ debug requestだけ`{"status": "runner_unsplit"}`を付け、生成ログでは
 `ttft-phase: runner_unsplit (prefill+first_token)`と表示する。stream/non-streamの両経路を対象にし、
 通常requestにはfieldも時計も追加しない。対象5 testと`bench/test_server.py`全455 testが合格した
 (`d083a42`)。これでP0は完了し、次はprospective admissionと固定multi-session traceを持つP1へ進む。
+
+### 2026-09-05 04:34 hot prefill P1 byte-budget LRUを保留
+
+Flash-Next限定のprospective byte admission、post-generation実測調整、unknown/error/cancel時の
+撤去、status snapshotを試作したが、本体差分が718行になった。追加8 test、既存455 test、
+trace補助2 testは通ったものの、これは生成tok/sを上げる変更ではなく、count-8から漏れる9本目以降の会話だけを
+救うものだった。50k×8本はP0実測から約16.63 GiBで、8本不足を示す実トラフィックもない。
+
+複雑さに対する便益を示せないため、実モデルtraceをserver起動中に中止し、試作・専用trace・testを
+commit前に撤回した。既定count-8は変更しない。再開条件は、既存telemetryで8本超の再利用missが
+実運用の支配項だと確認できた場合だけ。速度研究はcold prefillと長文decodeへ戻す。

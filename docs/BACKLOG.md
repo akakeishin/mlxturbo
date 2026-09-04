@@ -1158,3 +1158,11 @@ stream/non-streamとserver全455 testを通して完了した (`d083a42`)。P1�
 同じ固定multi-session traceで比較する。開始前の容量予約、実tokenizer retemplate、
 10% scratch余白、OOM/swap 0、予測差5%以内を前提とする。value scoreは式・減衰・tie-breakが
 未定義なので、byte-LRUよりhold-out traceで明確に勝てる定義ができるまで既定候補にしない。
+
+## 保留: hot prefill P1 byte-budget LRU (2026-09-05 04:34 JST)
+
+試作は本体718行まで膨らみ、生成tok/sそのものは上げず、9会話以上を同時に再利用する場合だけ
+count-8より有利になる設計だった。50kを8本保持しても実測約16.63 GiBで、現時点に
+「8本では足りない」という実トラフィック根拠はない。複雑さに見合う便益をまだ示せないため、
+試作と専用traceはcommitせず撤回し、既定count-8を維持する。再開条件は、実利用で8本超の
+再利用missが支配的だとtelemetryで確認できた場合だけ。無制限保持とvalue scoreは引き続き不採用。

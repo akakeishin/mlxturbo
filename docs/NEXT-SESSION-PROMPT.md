@@ -967,3 +967,16 @@ BIGLOCK_PRIO=1 tools/biglock.sh .venv/bin/python bench/hot_prefill_bench.py --he
 ```bash
 rg -n "max_sessions|session_pool|evict|allocated_bytes|session_id" mlxturbo/server.py bench/hot_prefill_bench.py
 ```
+
+## 保留: hot prefill P1 byte-budget LRU (2026-09-05 04:34 JST)
+
+- 生成速度には直接効かず、8会話を超える同時再利用だけを救う機能だった。
+- 本体718行の試作は過剰と判断し、commit前に撤回。既定`--max-sessions 8`を維持する。
+- 50k×8本は実測換算約16.63 GiB。実トラフィックで8本超の再利用missが支配的になるまで再開しない。
+- 次はsession policyではなく、cold prefillまたは長文decodeの支配的kernelへ戻る。
+
+再開の1コマンド:
+
+```bash
+rg -n "persistent streaming MoE|MTPLX 2.11.1|mixed KV" docs/BACKLOG.md
+```
