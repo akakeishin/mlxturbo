@@ -63,7 +63,7 @@
 
 読み: 素の 1 トークン forward 42 ms (帯域下限 35 + 糊 7)。verify は S≈4 で 62 ms = 42 + **行の費用 20 ms** (GDN の再帰が行ごとに逐次 48 層 × 4、`_linear_capture` の写しで自前部品なし、状態の控え)。draft は 4 リンクで 21 ms = 1 リンク 5 ms (lm_head 0.64 GB の読み 1.5 ms + MTP 層 + 同期)。**的の順: verify の行の費用 (20 ms、第 1 段) → draft の同期と本数 (21 ms、第 2 段) → S=1 の糊 (7 ms)。**mlx-serve の 23 ms/tok は tok/round 2.2 なら round 50 ms 相当 = うちの verify 62 ms より軽い。
 
-## 第 1 段の結果 (2026-09-04 10:15、CATCHUP 同時刻)
+## 第 1 段の結果 (2026-09-04 10:09、CATCHUP 同時刻)
 
 round ≒ **43 ms + 10 ms × draft 本数**。mlx-serve は draft 2 本で 52 ms (24.4 ms/tok)、うちは同じ 2 本で 73〜75 ms。差 20 ms/round のうち固定費 +8 (43 対 35)、リンク 1 本 +8 (10 対 下限 2)。段階投入 (S>1) は -1.9% で既定 on。capture の写しの素通しは前処理だけで、当てても -0.3% (幅 5+ で数 ulp ずれる穴あり)。
 第 2 段: draft chain の同期 (`mx.eval(*confidences)` と各リンクの `.item()`) の廃止、引いてから捨てる本数 (max_draft 8 → 幅表 / EMA で先に決める)、次 round の draft の先行投入、固定費 +8 の内訳。判定は複数プロンプト平均の tok/round と ms/tok、KLD (参照 = 素 4bit)。

@@ -2814,7 +2814,7 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - GDN Metal (prefill): 09:15 の結果 (4k -1.4% / 17k +0.1%) と品質の代金 (KLD 0.00027) を合わせ、**27B (移植した族) では既定 off にする** (第 1 段の着地後に fused.py を触る。Flash-Next は従来どおり on)。
 - 27B の prefill の部品はこれで一巡: 取り分は合計 1% 未満。**27B の的は decode 経路** (round 82〜112 ms 対 下限 35 ms)。
 
-### 2026-09-04 10:15 27B decode 経路の第 1 段: 段階投入を S>1 の verify にも (既定 on、短 -1.9% / 4k -0.4%、生成列は完全一致)。capture の写しをモジュール呼び出しにする案は取り分なし (-0.3%) で既定 off。`staged.py` は `_hidden_forward` に畳んで写しを 1 本減らした
+### 2026-09-04 10:09 27B decode 経路の第 1 段: 段階投入を S>1 の verify にも (既定 on、短 -1.9% / 4k -0.4%、生成列は完全一致)。capture の写しをモジュール呼び出しにする案は取り分なし (-0.3%) で既定 off。`staged.py` は `_hidden_forward` に畳んで写しを 1 本減らした
 
 - 発火の確認 (合成 qwen3_5、`_fire`): `_linear_capture` (写し) は `gdn_prework` 0 / `rms_norm_gated` 3、モジュール呼び出しは 3 / 3。**素通しは前処理カーネルだけ**で、出力 norm は写しでも当たっていた。両経路の出力・cache はビット一致。
 - 変更: `fused.gdn_capture(sink)` (動的サブクラスに状態の取り出し口)、`spec._capture_via_module` (`MLXTURBO_SPEC_CAPTURE_MODULE`、既定 0)、`_hidden_forward` を 1 本化して `staged.py` を削除、`MLXTURBO_SPEC_STAGED_VERIFY` (**既定 on に変更**)、`MLXTURBO_ROUND_TRACE=1` / `decode_ab_generic --round-trace`。
