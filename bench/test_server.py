@@ -2431,6 +2431,11 @@ class _ContractFlashEngine:
         self.inputs = []
 
     def generate_stream(self, ids, max_tokens, caches=None, **_kwargs):
+        if _kwargs.get("trace_timing"):
+            self.last_ttft_phase = {
+                "runner_prefill_s": 0.012,
+                "runner_first_token_s": 0.003,
+            }
         prompt = list(ids[0].tolist())
         self.inputs.append(prompt)
         caches["fed"].extend(prompt)
@@ -2482,6 +2487,24 @@ def test_flash_spec_runner_publishes_only_tokens_already_fed_to_cache():
     assert session.processed == session.cache["fed"] == second_prompt
 
 
+def test_flash_spec_runner_ttft_phase_is_opt_in_and_forwarded():
+    engine = _ContractFlashEngine([[50], [51]])
+    runner = FlashSpecRunner(engine)
+
+    plain = runner.generate(
+        [1, 2], 1, 0.0, set(), None, FallbackSession(),
+    )
+    traced = runner.generate(
+        [1, 2], 1, 0.0, set(), None, FallbackSession(), trace_timing=True,
+    )
+
+    assert "_ttft_phase" not in plain
+    assert traced["_ttft_phase"] == {
+        "runner_prefill_s": 0.012,
+        "runner_first_token_s": 0.003,
+    }
+
+
 def test_flash_spec_generate_stream_zero_tokens_prefills_without_yield(monkeypatch):
     """max_tokens=0 must not leak the prefill-produced cur to callers."""
 
@@ -2524,6 +2547,17 @@ def test_flash_spec_generate_stream_zero_tokens_prefills_without_yield(monkeypat
         )
     )
     assert chunks == []
+    assert not hasattr(engine, "last_ttft_phase")
+
+    traced = list(
+        engine.generate_stream(
+            mx.array([[1, 2]]), max_tokens=0, caches=[], temp=0.0,
+            eos_ids=set(), trace_timing=True,
+        )
+    )
+    assert traced == []
+    assert engine.last_ttft_phase["runner_prefill_s"] >= 0.0
+    assert engine.last_ttft_phase["runner_first_token_s"] == 0.0
 
 
 def test_flash_spec_callback_failure_does_not_publish_mutated_reused_cache():
@@ -2599,6 +2633,22 @@ def test_nonstream_cancellation_keeps_lock_until_worker_finishes():
         assert not state.lock.locked()
 
     asyncio.run(run())
+
+
+def test_nonstream_debug_requests_ttft_phase_only_from_capable_runner():
+    class PhaseRunner(FakeRunner):
+        SUPPORTS_TTFT_PHASES = True
+
+    runner = PhaseRunner([10])
+    state = _install_state(runner)
+    state.debug_log = True
+
+    result = asyncio.run(
+        server._run_generate([1, 2], 1, 0.0, state.eos_ids, None, None)
+    )
+
+    assert result["tokens"] == [10]
+    assert runner.calls[0]["trace_timing"] is True
 
 
 def test_stream_cancel_wakes_blocking_queue_get_with_internal_sentinel():
@@ -4549,6 +4599,10 @@ def test_generation_log_includes_session_selection_fields():
         "decode_tps": 10.0,
         "tokens_per_step": 1.0,
         "ttft_s": 0.1,
+        "_ttft_phase": {
+            "runner_prefill_s": 0.08,
+            "runner_first_token_s": 0.02,
+        },
         "_session_selection": {
             "match_kind": "checkpoint",
             "lcp": 8,
@@ -4568,6 +4622,7 @@ def test_generation_log_includes_session_selection_fields():
     assert "reused=6" in line
     assert "new=2" in line
     assert "evicted_bytes=unknown" in line
+    assert "ttft-phase: prefill=80.0ms first_token=20.0ms" in line
 
 
 # ---------- 12b. バグ修正: チェックポイントによる部分一致からの復元 ----------

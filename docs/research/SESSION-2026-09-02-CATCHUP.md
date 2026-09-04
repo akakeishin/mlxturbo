@@ -3465,3 +3465,16 @@ view / 遅延concat型も誤って受ける穴があった。
 既存attentionへfail closedする。契約テストは**4 passed**。GPU検証は実モデル形状の配列4条件が
 全て許容内、合成Flash-Nextでカーネルが2回発火し、QSA不活性域はbit一致、全出力が
 `1e-4`以内で総合合格。既存の他モデル融合契約も**10 passed**。BACKLOG C11を閉じた。
+
+### 2026-09-04 20:24 Flash-NextのTTFTをrunner prefill / first-tokenへ分離
+
+hot cacheの速さとcold prefill本体を同じ`ttft_s`だけで扱わないため、serverのdebug requestに
+限りFlashSpecEngineの既存境界で`runner_prefill_s`と`runner_first_token_s`を記録するようにした。
+prefill完了は通常のcache更新・MTP prime後、first-token完了は既存の`cur.item()`後で、
+計測用`mx.eval`は追加しない。通常requestではserverがフラグを渡さず、内部結果キーも増えない。
+
+対象4 testと`bench/test_server.py`全体は**443 passed**。実Flash-Nextをdebugで一時起動し、
+60 input / 8 output tokenの1 requestはHTTP 200、`ttft=0.97s`に対して
+`prefill=971.2ms / first_token=0.4ms`と出た。短い機能確認なので速度の採否には使わないが、
+cold入力ではserver固定費でなくrunner prefillが支配することを同じrequestで確認できた。
+残るP0はtokenize/LCP探索/restore、batch-forfeited reuse、preemption再計算tokenである。

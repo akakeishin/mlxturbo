@@ -2066,6 +2066,7 @@ class FlashSpecEngine:
         resume: tuple | None = None,
         sampler=None,
         logprob_rows: list | None = None,
+        trace_timing: bool = False,
     ):
         """The token-by-token version of ``generate()`` (for mlxturbo-serve's
         streaming).
@@ -2158,6 +2159,23 @@ class FlashSpecEngine:
         """
         if max_tokens < 0:
             raise ValueError("max_tokens must be non-negative")
+        # サーバーのdebug計測からだけ有効にする。既存の同期点を挟まず、
+        # prefill完了と最初のtokenをhostへ取り出した境界の壁時計だけを記録する。
+        # runnerが同じ直列呼出しの直後に読むため、request間の相関IDは不要。
+        if trace_timing:
+            self.last_ttft_phase = None
+        _ttft_t0 = time.perf_counter() if trace_timing else None
+
+        def _record_ttft_phase(prefill_done: float, first_done: float | None) -> None:
+            if _ttft_t0 is None:
+                return
+            self.last_ttft_phase = {
+                "runner_prefill_s": prefill_done - _ttft_t0,
+                "runner_first_token_s": (
+                    0.0 if first_done is None else first_done - prefill_done
+                ),
+            }
+
         eos = set(eos_ids)
         model = self.model
         caches = caches if caches is not None else model.make_cache()
@@ -2452,6 +2470,8 @@ class FlashSpecEngine:
                 # Keep the successfully prefetched cache, but do not expose the
                 # first sampled ``cur``.  This mirrors SpecEngine.generate(0) and
                 # lets FlashSpecRunner publish exactly the prompt as processed.
+                if trace_timing:
+                    _record_ttft_phase(time.perf_counter(), None)
                 if _pf:
                     _pf.mark_end()
                     _pf.summary()
@@ -2469,15 +2489,20 @@ class FlashSpecEngine:
             if _pf:
                 _pf.mark_end()
 
+        _ttft_prefill_done = time.perf_counter() if trace_timing else None
         if max_tokens == 0:
             # Only reachable via ``use_resume`` -- the normal path already
             # returned above.
+            if _ttft_prefill_done is not None:
+                _record_ttft_phase(_ttft_prefill_done, None)
             return 0, 0, (logits_tail, hyper_tail0, mtp_snap)
 
         hyper_prev = hyper_tail0
         cur = self._sample(logits_tail, temp, sampler)
 
         first = int(cur.item())
+        if _ttft_prefill_done is not None:
+            _record_ttft_phase(_ttft_prefill_done, time.perf_counter())
         out = [first]
         if logprob_rows is not None:
             logprob_rows.extend(_logsoftmax_rows(logits_tail, 1))

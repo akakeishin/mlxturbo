@@ -116,9 +116,15 @@ LCP、checkpoint位置、reused/new、追放token/allocated bytesを1 request 1�
 未知session数、processed token、累積選択/追放統計を追加した。byte走査はstatus poll時と追放時だけで、
 通常requestでは行わない。436件のserver testがMetal実機で通った。
 
-残るP0は、tokenize/LCP探索/restore/prefill/first-tokenを個別の時間へ分けること、batchを選んだため
-失ったLCP、preemption後の再計算tokenを記録すること、固定suffixの反復でallocated bytesと
-MLX active memoryの差を5%以内へ合わせることである。
+2026-09-04 20:24には、Flash-Nextのdebug requestだけでrunner内部を
+`runner_prefill_s` / `runner_first_token_s`へ分けた。既存の同期点だけを使い、追加`mx.eval`は無い。
+通常requestは計測フラグも結果キーも作らない。実Flash-Nextの60-token煙試験では、serverの
+`ttft=0.97s`に対してprefill 971.2ms、first-token 0.4msと対応した。server全回帰は443件通過。
+
+残るP0は、tokenize/LCP探索/restoreを個別の時間へ分けること、Flash以外のrunnerでは
+分割不能な区間を明示すること、batchを選んだため失ったLCP、preemption後の再計算tokenを
+記録すること、固定suffixの反復でallocated bytesとMLX active memoryの差を5%以内へ
+合わせることである。
 
 ### P1: byte-budget比較
 

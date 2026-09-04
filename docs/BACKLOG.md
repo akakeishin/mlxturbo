@@ -1028,8 +1028,9 @@ PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスク�
   request単位に解釈する。441 testと実Flash-Nextへの2/2 requestで、両方が要求8 tokenを
   返すことを確認した。公開表には引き続き実output token数も載せる。
 
-hot prefillのsession選択種別、LCP、reused/new、pool/追放byte、MLX memoryの観測は追加済み。
-次は段階時間とbatchで捨てたreuseを追加し、suffix 0/16/64/256、pure append/retokenizedで
-byte実測を合わせる。無制限cacheは入れない。
+hot prefillのsession選択種別、LCP、reused/new、pool/追放byte、MLX memoryに加え、
+Flash-Nextのdebug時だけrunner prefill/first-token時間を追加済み（追加同期なし、443 testと
+実モデル煙試験）。次はtokenize/LCP探索/restoreとbatchで捨てたreuseを追加し、
+suffix 0/16/64/256、pure append/retokenizedでbyte実測を合わせる。無制限cacheは入れない。
 設計判断、50kで下限2.189 GiB/sessionとなる容量見積もり、段階別の合格線は
 `docs/research/HOT-PREFILL-DESIGN-2026-09.md`を正本にする。

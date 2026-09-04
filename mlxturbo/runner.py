@@ -113,6 +113,8 @@ class Runner(Protocol):
     # logprobs を自分で出せるか (server.py が降格の判定に使う)。宣言しない
     # runner は False 扱い = logprobs 付きのリクエストは非投機へ降ろされる。
     SUPPORTS_LOGPROBS: bool
+    # debug時にだけserverがtrace_timing=Trueを渡せるrunner。未宣言はFalse。
+    SUPPORTS_TTFT_PHASES: bool
     fallback_reason: str | None
 
     def generate(
@@ -293,6 +295,7 @@ class FlashSpecRunner:
     # 正しく条件付いていて、棄却位置のものは採用側に混ざらない。先頭トークン
     # だけ出所が prefill 末尾の logits_tail。
     SUPPORTS_LOGPROBS = True
+    SUPPORTS_TTFT_PHASES = True
 
     def __init__(self, engine, tokenizer=None):
         self.engine = engine
@@ -305,7 +308,7 @@ class FlashSpecRunner:
         self, prompt_ids, max_tokens, temp, eos_ids, on_tokens, session,
         seed=None, top_p: float = 0.0, top_k: int = 0, min_p: float = 0.0,
         logit_bias: dict | None = None, logprobs: bool = False,
-        top_logprobs: int = 0, **extra
+        top_logprobs: int = 0, trace_timing: bool = False, **extra
     ):
         # [gen-trace] (a) function entry -- see _log_gen_trace/_GEN_TRACE
         # above. Captured unconditionally (perf_counter() is cheap and this
@@ -402,6 +405,7 @@ class FlashSpecRunner:
             resume=resume,
             sampler=sampler,
             logprob_rows=logprob_rows,
+            trace_timing=trace_timing,
             **extra,
         )
         try:
@@ -477,6 +481,8 @@ class FlashSpecRunner:
         }
         if logprob_rows is not None:
             result["logprobs"] = logprob_entries
+        if trace_timing and getattr(self.engine, "last_ttft_phase", None):
+            result["_ttft_phase"] = dict(self.engine.last_ttft_phase)
         # MLXTURBO_PHASE_TIMERS=1 のときだけ engine が埋める (spec_flash.py)。
         if getattr(self.engine, "last_phase", None):
             result["phase"] = {**self.engine.last_phase, "rounds": rounds}

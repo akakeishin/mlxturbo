@@ -2980,6 +2980,15 @@ def _log_gen_stats(res: dict) -> None:
             for k in ("draft", "verify", "post", "rollback") if k in ph
         )
         line += f" | phase/round: {parts} (rounds={rounds})"
+    ttft_phase = res.get("_ttft_phase")
+    if isinstance(ttft_phase, dict):
+        parts = " ".join(
+            f"{key.removeprefix('runner_').removesuffix('_s')}={ttft_phase[key] * 1000:.1f}ms"
+            for key in ("runner_prefill_s", "runner_first_token_s")
+            if key in ttft_phase
+        )
+        if parts:
+            line += f" | ttft-phase: {parts}"
     selection = res.get("_session_selection")
     if isinstance(selection, dict):
         checkpoint = selection.get("checkpoint_position")
@@ -3288,14 +3297,21 @@ async def _run_generate(
     ``STATE.downgrade_runner``."""
 
     loop = asyncio.get_running_loop()
+    chosen_runner = runner or STATE.runner
+    trace_kwargs = (
+        {"trace_timing": True}
+        if STATE.debug_log and getattr(chosen_runner, "SUPPORTS_TTFT_PHASES", False)
+        else {}
+    )
     fn = functools.partial(
-        (runner or STATE.runner).generate,
+        chosen_runner.generate,
         prompt_ids,
         max_tokens=max_tokens,
         temp=temp,
         eos_ids=eos_ids,
         on_tokens=on_tokens,
         session=session,
+        **trace_kwargs,
         **sampling_kwargs,
     )
     future = loop.run_in_executor(STATE.executor, fn)
@@ -3521,13 +3537,21 @@ def _start_generation(
         if t_trace is not None:
             t_trace["d_run"] = time.perf_counter()
         try:
-            res = (runner or STATE.runner).generate(
+            chosen_runner = runner or STATE.runner
+            trace_kwargs = (
+                {"trace_timing": True}
+                if STATE.debug_log
+                and getattr(chosen_runner, "SUPPORTS_TTFT_PHASES", False)
+                else {}
+            )
+            res = chosen_runner.generate(
                 prompt_ids,
                 max_tokens=max_tokens,
                 temp=temp,
                 eos_ids=effective_eos_ids,
                 on_tokens=on_tokens,
                 session=session,
+                **trace_kwargs,
                 **sampling_kwargs,
             )
             res = _attach_selection_to_result(res, prompt_ids, session)

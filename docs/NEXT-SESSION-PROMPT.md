@@ -774,3 +774,21 @@ Flash-Nextの`_AttnCache`は継承のみなので従来どおり発火し、over
 ```bash
 BIGLOCK_PRIO=0 tools/biglock.sh .venv/bin/python tools/verify_prefill_attn.py
 ```
+
+## Flash-Nextのcold/warm TTFTをrunner内で分離 (2026-09-04 20:24 JST)
+
+debug requestに限り、FlashSpecEngineの既存同期境界から`runner_prefill_s`と
+`runner_first_token_s`を生成ログへ出す。追加`mx.eval`は無く、通常requestでは計測フラグも
+結果キーも作らない。対象4 testとserver全443 testが通過。実Flash-Nextの60-token煙試験は
+`ttft=0.97s | ttft-phase: prefill=971.2ms first_token=0.4ms`で、cold側がmodel prefillに
+支配されることを同じrequest内で確認した。これは速度改善値ではなくP0観測の追加である。
+
+P0の次はtokenize/LCP探索/restoreの分離とbatch-forfeited reuse。cold本体の性能判定は、
+強冷却確認後の50k n-gram ABBAを優先する。
+
+再開の1コマンド:
+
+```bash
+uv run mlxturbo-serve --model ~/models/ddalcu-mlxlm-head4 --ngram ~/models/ddalcu-ngram \
+  --served-model-name qwen38fn --require-runner flash_spec --log-level debug
+```
