@@ -877,3 +877,25 @@ BIGLOCK_PRIO=1 tools/biglock.sh .venv/bin/python bench/hot_prefill_bench.py --he
 jq '.depths[0].summary | {mean_decode_tok_s,mean_end_to_end_tok_s,mean_speedup_vs_ar}' \
   bench/results/mtplx211-flashnext-d3-batched-strongcool-0904.json
 ```
+
+## Qwen3.6強冷却fullと長文脈低下 (2026-09-04 22:20 JST)
+
+- GPU走行後に10分以上休止し、固定10秒GEMM 12.76 TFLOPS（基準12.78比-0.16%）を確認してから実施。
+- `self_snapshot.py`はSSE chunk数ではなく結合本文を同じtokenizerで再計数する修正版。旧方式は
+  2.4〜5.0%低く出ていた。
+- 正式decodeは0/4k/17k/25k/32k/50kで117.98/120.16/104.68/86.64/82.54/65.56 tok/s。
+  50kは短文比-44.4%。cold TTFTは52.886秒、warm TTFTは0.691秒。
+- tok/stepは大崩れしておらず、10個のfull-attention層が長いKVを読むround費用が主因。次は
+  50kだけを同一process ABBAで`MLXTURBO_SDPA_SPLIT_GENERIC=auto,0`、`--prefill-once`、
+  `--round-trace`なしで測る。速度測定後、別走行のround anatomyで内訳を取る。
+- 連続GPU走行後は5〜10分休止し、再びGEMMが12.78 TFLOPSの±1.5%なら次へ進む。
+
+再開の1コマンド:
+
+```bash
+BIGLOCK_NO_WORKER=1 BIGLOCK_PRIO=0 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py \
+  --model /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46 \
+  --mtp /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-MTP-5bit/snapshots/998d26dc27cc06baf60ff6e27d673b15f877f0b3 \
+  --mtp-bits 5 --knob MLXTURBO_SDPA_SPLIT_GENERIC=auto,0 --ctx 50000 --prefill-once \
+  --tokens 256 --reps 2 --out bench/results/qwen36-sdpa-split-50k-strongcool-0904.json
+```

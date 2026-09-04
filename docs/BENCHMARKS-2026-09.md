@@ -189,3 +189,25 @@ mlx-serveは2GiBのhot-cache上限で40,960/50,105 tokenしか残らず、9,145 
 この結果は内部診断の速報で、公開用の正本はGuideLLM 0.7.3へ移す。
 `docs/GUIDELLM-BENCHMARK.md`の固定scenarioでrequest数を増やし、TTFT/ITLの
 p50/p95、実output token数、冷却、server側reused/newを併記する。
+
+## 2026-09-04 のQwen3.6-35B-A3B強冷却フルベンチ
+
+本体4bit + MTP-5bit、thinking off、生成256 token、文脈0/4k/17k/25k/32k/50kを
+各2回。開始前に10分以上休止し、固定10秒GEMMが12.76 TFLOPS（冷えた基準
+12.78比-0.16%）だったことを確認した。JSONは
+`bench/results/qwen36-full-strongcool-tokenfix-0904.json`。
+
+| 文脈 | 冷TTFT | 温TTFT | decode | 短文比 | input tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0.082 s | 0.254 s | 117.98 tok/s | — | 231 |
+| 4k | 2.310 s | 0.286 s | **120.16 tok/s** | +1.8% | 1,652 |
+| 17k | 13.490 s | 0.425 s | 104.68 tok/s | -11.3% | 1,246 |
+| 25k | 21.155 s | 0.499 s | 86.64 tok/s | -26.6% | 1,173 |
+| 32k | 28.216 s | 0.542 s | 82.54 tok/s | -30.0% | 1,128 |
+| 50k | 52.886 s | 0.691 s | 65.56 tok/s | **-44.4%** | 942 |
+
+SSE deltaの個数ではなく、結合した本文を同じtokenizerで数え直した値をdecodeの分母にした。
+旧chunk方式は条件ごとに2.4〜5.0%過小評価していた。修正後も長文脈低下は残り、サーバー内部値とも
+概ね一致する。tok/stepは短2.36〜2.38、50k 2.20〜3.00で採択率だけの崩壊ではなく、40層中
+10個のfull-attention層が長いKVを読むverify stepの費用増が主因。次は50k同一processで
+汎用SDPA幅分割on/offを測り、round時間とtok/roundを分けて判定する。

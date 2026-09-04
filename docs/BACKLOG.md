@@ -1017,7 +1017,7 @@ PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスク�
 学習する案はユーザー保留中の学習レーンに属し、この外部artifact移植とは別論点。FR-Spec完成後だけ
 行う予定だったANE coarse-head置換も開始条件を失ったため、現時点では実施しない。
 
-## 進行中: Qwen3.6-35B-A3B MTP-5bit (2026-09-04 18:28)
+## 進行中: Qwen3.6-35B-A3B MTP-5bit (2026-09-04 22:20)
 
 - **取得済み**: 本体4bit約19GB、MTP-5bit 572MiB。
 - **読込修復済み**: MoEの`SwitchLinear` 3本を量子化対象に含め、sidecarの6個の
@@ -1026,8 +1026,14 @@ PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスク�
   (+51.0%)、4k 83.7→131.7 tok/s (+57.3%)。後段の4kまで速度を維持した。
 - **温TTFTも修復**: 再templateの末尾8 token差に合わせてcheckpointを置き、4k追記を
   1.851→0.491秒 (-73.5%)。3,817 / 3,823 tokenを再利用し、439 test pass。
-- **判定**: MTP読込と8-token checkpointを採用。残りは現在の常時冷却でフルベンチを回し、
-  長文脈・品質を含む最終表へ載せる。
+- **強冷却full完了**: 本文token再計数後のdecodeは0/4k/17k/25k/32k/50kで
+  117.98/120.16/104.68/86.64/82.54/65.56 tok/s。50kは短文比-44.4%。cold TTFTは
+  0.082/2.310/13.490/21.155/28.216/52.886秒、warmは0.254〜0.691秒。
+- **原因の切り分け**: tok/stepは短2.36〜2.38、50k 2.20〜3.00で、採択率だけの崩壊ではない。
+  full-attention 10層のKV走査を含む1 roundの費用増が主。50k汎用SDPA幅分割A/Bとround anatomyを
+  次に行う。SSE chunk分母は2.4〜5.0%過小評価するため今後使わない。
+- **判定**: MTP読込、8-token checkpoint、full速度表を採用。残りは品質/KLDの最終表と、50kの
+  attention A/Bである。
 
 ## 完了: 常時冷却Flash-NextフルベンチとGuideLLM導入 (2026-09-04 19:12)
 

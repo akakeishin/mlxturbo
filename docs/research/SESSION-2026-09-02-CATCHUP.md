@@ -3583,3 +3583,28 @@ temperature 1、D3、128 tokenでAR 28.38、MTP 52.79 tok/s（1.86倍）、end-t
 26.84→47.57 tok/s。D3受理率は100.0 / 93.8 / 78.1%、検証2/2合格、routeは`eager_plain`。
 製品のturbo/capture-commitではないため勝敗表には載せず、上流修正版が出るまで再比較を保留する。
 結果は`bench/results/mtplx211-flashnext-d3-batched-strongcool-0904.json`（gitignore）。
+
+### 2026-09-04 22:20 Qwen3.6強冷却full: 50k decode 65.56 tok/s、短文比-44.4%
+
+直前のGPU走行から10分以上休止し、固定10秒GEMMが12.76 TFLOPS（冷えた基準12.78比-0.16%）
+であることを確認した。Qwen3.6-35B-A3B本体4bit + MTP-5bit、thinking off、生成256 token、
+各2回で0/4k/17k/25k/32k/50kを測定した。
+
+| 文脈 | cold TTFT | warm TTFT | decode tok/s | 短文比 | input tok/s |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0.082秒 | 0.254秒 | 117.98 | — | 231 |
+| 4k | 2.310秒 | 0.286秒 | 120.16 | +1.8% | 1,652 |
+| 17k | 13.490秒 | 0.425秒 | 104.68 | -11.3% | 1,246 |
+| 25k | 21.155秒 | 0.499秒 | 86.64 | -26.6% | 1,173 |
+| 32k | 28.216秒 | 0.542秒 | 82.54 | -30.0% | 1,128 |
+| 50k | 52.886秒 | 0.691秒 | 65.56 | **-44.4%** | 942 |
+
+`self_snapshot.py`の旧版は非空SSE deltaを1 tokenとして数え、1 chunkに複数tokenが入る応答を
+過小評価していた。結合本文を同じtokenizerで再計数するよう直した結果、旧chunk方式との差は
+条件ごとに+2.4〜+5.0%。サーバー内部のdecode値とも概ね一致した。修正後も長文脈の低下は残る。
+
+内部ログのcold走行ではtok/stepが短2.36/2.38、50k 2.20/3.00で、MTP採択率が半減した形ではない。
+一方、概算のround費用は短約20msから50k約37〜46msへ増える。40層のうち30層はGDN、10層が
+full attentionであり、後者が各verify roundで長いKVを読む帯域費用が主因と判断する。次は50kの
+同一process ABBAで汎用SDPA幅分割on/offを測り、その後に別走行のround anatomyで相別内訳を取る。
+結果は`bench/results/qwen36-full-strongcool-tokenfix-0904.json`（gitignore）。
