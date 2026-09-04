@@ -418,7 +418,8 @@ mlx-serve は 4k の decode が 25.3 -> 43.2 tok/s。
 | エンジン | 設定 | 冷 TTFT (0) | decode (0) | 冷 TTFT (4k) | 温 TTFT (4k) | decode (4k) | 結果 JSON |
 |---|---|---|---|---|---|---|---|
 | mlxturbo (13:22、fdc06e1 + sdpa 分割 auto) | MTP あり | 0.23 | **33.8** | 16.10 | **0.27** | **32.1** | `smoke-27b-mlxturbo-b2-0904` |
-| mlxturbo | lookup のみ (`--no-mtp`。投機ゼロではない。素の経路を強制する口は未実装、HANDOFF) | 0.22 | 23.4 | 16.11 | 0.26 | 22.3 | `smoke-27b-mlxturbo-nospec-0904` |
+| mlxturbo | lookup のみ (`--no-mtp`。投機ゼロではない) | 0.22 | 23.4 | 16.11 | 0.26 | 22.3 | `smoke-27b-mlxturbo-nospec-0904` |
+| mlxturbo (13:38) | **投機ゼロ** (`MLXTURBO_RUNNER=fallback`、融合は有効) | 0.36 | 23.8 | 15.94 | 0.38 | 22.9 | `smoke-27b-mlxturbo-nospec-forced-0904` |
 | mlx-lm | 投機なし (`qwen3_5_mtp` を読めない) | 0.43 | 21.8 | 18.92 | 0.44 | 20.9 | `smoke-27b-mlx-lm-0904` |
 | oMLX | 投機なし (ペア付けを外す) | 0.49 | 24.5 | 17.74 | 19.92 | 23.2 | `smoke-27b-omlx-nospec-0904` |
 | oMLX | 投機あり (縛った設定) | 0.45 | **33.7** | 18.98 | 20.24 | **32.8** | `smoke-27b-omlx-0904` |

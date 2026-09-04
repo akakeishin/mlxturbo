@@ -3013,3 +3013,17 @@ head4、depth 2 固定、回文順、burn-in 済み。A = compile / B = 素 (`be
 - 17k が PoL の -1.3% に対して -0.6% (符号は 6 本とも負)。`--prefill-once` の有無か熱。バッチ検証 (B>1) と MTP の draft ブロックは warm-up に入れていない (初回に 1 回、≈0.05 s / 5 ms)。
 - **A/B を投げた後は `mlxturbo/*.py` を触らない** (worker の code fingerprint が変わって読み直し 290 s。今日 2 回踏んだ)。
 - 検査: pytest 4 ファイル 436 passed、`vendor_fingerprint` 全一致。
+
+### 2026-09-04 13:38 27B の投機ゼロの行 (`MLXTURBO_RUNNER=fallback`、99ba892、`smoke-27b-mlxturbo-nospec-forced-0904.json`): 素の効率は相手と同着、差は投機の取り分
+
+| 設定 | dec (0) | dec (4k) | 対 mlx-lm |
+|---|---|---|---|
+| mlxturbo 投機ゼロ | 23.8 | 22.9 | 1.09x |
+| mlxturbo lookup のみ (`--no-mtp`) | 23.4 | 22.3 | 1.07x |
+| mlxturbo MTP | 33.8 | 32.1 | 1.54x |
+| mlx-serve 投機ゼロ (`--no-mtp --no-pld`) | 24.3 | 25.3 | 1.16x |
+| mlx-serve MTP | 28.9 | 43.2 | 1.98x |
+| mlx-lm | 21.8 | 20.9 | 1.00x |
+
+- `--no-mtp` (lookup のみ) は投機ゼロと同じ数字 = この文では lookup の取り分ゼロ。`MLXTURBO_RUNNER=fallback` は `_build_base_runner` の先頭で FallbackRunner に落とす計測用の口 (融合は有効のまま)。
+- **mlx-serve との差 (4k で 43.2 対 32.1) は素の効率ではなく投機の取り分** (相手は MTP で 1.71 倍、うち 1.40 倍。相手は depth 6 で per_draft 30%、うちは静的 depth 2)。同じ MTP 頭なので、draft の深さと chain の入力の質が的。小 M で verify 幅の代金が下がった今、depth 3〜4 を掃引し直す。
