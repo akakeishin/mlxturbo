@@ -700,3 +700,22 @@ rg -n "MTP: あり|tok/step" scratchpad/log-qwen36-mtp-fixed-smoke-0904.txt && g
 ```bash
 rg -n "def _select_session|prefill_reused|ttft-trace|memory|session_pool" mlxturbo/server.py mlxturbo/{runner,spec,spec_flash}.py
 ```
+
+## Flash-Next cold prefill本体の次の判定 (2026-09-04 19:49 JST)
+
+- 現行17k解剖を常時冷却で取り直した。中間2048 tokenは壁時3.530秒、MoE 1.410、
+  GDN 0.950、attention 0.891、HC 0.355秒。部品和は壁時計+3.2%で整合。
+- 単純chunk 4096/8192、causal mask融合、small-kv QSA、K/V prefix trim、HC elem拡張、
+  GDN state_out削減は棄却済みなので再開しない。
+- 新規に長文cold +5%を見込める確定候補は無い。残る最優先は既存n-gram prefetchの
+  50k未測定のみ。強冷却で50k ABBAを行い、出力一致かつprefill wall -5%以上なら
+  既定onの長文効果を確定、未満ならcold次候補を閉じる。所要は約25分。
+- `bench/hot_prefill_bench.py`はcold行とinput token/sも保存する。commit `b808ea0` / `f247729`。
+
+再開の1コマンド（強冷却の準備を確認してから）:
+
+```bash
+FASTMLX_NGRAM_NOCACHE=1 BIGLOCK_PRIO=0 tools/biglock.sh .venv/bin/python tools/decode_ab.py \
+  --knob ngram-prefetch --model ~/models/ddalcu-mlxlm-head4 --ngram ~/models/ddalcu-ngram \
+  --only long --ctx 50000 --tokens 32 --out bench/results/ngram-prefetch-50k-cold-0904.json
+```

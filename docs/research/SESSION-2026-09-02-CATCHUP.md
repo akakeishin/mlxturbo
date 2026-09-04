@@ -3402,3 +3402,22 @@ reused/new token、追放時のprocessed token/allocated bytesを追加した。
 重複排除して数える。`/api/status`では同じ方法でpool全体をpoll時だけ走査し、MLXのactive/cache
 memoryと並べて返す。通常requestではbyte走査を行わない。Metal実機で`bench/test_server.py`は
 **436 passed**。次は段階時間、batch-forfeited reuse、固定suffix反復を足す。
+
+### 2026-09-04 19:49 cold prefillの現行解剖と次の50k判定
+
+`tools/prefill_anatomy.py --ctx 17000 --reps 1`を常時冷却・biglock下で実行し、
+2048 token完全チャンクの先頭 / 中間 / 末尾を現行既定値で分けた。チャンク主導の
+壁時計は3.231 / 3.530 / 3.637秒。中間の内訳はMoE 1.410秒、GDN 0.950秒、
+attention 0.891秒、HC 0.355秒、PLE 0.037秒。部品和と壁時計の差は中間+3.2%、
+末尾-2.1%で整合した。先頭だけ-14.1%（0.456秒不足）だが、1 repかつ初回実行なので
+これを新しい最適化候補にはしない。
+
+MoEは中間/末尾で計算下限の68.9/70.8%、GDNは80.3/80.4%、HCは66.0/66.3%。
+ただしMoEの行列積3本だけで1.17秒を占め、現行のgrouped GEMM・qmm_wide後の上積みなので、
+既棄却の単純chunk拡大やroute擬似融合に戻らない。現行cold 17k/25k/50kは
+28.791/40.424/84.315秒（約590〜620 input token/s）。新規に5%線を超える確定候補は無く、
+未決は既存n-gram prefetchの50k cold A/Bだけ。17kは平均-3.0%（揃った2ケースは
+-5.0/-4.6%）、出力一致。50kで壁時計5%以上を通るかを強冷却ABBAで決める。
+
+hot/coldを同じ成果物で追えるよう、`bench/hot_prefill_bench.py`にcold行と
+`input_tokens_per_ttft_s`を保存するようにした。5/5 testと実Flash-Next煙試験を通した。
