@@ -42,7 +42,13 @@ from typing import Protocol
 import mlx.core as mx
 
 from ._mlx_compat import TextModelArgs, resolve_local_model_path
-from .spec import PREFILL_STEP_SIZE, ChatSession, SpecEngine
+from .spec import (
+    CHECKPOINT_RETENTION,
+    PREFILL_STEP_SIZE,
+    ChatSession,
+    SpecEngine,
+    snapshot_untrimmable_caches,
+)
 
 # [gen-trace] (debug-only, see FlashSpecRunner.generate / _log_gen_trace
 # below). This module has no access to server.py's STATE.debug_log (that
@@ -507,12 +513,10 @@ class FallbackSession:
     boundary and then have only the delta prefilled again (consumed by
     ``_try_checkpoint_restore_session_cache`` in mlxturbo/server.py; see the
     ``FlashSpecRunner`` docstring in mlxturbo/runner.py). ``FallbackRunner``
-    (this class's other user) uses ``mlx_lm.generate.stream_generate``
-    directly and does not take snapshots at chunk boundaries itself, so for
-    it this stays empty forever — ``_try_checkpoint_restore_session_cache``
-    treats an empty list as falsy and gives up immediately, so as far as that
-    path is concerned, the addition of this field itself changes nothing from
-    the previous two-way choice of "full match or a new slot".
+    uses ``mlx_lm.generate.stream_generate`` directly and publishes a bounded
+    tail snapshot for cache layers that cannot be rewound. The server can then
+    restore the nearest checkpoint before a re-templated prompt's LCP and
+    prefill only the remaining tail.
     """
 
     def __init__(self):
@@ -617,10 +621,11 @@ class FallbackRunner:
     as-is and only the delta is prefilled, but only when the LCP (longest
     common prefix) with the previously processed sequence matches that
     session's entire processed sequence. If it does not match (the
-    conversation switched, the template rewrote the history, etc.), it
-    silently creates a new prompt_cache and runs the whole prompt through
-    again — no partial rewind is performed (see the FallbackSession
-    docstring). If session is None, this mechanism itself is bypassed and,
+    conversation switched, the template rewrote the history, etc.), the
+    server may restore a bounded checkpoint before rebuilding the delta;
+    otherwise it silently creates a new prompt_cache and runs the whole prompt
+    through again (see the FallbackSession docstring). If session is None, this
+    mechanism itself is bypassed and,
     as before, the temporary cache on the mlx_lm side is relied upon (full
     prefill every turn). n_draft/max_draft/fly_* are also for the
     speculative paths only, so they are merely received via **extra and
@@ -655,6 +660,7 @@ class FallbackRunner:
     """
 
     KIND = "fallback"
+    _CHECKPOINT_TAIL = 8
     SUPPORTED_SAMPLING_PARAMS = frozenset(
         {
             "top_p",
@@ -694,7 +700,7 @@ class FallbackRunner:
         top_logprobs: int = 0,
         **extra,
     ):
-        from mlx_lm.generate import stream_generate
+        from mlx_lm.generate import generate_step, stream_generate
         from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
         if seed is not None:
@@ -717,7 +723,9 @@ class FallbackRunner:
         # hitting this method directly with session=None do not break).
         prompt_cache = None
         reused = 0
+        checkpoints: list | None = None
         if session is not None:
+            checkpoints = session.checkpoints
             if session.cache is not None:
                 pl = session.processed
                 n = min(len(pl), len(prompt_ids))
@@ -739,8 +747,59 @@ class FallbackRunner:
                 from mlx_lm.models.cache import make_prompt_cache
 
                 prompt_cache = make_prompt_cache(self.model)
+                checkpoints = []
 
         remaining_prompt = prompt_ids[reused:]
+
+        # Retain an eight-token tail so that a re-templated prompt whose last
+        # few tokens diverge can still restore to a checkpoint at or before its
+        # LCP. ``generate_step(max_tokens=0)`` consumes the prefix's final token
+        # and then invokes its final progress callback; at that point a rotating
+        # cache is back at its steady ring-buffer size. stream_generate consumes
+        # the reserved tail normally.
+        stream_prompt = remaining_prompt
+        checkpoint_position = None
+        checkpoint_total = None
+
+        def on_prompt_progress(processed: int, total: int) -> None:
+            nonlocal checkpoint_position
+            if (
+                checkpoints is None
+                or checkpoint_position is not None
+                or not isinstance(prompt_cache, list)
+            ):
+                return
+            if checkpoint_total is None:
+                if processed <= 0 or processed != total - 1:
+                    return
+            elif total != checkpoint_total or processed != total:
+                return
+            snapshot = snapshot_untrimmable_caches(prompt_cache, deep=True)
+            checkpoints.append((reused + processed, snapshot))
+            del checkpoints[:-CHECKPOINT_RETENTION]
+            checkpoint_position = reused + processed
+
+        t0 = time.perf_counter()
+        if (
+            checkpoints is not None
+            and isinstance(prompt_cache, list)
+            and len(remaining_prompt) > self._CHECKPOINT_TAIL
+        ):
+            prefix_len = len(remaining_prompt) - self._CHECKPOINT_TAIL
+            checkpoint_total = prefix_len
+            prefix = mx.array(remaining_prompt[:prefix_len])
+            for _ in generate_step(
+                prefix,
+                self.model,
+                max_tokens=0,
+                sampler=lambda logits: mx.argmax(logits, axis=-1),
+                logits_processors=logits_processors,
+                prefill_step_size=PREFILL_STEP_SIZE,
+                prompt_cache=prompt_cache,
+                prompt_progress_callback=on_prompt_progress,
+            ):
+                pass
+            stream_prompt = remaining_prompt[prefix_len:]
 
         tokens: list[int] = []
         # Collected only when requested (item 17; see this class's docstring)
@@ -748,11 +807,12 @@ class FallbackRunner:
         # "logprobs" key itself does not appear in the returned dict (so that
         # always collecting does not cost memory and speed).
         collected_logprobs: list[dict] | None = [] if logprobs else None
-        t0 = time.perf_counter()
         ttft = None
         stream_kwargs = {}
         if prompt_cache is not None:
             stream_kwargs["prompt_cache"] = prompt_cache
+        if checkpoints is not None:
+            stream_kwargs["prompt_progress_callback"] = on_prompt_progress
         # stream_generate yields exactly one GenerationResponse per generated
         # token (the very last one is folded into the finish_reason-carrying
         # wrap-up response instead of a plain per-step one, see its source),
@@ -761,7 +821,7 @@ class FallbackRunner:
         for resp in stream_generate(
             self.model,
             self.tokenizer,
-            remaining_prompt,
+            stream_prompt,
             max_tokens=max_tokens,
             sampler=sampler,
             logits_processors=logits_processors,
@@ -796,7 +856,11 @@ class FallbackRunner:
             # of the next step before emitting it (and likewise when it ends
             # early on EOS), so tokens matches exactly the generated sequence
             # already fed into prompt_cache.
-            session.publish(prompt_cache, list(prompt_ids) + tokens)
+            session.publish(
+                prompt_cache,
+                list(prompt_ids) + tokens,
+                checkpoints=checkpoints,
+            )
         result = {
             "tokens": tokens,
             "ttft_s": ttft or 0.0,

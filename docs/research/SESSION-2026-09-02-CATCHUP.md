@@ -3255,3 +3255,26 @@ target verifyの分布を守れても受理率上限を大きく落とす。Q8 h
 code-ranked sidecarは不採用。PR本文の99.64%、実装docstringのbuild 99.487% / real trace 99.728%は
 相手corpusの値で、こちらの日本語・混合タスクへ移せない。FR-Spec完成を前提にしていたANE draft-head
 置換も開始条件を失ったため閉じる。再開には別の汎用corpusで作った固定sidecarが同じ事前線を通ることが必要。
+
+### 2026-09-04 17:56 Gemma 4の温TTFTを4k 0.382秒、17k 0.415秒へ修復
+
+原因はFallbackRunnerのsessionが、Gemma 4の`RotatingKVCache`をwindow越しに巻き戻せる
+checkpointを持たなかったことだった。会話テンプレートでは次turnのLCPが直前promptより4 token短くなる
+実例があり、直前prompt終端だけを保存しても使えない。そこでプロンプト末尾8 tokenを通常prefillへ残し、
+その直前でRotating cacheの配列と`meta_state`を深く保存するようにした。既存SpecEngineの浅い4-field
+checkpointは変更せず、Fallback用の5-fieldだけを追加した。
+
+`--reps 2 --warm-long 4000`、64 token、冷却なしの実サーバー測定:
+
+| 文脈 | 冷TTFT | 温TTFT | decode |
+|---|---:|---:|---:|
+| 0 | 0.243 s | 0.328 s | 96.5 tok/s |
+| 4k | 2.918 s | **0.382 s** | 87.4 tok/s |
+| 17k | 14.783 s | **0.415 s** | 74.1 tok/s |
+
+4k温TTFTは旧煙試験2.76 sから-86.1%、7.2倍。ログでも4kは3,820/3,826 token、17kは
+16,820/16,826 tokenを再利用した。別の1-session実験で、checkpoint復元armと意図的にsessionを
+追い出して全量再構築したarmの64-token出力は完全一致した。合成ではwindow到達前後、反復restore、
+KVCacheとの混在を固定し、`bench/test_server.py`と`bench/test_fusions_other_family.py`は437 passed。
+冷TTFTの旧値との差は走行条件と熱が違うので採否に使わない。温側は同一run内の接頭辞再利用そのものを
+示し、mlx-lmの機能基準0.37 sにもほぼ到達したため採用する。

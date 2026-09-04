@@ -189,32 +189,77 @@ def _env_on(name: str, default: str = "0") -> bool:
     return (os.environ.get(name) or default).lower() not in ("0", "", "off", "false")
 
 
-def snapshot_untrimmable_caches(caches) -> list[tuple[int, object, object, object]]:
-    """Save the state of only those layers of ``caches`` that cannot be trimmed
+def _copy_cache_tree(value, leaves: list) -> object:
+    """Copy MLX array leaves while preserving the cache metadata shape."""
+
+    if isinstance(value, mx.array):
+        copied = mx.asarray(value, copy=True)
+        leaves.append(copied)
+        return copied
+    if isinstance(value, list):
+        return [_copy_cache_tree(v, leaves) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_cache_tree(v, leaves) for v in value)
+    if isinstance(value, dict):
+        return {k: _copy_cache_tree(v, leaves) for k, v in value.items()}
+    return value
+
+
+def _is_rotating_cache(cache) -> bool:
+    """Identify mlx-lm's rotating cache without importing its concrete class."""
+
+    return (
+        type(cache).__name__ == "RotatingKVCache"
+        and hasattr(cache, "keep")
+        and hasattr(cache, "max_size")
+        and hasattr(cache, "_idx")
+    )
+
+
+def snapshot_untrimmable_caches(caches, *, deep: bool = False) -> list[tuple]:
+    """Save the state of layers that cannot be trimmed
     (``is_trimmable()`` is False -- ArraysCache in the GDN hybrid). Trimmable
     layers (KVCache and the like) can be taken back to any position with
-    ``.trim()``, so they are left untouched here.
+    ``.trim()``, so they are left untouched here. Deep Fallback snapshots also
+    retain RotatingKVCache while its current offset is below ``max_size`` so a
+    later crossing of that window remains restorable.
 
     When the value returned by ``c.state`` is a list (as it is for ArraysCache),
     that getter hands back the internal mutable list itself -- if some other slot
     is updated later, as in ``cache[i] = new_array``, holding only the reference
     means what was supposed to be a "snapshot" gets swapped out for the latest
-    state (each individual mx.array is itself immutable, but the list slot
-    pointing at it does get replaced). So here we ``list(state)`` to copy the list
-    itself, without copying the elements (mx.array is immutable unless explicitly
-    overwritten via ``__setitem__``, so sharing the elements is safe).
+    state. MLX cache implementations can also update their array storage in
+    place (notably RotatingKVCache). With ``deep=True``, every MLX array leaf is
+    copied and evaluated before the snapshot is published, and the fifth field
+    carries the cache's optional metadata state. The default remains the
+    lightweight four-field snapshot used by SpecEngine's existing prefill
+    checkpoints; older four-field snapshots remain accepted by
+    restore_untrimmable_caches().
     """
 
     snapshot = []
     for i, c in enumerate(caches):
-        if c.is_trimmable():
+        # A rotating cache can cross its window between capture and restore.
+        # Deep Fallback checkpoints retain it even while currently trimmable so
+        # that the later full-window state still has a matching snapshot.
+        if c.is_trimmable() and not (deep and _is_rotating_cache(c)):
             continue
-        state = c.state
-        if isinstance(state, list):
-            state = list(state)
-        snapshot.append(
-            (i, state, getattr(c, "left_padding", None), getattr(c, "lengths", None))
-        )
+        if deep:
+            leaves = []
+            state = _copy_cache_tree(c.state, leaves)
+            left_padding = _copy_cache_tree(getattr(c, "left_padding", None), leaves)
+            lengths = _copy_cache_tree(getattr(c, "lengths", None), leaves)
+            meta_state = _copy_cache_tree(getattr(c, "meta_state", None), leaves)
+            if leaves:
+                mx.eval(leaves)
+            snapshot.append((i, state, left_padding, lengths, meta_state))
+        else:
+            state = c.state
+            if isinstance(state, list):
+                state = list(state)
+            snapshot.append(
+                (i, state, getattr(c, "left_padding", None), getattr(c, "lengths", None))
+            )
     return snapshot
 
 
@@ -223,24 +268,38 @@ def restore_untrimmable_caches(caches, snapshot) -> None:
 
     ``ArraysCache.state``'s setter (mlx_lm.models.cache) merely aliases
     (``self.cache = v``), and its ``__setitem__`` mutates that list in place
-    (``self.cache[idx] = value``). Handing it the snapshot's list as-is would
-    therefore make the live cache and the archived checkpoint snapshot the
-    *same* list object -- invisible on this first restore (nothing has
-    written to it yet), but the very next decode round's ``cache[i] = ...``
-    would then silently corrupt the snapshot too, breaking a *second* restore
-    from the same checkpoint entry (measured: a regenerate/exact-repeat sent a
-    third time). So we copy the list here (not its elements -- mx.array is
-    immutable), the same as ``snapshot_untrimmable_caches`` already does on
-    the capture side.
+    (``self.cache[idx] = value``). RotatingKVCache can also mutate array storage
+    in place. Five-field snapshots therefore copy every MLX array leaf as well
+    as list containers and restore the optional ``meta_state`` field. Four-field
+    hand-written snapshots retain the existing lightweight restore behavior and
+    leave the cache's metadata untouched for compatibility.
     """
 
-    for i, state, left_padding, lengths in snapshot:
+    for entry in snapshot:
+        if len(entry) == 4:
+            i, state, left_padding, lengths = entry
+            c = caches[i]
+            c.state = list(state) if isinstance(state, list) else state
+            if left_padding is not None:
+                c.left_padding = left_padding
+            if lengths is not None:
+                c.lengths = lengths
+            continue
+        elif len(entry) == 5:
+            i, state, left_padding, lengths, meta_state = entry
+        else:
+            raise ValueError("cache checkpoint entries must have four or five fields")
         c = caches[i]
-        c.state = list(state) if isinstance(state, list) else state
+        leaves = []
+        c.state = _copy_cache_tree(state, leaves)
+        if meta_state is not None:
+            c.meta_state = _copy_cache_tree(meta_state, leaves)
         if left_padding is not None:
-            c.left_padding = left_padding
+            c.left_padding = _copy_cache_tree(left_padding, leaves)
         if lengths is not None:
-            c.lengths = lengths
+            c.lengths = _copy_cache_tree(lengths, leaves)
+        if leaves:
+            mx.eval(leaves)
 
 
 class ChatSession:

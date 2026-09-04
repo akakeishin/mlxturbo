@@ -2134,6 +2134,94 @@ def test_fallback_runner_reuses_prompt_cache_on_append(monkeypatch):
     assert session.cache is existing_cache
 
 
+def test_fallback_runner_publishes_bounded_rotating_checkpoint(monkeypatch):
+    """FallbackRunner は最後の8 tokenを stream_generate に残し、prefix
+    prefill の終端 callback で absolute checkpoint を session に公開する。"""
+
+    import importlib
+
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    from mlxturbo.spec import restore_untrimmable_caches
+
+    mlx_generate = importlib.import_module("mlx_lm.generate")
+
+    def token(value):
+        return mx.array([[[[float(value)]]]])
+
+    rotating = RotatingKVCache(max_size=2, keep=1)
+    trimmable = KVCache()
+    for value in range(2):
+        rotating.update_and_fetch(token(value), token(value))
+        trimmable.update_and_fetch(token(value), token(value))
+    prompt_cache = [rotating, trimmable]
+    session = FallbackSession()
+    session.publish(prompt_cache, [1, 2])
+    callback_calls = []
+    stream_calls = []
+
+    def fake_generate_step(prompt, model, *, prompt_progress_callback, prompt_cache, **_kwargs):
+        prefix = prompt.tolist()
+        for value in prefix:
+            prompt_cache[0].update_and_fetch(token(value), token(value))
+            prompt_cache[1].update_and_fetch(token(value), token(value))
+        prompt_progress_callback(len(prefix) - 1, len(prefix))
+        prompt_progress_callback(len(prefix), len(prefix))
+        return iter(())
+
+    def fake_stream_generate(
+        model,
+        tokenizer,
+        prompt,
+        max_tokens,
+        sampler=None,
+        logits_processors=None,
+        prompt_cache=None,
+        prompt_progress_callback=None,
+        **_kwargs,
+    ):
+        stream_calls.append(
+            {
+                "prompt": list(prompt),
+                "prompt_cache": prompt_cache,
+                "callback": prompt_progress_callback,
+            }
+        )
+        prompt_progress_callback(0, len(prompt))
+        callback_calls.append((len(prompt) - 1, len(prompt)))
+        prompt_progress_callback(len(prompt) - 1, len(prompt))
+        yield _FakeGenResponse(50, "x")
+
+    monkeypatch.setattr(mlx_generate, "generate_step", fake_generate_step)
+    monkeypatch.setattr(mlx_generate, "stream_generate", fake_stream_generate)
+
+    runner = FallbackRunner(model=object(), tokenizer=object())
+    result = runner.generate(
+        list(range(1, 13)),
+        max_tokens=1,
+        temp=0.0,
+        eos_ids=set(),
+        on_tokens=None,
+        session=session,
+    )
+
+    assert stream_calls[0]["prompt"] == list(range(5, 13))
+    assert stream_calls[0]["prompt_cache"] is prompt_cache
+    assert callable(stream_calls[0]["callback"])
+    assert callback_calls == [(7, 8)]
+    assert result["prefill_reused"] == 2
+    assert [position for position, _ in session.checkpoints] == [4]
+
+    checkpoint = session.checkpoints[0][1]
+    assert len(checkpoint[0]) == 5
+    assert checkpoint[0][4] == ("1", "2", "4", "2")
+    snapshot_keys = checkpoint[0][1][0]
+    rotating.update_and_fetch(token(999), token(999))
+    assert snapshot_keys.tolist() != rotating.keys.tolist()
+    restore_untrimmable_caches(prompt_cache, checkpoint)
+    assert rotating.meta_state == ("1", "2", "4", "2")
+
+
 def test_fallback_runner_discards_and_rebuilds_on_non_append_prompt(monkeypatch):
     """新プロンプトが前回処理済み列の追記でなければ、古い cache は使わず
     全量を新しい cache へ流し直す (部分巻き戻しはしない)。"""
@@ -4304,6 +4392,115 @@ def test_restore_untrimmable_caches_does_not_alias_the_stored_snapshot():
     # これが壊れていると、次にこの位置へ復元しようとした誰か (別スロットの
     # 再利用など) も巻き添えになる。
     assert float(snapshot[0][1][0].item()) == 1.0
+
+
+def test_deep_checkpoint_copies_rotating_cache_state_and_metadata():
+    """RotatingKVCache の in-place 更新後も、5-field snapshot が状態と
+    keep/max_size/offset/_idx をそのまま復元できる。KVCache は trim 可能
+    なので snapshot 対象に含めない。"""
+
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    from mlxturbo.spec import restore_untrimmable_caches, snapshot_untrimmable_caches
+
+    def token(value):
+        return mx.array([[[[float(value)]]]])
+
+    rotating = RotatingKVCache(max_size=4, keep=1)
+    trimmable = KVCache()
+    for value in range(4):
+        rotating.update_and_fetch(token(value), token(value))
+        trimmable.update_and_fetch(token(value), token(value))
+    mx.eval([rotating.keys, rotating.values])
+    expected_meta = rotating.meta_state
+    expected_keys = mx.asarray(rotating.keys, copy=True)
+    mx.eval(expected_keys)
+
+    snapshot = snapshot_untrimmable_caches([rotating, trimmable], deep=True)
+
+    assert [entry[0] for entry in snapshot] == [0]
+    assert len(snapshot[0]) == 5
+    assert snapshot[0][4] == expected_meta
+
+    rotating.update_and_fetch(token(99), token(99))
+    mx.eval(rotating.keys)
+    assert snapshot[0][1][0].tolist() == expected_keys.tolist()
+
+    restore_untrimmable_caches([rotating, trimmable], snapshot)
+    assert rotating.meta_state == expected_meta
+    assert rotating.keys.tolist() == expected_keys.tolist()
+
+    # Restoring again after another in-place write proves restore does not
+    # alias the archived MLX array leaves back into the live ring buffer.
+    rotating.update_and_fetch(token(100), token(100))
+    restore_untrimmable_caches([rotating, trimmable], snapshot)
+    assert rotating.meta_state == expected_meta
+    assert rotating.keys.tolist() == expected_keys.tolist()
+
+
+def test_deep_checkpoint_keeps_rotating_cache_before_window_fills():
+    """RotatingKVCache が checkpoint 時点では trim 可能でも、その後
+    max_size を跨いだ場合に 5-field snapshot から復元できる。"""
+
+    from mlx_lm.models.cache import RotatingKVCache
+
+    from mlxturbo.spec import restore_untrimmable_caches, snapshot_untrimmable_caches
+
+    def token(value):
+        return mx.array([[[[float(value)]]]])
+
+    rotating = RotatingKVCache(max_size=4, keep=1)
+    for value in range(2):
+        rotating.update_and_fetch(token(value), token(value))
+    expected_meta = rotating.meta_state
+    expected_keys = mx.asarray(rotating.keys[..., : rotating.offset, :], copy=True)
+    mx.eval(expected_keys)
+
+    snapshot = snapshot_untrimmable_caches([rotating], deep=True)
+    assert [entry[0] for entry in snapshot] == [0]
+    assert snapshot[0][4] == expected_meta
+
+    for value in range(2, 6):
+        rotating.update_and_fetch(token(value), token(value))
+    restore_untrimmable_caches([rotating], snapshot)
+
+    assert rotating.meta_state == expected_meta
+    assert rotating.keys.tolist() == expected_keys.tolist()
+
+
+def test_select_session_restores_gemma_style_rotating_checkpoint():
+    """RotatingKVCache と KVCache の混在で window を跨いだ後も、server の
+    partial-LCP restore が同じ session を checkpoint 位置へ戻す。"""
+
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+    from mlxturbo.spec import snapshot_untrimmable_caches
+
+    _install_state(FakeRunner(tokens_to_emit=[]))
+
+    def token(value):
+        return mx.array([[[[float(value)]]]])
+
+    rotating = RotatingKVCache(max_size=4, keep=1)
+    trimmable = KVCache()
+    for value in range(4):
+        rotating.update_and_fetch(token(value), token(value))
+        trimmable.update_and_fetch(token(value), token(value))
+    checkpoint = snapshot_untrimmable_caches([rotating, trimmable], deep=True)
+    for value in range(4, 6):
+        rotating.update_and_fetch(token(value), token(value))
+        trimmable.update_and_fetch(token(value), token(value))
+
+    session = FallbackSession()
+    session.publish([rotating, trimmable], list(range(1, 7)), checkpoints=[(4, checkpoint)])
+    server.STATE.session_pool[0] = session
+
+    got = server._select_session([1, 2, 3, 4, 90, 91])
+
+    assert got is session
+    assert got.processed == [1, 2, 3, 4]
+    assert got.cache[1].offset == 4
+    assert got.cache[0].meta_state == ("1", "4", "4", "4")
 
 
 def test_select_session_reuses_via_checkpoint_when_trim_is_not_possible_even_with_mtp_valid():

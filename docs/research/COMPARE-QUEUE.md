@@ -636,3 +636,11 @@ mlxturbo の行は「1・3 着地」待ちで未実施。
   27B ほど目立たない。draft を入れると 3.51 / 3.48 s に悪化する。
 - **26B (アクティブ 3.8B) の decode は 27B (dense) の 3〜4 倍。**素の decode で
   oMLX 122 / mlx-serve 109 / mlx-lm 87 tok/s。投機の余地はそもそも小さい。
+
+## mlxturbo接頭辞checkpoint修復後 (2026-09-04 17:56)
+
+FallbackRunnerへ`RotatingKVCache`の深いcheckpointを追加後、`--reps 2 --warm-long 4000`で
+再計測した。4kは冷2.918 / 温**0.382 s**、17kは冷14.783 / 温**0.415 s**。
+旧煙試験の4k温2.76 s比では-86.1%、7.2倍で、mlx-lmの0.37 sと同水準になった。
+実サーバーでcheckpoint復元と全量再構築の64-token出力も完全一致した。条件が異なるため、この行で
+decode速度のエンジン間順位は更新しない。

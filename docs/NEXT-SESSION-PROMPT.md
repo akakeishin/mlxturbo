@@ -624,3 +624,18 @@ rg -n "_build_rerank|_draft_argmax|RERANK_BITS|RERANK_TOP|topk" mlxturbo/spec_fl
 ```bash
 rg -n "Gemma|warm TTFT|QuantizedKVCache|TurboQuant|assistant" docs/BACKLOG.md docs/research mlxturbo tools
 ```
+
+## Gemma 4 温 TTFT 修復後の更新 (2026-09-04 17:56 JST)
+
+- **完了・採用**: `RotatingKVCache` の深いcheckpointと末尾8 token保持をFallbackRunnerへ追加。
+- **速度**: 4k温TTFT 2.76→0.382 s (-86.1%、7.2倍)、17k温TTFT 0.415 s。
+- **正しさ**: 実Gemmaサーバーでcheckpoint復元と全量再構築の64-token出力が完全一致。
+  `bench/test_server.py` + `bench/test_fusions_other_family.py` は437 passed。
+- **次**: Gemma 4の同じhiddenに対するpre-feedforward norm 2本とRouter normの共通統計化を、
+  生成経路の同一process A/Bで判定する。その後に組み込み`QuantizedKVCache`、TurboQuant。
+
+再開の1コマンド:
+
+```bash
+rg -n "pre_feedforward_layernorm|pre_feedforward_layernorm_2|class Router|RMSNorm" .venv/lib/python*/site-packages/mlx_lm/models/gemma4_text.py mlxturbo
+```

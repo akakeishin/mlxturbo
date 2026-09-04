@@ -847,10 +847,15 @@ MLX の `quantized_matmul` は M=1 (qmv) で 400 GB/s 級なのに M=2〜8 (fast
 冷 micro では K/V を切る変種が 13〜18% 速く、fp32 参照への距離は同じ。17k S=3 で 0.256 → 0.221 ms/層の余地 (`scratchpad/agent-27b-sdpa-split.md` → `docs/research/AGENT-LEDGERS-DIGEST-2026-09-04.md`)。
 ゲートは 17k A/B と `tools/vendor_fingerprint.py`。qwen4_exp を汎用の分岐ルートに載せるときに一緒に。
 
-## Gemma 4 (FallbackRunner 経路) の温 TTFT が冷と同じ (2026-09-04 13:22、未着手)
+## 完了: Gemma 4 (FallbackRunner 経路) の温 TTFT が冷と同じ (2026-09-04 17:56)
 
 煙試験 (`smoke-gemma4-26b-mlxturbo-nodraft-0904.json`) で 4k の温 TTFT 2.76 s 対 冷 2.69 s。mlx-lm は 0.37、mlx-serve は 0.18。FallbackRunner の session (接頭辞の再利用) が gemma4 では効いていない
 (KV の形が違う、あるいは cache のスナップショットが gemma4 の cache 型に対応していない疑い)。27B の spec 経路は 0.27 で効いている。Gemma レーンの最初の直し。
+
+`RotatingKVCache` の状態と ring metadata を深い checkpoint に保存し、プロンプト末尾8 tokenを
+残した位置から復元するようにした。`--reps 2 --warm-long 4000` で温 TTFT は4k **0.382 s**
+(旧2.76 s比 -86.1%、7.2倍)、17k **0.415 s**。実サーバーで checkpoint 復元と全量再構築の
+64-token出力が完全一致し、関連437 testも通った。次は Gemma の norm 331本/stepの削減。
 
 ## 27B の capture のモジュール呼び出し (`MLXTURBO_SPEC_CAPTURE_MODULE=1`) が幅 5/7/8/9 の verify だけ数 ulp ずれる (2026-09-04、原因未特定、既定は写しのまま)
 
