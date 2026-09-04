@@ -953,3 +953,11 @@ fallback無しでANE実行、M3 Ultra 290倍実時間を報告する。固定窓
 65,536-row coarse headをANEへ**置換**する小実験を行う。継続条件は (i) CPU_AND_NEがCPU_ONLYより
 十分速くANE参入を確認、(ii) MLX側headを外した定常RSSが増えない、(iii) 入出力・top-kを含むp50が
 MLX比20%以上短い、(iv) short / 17kの壁時計とrecallが非悪化。1つでも外れれば再び畳む。
+
+## 畳んだ: Flash-Next SDPAのK/V prefix trim (2026-09-04 17:23)
+
+通常attentionの幅分割ごとに不可視なK/V末尾を切る案。合成S=2/3/4/6/8と関連18 testは通ったが、
+splitを両armでonにした専用ABBAで短3本のms/tok **+5.2%**、ms/round +5.0%。生成列とtok/roundは
+一致した。17kはQSA decodeが当該経路を迂回して発火ゼロ。slice viewと可変shapeの代金が読み飛ばしを
+上回るため、実装・一時knobとも残さず閉じる。`sdpa-split` knob自体はQSA有無も変えるので、この案の
+比較には再利用しない。

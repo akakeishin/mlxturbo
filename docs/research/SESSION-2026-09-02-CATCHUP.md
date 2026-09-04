@@ -3197,3 +3197,24 @@ Vozは467MBの固定ASRグラフをfallback無しでANEへ載せた有力な実�
 展開とPython/MLX境界の代金は実機依存。既存M3 Max実測もANEはGPU占有時の8k以下で勝つが、空きGPUと
 16kでは負けている。full model移植は再開せず、FR-Spec 65,536-row head完成後だけ、定常RSS非増加・
 I/O込み20%以上・short/17k非悪化の置換実験を行う。
+
+### 2026-09-04 17:23 Flash-Next SDPAのK/V prefix trimは短文+5.2%で不採用
+
+通常attentionの幅分割は各query塊から未来のK/V列を見ないので、K/Vとbool maskを
+`offset + t1`まで切る案を試した。合成では非ゼロoffset、S=2/3/4/6/8、fp32/bf16が従来の
+full K/V版と許容差内で一致し、関連18 testとvendor fingerprintも通った。
+
+既存の`sdpa-split` knobはoff側でQSA decodeまで外すため、今回の差だけを測る一時
+`sdpa-prefix` knobを作り、split自体は両armでonに固定した。短3本 × 512の同一process ABBA:
+
+| 短文 | prefix trim | full K/V | 差 |
+|---|---:|---:|---:|
+| ms/tok | 25.255 | 24.008 | **+5.2%** |
+| ms/round | 54.777 | 52.157 | **+5.0%** |
+| tok/round | 2.186 | 2.186 | 0.0% |
+
+生成列は3/3で一致。筐体の熱で絶対値は18ms/tok台から24ms/tok台へ落ちたが、ABBA内で
+prefix側が全prompt遅く、round単価にも同じ符号が出た。17kでは既定のQSA decodeが通常attentionを
+迂回し、このsliceは発火しない。したがって文脈長gateを足さず、実装と一時knobを戻して不採用とする。
+結果は`qwen4-sdpa-prefix-direct-short-0904.json`。途中の`qwen4-sdpa-prefix-17k-0904.json`は
+knob交絡を発見して中断した不完全runなので採否には使わない。

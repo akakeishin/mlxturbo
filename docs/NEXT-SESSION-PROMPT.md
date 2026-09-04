@@ -579,3 +579,17 @@ rg -n "enable_sdpa_split|enable_sdpa_split_generic|_model_layers|_arch_registry"
 ```bash
 rg -n "def _verify|def _draft_chain|_staged_forward|_draft_argmax" mlxturbo/spec_flash.py
 ```
+
+## Flash-Next K/V prefix trim 決着後の更新 (2026-09-04 17:23 JST)
+
+- **完了・不採用**: SDPA幅分割の各塊でK/Vを`offset+t1`まで切る案は、短3本で
+  ms/tok +5.2% / ms/round +5.0%。生成列とtok/roundは同一だった。
+- **17kでは対象外**: 既定QSA decodeが通常attentionを迂回するため、このsliceは発火しない。
+- **次**: fixed-M4は幅4への固定ではなく、cache offsetとGDN/PLE/KV/indexer状態を明示した
+  state-in/state-out境界が作れるかを先に合成検査する。既存compile失敗を無視したgraphbank移植はしない。
+
+再開の1コマンド:
+
+```bash
+rg -n "def _verify|def _draft_chain|def _staged_forward|def capture|def rollback" mlxturbo/spec_flash.py
+```
