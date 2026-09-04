@@ -3915,3 +3915,11 @@ entry 7個のうち追加割当が古い6組だけなので、実測前の粗い
 `scratchpad/log-hot-prefill-full-0905.txt`（どちらもgitignore）。次はFlash以外のTTFT非分割区間を
 明示してP0を閉じる。その後、resetでLRU順位を動かさない別traceを作り、count-8とbyte-budgetを
 比較する。実tokenizer retemplate、開始前容量予約、10% scratch余白、OOM/swap 0がP1の前提。
+
+### 2026-09-05 04:06 hot prefill P0完了: 非Flash TTFTを非分割と明示
+
+Flash以外のrunnerは内部のprefill完了境界を公開できず、従来は`_ttft_phase`が欠落するだけだった。
+debug requestだけ`{"status": "runner_unsplit"}`を付け、生成ログでは
+`ttft-phase: runner_unsplit (prefill+first_token)`と表示する。stream/non-streamの両経路を対象にし、
+通常requestにはfieldも時計も追加しない。対象5 testと`bench/test_server.py`全455 testが合格した
+(`d083a42`)。これでP0は完了し、次はprospective admissionと固定multi-session traceを持つP1へ進む。

@@ -151,8 +151,9 @@ preemptionは、退避時ではなく復帰prefill完了時の実入力token数�
 50kのp95はappendが0.021/0.196/0.538/0.945秒、末尾書換えが
 0.111/0.341/0.466/0.964秒。44分連続負荷のためcold絶対値は熱を含み、冷却時のcold基準を
 置き換えない。hot側は全反復で50k suffix 256まで1秒未満だった。実tokenizerでのretemplateと
-複数session競合はP1へ分ける。Flash以外でrunner内prefill/first-tokenを分割できない区間の明示だけが
-P0の残件である。
+複数session競合はP1へ分ける。Flash以外のrunnerは内部のprefill/first-token境界を持たないため、
+debug telemetry/logで`runner_unsplit (prefill+first_token)`と明示した。通常requestは不変で、
+server全455 testを通過した (`d083a42`)。これでP0は完了。
 
 ### P1: byte-budget比較
 

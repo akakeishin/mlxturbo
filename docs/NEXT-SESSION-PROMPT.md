@@ -954,8 +954,9 @@ BIGLOCK_PRIO=1 tools/biglock.sh .venv/bin/python bench/hot_prefill_bench.py --he
   `7713f23`。対象test 11、server全453 testを通過。
 - 50k pool総量p50は2.079 GiB/session、8本で約16.63 GiB。byte model差0.218%、最大1.232%。
   cold 50kは長時間負荷で95.40〜105.53秒へ熱変動したため、冷却時のcold基準を置き換えない。
-- 次はFlash以外のrunnerで内部prefill/first-tokenを分割できないことをdebug出力へ明示してP0を閉じる。
-  その後、prospective admission、実tokenizer retemplate、固定multi-session traceを備えたP1で
+- 非Flash runnerはdebug時に`runner_unsplit (prefill+first_token)`を明示するようにし、通常requestを
+  変えずserver全455 testを通してP0を閉じた (`d083a42`)。次はprospective admission、
+  実tokenizer retemplate、固定multi-session traceを備えたP1で
   count-8とbyte-budget LRUを比較する。value scoreは定義とhold-out勝利が得られるまで後段。
 
 結果は`bench/results/hot-prefill-full-0905.json`、ログは
@@ -964,5 +965,5 @@ BIGLOCK_PRIO=1 tools/biglock.sh .venv/bin/python bench/hot_prefill_bench.py --he
 再開の1コマンド:
 
 ```bash
-rg -n "SUPPORTS_TTFT_PHASES|trace_timing|_ttft_phase|ttft-phase" mlxturbo/runner.py mlxturbo/server.py
+rg -n "max_sessions|session_pool|evict|allocated_bytes|session_id" mlxturbo/server.py bench/hot_prefill_bench.py
 ```

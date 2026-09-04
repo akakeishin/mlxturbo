@@ -1153,7 +1153,8 @@ TTFT区間の明示。その後にbyte-budget LRU比較へ進む。
 - 44分連続負荷のcold 50kは95.40〜105.53秒まで熱を含むので、冷却時のcold基準を置き換えない。
   実測正本は`docs/research/HOT-PREFILL-DESIGN-2026-09.md`とCATCHUP。
 
-残るP0はFlash以外のrunner内でprefill/first-tokenを分割できない区間の明示だけ。P1はcount-8と
-byte-budgetを同じ固定multi-session traceで比較する。開始前の容量予約、実tokenizer retemplate、
+P0最後の非Flash runnerも、debug時に`runner_unsplit (prefill+first_token)`を返すようにし、
+stream/non-streamとserver全455 testを通して完了した (`d083a42`)。P1はcount-8とbyte-budgetを
+同じ固定multi-session traceで比較する。開始前の容量予約、実tokenizer retemplate、
 10% scratch余白、OOM/swap 0、予測差5%以内を前提とする。value scoreは式・減衰・tie-breakが
 未定義なので、byte-LRUよりhold-out traceで明確に勝てる定義ができるまで既定候補にしない。
