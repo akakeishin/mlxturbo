@@ -131,10 +131,11 @@ fastmlx/mlxturbo 側の現状:
 10. **`prefill_attn` に S の下限が無い。**decode 幅でも比のゲートを通れば
     入るので、`--knob prefill-attn` は prefill だけの knob ではない。
     A/B は `prefill_s` と `ms_per_tok` を別々に読むこと。
-11. **`prefill_attn` がキャッシュの内部表現に依存する** (確保済みバッファと
-    確保幅を直接受け取る)。連続性 (strides) を見ていないので、**keys が
-    ビューや遅延 concat になるキャッシュ型が入ると、`ensure_row_contiguous`
-    が CAP 幅を毎回コピーする性能罠に静かに落ちる。**
+11. **解決済み (2026-09-04): `prefill_attn` の直接バッファ契約を固定。**
+    `KVCache.update_and_fetch`を継承した標準KVCacheだけを受け、duck typeや
+    `update_and_fetch` overrideを持つcacheは既存attentionへfail closedする。
+    形だけ同じview / 遅延concatが将来入り、`ensure_row_contiguous`がCAP幅を
+    毎回暗黙コピーする性能罠を防ぐ。契約4 testと融合attentionのGPU検証を通した。
 12. **`_segments_gpu` が 1 MoE 層あたり 2 回走る。**`fused.py` が
     `gather_gate_up` と `gather_down` に同じ添字を渡すのに、それぞれが内部で
     呼び直す。中身は 15 本前後の直列小カーネルで、それを倍払っている。

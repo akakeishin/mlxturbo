@@ -759,3 +759,18 @@ BACKLOG B7/C9を閉じた。
 ```bash
 .venv/bin/python -m pytest bench/test_gdn_prework_predicate.py -q
 ```
+
+## prefill attentionのKV直接読出し契約を固定 (2026-09-04 20:19 JST)
+
+`prefill_attn`は確保済みKV本体をMetalへ渡してprefix viewの暗黙コピーを避ける。
+今後、形だけ同じview / 遅延concat型が追加されてもCAP幅を毎回コピーしないよう、
+標準`KVCache.update_and_fetch`をそのまま継承するcacheだけを受ける契約に狭めた。
+Flash-Nextの`_AttnCache`は継承のみなので従来どおり発火し、override版とduck typeは
+既存attentionへfail closedする。契約4 test、合成GPU配列4条件、合成モデルで
+カーネル2回発火を含む正当性検査に合格。BACKLOG C11を閉じた。
+
+再開の1コマンド:
+
+```bash
+BIGLOCK_PRIO=0 tools/biglock.sh .venv/bin/python tools/verify_prefill_attn.py
+```

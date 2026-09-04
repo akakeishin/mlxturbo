@@ -66,6 +66,7 @@ from __future__ import annotations
 from typing import Any
 
 import mlx.core as mx
+from mlx_lm.models.cache import KVCache
 
 from . import _fire
 
@@ -391,6 +392,16 @@ def _kv_buffers(cache, k: mx.array, v: mx.array, kv_len: int):
 
     条件に合わないキャッシュでは ``None`` を返す (呼び出し側は既存経路へ)。
     """
+    # 直接バッファを読める根拠は、KVCache.update_and_fetch が行連続の
+    # 確保済み配列を所有し、その prefix view だけを返す契約にある。同じ形の
+    # duck type や override 版は遅延 concat / view を使えるため、受けると
+    # Metal の引数変換が CAP 幅を黙って全コピーしうる。その実装専用の契約を
+    # 足すまでは fail closed にする。
+    if not isinstance(cache, KVCache):
+        return None
+    if type(cache).update_and_fetch is not KVCache.update_and_fetch:
+        return None
+
     keys = getattr(cache, "keys", None)
     values = getattr(cache, "values", None)
     if not isinstance(keys, mx.array) or not isinstance(values, mx.array):

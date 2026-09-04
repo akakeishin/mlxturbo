@@ -3452,3 +3452,16 @@ training、`cache.lengths`の5条件を`gdn_prework.wants()`へ集約した。�
 実Flash-Nextでは8kでcheckpointありのgroup=0/4を比較し、**110 cache配列すべて
 bit-identical**。checkpointなしは既知のtail-in-group 2047+1丸め差だけで、この判定共有とは
 無関係。BACKLOG B7とC9を閉じた。
+
+### 2026-09-04 20:19 `prefill_attn`のKV直接読出しを標準契約へ限定
+
+融合attentionは`KVCache.update_and_fetch`が返す途中切りviewではなく、cacheが持つ確保済み
+KV本体とCAP幅をMetalへ渡す。これにより17kで約35MB/層の
+`ensure_row_contiguous`暗黙コピーを避けている一方、従来は配列形状しか確認せず、将来の
+view / 遅延concat型も誤って受ける穴があった。
+
+標準`KVCache`またはその`update_and_fetch`をoverrideしないsubclassだけを受けるようにした。
+現行Flash-Nextの`_AttnCache`は単純継承なので発火条件は変わらない。override版とduck typeは
+既存attentionへfail closedする。契約テストは**4 passed**。GPU検証は実モデル形状の配列4条件が
+全て許容内、合成Flash-Nextでカーネルが2回発火し、QSA不活性域はbit一致、全出力が
+`1e-4`以内で総合合格。既存の他モデル融合契約も**10 passed**。BACKLOG C11を閉じた。
