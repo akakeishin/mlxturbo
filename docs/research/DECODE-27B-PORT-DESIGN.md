@@ -48,3 +48,17 @@
 - maint (rollback と MTP の積み直し) に同期が無いので、その GPU 費用は次 round の draft の同期に乗る (相の帰属が歪む)。
 - `_gate_depth` の rollback コストは固定定数 0.19 (spec.py:63)。prime / presync / DepthController は spec_flash 側だけ。
 - 道具: `tools/decode_round_anatomy_generic.py` (spec.mx の proxy で eval の回数と待ち、5 メソッドを包んで相ごとに sync / build / glue、GPU は `decode_gpu_trace.Probe`)。結果は `bench/results/round-anatomy-27b-0904.json` / `scratchpad/anatomy-27b-0904.log`。
+
+## 計測 (anatomy 2026-09-04 09:36、短文脈 case 0 のみ。以降は `staged` の import で落ちた = 第 1 段が `staged.py` を消している最中)
+
+| | 値 |
+|---|---|
+| round (clean) | **83.6 ms**、tok/round 2.21、72 round |
+| draft (MTP 連鎖 + lm_head 射影 + 同期) | **21.5 ms (25.7%)** |
+| verify (S ≈ 4 の trunk forward + 受理) | **61.9 ms (74.1%)** |
+| maint (rollback + MTP 積み直し) | 0.2 ms (同期が無いので次 round の draft に乗る) |
+| 非投機 (S=1、MTP / lookup 無し) | **42.4 ms/token** (投機は 37.9 ms/tok → **投機の利得は 1.12 倍しか無い**) |
+| lookup 無し (MTP だけ) | 83.1 ms/round (lookup の費用 +0.5 ms) |
+| 発火 | `rms_norm_gated` 3456 = 48 層 × 72 round (S=1 の経路だけ。S>1 の verify には当たっていない) |
+
+読み: 素の 1 トークン forward 42 ms (帯域下限 35 + 糊 7)。verify は S≈4 で 62 ms = 42 + **行の費用 20 ms** (GDN の再帰が行ごとに逐次 48 層 × 4、`_linear_capture` の写しで自前部品なし、状態の控え)。draft は 4 リンクで 21 ms = 1 リンク 5 ms (lm_head 0.64 GB の読み 1.5 ms + MTP 層 + 同期)。**的の順: verify の行の費用 (20 ms、第 1 段) → draft の同期と本数 (21 ms、第 2 段) → S=1 の糊 (7 ms)。**mlx-serve の 23 ms/tok は tok/round 2.2 なら round 50 ms 相当 = うちの verify 62 ms より軽い。
