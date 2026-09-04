@@ -2909,3 +2909,14 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - 修正 (`kernels/dispatch.py:290-301`): `DispatchedQuantizedLinear.__call__` の先頭で、非活性 (`dispatch_scope()` の外) なら `super().__call__(x)` に委ねる → 基底の `enable_qmm_wide` の差し替えが効く。活性の枝 (経路表) は不変。修正前の実機: 印 368 本、発火 **0**。修正後: 4k 736 / 17k 2944。
 - A/B (`decode_ab_generic --knob MLXTURBO_QMM_WIDE=auto,off`、`bench/results/qmm-wide-27b-fix-{4k,17k}.json`): prefill_s **17.28 対 18.58 (-7.0%)**、**84.09 対 89.03 (-5.6%、4 本とも)**、tok/round ±0、生成列 64 トークン全長一致 (ビット一致の設計どおり)。修正前は +0.4% (差なし)。Flash-Next は指紋一致で無影響。テスト 2 本追加 (修正を外すと落ちる)。
 - lm_head の切り分け (`tools/probe_lm_head_bw.py` 一般化、715 MB): 非常駐 335 GB/s / 常駐アイドル 344 / decode 直後 341 = **その状態の天井の 97〜99%**。Flash-Next の「常駐時 109 GB/s」は 27B では再現しない (常駐量 98 対 15〜17 GB の差)。第 2 段の「lm_head 4.6 ms = 139 GB/s」は単体 2.1 ms なので、差 2.5 ms は trace の per-kernel の帰属 (CB 按分) の側。**27B の lm_head は的ではない。**
+
+### 2026-09-04 12:28 層単位 `mx.compile` の PoL (Flash-Next、`tools/compile_layer_poc.py`、`scratchpad/agent-fn-compile-poc.md`): 層まるごとは原理的に不可、**MoE ブロックだけ可で -1.2% (ビット一致) → 既定 on に配線する**
+
+| 単位 | 可否 | 理由 |
+|---|---|---|
+| HC の read / write、router | 可 | 純関数 (取り分 ±0) |
+| **MoE ブロック (`SparseMoeBlock.__call__`)** | **可** | 純関数。dispatch -7.7%、短 ms/round **-1.2%** (3 本とも)、17k **-1.3%**、tok/round 完全一致 |
+| GDN / attention ブロック、層まるごと、forward まるごと、`_staged_forward` | **不可** | compile は再トレースしないので cache の副作用 (`cache[0]=` 等) がトレース時の 1 回で固定され 2 回目に古い。PLE の n-gram は host 同期。`inputs=` / `outputs=` で状態を宣言しても vendor の GDN には効かない。`shapeless=True` は全滅 (Slice / Split / reshape) |
+
+- 固定費: 1 グラフ 3〜6 ms のトレース × 48 層 × 形。短文脈 prefill の初回 +0.6 s (98 グラフ)、本番は S=1〜4 で ≈ 240 グラフ ≈ 1.5 s → **起動時の warm-up で払う** (TTFT に乗せない)。
+- 判定: 判定線 (-3%) には届かないが代金ゼロ (ビット一致、遅くなる文脈なし) → 既定 on に配線 (エージェント、`scratchpad/agent-fn-moe-compile.md`)。レーン 9 (層単位 compile) はこれで最終回答 = 「層は不可、MoE ブロックだけ」。
