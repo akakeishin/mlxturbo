@@ -37,8 +37,9 @@ def split_and_checkpoint_tail(
     retention: int,
     snapshot_fn: Callable[[Any], Any],
     forward_head: Callable[[mx.array], Any],
+    tail_size: int = 1,
 ) -> tuple[mx.array, tuple]:
-    """最終チャンクの末尾 1 トークンを切り離し、手前 (head) を forward して
+    """最終チャンクの末尾 ``tail_size`` トークンを切り離し、手前を forward して
     そこにも checkpoint を積む。
 
     ``checkpoints`` が None (checkpoint 機構が無効 = サーバー経路以外の
@@ -47,8 +48,8 @@ def split_and_checkpoint_tail(
     まるごと 1 回で forward すればよい (no-op)。
 
     分割する場合:
-      1. ``forward_head(head)`` を呼ぶ -- head = chunk の末尾 1 トークンを
-         除いた部分。戻り値はエンジンごとに違う中間結果 (例:
+      1. ``forward_head(head)`` を呼ぶ -- head = chunk の末尾 ``tail_size``
+         トークンを除いた部分。戻り値はエンジンごとに違う中間結果 (例:
          spec_flash.py の ``(h0, cap0.hyper)``、spec.py の ``h0`` 単体)。
          tuple でなければ 1 要素の tuple に包む。
       2. その戻り値をまとめて ``mx.eval`` する (元の各エンジンの実装が
@@ -76,11 +77,13 @@ def split_and_checkpoint_tail(
     サーバー経路だけなので、generate() や検証プローブ (checkpoints=None)
     はこの分岐を通らない。
     """
-    if checkpoints is None or chunk.shape[-1] <= 1:
+    if tail_size < 1:
+        raise ValueError("tail_size must be at least 1")
+    if checkpoints is None or chunk.shape[-1] <= tail_size:
         return chunk, ()
 
-    head = chunk[..., :-1]
-    tail = chunk[..., -1:]
+    head = chunk[..., :-tail_size]
+    tail = chunk[..., -tail_size:]
     result = forward_head(head)
     if not isinstance(result, tuple):
         result = (result,)

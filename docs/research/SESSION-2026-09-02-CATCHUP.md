@@ -3337,3 +3337,25 @@ CLI周辺7 testが通った。実サーバーも`投機デコード有効 (MTP: 
 64 token・短文1本の入口確認は**119.8 tok/s**、server側tok/stepは3.0〜3.5。先に別条件で取った
 投機なし91.0 tok/sより31.7%高いが、thinking指定と熱履歴を揃えた同一条件A/Bではないため、これは
 採否の数字にしない。次は通常冷却でAR/MTPの条件を揃え、複数prompt・512 tokenと4kを測る。
+
+### 2026-09-04 18:36 Qwen3.6 MTPは短+51.0%・4k +57.3%、追記TTFTも0.49秒へ修復
+
+現在の常時冷却、thinking指定を`chat_template_kwargs.enable_thinking=false`に統一し、ARを先、MTPを後に
+短/4k各3 prompt × 512 tokenで測った。別process比較なので採否の最終形ではないが、後段のMTP側が
+熱的に有利になる並びではない。
+
+| 文脈 | AR | MTP | 差 | MTP tok/step |
+|---|---:|---:|---:|---:|
+| 短 | 86.9 tok/s | **131.3 tok/s** | **+51.0%** | 2.39〜2.82 |
+| 4k | 83.7 tok/s | **131.7 tok/s** | **+57.3%** | 2.92〜3.34 |
+
+MTPは後半の4kでも131.7 tok/sを維持し、現在の常時冷却で連続負荷を扱える。一方、最初の測定では
+会話追記時にLCPが3,823 tokenあってもcheckpointが3,830にしかなく、2,048まで戻って2,301〜2,307
+tokenを再prefillし、温TTFTが1.85秒だった。Qwen3.6の再templateは末尾8 tokenまで変わるため、
+SpecEngineもFallbackRunnerと同じく末尾8 tokenを通常prefillへ残し、その手前へcheckpointを置くようにした。
+
+修正後の4k × 2 prompt × 512 tokenでは3,817 / 3,823 tokenを再利用し、新規は各532 token、温TTFTは
+**0.491秒**。修正前1.851秒比-73.5%、ARの0.626秒も下回った。MTP付きcheckpoint復元と全量再構築の
+生成一致を含む`test_server` + draft-chainは439 passed。decode中央値は129.2 tok/sで維持したため採用する。
+
+ユーザーは18時台、追加の強冷却ではなく現在の常時冷却をフルベンチ条件にすると決定した。

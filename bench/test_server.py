@@ -4597,9 +4597,9 @@ def test_checkpoint_restore_end_to_end_matches_full_rebuild_with_mtp():
         session=sess,
     )
     assert sess.mtp_valid is True  # 実運用の通常状態を再現できていることの確認
-    # 3,6,9 はチャンク境界。11 は BPE 末尾分割 (prefill_common の
-    # split_and_checkpoint_tail を dense 経路へ移植したぶん)、12 が全体。
-    assert [pos for pos, _ in sess.checkpoints] == [3, 6, 9, 11, 12]
+    # 3,6,9,12 はチャンク境界。最終chunkは8 token以下なので、FallbackRunner
+    # と同じく追加分割しない。
+    assert [pos for pos, _ in sess.checkpoints] == [3, 6, 9, 12]
 
     full_history = turn1_prompt + r1["tokens"]
     turn2_prompt = full_history[:-2] + [40, 41]  # 末尾 2 トークンだけ違う
@@ -4645,6 +4645,126 @@ def test_checkpoint_restore_end_to_end_matches_full_rebuild_with_mtp():
     )
 
     assert r2_reused["tokens"] == r2_fresh["tokens"]
+
+
+def test_spec_checkpoint_reserves_eight_prompt_tokens_and_matches_rebuild():
+    """Qwen3.6実測と同じ、prompt末尾8 tokenが再templateで変わる形を固定する。"""
+
+    from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
+
+    from mlxturbo.mtp import MTPModule
+
+    mx.random.seed(12)
+    args = TextModelArgs(
+        model_type="qwen3_5",
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=6,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=48,
+        linear_num_value_heads=4,
+        linear_num_key_heads=2,
+        linear_key_head_dim=16,
+        linear_value_head_dim=16,
+        linear_conv_kernel_dim=4,
+        full_attention_interval=3,
+        head_dim=8,
+        tie_word_embeddings=True,
+    )
+    text_model = TextModel(args)
+    mx.eval(text_model.parameters())
+    mtp = MTPModule(args)
+    mx.eval(mtp.parameters())
+    engine = SpecEngine(
+        SimpleNamespace(language_model=text_model), mtp=mtp, prefill_step_size=64
+    )
+
+    turn1_prompt = list(range(20))
+    sess = ChatSession()
+    engine.generate(
+        turn1_prompt,
+        max_tokens=4,
+        n_draft=2,
+        max_draft=2,
+        lookup_len=0,
+        temp=0.0,
+        eos_ids=set(),
+        session=sess,
+    )
+    assert [pos for pos, _ in sess.checkpoints] == [12, 20]
+
+    turn2_prompt = turn1_prompt[:12] + list(range(32, 40))
+    cp_pos = server._try_checkpoint_restore_session_cache(sess, lcp=12)
+    assert cp_pos == 12
+    sess.processed = sess.processed[:cp_pos]
+    sess.checkpoints = [c for c in sess.checkpoints if c[0] <= cp_pos]
+    sess.mtp_cache = None
+    sess.h_last = None
+    sess.mtp_valid = False
+
+    reused = engine.generate(
+        turn2_prompt,
+        max_tokens=4,
+        n_draft=2,
+        max_draft=2,
+        lookup_len=0,
+        temp=0.0,
+        eos_ids=set(),
+        session=sess,
+    )
+    fresh = engine.generate(
+        turn2_prompt,
+        max_tokens=4,
+        n_draft=2,
+        max_draft=2,
+        lookup_len=0,
+        temp=0.0,
+        eos_ids=set(),
+        session=None,
+    )
+    assert reused["prefill_reused"] == 12
+    assert reused["tokens"] == fresh["tokens"]
+    assert sess.tail is not None and sess.tail[0] == len(turn2_prompt)
+
+
+def test_split_and_checkpoint_tail_size_boundaries():
+    """8-token保持、既定1-token、短いchunkのno-opを個別に固定する。"""
+
+    from mlxturbo.prefill_common import split_and_checkpoint_tail
+
+    seen = []
+    checkpoints = []
+
+    def forward(head):
+        seen.append(head)
+        return head
+
+    chunk = mx.arange(20)
+    tail, result = split_and_checkpoint_tail(
+        chunk, checkpoints, 0, [], 8, lambda _: [], forward, tail_size=8
+    )
+    assert seen[0].shape[-1] == 12
+    assert tail.shape[-1] == 8
+    assert result[0].shape[-1] == 12
+    assert [pos for pos, _ in checkpoints] == [12]
+
+    default_cp = []
+    default_tail, _ = split_and_checkpoint_tail(
+        chunk, default_cp, 0, [], 8, lambda _: [], forward
+    )
+    assert default_tail.shape[-1] == 1
+    assert [pos for pos, _ in default_cp] == [19]
+
+    for n in (1, 8):
+        short_cp = []
+        short = mx.arange(n)
+        got, result = split_and_checkpoint_tail(
+            short, short_cp, 0, [], 8, lambda _: [], forward, tail_size=8
+        )
+        assert got is short
+        assert result == ()
+        assert short_cp == []
 
 
 # ---------- 12d. バグ修正: 温まった prompt cache の diff-0 再利用 (TTFT) ----------

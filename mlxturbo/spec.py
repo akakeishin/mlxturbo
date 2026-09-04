@@ -161,6 +161,10 @@ PREFILL_STEP_SIZE = 2048
 # have been pushed out), no matching checkpoint is simply found and we fall over
 # to a fresh slot (the safe side).
 CHECKPOINT_RETENTION = 8
+# 会話テンプレートの末尾再書換えはQwen3.6実測で8 tokenに届く。最後の1 token
+# だけを分ける旧規則では4k promptのLCP=3823に対してcheckpoint=3830となり、
+# 2048まで戻っていた。FallbackRunnerと同じ8 tokenを通常prefillへ残す。
+CHECKPOINT_TAIL = 8
 
 
 # ---------- staged submission (段階投入) ----------
@@ -594,6 +598,7 @@ class SpecEngine:
                     CHECKPOINT_RETENTION,
                     snapshot_untrimmable_caches,
                     lambda head: self._hidden_forward(head, caches, capture=False)[0],
+                    tail_size=CHECKPOINT_TAIL,
                 )
                 if head_result:
                     chunks.append(head_result[0])

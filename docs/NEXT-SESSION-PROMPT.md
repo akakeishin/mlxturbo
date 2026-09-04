@@ -667,3 +667,17 @@ rg -n "QuantizedKVCache|RotatingKVCache|to_quantized|make_cache" .venv/lib/pytho
 ```bash
 rg -n "MTP: あり|tok/step" scratchpad/log-qwen36-mtp-fixed-smoke-0904.txt && git show --stat --oneline HEAD
 ```
+
+## Qwen3.6通常冷却比較と追記TTFT修復 (2026-09-04 18:36 JST)
+
+- 同条件3 prompt × 512 tokenでAR→MTPは、短86.9→131.3 tok/s (+51.0%)、
+  4k 83.7→131.7 tok/s (+57.3%)。
+- 末尾8-token checkpointで4k追記TTFTを1.851→0.491秒 (-73.5%)。
+  3,817 / 3,823 tokenを再利用し、decode 129.2 tok/sを維持。関連439 test pass。
+- ユーザー決定: フルベンチは追加の強冷却を使わず、現在の常時冷却を固定条件にする。
+
+再開の1コマンド:
+
+```bash
+.venv/bin/python bench/self_snapshot.py --help
+```

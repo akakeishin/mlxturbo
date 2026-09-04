@@ -1009,6 +1009,9 @@ PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスク�
 - **取得済み**: 本体4bit約19GB、MTP-5bit 572MiB。
 - **読込修復済み**: MoEの`SwitchLinear` 3本を量子化対象に含め、sidecarの6個の
   `scales`/`biases`を受け取れるようにした。合成6/6、CLI 7/7、実機で`MTP: あり`を確認。
-- **入口の速度**: 短文64 token 1本で119.8 tok/s、tok/step 3.0〜3.5。比較条件が未統一なので暫定値。
-- **残り**: 通常冷却、同じthinking指定・prompt・生成長でAR対MTPを複数prompt × 512 token、4kまで
-  比較する。target verify後の生成品質と受理率も記録し、そこで既定採用を判定する。
+- **速度**: 通常冷却、同じthinking指定、各3 prompt × 512 tokenで、短86.9→131.3 tok/s
+  (+51.0%)、4k 83.7→131.7 tok/s (+57.3%)。後段の4kまで速度を維持した。
+- **温TTFTも修復**: 再templateの末尾8 token差に合わせてcheckpointを置き、4k追記を
+  1.851→0.491秒 (-73.5%)。3,817 / 3,823 tokenを再利用し、439 test pass。
+- **判定**: MTP読込と8-token checkpointを採用。残りは現在の常時冷却でフルベンチを回し、
+  長文脈・品質を含む最終表へ載せる。
