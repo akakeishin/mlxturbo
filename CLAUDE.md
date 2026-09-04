@@ -105,6 +105,11 @@
   qwen3_5 (27B) の verify 幅 M=2..5 の量子化 dense 射影 (N, K ≥ 1024) を `kernels/qmv_small_m.py` に (各行が MLX の qmv とビット一致、fp32 参照への距離は素と同じ)。
   27B in-model (512 × 短 3 本 × 2 回文 + 4k、`ab-smallm-3way-*-0904.json`): small_m 短 -1.9% / 4k -4.6%、nocap 短 -1.9% / 4k +0.8%、mma 短 +3.1% / 4k +5.2% (fp32 から素の 1.3〜1.7 倍遠い)。
   Flash-Next は `dispatch_scope` を通らないので未接続 (当てるなら fused.py に enable が 1 つ要る)。bits=8 / group_size≠64 は素に委譲。
+  `MLXTURBO_DRAFT_RERANK` (既定 on、`=0` で exact head) は Flash-Next に加え、qwen3_5 の
+  q4 affine / group64 headでもMTP proposalだけをq2全語彙top-32 + q4候補行再採点へ替える。
+  target verifyと通常headはexactのまま。27Bはq2 recall@32 100% (1,677 proposal)、短 -2.0% /
+  4k -1.6% / 17k -3.0% ms/tok。常駐378.9 MiB、起動時temporary約2.37 GiB、構築0.08s。
+  17kは受理率 +6.6%で生成列が262 token目から丸め分岐したため、exact出力が必要なら`=0`を使う。
   `MLXTURBO_SDPA_ROWTILE` (既定 256、`=0` で off) も本番の既定値: head_dim 256 の sdpa は MLX の fallback でタイルを飛ばさないので、
   prefill の dense 経路で q を 256 行ずつに割り前方の K/V だけ渡す (4k -1.1% / 8k -1.2% / 17k -1.0%、KLD 差 0.0、2026-09-03)。
   `MLXTURBO_SDPA_SPLIT_GENERIC` (既定 auto = 非 NAX 機で on、`=0` で off) は 2026-09-04 13:15 に入れた本番の既定値: qwen4_exp 以外の族 (27B など) の decode / verify 幅 (1 < S ≤ 16) で

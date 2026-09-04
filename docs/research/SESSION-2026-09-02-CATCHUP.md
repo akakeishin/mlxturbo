@@ -3150,3 +3150,36 @@ module import時の `mx.set_default_device(mx.cpu)` をautouse fixtureへ移し�
 終了時に元のdeviceへ戻すようにした。n-gram 23本を先頭に置き、その後ろへcontroller拡大実行で
 誤skipしたcapture 5本 / attention+MLP 12本 / GDN 13本を同一pytest processで並べて53 passed。
 既存の526 passed / 10 failedは実装故障ではなく、このcollection時のprocess-global設定漏れだった。
+
+### 2026-09-04 16:58 27B proposal headをq2 top-32へ。短 -2.0%、4k -1.6%、17k -3.0%で採用
+
+まずexact q4 proposalを変えないobserverで1,677 linkを測った。継続条件は走行前に「全体R@32
+99.9%以上、各prompt 99.5%以上」と置いた。
+
+| 指標 | 結果 |
+|---|---:|
+| q2 R@1 / R@4 | 85.152% / 98.927% |
+| q2 R@8 / R@16 / R@32 | 99.881% / 100% / 100% |
+| q4候補行再採点と全語彙q4 proposalの一致 | 99.284% |
+| q2常駐 / 構築 | 378.9 MiB / 0.08s |
+| 起動時dense temporary | 約2.37 GiB |
+
+再採点A/Bはq2を両armで常駐させ、同一processのABBA、512 token、長文はprefill-once。
+
+| 文脈 | rerank ms/tok | exact ms/tok | 差 | tok/round差 | 生成列 |
+|---|---:|---:|---:|---:|---|
+| 短3本 × 2回文 | 30.626 | 31.259 | **-2.0%** | 0.0% | 512 / 512 / 345一致 |
+| 4k × 2回文 | 37.298 | 37.914 | **-1.6%** | -0.5% | 512一致 |
+| 17k × 2回文 | 47.793 | 49.267 | **-3.0%** | **+6.6%** | 262 token目で分岐 |
+
+17kの絶対値は52.4→44.4 ms/tokへ逆向きに動き、筐体温度の変化が大きい。位置順も含むABBA平均を
+採用し、絶対tok/sは根拠にしない。17kではrerankのround単価が +3.4%だが、proposalの違いで
+受理率が2.427→2.586へ上がり、壁時計は3.0%短くなった。分岐後の両出力は同じ問いへの整合した
+文章で、target verifyと通常headはexactのまま。検証幅ごとのq4丸め差に属する。短・4k・17kの
+全条件で速く、追加378.9 MiBは27B重みの0.4%未満なので既定採用する。
+
+本体はq4 affine / group64だけでrerankを構築し、それ以外はexactへfail closedする。
+`MLXTURBO_DRAFT_RERANK=0`で従来proposalへ戻せる。合成qwen3_5でq2候補行再採点とoff時exactを固定し、
+SpecEngine関連は27 passed。本体移植後の実モデル128 token smokeも短3本でms/tok -2.9%、
+生成列128 / 128 / 128一致。再現道具は`tools/mtp_head_recall_27b.py`と
+`tools/mtp_head_rerank_ab_27b.py`、結果は`mtp-head-q2-*-0904.json`。

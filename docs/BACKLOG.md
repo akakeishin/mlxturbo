@@ -899,12 +899,14 @@ full / D7 / EOS / direct lookupの8ケースでcacheと次proposalのbit一致�
 2回文はms/tok -0.9%、ms/round -0.9%、3/3 prompt非悪化、生成列一致。代金ゼロなので既定採用。
 結果と熱ドリフトはCATCHUP 16:25節。
 
-## P1候補: 27B proposal-only q2 top-32 rerank (2026-09-04 14:48、未測)
+## 完了・採用: 27B proposal-only q2 top-32 rerank (2026-09-04 16:58)
 
 exact q4 lm_head の matvec は帯域天井の97〜99%なので、カーネル高速化は再開しない。一方、MTP の
-proposal-only call は1リンク約1.88 msで、Flash と vendored Swift には q2 coarse top-32 + exact
-row rerank の先例がある。まず exact proposal に対する top-32 recall trace だけを取る。recall が
-十分でなければ実装しない。十分でも追加の常駐重み、warm-up、品質、net ms/tok を別々に審査する。
+proposal-only call は1リンク約1.88 ms。exact proposal 1,677件に対するq2 recallはR@8 99.881%、
+R@16 / R@32 100%。q2 top-32 + q4候補行再採点は短 / 4k / 17kの全条件でms/tokを
+2.0% / 1.6% / 3.0%短縮した。17kはtok/round +6.6%、ms/round +3.4%で、proposal差により
+生成列が262 token目から丸め分岐したが、target verifyはexactのまま。常駐378.9 MiB、起動時
+temporary約2.37 GiB、構築0.08sの代金を明記して既定採用。`MLXTURBO_DRAFT_RERANK=0`で従来headへ戻る。
 
 ## 畳んだ: Flash-Next の小M射影 (2026-09-04 14:48)
 

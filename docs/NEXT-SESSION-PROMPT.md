@@ -550,3 +550,18 @@ rg -n "mtp_off0|mtp_cache.trim|_mtp_append\(window|chain_head" mlxturbo/spec.py 
 ```bash
 rg -n "_build_rerank|_draft_argmax|DRAFT_RERANK|applyDraftLMHead|_head\(h_mtp" mlxturbo/spec_flash.py mlxturbo/spec.py tools/reference/e120
 ```
+
+## 27B q2 proposal head 決着後の更新 (2026-09-04 16:58 JST)
+
+- **完了・採用**: q2 coarse top-32 + q4候補行再採点。1,677 proposalのR@32 100%。
+- **速度**: 短 -2.0% / 4k -1.6% / 17k -3.0% ms/tok。17kはtok/round +6.6%。
+- **代金**: 常駐378.9 MiB、起動時temporary約2.37 GiB。17k生成列は262 token目から丸め分岐。
+  target verifyはexactで、`MLXTURBO_DRAFT_RERANK=0`が従来headへの退避口。
+- **次**: qwen4_expの汎用分岐とK/V slice SDPA。PR #391のfixed-M4 verifier / FR-Spec等も
+  現行実装との差分を棚卸しして、重複しない高価値レーンだけ足す。
+
+再開の1コマンド:
+
+```bash
+rg -n "enable_sdpa_split|enable_sdpa_split_generic|_model_layers|_arch_registry" mlxturbo/fused.py mlxturbo/_arch_registry.py mlxturbo/spec_flash.py
+```

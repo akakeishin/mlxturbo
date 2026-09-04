@@ -300,6 +300,9 @@ class ChatSession:
 
 
 class SpecEngine:
+    RERANK_BITS = 2
+    RERANK_TOP = 32
+
     def __init__(self, model, mtp, prefill_step_size: int = PREFILL_STEP_SIZE):
         validate_spec_model_contract(model)
         self.text = model.language_model
@@ -309,6 +312,12 @@ class SpecEngine:
         # (S, dtype, mask 有無) ごとの「検証フォワードをモジュール呼び出しで
         # 通せるか」の判定を控える (_capture_via_module)。
         self._capture_module_ok: dict = {}
+        # MTP proposal だけを q2 で粗く全語彙走査し、候補32行を本体の
+        # q4 lm_head で再採点する。target の通常 head / verify は触らない。
+        # 27B q4 affine g64 以外は未計測なので exact head へ落とす。
+        self._rerank = None
+        if os.environ.get("MLXTURBO_DRAFT_RERANK", "1") != "0":
+            self._build_rerank()
         # Install the replacement without touching prefill/draft behavior.
         # Dispatch is activated only by the verification scopes below.
         enable_quantized_dispatch(self.text, active=False)
@@ -334,6 +343,32 @@ class SpecEngine:
             return embedding.as_linear(out)
         with dispatch_scope():
             return self.text.lm_head(out)
+
+    def _build_rerank(self) -> None:
+        lm = getattr(self.text, "lm_head", None)
+        if (
+            lm is None
+            or not hasattr(lm, "scales")
+            or getattr(lm, "bits", None) != 4
+            or getattr(lm, "group_size", None) != 64
+            or getattr(lm, "mode", "affine") != "affine"
+        ):
+            return
+        w = mx.dequantize(
+            lm.weight,
+            lm.scales,
+            lm.biases,
+            group_size=lm.group_size,
+            bits=lm.bits,
+            mode=lm.mode,
+        )
+        cw, cs, cb = mx.quantize(
+            w, group_size=64, bits=self.RERANK_BITS, mode="affine"
+        )
+        mx.eval(cw, cs, cb)
+        self._rerank = (cw, cs, cb)
+        del w
+        mx.clear_cache()
 
     # ---------- main-model forward ----------
 
@@ -697,6 +732,42 @@ class SpecEngine:
         if tok_ids.shape[0] > 0:
             self._mtp_append(tok_ids, self._mtp_base(true_hiddens), mtp_cache)
 
+    def _draft_argmax_exact(self, h_mtp: mx.array) -> mx.array:
+        """Choose one MTP proposal with the exact q4 production head."""
+        logits = self._head(h_mtp[:, -1:], self.mtp.norm)[0, -1]
+        return mx.argmax(logits, axis=-1).reshape(1)
+
+    def _draft_argmax(self, h_mtp: mx.array) -> mx.array:
+        """Choose one proposal with q2 coarse top-32 and q4 row reranking."""
+        if getattr(self, "_rerank", None) is None:
+            return self._draft_argmax_exact(h_mtp)
+        lm = self.text.lm_head
+        row = self.mtp.norm(h_mtp)[:, -1]
+        cw, cs, cb = self._rerank
+        coarse = mx.quantized_matmul(
+            row,
+            cw,
+            scales=cs,
+            biases=cb,
+            transpose=True,
+            group_size=64,
+            bits=self.RERANK_BITS,
+            mode="affine",
+        )
+        top_n = min(self.RERANK_TOP, coarse.shape[-1])
+        top = mx.argpartition(-coarse, top_n - 1, axis=-1)[..., :top_n]
+        rows = mx.dequantize(
+            lm.weight[top[0]],
+            lm.scales[top[0]],
+            lm.biases[top[0]],
+            group_size=lm.group_size,
+            bits=lm.bits,
+            mode=lm.mode,
+        )
+        scores = row.astype(rows.dtype) @ rows.T
+        best = mx.argmax(scores, axis=-1, keepdims=True)
+        return mx.take_along_axis(top, best, axis=-1).reshape(1)
+
     def _draft_chain(self, y, h_last, mtp_cache, keep: int, first=None) -> list:
         """Draw ``keep`` MTP links with no host sync at all
         (MLXTURBO_SPEC_DRAFT_NOSYNC, on by default; the dense counterpart of
@@ -727,8 +798,7 @@ class SpecEngine:
             dh, dtok = self._mtp_base(h_last), y
         for i in range(len(drafts), keep):
             h_mtp = self._mtp_append(dtok, dh, mtp_cache)
-            d_logits = self._head(h_mtp[:, -1:], self.mtp.norm)[0, -1]
-            d = mx.argmax(d_logits, axis=-1).reshape(1)
+            d = self._draft_argmax(h_mtp)
             drafts.append(d)
             dh, dtok = self.mtp.norm(h_mtp[:, -1:]), d
             if i < keep - 1:
@@ -1278,15 +1348,17 @@ class SpecEngine:
                 # analogy with ReSpec's source-aware verification).
                 dh, dtok = self._mtp_base(h_last), y
                 h_mtp = self._mtp_append(dtok, dh, mtp_cache)
-                d_logits = self._head(h_mtp[:, -1:], self.mtp.norm)[0, -1]
                 # NOSYNC のときは AdaEDL の confidence に読み手がいない
                 # (深さは引く前に決まっている) ので、語彙長の softmax と
                 # エントロピーの reduce ごと組まない。
                 conf1 = None
-                if not nosync:
+                if nosync:
+                    d1 = self._draft_argmax(h_mtp)
+                else:
+                    d_logits = self._head(h_mtp[:, -1:], self.mtp.norm)[0, -1]
                     d_probs = mx.softmax(d_logits.astype(mx.float32), axis=-1)
                     conf1 = -mx.sum(d_probs * mx.log(mx.maximum(d_probs, 1e-12)))
-                d1 = mx.argmax(d_logits, axis=-1).reshape(1)
+                    d1 = mx.argmax(d_logits, axis=-1).reshape(1)
                 mx.eval(d1)
                 m1 = int(d1.item())
                 ext_len, _ = sam.peek_match(m1)

@@ -29,6 +29,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import mlx.core as mx  # noqa: E402
+import mlx.nn as nn  # noqa: E402
 import mlxturbo  # noqa: E402,F401 -- sys.meta_path フック
 from mlx_lm.models import qwen3_5 as Q35  # noqa: E402
 from mlxturbo._mlx_compat import KVCache, TextModelArgs  # noqa: E402
@@ -203,6 +204,51 @@ def test_mtp_cache_length_does_not_depend_on_the_draft():
                             session=session)
             lens.append(session.mtp_cache.offset)
     assert lens[0] == lens[1], f"MTP キャッシュの長さが knob で変わった: {lens}"
+
+
+def test_draft_argmax_off_is_the_exact_mtp_head_argmax():
+    """rerankを切れば、従来のexact q4 argmaxそのものへ戻る。"""
+    model, mtp = _build()
+    with _env(MLXTURBO_DRAFT_RERANK="0"):
+        engine = SpecEngine(model, mtp=mtp)
+    h_mtp = mx.random.normal((1, 1, HIDDEN))
+    got = engine._draft_argmax(h_mtp)
+    want = mx.argmax(
+        engine._head(h_mtp[:, -1:], engine.mtp.norm)[0, -1], axis=-1
+    ).reshape(1)
+    mx.eval(got, want)
+    assert got.tolist() == want.tolist()
+
+
+def test_draft_argmax_q2_top32_reranks_q4_rows():
+    """q2粗選択とq4候補行の再採点を、合成の量子化headで固定する。"""
+    model, mtp = _build()
+    model.language_model.lm_head = nn.QuantizedLinear.from_linear(
+        model.language_model.lm_head, group_size=64, bits=4
+    )
+    with _env(MLXTURBO_DRAFT_RERANK="1"):
+        engine = SpecEngine(model, mtp=mtp)
+    assert engine._rerank is not None
+
+    h_mtp = mx.random.normal((1, 1, HIDDEN))
+    row = engine.mtp.norm(h_mtp)[:, -1]
+    lm = engine.text.lm_head
+    cw, cs, cb = engine._rerank
+    coarse = mx.quantized_matmul(
+        row, cw, scales=cs, biases=cb, transpose=True,
+        group_size=64, bits=2, mode="affine",
+    )
+    top = mx.argpartition(-coarse, 31, axis=-1)[..., :32]
+    rows = mx.dequantize(
+        lm.weight[top[0]], lm.scales[top[0]], lm.biases[top[0]],
+        group_size=64, bits=4, mode="affine",
+    )
+    scores = row.astype(rows.dtype) @ rows.T
+    best = mx.argmax(scores, axis=-1, keepdims=True)
+    want = mx.take_along_axis(top, best, axis=-1).reshape(1)
+    got = engine._draft_argmax(h_mtp)
+    mx.eval(got, want)
+    assert got.tolist() == want.tolist()
 
 
 def _active_cache(cache):
