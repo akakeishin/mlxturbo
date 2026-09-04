@@ -157,3 +157,35 @@ thinking off、Qwen3.8-Flash-Next 4-bit (mlxturbo: `ddalcu-mlxlm` (lm_head 8-bit
 主張すること: 温 TTFT (接頭辞キャッシュが当たる 2 ターン目以降) は mlxturbo が 4〜17 倍速い。冷 prefill は mlx-serve が
 1.13〜1.21 倍速い。decode は ±10% で、反復 1 回の揺れの範囲。主張しないこと: 品質の優劣 (同じ 4-bit パックだが
 lm_head のビットが違う)、25k の decode 差 (tok/step の当たり)。
+
+## 2026-09-04 の常時冷却フルベンチ (self_snapshot、反復2)
+
+ユーザーが普段使う常時冷却を固定し、追加の強冷却は使わなかった。生成256 token、
+thinking off、文脈0/4k/17k/25k/32k/50k、各2回の中央値。mlxturboは
+`ddalcu-mlxlm-head4` + n-gram sidecar、mlx-serveは
+`ddalcu-flashnext-serve-4bit --mtp`。JSONは
+`bench/results/self-snapshot-full-normalcool-{turbo,serve}-0904.json`。
+
+| 文脈 | 冷TTFT turbo / serve | 温TTFT turbo / serve | 温の倍率 | decode turbo / serve |
+|---:|---:|---:|---:|---:|
+| 0 | 0.174 / 0.185 s | 0.143 / 0.730 s | **5.11倍** | **53.55** / 48.46 tok/s |
+| 4k | 6.111 / 5.861 s | 0.160 / 0.865 s | **5.39倍** | 52.66 / **55.51** tok/s |
+| 17k | 28.791 / 28.388 s | 0.207 / 0.891 s | **4.30倍** | **49.89** / 48.37 tok/s |
+| 25k | **40.424** / 43.632 s | **0.488** / 0.902 s | **1.85倍** | **51.86** / 47.43 tok/s |
+| 32k | **52.733** / 55.968 s | **0.752** / 0.923 s | **1.23倍** | **51.56** / 49.21 tok/s |
+| 50k | **84.315** / 89.843 s | **0.600** / 16.871 s | **28.10倍** | **45.11** / 41.58 tok/s |
+
+冷TTFTは0〜17kでほぼ互角、25k以降はmlxturboが6.1〜7.9%速い。decodeは
+6条件中5条件で3.1〜10.5%速く、4kだけ5.1%遅い。ただし反復2なのでp95を主張せず、
+4k serveの52.46/58.55 tok/sや25k turbo温TTFTの0.235/0.741秒という振れも
+隠さない。
+
+温TTFTは単なる「50k prefillが0.6秒」ではない。直前のassistant出力を含む履歴を
+送り直し、token IDのLCPを再利用した値である。mlxturboの50kは一方が49,826 tokenを
+再利用して274 tokenを新規処理、もう一方が50,088 tokenを再利用して16 tokenを処理した。
+mlx-serveは2GiBのhot-cache上限で40,960/50,105 tokenしか残らず、9,145 tokenを
+再処理して16.7秒掛かった。長文会話ではこの容量差がdecodeの数%差より大きい。
+
+この結果は内部診断の速報で、公開用の正本はGuideLLM 0.7.3へ移す。
+`docs/GUIDELLM-BENCHMARK.md`の固定scenarioでrequest数を増やし、TTFT/ITLの
+p50/p95、実output token数、冷却、server側reused/newを併記する。

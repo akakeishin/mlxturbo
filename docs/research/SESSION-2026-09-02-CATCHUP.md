@@ -3359,3 +3359,30 @@ SpecEngineもFallbackRunnerと同じく末尾8 tokenを通常prefillへ残し、
 生成一致を含む`test_server` + draft-chainは439 passed。decode中央値は129.2 tok/sで維持したため採用する。
 
 ユーザーは18時台、追加の強冷却ではなく現在の常時冷却をフルベンチ条件にすると決定した。
+
+### 2026-09-04 19:12 常時冷却フルベンチ: 長文coldとdecodeは概ね勝ち、warmは最大28.1倍
+
+現在の常時冷却をそのまま固定し、追加の強冷却なしでFlash-Nextの`self_snapshot`
+をmlxturbo→mlx-serveの順に実行した。thinking off、256 token、各2回の中央値。
+
+| 文脈 | cold turbo / serve | warm turbo / serve | decode turbo / serve |
+|---:|---:|---:|---:|
+| 0 | 0.174 / 0.185 s | 0.143 / 0.730 s | 53.55 / 48.46 tok/s |
+| 4k | 6.111 / 5.861 s | 0.160 / 0.865 s | 52.66 / 55.51 tok/s |
+| 17k | 28.791 / 28.388 s | 0.207 / 0.891 s | 49.89 / 48.37 tok/s |
+| 25k | 40.424 / 43.632 s | 0.488 / 0.902 s | 51.86 / 47.43 tok/s |
+| 32k | 52.733 / 55.968 s | 0.752 / 0.923 s | 51.56 / 49.21 tok/s |
+| 50k | 84.315 / 89.843 s | 0.600 / 16.871 s | 45.11 / 41.58 tok/s |
+
+coldは0〜17kが±4.1%、25k以降はmlxturboが6.1〜7.9%速い。decodeは4kの
+-5.1%を除き+3.1〜+10.5%。warmはmlxturboが1.23〜28.10倍速い。ただし反復2は
+分布を語れず、25k/50kのwarmは新規suffixが16〜274 tokenと混ざる。
+
+50kの差は容量で説明できる。mlx-serveは2GiB上限で40,960/50,105 tokenだけを
+残し、9,145 tokenを16.7秒で再prefillした。mlxturboは49,826または50,088 tokenを
+再利用し、新規274/16 tokenを0.71/0.36秒で処理した。常時冷却は約20分の連続runで
+熱崩落せず、9月3日の長文cold負けも消えた。
+
+公開ベンチはGuideLLM 0.7.3へ移す。隔離venv、macOSのspawn回避、固定scenario runnerを
+追加し、実mlxturboへ2/2 request、JSON/CSV/HTML出力を確認した。GuideLLMの
+`ignore_eos`は現行サーバーが未解釈なので、当面は実output token数を正本にする。

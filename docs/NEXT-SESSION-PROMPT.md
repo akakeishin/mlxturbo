@@ -681,3 +681,19 @@ rg -n "MTP: あり|tok/step" scratchpad/log-qwen36-mtp-fixed-smoke-0904.txt && g
 ```bash
 .venv/bin/python bench/self_snapshot.py --help
 ```
+
+## 常時冷却フルベンチとGuideLLM導入後 (2026-09-04 19:12 JST)
+
+- Flash-Nextフルベンチ完了。25k/32k/50k coldはmlxturboが7.9/6.1/6.6%速く、
+  decodeは4k以外の5条件で勝ち。warm TTFTは1.23〜28.10倍速い。
+- 反復2かつwarm suffixが16〜274 tokenで混在するため、分布やcache policyの採否には使わない。
+- GuideLLM 0.7.3を公開ベンチに採用。`tools/guidellm.sh setup`、
+  `bench/guidellm_bench.py`、`docs/GUIDELLM-BENCHMARK.md`を追加し、実serverで2/2成功。
+- 次はhot prefill telemetry。LCP、checkpoint位置、reused/new、各段階時間、sessionごとの
+  allocated bytes、eviction、batch-forfeited reuseを出してからbyte-budget LRUを比較する。
+
+再開の1コマンド:
+
+```bash
+rg -n "def _select_session|prefill_reused|ttft-trace|memory|session_pool" mlxturbo/server.py mlxturbo/{runner,spec,spec_flash}.py
+```
