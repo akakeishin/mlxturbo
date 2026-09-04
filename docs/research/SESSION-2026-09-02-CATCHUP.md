@@ -4115,3 +4115,14 @@ MTP priming graphをhostで組む案を、4k・64 token・3 promptで`A,B,B,A`�
 3ケースとも生成列一致。GPU上の依存列は変わらず、隠せるhost構築も小さいため壁時計は動かなかった。
 製品helperと測定knobは撤回した。結果は
 `bench/results/prefill-logits-async-4k-0905.json`（gitignore）。
+
+### 2026-09-05 08:05 Gemma B=2のqmm_wide mixed-dtype Metal失敗を修正
+
+Gemma 4 26Bを`--max-batch 4`で2要求同時に流すと、batch maskを通った一部のactivationが
+float32へ昇格する一方、量子化scale/biasはbf16のままになった。`qmm_wide`は単一のtemplate型を
+4入力へ使うため、`T=float`のkernelへbf16 pointerを渡してMetal compile errorとなり、HTTP 500を
+2件とも返していた。
+
+dispatch時にactivationとscale/biasのdtypeが一致する場合だけ専用kernelへ入り、不一致時はMLX標準の
+quantized matmulへ戻すようにした。mixed-dtypeの出力は標準経路と完全一致し、既存qmm_wide検査を含む
+13 testが通過。修正後のGemma B=2 fresh/append実機要求も500なしで完走した。

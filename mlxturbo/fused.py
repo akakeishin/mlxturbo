@@ -3411,16 +3411,20 @@ def _qmm_wide_dispatch(self, x):
 
         if x.ndim == 2:
             if x.shape[0] >= _QMM_WIDE_MIN_ROWS:
-                return qw.qmm_wide(
-                    x, self["weight"], self["scales"], self["biases"],
-                    tile=tile, group_size=self.group_size, bits=self.bits)
+                scales, biases = self["scales"], self["biases"]
+                if scales.dtype == x.dtype and biases.dtype == x.dtype:
+                    return qw.qmm_wide(
+                        x, self["weight"], scales, biases,
+                        tile=tile, group_size=self.group_size, bits=self.bits)
         elif x.ndim == 3 and x.shape[0] * x.shape[1] >= _QMM_WIDE_MIN_ROWS:
             B, S, K = x.shape
-            out = qw.qmm_wide(
-                x.reshape(B * S, K), self["weight"], self["scales"],
-                self["biases"], tile=tile, group_size=self.group_size,
-                bits=self.bits)
-            return out.reshape(B, S, -1)
+            scales, biases = self["scales"], self["biases"]
+            if scales.dtype == x.dtype and biases.dtype == x.dtype:
+                out = qw.qmm_wide(
+                    x.reshape(B * S, K), self["weight"], scales,
+                    biases, tile=tile, group_size=self.group_size,
+                    bits=self.bits)
+                return out.reshape(B, S, -1)
     return _QMM_WIDE_STOCK(self, x)
 
 

@@ -296,6 +296,32 @@ def test_qmm_wide_decode_width_falls_back():
     assert mx.array_equal(got, ref)
 
 
+def test_qmm_wide_mixed_activation_dtype_falls_back():
+    """batch mask 等で activation が float32 に昇格しても Metal を壊さない。"""
+    if not GPU:
+        return
+    mx.random.seed(0)
+    mlp = _quantized_mlp(dtype=mx.bfloat16)
+    model = _StubModel([_StubLayer(mlp=mlp)])
+    x = (mx.random.normal((16, 1024)) * 0.5).astype(mx.float32)
+    mx.eval(x)
+
+    from mlxturbo import fused as F
+
+    F._QMM_WIDE_ON = False
+    ref = mlp(x)
+    mx.eval(ref)
+    fused.enable_qmm_wide(model, mode="on", min_rows=16)
+    _fire.reset()
+    try:
+        got = mlp(x)
+        mx.eval(got)
+    finally:
+        F._QMM_WIDE_ON = False
+    assert mx.array_equal(got, ref)
+    assert not any(k.startswith("qmm_wide_") for k in _fire.snapshot())
+
+
 def test_qmm_wide_survives_spec_engine_dispatch_swap():
     """`SpecEngine.__init__` の後でも qmm_wide が発火する (2026-09-04 の回帰)。
 
