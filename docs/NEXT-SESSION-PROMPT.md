@@ -593,3 +593,19 @@ rg -n "def _verify|def _draft_chain|_staged_forward|_draft_argmax" mlxturbo/spec
 ```bash
 rg -n "def _verify|def _draft_chain|def _staged_forward|def capture|def rollback" mlxturbo/spec_flash.py
 ```
+
+## fixed-M4直接portの判定 (2026-09-04 17:28 JST)
+
+- **直接portは不採用**: 幅4は既存`depth=3`で実行できるが、同機体の既存掃引でdepth 2比
+  短+11.7% / 4k+8.2% / 17k+3.2%。固定幅だけに取り分はない。
+- **graphbankは前提不足**: GDN/PLE/KV/indexer/MTPとcache offsetを明示したstate-in/state-out adapterが
+  無く、過去のfull-forward compileはcache副作用のため失敗済み。状態を欠いたprobeは作らない。
+- **次**: FR-Spec Q8のrow selectionを出典どおり再現できるか確認し、まず読み取り専用recall traceを作る。
+- **後で再開する条件**: qwen4 component replacementでstate-pure adapterが完成し、幅4の全cacheと
+  rollback keep=1/3/4が既存経路と一致すること。
+
+再開の1コマンド:
+
+```bash
+rg -n "_build_rerank|_draft_argmax|RERANK_BITS|RERANK_TOP|topk" mlxturbo/spec_flash.py tools/decode_ab.py
+```

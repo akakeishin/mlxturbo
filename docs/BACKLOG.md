@@ -961,3 +961,14 @@ splitを両armでonにした専用ABBAで短3本のms/tok **+5.2%**、ms/round +
 一致した。17kはQSA decodeが当該経路を迂回して発火ゼロ。slice viewと可変shapeの代金が読み飛ばしを
 上回るため、実装・一時knobとも残さず閉じる。`sdpa-split` knob自体はQSA有無も変えるので、この案の
 比較には再利用しない。
+
+## 畳んだ: MTPLX fixed-M4 verifierの直接port (2026-09-04 17:28)
+
+Flash-Nextは`depth=3`で既に幅4を処理できるが、既存固定depth掃引ではdepth 2比で短+11.7%、4k+8.2%、
+17k+3.2%。相手の+21%はgraphbankによるもので、固定幅自体の効果ではない。現行にもtarget配列の一括evalと
+2層ごとのstaged投入があるが、GDN/PLE/KV/indexer/MTPの状態更新、hyper capture、cache offsetは
+state-in/state-outになっていない。既存compile試験もpureなMoE以外はcache副作用で失敗済み。
+
+状態を欠いたままgraphを再利用するとcacheを静かに壊すため直接portは閉じる。再開には、qwen4の汎用
+component replacementで全状態を明示するadapterを先に作り、幅4のlogits・全cache・rollback
+keep=1/3/4を既存経路と一致させる。group32 pack専用checkやoffsetだけのgraph keyは移植しない。

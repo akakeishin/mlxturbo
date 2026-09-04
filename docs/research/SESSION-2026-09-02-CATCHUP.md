@@ -3218,3 +3218,20 @@ prefix側が全prompt遅く、round単価にも同じ符号が出た。17kでは
 迂回し、このsliceは発火しない。したがって文脈長gateを足さず、実装と一時knobを戻して不採用とする。
 結果は`qwen4-sdpa-prefix-direct-short-0904.json`。途中の`qwen4-sdpa-prefix-17k-0904.json`は
 knob交絡を発見して中断した不完全runなので採否には使わない。
+
+### 2026-09-04 17:28 MTPLX fixed-M4の直接portはしない。state-pure化が前提
+
+`depth=3`なら検証pairは既に幅4になるため、固定幅そのものは未実装機能ではない。既存の同機体掃引は
+depth 2比で短 **+11.7%**、4k +8.2%、17k +3.2%で、17kではdepth 1が最速だった。MTPLX #391の
++21%は固定幅をcompile可能なgraphbankにした効果で、幅4へ固定するだけでは再現しない。
+
+現行はtargetの`nxt_all` / draft配列を検証と同じevalへ載せ、`_staged_forward`も2層ごとに
+`async_eval`しているので、target-array準備とgraph構築overlapの一部は既に同等。一方、検証forwardは
+GDN/PLE rollback、KV/indexer更新、hyper capture、Python整数のcache offsetを副作用として持つ。
+過去のcompile試験でもGDN/attention/full layer/full forward/staged forwardはcache副作用を再traceできず、
+pureなMoEだけが成功した。offsetをgraph keyに足すだけでは状態の欠落を直せない。
+
+したがってgroup64 packへfixed-M4 graphbankを直接差す案は不採用。再開条件は、GDN/PLE/KV/indexer/MTPの
+全状態を明示的なstate-in/state-outへ出すqwen4 adapterが先に完成し、幅4でlogits・全cache・rollback
+keep=1/3/4が既存経路と一致すること。これはqwen4汎用component replacementの設計課題として扱い、
+FR-Specの独立したdraft head実験を先に進める。
