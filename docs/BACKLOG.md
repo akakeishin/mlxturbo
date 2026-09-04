@@ -915,3 +915,41 @@ temporary約2.37 GiB、構築0.08sの代金を明記して既定採用。`MLXTUR
 ms/round -0.1% / ms/tok -2.4%だったが、「測った全条件で遅くならない」に届かない。
 N=2560 の低並列度だけが原因ではない。branch `worktree-agent-ae05b9756c852f071` の実験 commit
 `6553991` は main へ入れず、このレーンを閉じる。
+
+## 外部ベンチから再開: Flash-Next fixed-M4 verifier と FR-Spec (2026-09-04 17:04)
+
+[MTPLX PR #391](https://github.com/youssofal/MTPLX/pull/391) は16kで80.92 tok/s、upstream比
++40.4%を報告する。ただし相手は137GB q4/group32、比較先mlx-serveは98GB q4/group64で、sampling順、
+MTP停止、生成長、session bankも違う。fans最大・40°C gate・各cell前のwakeという熱管理も、こちらの
+同一process ABBAとは異なるので、絶対値と合算率はそのまま比較しない。
+
+現行に同等物があるn-gram先読み、staged graph投入、QSA decode、GDN prefill、session reuseは重ねない。
+4096 chunk、causal mask fusion、広いMoE route chainも既存の不採用記録を優先する。未実装で取り分が
+大きい順は次の2本。
+
+1. **fixed-M4 verifier / graphbank**: PR報告 +21% decode。`spec_flash.py:_verify` / `_staged_forward`
+   に固定幅4のcompile可能な境界があるか、まず構造とbit一致だけ検査する。汎用forward写しの整理とは
+   別commitにする。
+2. **FR-Spec Q8 65,536-row draft head**: PR報告 +6.27% decode、held-out coverage 99.64%。現行の
+   q2全語彙top-32とのrecall・常駐メモリ・短/17k A/Bを同条件で比較する。固定M4と同時に変えない。
+
+route kernel (-2.4%) / sparse QSA (-4.1% cycle、decode flat) / graph overlap (-1.5%) は上2本の後。
+group32専用の数値をgroup64 packへ推測移植しない。
+
+## ANE / Voz の再評価: 全体移植はしない。draft headだけ条件付き再開 (2026-09-04 17:04)
+
+[Voz](https://desertant.com/models/voz/) は467MBのParakeet 0.6B ASR固定グラフをCore MLへ変換し、
+fallback無しでANE実行、M3 Ultra 290倍実時間を報告する。固定窓の音声encoder/decoderがANEに収まる
+実例ではあるが、動的KV・投機制御・MLX custom kernelを持つfastmlx全体の移植根拠ではない。
+
+既存の`ANE-GATE-RESULTS.md`ではM3 MaxのGPU占有時、seq≤8192のfp16 matmulがANEで1.29–1.45倍。
+空きGPUには0.91倍、16kでは0.92倍、32kはCPU fallback相当だった。公開Core MLは
+[stateful KV](https://developer.apple.com/videos/play/wwdc2024/10161/)を持て、
+[2-bit paletteと4-bit per-block圧縮](https://apple.github.io/coremltools/docs-guides/source/opt-overview.html)も
+使えるが、実機backendがload時にdense展開するか実行時展開するかは
+モデル・機体依存。Python/MLXと`MLMultiArray`の同期境界も残る。
+
+したがって現時点ではfull model / prefill offloadを再開しない。上のFR-Spec Q8 headができた後だけ、
+65,536-row coarse headをANEへ**置換**する小実験を行う。継続条件は (i) CPU_AND_NEがCPU_ONLYより
+十分速くANE参入を確認、(ii) MLX側headを外した定常RSSが増えない、(iii) 入出力・top-kを含むp50が
+MLX比20%以上短い、(iv) short / 17kの壁時計とrecallが非悪化。1つでも外れれば再び畳む。

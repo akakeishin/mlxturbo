@@ -565,3 +565,17 @@ rg -n "_build_rerank|_draft_argmax|DRAFT_RERANK|applyDraftLMHead|_head\(h_mtp" m
 ```bash
 rg -n "enable_sdpa_split|enable_sdpa_split_generic|_model_layers|_arch_registry" mlxturbo/fused.py mlxturbo/_arch_registry.py mlxturbo/spec_flash.py
 ```
+
+## MTPLX #391 / Voz 調査の反映 (2026-09-04 17:04 JST)
+
+- qwen4の汎用structure routingは既にある。先に独立したK/V prefix trimを終える。
+- その後のFlash-Next高価値順は fixed-M4 verifier/graphbank (+21%報告) → FR-Spec Q8
+  65,536-row head (+6.27%報告)。外部のgroup32数値は方向だけ使い、group64で別々にA/Bする。
+- ANEへのfull model移植は再開しない。FR-Spec head完成後に限り、MLX headを置換して定常RSS非増加、
+  I/O込み20%以上短縮、short/17k非悪化を満たすか小さく測る。
+
+再開の1コマンド:
+
+```bash
+rg -n "def _verify|def _draft_chain|_staged_forward|_draft_argmax" mlxturbo/spec_flash.py
+```

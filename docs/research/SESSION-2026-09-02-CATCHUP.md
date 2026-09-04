@@ -3183,3 +3183,17 @@ module import時の `mx.set_default_device(mx.cpu)` をautouse fixtureへ移し�
 SpecEngine関連は27 passed。本体移植後の実モデル128 token smokeも短3本でms/tok -2.9%、
 生成列128 / 128 / 128一致。再現道具は`tools/mtp_head_recall_27b.py`と
 `tools/mtp_head_rerank_ab_27b.py`、結果は`mtp-head-q2-*-0904.json`。
+
+### 2026-09-04 17:04 MTPLX #391とVozを現行バックログへ照合
+
+MTPLX #391の16k 80.92 tok/sは、137GB group32 pack、temperature 1、固定depth 3、fans最大 / 40°C
+gateの値で、こちらの98GB group64・ABBAとは直接比較できない。24項目のうちn-gram先読み、staged投入、
+QSA decode、GDN prefill、session reuseは同等レーンがあり、4096 chunkと広いroute chainは既に棄却済み。
+未実装で報告値が大きいfixed-M4 verifier (+21%)とFR-Spec Q8 (+6.27%、coverage 99.64%)だけを、
+K/V prefix trimの後へ追加した。2本を同時に変えず、group64 packで個別に判定する。
+
+Vozは467MBの固定ASRグラフをfallback無しでANEへ載せた有力な実例だが、動的KVを持つMLX LLMへの
+差し込み口ではない。Appleの公開Core MLにはstateful KVと圧縮weightがある一方、圧縮weightのruntime
+展開とPython/MLX境界の代金は実機依存。既存M3 Max実測もANEはGPU占有時の8k以下で勝つが、空きGPUと
+16kでは負けている。full model移植は再開せず、FR-Spec 65,536-row head完成後だけ、定常RSS非増加・
+I/O込み20%以上・short/17k非悪化の置換実験を行う。
