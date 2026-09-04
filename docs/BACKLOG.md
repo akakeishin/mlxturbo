@@ -972,3 +972,14 @@ state-in/state-outになっていない。既存compile試験もpureなMoE以外
 状態を欠いたままgraphを再利用するとcacheを静かに壊すため直接portは閉じる。再開には、qwen4の汎用
 component replacementで全状態を明示するadapterを先に作り、幅4のlogits・全cache・rollback
 keep=1/3/4を既存経路と一致させる。group32 pack専用checkやoffsetだけのgraph keyは移植しない。
+
+## 畳んだ: PR同梱FR-Spec Q8 65,536-row head (2026-09-04 17:36)
+
+公式sidecar（commit `a5e38bb7`、SHA-256 `950adf…c1fba`）を、既存Flash top-k traceの本走行
+11,780 target tokenへ実装前照合した。support coverageは全体89.02%、prompt別53.88〜99.66%で、
+宣言済みの全体99.9% / 各prompt99.5%を大幅に下回る。support外はQ8 draftが提案できず必ずmissに
+なるため、target verifyの正しさとは別に受理率を失う。Q8構築・GPU A/Bへは進まず閉じる。
+
+PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスクへは移らない。新しい汎用rankを
+学習する案はユーザー保留中の学習レーンに属し、この外部artifact移植とは別論点。FR-Spec完成後だけ
+行う予定だったANE coarse-head置換も開始条件を失ったため、現時点では実施しない。

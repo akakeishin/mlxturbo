@@ -3235,3 +3235,23 @@ pureなMoEだけが成功した。offsetをgraph keyに足すだけでは状態�
 全状態を明示的なstate-in/state-outへ出すqwen4 adapterが先に完成し、幅4でlogits・全cache・rollback
 keep=1/3/4が既存経路と一致すること。これはqwen4汎用component replacementの設計課題として扱い、
 FR-Specの独立したdraft head実験を先に進める。
+
+### 2026-09-04 17:36 PR同梱FR-Spec 64K語彙は現行trace coverage 89.02%で不採用
+
+PR #391の実装と同じ`qwen38_code_ranked_64k.json`をcommit `a5e38bb7`から取得した。65,536件、
+重複無し、token id 0..248,319、384,797 bytes。SHA-256は
+`950adfea038612e28a3839c98c9be73f76f422fcde0596bb4588ac774e7c1fba`。実装前の継続線を
+「support coverage 全体99.9%以上、各prompt 99.5%以上」と宣言し、既存の読み取り専用
+`topk-trace.jsonl`の本走行11,780 target tokenへ照合した。
+
+| prompt | n | support coverage |
+|---|---:|---:|
+| short:0 / short:1 / short:2 | 2,060 / 2,160 / 790 | 53.88% / 99.17% / 80.51% |
+| long:3 / long:4 / long:5 | 2,430 / 1,990 / 2,350 | 98.02% / 94.17% / 99.66% |
+| **全体** | **11,780** | **89.02%** |
+
+6本中1本しか各prompt線を通らず、全体も10.88 point不足。support外のtarget tokenはproposal不能なので、
+target verifyの分布を守れても受理率上限を大きく落とす。Q8 headの構築とGPU A/Bへ進まず、この
+code-ranked sidecarは不採用。PR本文の99.64%、実装docstringのbuild 99.487% / real trace 99.728%は
+相手corpusの値で、こちらの日本語・混合タスクへ移せない。FR-Spec完成を前提にしていたANE draft-head
+置換も開始条件を失ったため閉じる。再開には別の汎用corpusで作った固定sidecarが同じ事前線を通ることが必要。

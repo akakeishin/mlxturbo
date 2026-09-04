@@ -609,3 +609,18 @@ rg -n "def _verify|def _draft_chain|def _staged_forward|def capture|def rollback
 ```bash
 rg -n "_build_rerank|_draft_argmax|RERANK_BITS|RERANK_TOP|topk" mlxturbo/spec_flash.py tools/decode_ab.py
 ```
+
+## FR-Spec 64K語彙の実装前判定 (2026-09-04 17:36 JST)
+
+- **完了・不採用**: PR同梱の公式65,536 ID（SHA-256 `950adf…c1fba`）は、現行Flash traceの
+  本走行11,780 target tokenでsupport coverage 89.02%。事前線99.9%を通らない。
+- **prompt別**: 53.88% / 99.17% / 80.51% / 98.02% / 94.17% / 99.66%。各prompt 99.5%線は1/6。
+- **実装しない**: support外は必ずdraft missになるため、Q8 headの構築・A/Bへ進む価値がない。
+- **ANEも閉じる**: FR-Spec headの置換を開始条件にしていたため、現時点で対象headが無い。
+- **次**: ローカルモデルがあるGemma 26B/31Bの速度レーンへ進む。Qwen3.6-35Bは未取得。
+
+再開の1コマンド:
+
+```bash
+rg -n "Gemma|warm TTFT|QuantizedKVCache|TurboQuant|assistant" docs/BACKLOG.md docs/research mlxturbo tools
+```
