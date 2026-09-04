@@ -158,6 +158,7 @@ def _reset_fusions(model, guard: _OrigGuard, warned: set) -> None:
         # `_vendor/qwen4_exp.py` のシームを立てるだけで 27B には届かない
         ("gdn_port", lambda: fused.disable_gdn_port(model)),
         ("sdpa_split", lambda: fused.disable_sdpa_split()),
+        ("sdpa_split_generic", lambda: fused.disable_sdpa_split_generic()),
         ("sdpa_rowtile", lambda: fused.disable_sdpa_rowtile()),
         ("fast_rope", lambda: fused.disable_fast_rope(model)),
         ("ple_hoist", lambda: fused.disable_ple_hoist(model)),
