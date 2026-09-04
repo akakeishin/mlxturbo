@@ -81,6 +81,10 @@
   (`MLXTURBO_PREFILL_ATTN_MIN_KV`、2026-09-03 17:20 に 12288 から下げた。交差点 8.1k、10k -0.8%、品質同一) だけ発火する (50k prefill -23%、17k -3.7%、2026-09-03)。長文脈の KLD (自前の dense
   比) 0.040 は、既に受理している GDN Metal の同じ物差しでの 0.111 より小さい。長文脈の品質は
   bf16 参照が無いので、この物差しではなく課題の正答率で見ること (CATCHUP 2026-09-03 07:40)。
+  `MLXTURBO_BATCH_WAIT_MS` (既定 2、`=0` で off) はcontinuous batchのcohort開始時だけ待つ。
+  Gemma 4 26Bの通常EOS・128 tokenで、0msのB=2 aggregate 63.30 tok/sに対し
+  2msは136.02 tok/s (2.15倍、B=1は88.88対89.52 tok/sで非退行、2026-09-05)。
+  live cohortへの途中参加では待たない。
   `MLXTURBO_MOE_COMBINE_FOLD` (既定 on、行数 ≥ 64 の prefill 幅だけ、`=0` で off) と `MLXTURBO_PRIME_WINDOW`
   (既定 512) も 2026-09-03 に A/B と KLD で入れた本番の既定値。
   `FASTMLX_NGRAM_BACKEND` は **既定 pread に戻した** (2026-09-03 16:15)。mmap は同じ機体で続けて測ると -6〜-7% に見えたが、それは前の走行が

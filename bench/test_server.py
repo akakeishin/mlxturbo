@@ -10178,6 +10178,74 @@ def test_batch_coordinator_handoff_reuses_prefix_and_publishes_copy(monkeypatch)
     assert FakeBatchGenerator.last.remove_calls == []
 
 
+def test_batch_coalescing_window_collects_second_request_before_first_tick(
+    monkeypatch,
+):
+    """The short default window belongs at cohort start, before first MLX work."""
+
+    import concurrent.futures as cf
+    import sys
+    import types
+
+    from mlxturbo import batch as batch_module
+
+    class Response:
+        def __init__(self, uid):
+            self.uid = uid
+            self.token = 8
+            self.finish_reason = "length"
+            self.prompt_cache = None
+            self.all_tokens = None
+
+    class FakeBatchGenerator:
+        last = None
+
+        def __init__(self, *_args, **_kwargs):
+            self.uids = []
+            self.first_tick_rows = None
+            FakeBatchGenerator.last = self
+
+        def insert(self, _prompts, _max_tokens, **_kwargs):
+            uid = len(self.uids)
+            self.uids.append(uid)
+            return [uid]
+
+        def next(self):
+            self.first_tick_rows = len(self.uids)
+            return [], [Response(uid) for uid in self.uids]
+
+        def close(self):
+            pass
+
+    fake_pkg = types.ModuleType("mlx_lm")
+    fake_generate = types.ModuleType("mlx_lm.generate")
+    fake_generate.BatchGenerator = FakeBatchGenerator
+    fake_pkg.generate = fake_generate
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake_pkg)
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", fake_generate)
+    monkeypatch.setattr(batch_module, "_indexer_budget", lambda _model: None)
+    monkeypatch.setenv("MLXTURBO_BATCH_WAIT_MS", "2")
+
+    first = _batch_admission_for_session([1, 2, 3])
+    second = _batch_admission_for_session([4, 5, 6])
+    executor = cf.ThreadPoolExecutor(max_workers=1)
+    coordinator = batch_module.BatchCoordinator(object(), executor, 2, 2, [99])
+    sleep_calls = []
+
+    def enqueue_during_window(seconds):
+        sleep_calls.append(seconds)
+        coordinator.submit(second)
+
+    monkeypatch.setattr(batch_module.time, "sleep", enqueue_during_window)
+    coordinator.submit(first)
+    first.future.result(timeout=5)
+    second.future.result(timeout=5)
+    executor.shutdown(wait=True)
+
+    assert sleep_calls == [pytest.approx(0.002)]
+    assert FakeBatchGenerator.last.first_tick_rows == 2
+
+
 def test_batch_stale_claim_falls_back_after_invalidating_old_session(monkeypatch):
     """A claim that no longer matches cannot publish or retain stale state."""
 

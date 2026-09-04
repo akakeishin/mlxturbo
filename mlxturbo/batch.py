@@ -853,6 +853,11 @@ class BatchCoordinator:
         self._inbox: "_queue.SimpleQueue[Admission]" = _queue.SimpleQueue()
         self._guard = threading.Lock()
         self._active = False
+        try:
+            coalesce_ms = float(os.environ.get("MLXTURBO_BATCH_WAIT_MS", "2"))
+        except ValueError:
+            coalesce_ms = 0.0
+        self._coalesce_s = max(0.0, coalesce_ms) / 1000.0
 
     def submit(self, admission: Admission) -> None:
         """Thread-safe; callable from any asyncio task. Enqueues the
@@ -1060,6 +1065,25 @@ class BatchCoordinator:
                     except _queue.Empty:
                         break
                     (pending_solo if adm.tier == "solo" else pending_pool).append(adm)
+
+                # The HTTP tasks that are effectively concurrent can reach
+                # this worker a fraction apart.  A short cohort-start-only
+                # window lets the second request join before the first MLX
+                # tick; once a cohort is live, the normal per-tick admission
+                # path below remains unchanged.
+                if (
+                    self._coalesce_s > 0
+                    and mode is None
+                    and not live
+                    and len(pending_pool) == 1
+                ):
+                    time.sleep(self._coalesce_s)
+                    while True:
+                        try:
+                            adm = self._inbox.get_nowait()
+                        except _queue.Empty:
+                            break
+                        (pending_solo if adm.tier == "solo" else pending_pool).append(adm)
 
                 if mode in (None, "pool"):
                     # B-3: 各候補は「今すでに live な pool 行 + 自分」の

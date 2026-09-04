@@ -2096,7 +2096,8 @@ def maybe_build_batch_coordinator(
     )
     print(
         f"{log_prefix} 継続バッチング有効 (--max-batch {max_batch}, FallbackRunner 限定、"
-        f" 待ち窓なし・毎 tick 途中参加、join prefill chunk={resolved_prefill_step_size})。"
+        f" cohort wait={coordinator._coalesce_s * 1000:g}ms・毎 tick 途中参加、"
+        f"join prefill chunk={resolved_prefill_step_size})。"
         " QSA が有効になりうるリクエスト (プロンプト長 + max_tokens が"
         " indexer_budget を超えうるもの) は自動で単独実行に倒します"
         " (mlxturbo/batch.py の classify() 参照)"
