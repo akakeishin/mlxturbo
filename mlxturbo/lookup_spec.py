@@ -56,7 +56,11 @@ def _prefill(model, cache, y: mx.array, step: int) -> mx.array:
     while y.size > 1:
         n = min(step, y.size - 1)
         model(y[:n][None], cache=cache)
-        mx.eval([c.state for c in cache])
+        # The next chunk depends on these state leaves, so MLX preserves the
+        # ordering without a host-side wait.  This is the same value graph as
+        # mx.eval(); only submission is brought forward while Python prepares
+        # the following slice.
+        mx.async_eval([c.state for c in cache])
         y = y[n:]
     return y
 
@@ -82,6 +86,30 @@ def _needs_logits_processors(
     if frequency_penalty not in (None, 0.0):
         return True
     return False
+
+
+def _safe_draft_cap(cache, requested: int, rotating_indices: tuple[int, ...]) -> int:
+    """Limit a speculative write to a range that can still be rewound.
+
+    ``RotatingKVCache.is_trimmable()`` changes from true to false once its
+    ring reaches ``max_size``.  Looking only at an empty probe cache therefore
+    is not enough: a draft that crosses that boundary cannot restore the
+    overwritten rows after a rejection.  Plain one-token greedy steps need no
+    rewind and remain safe; only the draft width is capped here.
+    """
+
+    if requested <= 0:
+        return 0
+    cap = requested
+    for index in rotating_indices:
+        entry = cache[index]
+        max_size = entry.max_size
+        offset = entry.offset
+        # The forward writes one pending token plus ``draft``.  Keep the
+        # post-forward offset strictly below max_size so trim() remains valid
+        # if any drafted token is rejected.
+        cap = min(cap, max_size - offset - 2)
+    return max(0, cap)
 
 
 class LookupSpecRunner:
@@ -122,6 +150,12 @@ class LookupSpecRunner:
         # Python objects and involves no GPU computation).
         probe_cache = make_prompt_cache(model)
         self.trimmable = can_trim_prompt_cache(probe_cache)
+        self._rotating_cache_indices = tuple(
+            index
+            for index, entry in enumerate(probe_cache)
+            if isinstance(getattr(entry, "max_size", None), int)
+            and isinstance(getattr(entry, "offset", None), int)
+        )
 
     def generate(
         self,
@@ -177,9 +211,13 @@ class LookupSpecRunner:
             # consume it anyway (avoids the caller's "I passed a seed and it was
             # silently ignored").
             mx.random.seed(seed)
-        return self._lookup_generate(prompt_ids, max_tokens, eos_ids, on_tokens)
+        return self._lookup_generate(
+            prompt_ids, max_tokens, eos_ids, on_tokens, session=session
+        )
 
-    def _lookup_generate(self, prompt_ids, max_tokens, eos_ids, on_tokens) -> dict:
+    def _lookup_generate(
+        self, prompt_ids, max_tokens, eos_ids, on_tokens, session=None
+    ) -> dict:
         """The greedy n-gram lookup speculation proper.
 
         Per round: (a) if the same run as the prefix decided up to now has
@@ -198,16 +236,35 @@ class LookupSpecRunner:
         separate; anything under docs/ is outside the scope of this change, so
         it is written here).
 
-        session (per-conversation prompt cache reuse) is not handled here — a
-        cache dedicated to that request is created anew every time (the caller's
-        session is neither read nor written. On the next turn it simply
-        re-prefills everything as usual; it does not misbehave).
+        A ``FallbackSession`` is reused under the same append-only contract as
+        ``FallbackRunner``.  The speculative loop leaves its final bonus token
+        un-fed, so the published ``processed`` prefix ends at the last token
+        that is actually present in the cache; the next turn naturally feeds
+        that pending token together with the new prompt suffix.
         """
 
         t0 = time.perf_counter()
-        cache = make_prompt_cache(self.model)
-        ids = mx.array(prompt_ids, dtype=mx.uint32)
+        cache = None
+        reused = 0
+        if session is not None and session.cache is not None:
+            processed = session.processed
+            n = min(len(processed), len(prompt_ids))
+            while reused < n and processed[reused] == prompt_ids[reused]:
+                reused += 1
+            # _prefill deliberately needs one pending token.  The server's
+            # session selector normally enforces this cap too; keep the runner
+            # safe for direct callers.
+            if reused == len(processed) and reused < len(prompt_ids):
+                cache = session.cache
+                session.invalidate()
+            else:
+                reused = 0
+        if cache is None:
+            cache = make_prompt_cache(self.model)
+
+        ids = mx.array(prompt_ids[reused:], dtype=mx.uint32)
         y = _prefill(self.model, cache, ids, PREFILL_STEP_SIZE)
+        cache_processed = len(prompt_ids) - 1
 
         sam = SuffixAutomaton()
         sam.extend_all(prompt_ids)
@@ -224,6 +281,10 @@ class LookupSpecRunner:
             # end — the same structure as DraftSpecRunner /
             # mlx_lm.speculative_generate_step).
             draft_cap = max(0, min(self.max_draft, budget_left - 1))
+            if self._rotating_cache_indices:
+                draft_cap = _safe_draft_cap(
+                    cache, draft_cap, self._rotating_cache_indices
+                )
             draft = sam.draft(draft_cap, min_len=self.min_match) if draft_cap > 0 else None
             cand = y.tolist() + (draft or [])
             cand_arr = mx.array(cand, dtype=mx.uint32)
@@ -241,29 +302,44 @@ class LookupSpecRunner:
             rejected = m - accepted
             if rejected > 0:
                 trim_prompt_cache(cache, rejected)
+            cache_processed += 1 + accepted
 
             emit = (draft[:accepted] if draft else []) + [bonus]
             batch: list[int] = []
-            for t in emit:
+            emitted_draft = 0
+            for emit_index, t in enumerate(emit):
                 if len(tokens) >= max_tokens:
                     break
                 tokens.append(t)
                 sam.extend(t)
                 batch.append(t)
+                if emit_index < accepted:
+                    emitted_draft += 1
                 if t in eos_ids:
                     stop = True
                     break
+            # An EOS can occur inside an accepted draft.  Tokens after it were
+            # teacher-forced already but are not part of the response/session.
+            surplus = accepted - emitted_draft
+            if surplus > 0:
+                trim_prompt_cache(cache, surplus)
+                cache_processed -= surplus
             if batch and on_tokens:
                 on_tokens(batch)
             y = mx.array([bonus], dtype=mx.uint32)
 
         decode_time = time.perf_counter() - t0 - (ttft or 0.0)
         n_decode = max(len(tokens) - 1, 0)
+        if session is not None:
+            session.publish(
+                cache,
+                (list(prompt_ids) + tokens)[:cache_processed],
+            )
         return {
             "tokens": tokens,
             "ttft_s": ttft or 0.0,
             "decode_tps": n_decode / decode_time if decode_time > 0 else 0.0,
-            "prefill_reused": 0,
-            "prefill_new": len(prompt_ids),
+            "prefill_reused": reused,
+            "prefill_new": len(prompt_ids) - reused,
             "tokens_per_step": (n_decode / rounds) if rounds else 0.0,
         }

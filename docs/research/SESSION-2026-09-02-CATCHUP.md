@@ -4041,3 +4041,28 @@ fresh cacheのbf16/q8を同一process ABBAで測った。
 同じ組み込み経路で速度・品質を逆転する根拠がないため走らせない。製品配線と実験器は残さず、
 TurboQuant第2段のpacked 3 bit専用kernelは別候補として扱う。結果は
 `bench/results/gemma4-kv-q8-{4k,17k}-0905.json`（gitignore）。
+
+### 2026-09-05 07:10 LookupSpecのhot prefillをsession再利用で2.819→0.052秒へ短縮
+
+汎用`--lookup-spec`には、毎requestでcacheを作り直し、呼び手から渡された
+`FallbackSession`を読まない実装穴が残っていた。投機ループのcacheは最終bonusだけ未入力なので、
+実際にcacheへ入った`prompt + tokens`の接頭辞をpublishし、次ターンではappend-only一致分をそのまま
+引き継ぐようにした。失敗時に半端なcacheを公開しないため、所有権を取った時点でsessionをinvalidateする。
+
+Gemma 4 26B・4kで、初回8 token生成後に短い追質問を足した。2ターン目は4,103/4,112 tokenを
+再利用し、fresh/warm TTFTは2.819/0.052秒、**-98.15%**。生成8 tokenは一致した。
+
+同時にprefill chunkごとの`mx.eval(cache state)`を`mx.async_eval`へ変えた。依存するcache stateの
+計算順序はMLX graphが保ち、hostだけ待たずに次chunkを組む。4kの同一process
+`sync, async, async, sync`ではcold TTFT平均2.792→2.765秒、**-0.95%**。4 armの生成列は一致。
+5%未満だが値・永続メモリ・JIT形状を変えず、同期waitを除くだけなので採用した。結果は
+`bench/results/lookup-session-gemma4-4k-0905.json`（gitignore）。
+
+測定中、Gemmaの`RotatingKVCache`は空の時だけ`is_trimmable=True`で、窓が埋まるとFalseへ変わるのに、
+runnerが構築時の空cacheだけで可否を固定していた安全性穴も確認した。draft forwardが窓境界を越えると
+棄却分をrollbackできないため、`offset/max_size`から安全なdraft幅を毎round絞り、飽和後はdraft 0の
+正確なgreedyへ移る。accepted draft途中のEOSでは、teacher-force済みだが未出力の末尾もtrimしてから
+sessionをpublishする。対象15 testと`bench/test_server.py`全458 testで固定した。
+
+自然文でlookup hitが少ない場合の既存decode -32%は、このprefill/session変更とは別に残る。
+したがって`--lookup-spec`の既定offは維持し、常時onにはしない。

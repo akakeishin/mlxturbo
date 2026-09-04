@@ -26,6 +26,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import mlxturbo.cli as cli_module
+import mlxturbo.lookup_spec as lookup_spec_module
 import mlxturbo.server as server
 from mlxturbo.lookup_spec import LookupSpecRunner
 from mlxturbo.runner import (
@@ -9033,6 +9034,22 @@ class _ScriptedGreedyModel:
         return mx.array([rows])
 
 
+def test_lookup_spec_caps_draft_before_rotating_cache_loses_rewind():
+    class _RotatingLike(_TrimTrackingCache):
+        def __init__(self, offset, max_size):
+            super().__init__()
+            self.offset = offset
+            self.max_size = max_size
+
+        def is_trimmable(self):
+            return self.offset < self.max_size
+
+    assert lookup_spec_module._safe_draft_cap([_TrimTrackingCache()], 8, ()) == 8
+    assert lookup_spec_module._safe_draft_cap([_RotatingLike(5, 10)], 8, (0,)) == 3
+    assert lookup_spec_module._safe_draft_cap([_RotatingLike(9, 10)], 8, (0,)) == 0
+    assert lookup_spec_module._safe_draft_cap([_RotatingLike(10, 10)], 8, (0,)) == 0
+
+
 def test_lookup_spec_runner_accepts_correct_multi_token_draft():
     """真の継続が周期的 (= 繰り返しが多い) なら、1 ラウンドで複数トークン
     を受理できる (tokens_per_step > 1)。"""
@@ -9057,6 +9074,63 @@ def test_lookup_spec_runner_accepts_correct_multi_token_draft():
     assert result["tokens"] == expected
     assert collected == expected
     assert result["tokens_per_step"] > 1.0
+
+
+def test_lookup_spec_runner_reuses_append_only_session_cache():
+    """2ターン目は前回cacheに実在するprefixだけを再利用する。"""
+
+    pattern = [1, 2, 3, 4]
+    true_seq = [pattern[i % 4] for i in range(32)]
+
+    class _CountingModel(_ScriptedGreedyModel):
+        def __init__(self, sequence):
+            super().__init__(sequence)
+            self.cache_builds = 0
+
+        def make_cache(self):
+            self.cache_builds += 1
+            return super().make_cache()
+
+    model = _CountingModel(true_seq)
+    runner = LookupSpecRunner(model, tokenizer=object(), max_draft=8, min_match=2)
+    session = FallbackSession()
+
+    first = runner.generate(
+        true_seq[:7], 4, 0.0, set(), None, session
+    )
+    assert first["tokens"] == true_seq[7:11]
+    # 最終bonusはまだcacheに入力されていない。
+    assert session.processed == true_seq[:10]
+    cache_after_first = session.cache
+    builds_after_first = model.cache_builds
+
+    second = runner.generate(
+        true_seq[:12], 4, 0.0, set(), None, session
+    )
+    assert second["tokens"] == true_seq[12:16]
+    assert second["prefill_reused"] == 10
+    assert second["prefill_new"] == 2
+    assert model.cache_builds == builds_after_first
+    assert session.cache is cache_after_first
+    assert session.processed == true_seq[:15]
+
+
+def test_lookup_spec_runner_session_trims_teacher_forced_tail_after_eos():
+    """accepted draft途中のEOSより後を公開cacheへ残さない。"""
+
+    pattern = [1, 2, 3, 4]
+    true_seq = [pattern[i % 4] for i in range(24)]
+    prompt_ids = true_seq[:7]
+    model = _ScriptedGreedyModel(true_seq)
+    runner = LookupSpecRunner(model, tokenizer=object(), max_draft=8, min_match=2)
+    session = FallbackSession()
+
+    result = runner.generate(
+        prompt_ids, 6, 0.0, {2}, None, session
+    )
+    assert result["tokens"] == [4, 1, 2]
+    assert session.processed == prompt_ids + result["tokens"]
+    assert session.cache[0].seen == session.processed
 
 
 def test_lookup_spec_runner_corrects_a_wrong_draft():

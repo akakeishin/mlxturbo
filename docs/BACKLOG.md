@@ -43,8 +43,12 @@
 
 `--lookup-spec` (`LookupSpecRunner`) は n-gram lookup だけを使う。trim 可能なキャッシュ
 かつ貪欲限定。繰り返しの多い入力で 361 → 427 tok/s (+18%) だが、**繰り返しの無い自然文
-では 367 → 245 tok/s (-32%) と遅くなる**。自前ループが mlx_lm の `generate_step` が持つ
-`async_eval` 二重バッファを持たないため。ここを埋めれば常時 on にできる可能性がある。
+では 367 → 245 tok/s (-32%) と遅くなる**ため、既定 off は維持する。2026-09-05にprefillの
+同期waitを`async_eval`へ変え、Gemma 4 26B・4kでcold TTFT 2.792→2.765秒 (-0.95%、出力一致)。
+さらにappend-only sessionを配線し、2ターン目は4,103/4,112 tokenを再利用してTTFT
+2.819→0.052秒 (-98.15%、出力一致) まで短縮した。これはhot prefillの穴を閉じる変更で、
+自然文のlookup hit不足によるdecode -32%までは解消しない。Gemmaの回転KVは窓が埋まると
+rollback不能になるため、境界を越えるdraftだけ0へ絞り、以後は正確なgreedyへ移る。
 
 残るのは、`spec` / `flash_spec` 級の速度 (1.25-1.39x) を他アーキテクチャで出すこと。
 それには MTP 相当のドラフトヘッドか、アーキテクチャ固有の状態捕獲が要る。

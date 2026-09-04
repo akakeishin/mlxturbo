@@ -1055,3 +1055,20 @@ git show --stat --oneline HEAD && rg -n "保留|未決" docs/BACKLOG.md | tail -
 ```bash
 rg -n "state-pure|fixed-M4|graphbank|component replacement" docs/BACKLOG.md docs/research/MTPLX-2.11-GAP-2026-09-04.md mlxturbo/spec_flash.py
 ```
+
+## 採用: LookupSpecの非同期prefillとsession再利用 (2026-09-05 07:10 JST)
+
+- Gemma 4 26B・4kの同一process `sync,async,async,sync` で、cold TTFTは
+  2.792→2.765秒 (-0.95%)。値を変えずhostの同期waitだけを外し、生成8 tokenは全arm一致した。
+- append-only sessionを配線し、2ターン目は4,103/4,112 tokenを再利用。TTFTは
+  fresh 2.819秒→warm 0.052秒 (-98.15%)、生成列一致。
+- 回転KVが窓を越えた後はrollbackできないため、境界前にdraft幅を絞り、飽和後は
+  lookup draftを0にして正確な1-token greedyを続ける。既定`--lookup-spec off`は維持する。
+- 次の直接速度レーンはLookupSpecの自然文decode二重buffer、またはFlash-Next fixed-M4。
+  fixed-M4は現行trunkで134 state leavesのadapterが先に必要なので、小さなpatchとしては扱わない。
+
+再開の1コマンド:
+
+```bash
+rg -n "LookupSpecRunner|_safe_draft_cap|async_eval" mlxturbo/lookup_spec.py docs/BACKLOG.md
+```
