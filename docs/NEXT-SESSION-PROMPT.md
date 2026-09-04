@@ -647,4 +647,5 @@ rg -n "pre_feedforward_layernorm|pre_feedforward_layernorm_2|class Router|RMSNor
 対象モデル・固定条件・所要時間をユーザーへ明示する。候補が弱い日は使わない。
 
 18:07の強冷却直後診断はFlash-Next短文59.5 tok/s、固定GEMM 12.05 TFLOPS。通常条件53.6 tok/s比
-約+11%だが、十分冷えた既往上限13.05 TFLOPSには未到達。冷却継続後に同じ`null`短文を再測する。
+約+11%。数分継続後の再測は**61.5 tok/s**、直後GEMM **12.72 TFLOPS**で既往上限13.05の
+97.5%まで到達した。現在の設定は普段の常時冷却として合格。追加の強冷却は正式ベンチ時だけ使う。
