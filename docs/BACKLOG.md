@@ -1017,7 +1017,7 @@ PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスク�
 学習する案はユーザー保留中の学習レーンに属し、この外部artifact移植とは別論点。FR-Spec完成後だけ
 行う予定だったANE coarse-head置換も開始条件を失ったため、現時点では実施しない。
 
-## 進行中: Qwen3.6-35B-A3B MTP-5bit (2026-09-04 22:20)
+## 完了: Qwen3.6-35B-A3B MTP-5bitと長文幅4既定 (2026-09-05 02:45)
 
 - **取得済み**: 本体4bit約19GB、MTP-5bit 572MiB。
 - **読込修復済み**: MoEの`SwitchLinear` 3本を量子化対象に含め、sidecarの6個の
@@ -1060,6 +1060,14 @@ PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスク�
   50kも3/3で現行比改善し、平均15.952→14.525 ms/token（**-8.9%**、62.7→68.8 tok/s）。
   1 promptではARがさらに10.0%速かったが、他2 promptは`cap3`がAR比-9.3/-15.1%であり、静的な
   AR切替線にはしない。事前線の現行比全prompt非退行を通ったため、次は条件付き既定へ配線する。
+- **条件付き既定を採用**: 実測した40層・hidden 2,048・256 experts・top-8・full-attention間隔4・
+  head dim 256・vocab 248,320の構造とMTPが揃い、CLIの3値と環境overrideが未指定の場合だけ、
+  tokenized prompt 3,830以上を3/3/0、未満を3/8/16にする。異なる構造、MTPなし、明示設定は従来どおり。
+  server全452 testと実モデル起動ログを通過した。
+- **絶対速度の再測定は熱依存を明記**: 同じfull入力の50kを先頭cellにした2本はcold TTFT
+  54.16/54.29秒、decode 65.23/72.90 tok/s（中央値69.06）。ただし固定GEMMが前12.74から
+  後12.01 TFLOPSへ下がり、前後±1.5%ゲートには不合格。採用根拠は熱条件を同じにした
+  同一process A/Bの4k/17k/50k 9/9勝ちとKLDであり、69.06 tok/sは冷却時の参考値とする。
 - **次のKV帯域候補**: MLX-LMの`QuantizedKVCache`をfull-attention 10層だけq8/q4にできる。
   49,832 tokenのtarget KV概算はbf16 1.02GB、q8 0.54GB、q4 0.29GB。ただし量子化cacheは現行の
   汎用SDPA幅分割を迂回する。幅4以下で元々分割しない`cap3`の境界確定後、まず同一processの

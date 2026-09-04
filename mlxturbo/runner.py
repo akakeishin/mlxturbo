@@ -62,6 +62,21 @@ from .spec import (
 # calls.
 _GEN_TRACE = os.environ.get("MLXTURBO_GEN_TRACE") == "1"
 
+# Qwen3.6-35B-A3B の temp=0.7 実測で、3,830 token 以上は
+# n_draft/max_draft/lookup_len=3/3/0 が現行 3/8/16 より9 promptすべてで
+# 速く、未満は lookup が大当たりする短文を残す必要があった。未測定域へ
+# 外挿しないため、合格した最小の実prompt長をそのまま境界にする。
+QWEN36_CAP3_MIN_PROMPT_TOKENS = 3830
+_QWEN36_CAP3_MODEL_SHAPE = {
+    "hidden_size": 2048,
+    "num_hidden_layers": 40,
+    "num_experts": 256,
+    "num_experts_per_tok": 8,
+    "full_attention_interval": 4,
+    "head_dim": 256,
+    "vocab_size": 248320,
+}
+
 
 def _log_gen_trace(t_entry: float, t_cache: float, t0: float, t_first: float, t_queue: float) -> None:
     """Debug-only breakdown of one ``FlashSpecRunner.generate()`` call's
@@ -163,10 +178,26 @@ class SpecRunner:
     KIND = "spec"
     SUPPORTED_SAMPLING_PARAMS = frozenset({"seed"})
 
-    def __init__(self, engine: SpecEngine, n_draft: int, max_draft: int):
+    def __init__(
+        self,
+        engine: SpecEngine,
+        n_draft: int,
+        max_draft: int,
+        lookup_len: int = 16,
+        adaptive_cap3_min_prompt_tokens: int | None = None,
+    ):
         self.engine = engine
         self.n_draft = n_draft
         self.max_draft = max_draft
+        self.lookup_len = lookup_len
+        # MLXTURBO_SPEC_MAX_DRAFT は明示的な計測overrideなので、起動時に
+        # 指定されていれば族既定より優先する。環境knobはプロセス中に
+        # 書き換えない契約で、request hot pathの getenv も増やさない。
+        self.adaptive_cap3_min_prompt_tokens = (
+            None
+            if os.environ.get("MLXTURBO_SPEC_MAX_DRAFT")
+            else adaptive_cap3_min_prompt_tokens
+        )
         self.fallback_reason = None
 
     def generate(
@@ -174,17 +205,59 @@ class SpecRunner:
     ):
         if seed is not None:
             mx.random.seed(seed)
+        n_draft = self.n_draft
+        max_draft = self.max_draft
+        lookup_len = self.lookup_len
+        if (
+            self.adaptive_cap3_min_prompt_tokens is not None
+            and len(prompt_ids) >= self.adaptive_cap3_min_prompt_tokens
+        ):
+            n_draft, max_draft, lookup_len = 3, 3, 0
         return self.engine.generate(
             prompt_ids,
             max_tokens=max_tokens,
-            n_draft=self.n_draft,
-            max_draft=self.max_draft,
+            n_draft=n_draft,
+            max_draft=max_draft,
+            lookup_len=lookup_len,
             temp=temp,
             eos_ids=eos_ids,
             on_tokens=on_tokens,
             session=session,
             **extra,
         )
+
+
+def _resolve_spec_runner_defaults(
+    model_type: str | None,
+    has_mtp: bool,
+    n_draft: int | None,
+    max_draft: int | None,
+    lookup_len: int | None,
+    text_args=None,
+) -> tuple[int, int, int, int | None]:
+    """Resolve generic defaults and the one measured family policy.
+
+    Any explicit value disables the Qwen3.6 policy as a unit.  This avoids a
+    caller asking for one depth while the runner silently changes the other
+    depth or lookup length at 3,830 tokens.
+    """
+
+    explicit = any(value is not None for value in (n_draft, max_draft, lookup_len))
+    measured_shape = text_args is not None and all(
+        getattr(text_args, name, None) == value
+        for name, value in _QWEN36_CAP3_MODEL_SHAPE.items()
+    )
+    adaptive_min = (
+        QWEN36_CAP3_MIN_PROMPT_TOKENS
+        if model_type == "qwen3_5_moe" and measured_shape and has_mtp and not explicit
+        else None
+    )
+    return (
+        3 if n_draft is None else n_draft,
+        8 if max_draft is None else max_draft,
+        16 if lookup_len is None else lookup_len,
+        adaptive_min,
+    )
 
 
 def _position_local_sampler(temp, top_p, top_k, min_p, logit_bias):
@@ -1777,9 +1850,10 @@ def build_runner(
     tokenizer,
     config,
     args,
-    n_draft: int = 3,
-    max_draft: int = 8,
+    n_draft: int | None = None,
+    max_draft: int | None = None,
     log_prefix: str = "[mlxturbo]",
+    lookup_len: int | None = None,
 ) -> Runner:
     """A thin wrapper that handles the two of
     ``args.draft_model``/``args.lookup_spec`` ahead of the existing
@@ -1869,7 +1943,14 @@ def build_runner(
         return DraftSpecRunner(model, draft_model, tokenizer, num_draft_tokens=num_draft_tokens)
 
     resolved = _build_base_runner(
-        model, tokenizer, config, args, n_draft=n_draft, max_draft=max_draft, log_prefix=log_prefix
+        model,
+        tokenizer,
+        config,
+        args,
+        n_draft=n_draft,
+        max_draft=max_draft,
+        lookup_len=lookup_len,
+        log_prefix=log_prefix,
     )
 
     if getattr(args, "lookup_spec", False) and resolved.KIND == FallbackRunner.KIND:
@@ -1990,9 +2071,10 @@ def _build_base_runner(
     tokenizer,
     config,
     args,
-    n_draft: int = 3,
-    max_draft: int = 8,
+    n_draft: int | None = None,
+    max_draft: int | None = None,
     log_prefix: str = "[mlxturbo]",
+    lookup_len: int | None = None,
 ) -> Runner:
     """Try to construct a SpecEngine and drop to ordinary generation if the
     model's shape does not fit.
@@ -2247,5 +2329,33 @@ def _build_base_runner(
         return FallbackRunner(model, tokenizer, fallback_reason=reason)
 
     mtp_note = "MTP: なし" if mtp is None else "MTP: あり"
-    print(f"{log_prefix} 投機デコード有効 ({mtp_note} / lookup: 有効)")
-    return SpecRunner(engine, n_draft=n_draft, max_draft=max_draft)
+    (
+        resolved_n_draft,
+        resolved_max_draft,
+        resolved_lookup_len,
+        adaptive_cap3_min_prompt_tokens,
+    ) = _resolve_spec_runner_defaults(
+        getattr(model.args, "model_type", None),
+        mtp is not None,
+        n_draft,
+        max_draft,
+        lookup_len,
+        text_args=text_args,
+    )
+    if (
+        adaptive_cap3_min_prompt_tokens is not None
+        and not os.environ.get("MLXTURBO_SPEC_MAX_DRAFT")
+    ):
+        print(
+            f"{log_prefix} 投機デコード有効 ({mtp_note} / Qwen3.6条件付き幅4: "
+            f"入力{QWEN36_CAP3_MIN_PROMPT_TOKENS} token以上、未満はlookup有効)"
+        )
+    else:
+        print(f"{log_prefix} 投機デコード有効 ({mtp_note} / lookup: 有効)")
+    return SpecRunner(
+        engine,
+        n_draft=resolved_n_draft,
+        max_draft=resolved_max_draft,
+        lookup_len=resolved_lookup_len,
+        adaptive_cap3_min_prompt_tokens=adaptive_cap3_min_prompt_tokens,
+    )

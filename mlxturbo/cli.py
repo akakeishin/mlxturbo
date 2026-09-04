@@ -91,8 +91,18 @@ def main() -> None:
     ap.add_argument("--original", default="Qwen/Qwen3.8-27B")
     ap.add_argument("--temp", type=float, default=0.7)
     ap.add_argument("--max-tokens", type=int, default=2048)
-    ap.add_argument("--n-draft", type=int, default=3)
-    ap.add_argument("--max-draft", type=int, default=8)
+    ap.add_argument(
+        "--n-draft", type=int, default=None,
+        help="MTPの基本draft数。未指定は族既定（通常3）",
+    )
+    ap.add_argument(
+        "--max-draft", type=int, default=None,
+        help="MTPの適応draft上限。未指定は族既定（通常8）",
+    )
+    ap.add_argument(
+        "--lookup-len", type=int, default=None,
+        help="n-gram lookupの最大長。未指定は族既定（通常16）",
+    )
     ap.add_argument("--mtp-bits", type=int, default=4)
     ap.add_argument(
         "--no-mtp",
@@ -143,7 +153,13 @@ def main() -> None:
         install(model, args.ngram)
     print(f"[mlxturbo] loaded in {time.perf_counter() - t0:.1f}s: {args.model}")
     runner = build_runner(
-        model, tokenizer, config, args, n_draft=args.n_draft, max_draft=args.max_draft
+        model,
+        tokenizer,
+        config,
+        args,
+        n_draft=args.n_draft,
+        max_draft=args.max_draft,
+        lookup_len=args.lookup_len,
     )
 
     eos_ids = set(tokenizer.eos_token_ids)

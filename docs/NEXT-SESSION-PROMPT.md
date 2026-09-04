@@ -922,3 +922,23 @@ jq '.depths[0].summary | {mean_decode_tok_s,mean_end_to_end_tok_s,mean_speedup_v
 ```bash
 .venv/bin/python -m pytest -q bench/test_server.py
 ```
+
+## 完了: Qwen3.6長文を条件付き幅4へ配線 (2026-09-05 02:45 JST)
+
+- 実測したQwen3.6-35B-A3Bの構造 + MTP + 3値未指定時だけ、tokenized prompt 3,830以上を
+  `n_draft/max_draft/lookup_len=3/3/0`、未満を従来の3/8/16にする。異なる`qwen3_5_moe`構造へは
+  外挿せず、CLIのいずれか1値または非空の`MLXTURBO_SPEC_MAX_DRAFT`を指定した場合も自動切替しない。
+- 対象4 testとserver全452 testが合格。実モデル起動ログでも条件付き幅4を確認した。
+- 採用根拠はtemp=0.7の4k/17k/50kが9/9非退行（平均-10.4/-9.4/-8.9%）かつ、幅9比の
+  ΔKLD +0.000043。短文は1/3が+8.9%だったのでlookupを残した。
+- formal fullは50kでcold TTFTとdecodeが同時に崩れたため熱無効。50kを先頭に同一2 promptで
+  再生するとcold 54.16/54.29秒、decode中央値69.06 tok/sまで戻ったが、終了直後GEMMが
+  12.01 TFLOPS（基準比-6.0%）なので絶対値の正式線には使わない。
+- 次はhot prefill P0の固定suffix反復。Qwen3.6の次の速度候補はfull-attention 10層だけの
+  mixed KV q8/q4だが、現行SDPA分割を失うため、まずメモリ候補として同一process A/Bする。
+
+再開の1コマンド:
+
+```bash
+BIGLOCK_PRIO=1 tools/biglock.sh .venv/bin/python bench/hot_prefill_bench.py --help
+```

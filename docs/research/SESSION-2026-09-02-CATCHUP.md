@@ -3851,3 +3851,27 @@ seed固定、EOSを無視した512 token回文を、約50kの非重複3 prompt�
 未満を現行3/8/16にする条件付き既定を製品経路へ配線する。
 
 結果は`bench/results/qwen36-mtp-cap3-ar-3prompt-50k-temp07-strongcool-0905.json`（gitignore）。
+
+### 2026-09-05 02:45 Qwen3.6長文の条件付き幅4を採用、冷却時50kは69.06 tok/s
+
+実測したQwen3.6-35B-A3Bの構造（40層、hidden 2,048、256 experts、top-8、full-attention間隔4、
+head dim 256、vocab 248,320）+ MTP + 未指定時だけ、tokenized prompt 3,830以上を
+`n_draft/max_draft/lookup_len=3/3/0`、未満を3/8/16へ配線した。CLIの3値のどれか、または
+非空の`MLXTURBO_SPEC_MAX_DRAFT`がある場合は自動切替しない。対象4 testとserver全452 testが通過。
+
+再fullは短/4k/17k/25k/32kまで117.41/119.11/108.96/94.13/83.30 tok/sだったが、最後の50kで
+cold TTFT 65.81秒・decode 54.05 tok/sへ同時に崩れた。cap3が触らないcold prefillまで旧full比
++24.4%なので熱無効と判定した。10分超休止後、旧fullと同じoffset 154,400/204,200の2 promptだけを
+最初のcellに再生すると次になった。
+
+| 指標 | rep 0 | rep 1 | 中央値 |
+|---|---:|---:|---:|
+| cold TTFT | 54.159秒 | 54.293秒 | 54.226秒 |
+| warm TTFT | 0.618秒 | 0.616秒 | 0.617秒 |
+| decode | 65.23 tok/s | 72.90 tok/s | **69.06 tok/s** |
+
+前固定GEMMは12.74 TFLOPS（12.78比-0.3%）だったが、終了直後は12.01（-6.0%）で、独立レビューが
+定めた前後±1.5%ゲートには不合格。したがって69.06 tok/sは冷却時の再現参考値に留める。
+条件付き既定の採用は、同一process回文A/Bでtemp=0.7の4k/17k/50kが9/9現行比非退行、平均
+ms/token -10.4/-9.4/-8.9%、かつ幅9比ΔKLD +0.000043という熱差を相殺した証拠に基づく。
+結果は`bench/results/qwen36-{full-cap3-strongcool,50k-cap3-cooled}-0905.{json,log}`（gitignore）。

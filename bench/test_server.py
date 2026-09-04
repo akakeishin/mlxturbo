@@ -8701,6 +8701,117 @@ def test_draft_spec_runner_seed_calls_mx_random_seed(monkeypatch):
     assert calls == [99]
 
 
+class _CaptureSpecEngine:
+    def __init__(self):
+        self.calls = []
+
+    def generate(self, prompt_ids, **kwargs):
+        self.calls.append((len(prompt_ids), kwargs))
+        return {"tokens": []}
+
+
+def _call_spec_runner(runner, prompt_len):
+    return runner.generate(
+        [1] * prompt_len,
+        max_tokens=1,
+        temp=0.7,
+        eos_ids=set(),
+        on_tokens=None,
+        session=None,
+    )
+
+
+def test_qwen36_adaptive_cap3_switches_at_measured_prompt_boundary():
+    engine = _CaptureSpecEngine()
+    runner = SpecRunner(
+        engine,
+        n_draft=3,
+        max_draft=8,
+        lookup_len=16,
+        adaptive_cap3_min_prompt_tokens=3830,
+    )
+
+    # 同じrunner/session系列で短→長→短になっても、request開始時のtokenized
+    # prompt長だけで毎回決まり、前requestの設定を持ち越さない。
+    for prompt_len in (3829, 3830, 22):
+        _call_spec_runner(runner, prompt_len)
+
+    settings = [
+        (call[1]["n_draft"], call[1]["max_draft"], call[1]["lookup_len"])
+        for call in engine.calls
+    ]
+    assert settings == [(3, 8, 16), (3, 3, 0), (3, 8, 16)]
+
+
+def test_qwen36_adaptive_cap3_respects_environment_override(monkeypatch):
+    monkeypatch.setenv("MLXTURBO_SPEC_MAX_DRAFT", "8")
+    engine = _CaptureSpecEngine()
+    runner = SpecRunner(
+        engine,
+        n_draft=3,
+        max_draft=8,
+        lookup_len=16,
+        adaptive_cap3_min_prompt_tokens=3830,
+    )
+    _call_spec_runner(runner, 50000)
+    kwargs = engine.calls[0][1]
+    assert (kwargs["n_draft"], kwargs["max_draft"], kwargs["lookup_len"]) == (3, 8, 16)
+
+
+def _measured_qwen36_args(**changes):
+    values = dict(
+        hidden_size=2048,
+        num_hidden_layers=40,
+        num_experts=256,
+        num_experts_per_tok=8,
+        full_attention_interval=4,
+        head_dim=256,
+        vocab_size=248320,
+    )
+    values.update(changes)
+    return SimpleNamespace(**values)
+
+
+def test_resolve_spec_runner_defaults_isolates_qwen36_mtp():
+    import mlxturbo.runner as runner_module
+
+    cases = [
+        ("qwen3_5_moe", True, (None, None, None), _measured_qwen36_args(),
+         (3, 8, 16, 3830)),
+        ("qwen3_5_moe", False, (None, None, None), _measured_qwen36_args(),
+         (3, 8, 16, None)),
+        ("qwen3_5", True, (None, None, None), _measured_qwen36_args(),
+         (3, 8, 16, None)),
+        ("qwen4_exp", True, (None, None, None), _measured_qwen36_args(),
+         (3, 8, 16, None)),
+        ("qwen3_5_moe", True, (3, 8, None), _measured_qwen36_args(),
+         (3, 8, 16, None)),
+        ("qwen3_5_moe", True, (None, None, 0), _measured_qwen36_args(),
+         (3, 8, 0, None)),
+        ("qwen3_5_moe", True, (None, None, None),
+         _measured_qwen36_args(num_hidden_layers=32), (3, 8, 16, None)),
+    ]
+    for model_type, has_mtp, values, text_args, expected in cases:
+        assert runner_module._resolve_spec_runner_defaults(
+            model_type, has_mtp, *values, text_args=text_args
+        ) == expected
+
+
+def test_qwen36_adaptive_cap3_treats_empty_environment_override_as_unset(monkeypatch):
+    monkeypatch.setenv("MLXTURBO_SPEC_MAX_DRAFT", "")
+    engine = _CaptureSpecEngine()
+    runner = SpecRunner(
+        engine,
+        n_draft=3,
+        max_draft=8,
+        lookup_len=16,
+        adaptive_cap3_min_prompt_tokens=3830,
+    )
+    _call_spec_runner(runner, 50000)
+    kwargs = engine.calls[0][1]
+    assert (kwargs["n_draft"], kwargs["max_draft"], kwargs["lookup_len"]) == (3, 3, 0)
+
+
 def test_runner_kinds_includes_draft_spec_and_lookup_spec():
     assert "draft_spec" in RUNNER_KINDS
     assert "lookup_spec" in RUNNER_KINDS
