@@ -3017,8 +3017,7 @@ _MOE_GATHER_FOLD_ON = False
 _MOE_FOLD_MODE = "combine"
 
 
-def _moe_fold_block(switch_mlp, x_rows, row_src, idx_s, order, w_flat,
-                    extra=None):
+def _moe_fold_block(switch_mlp, x_rows, row_src, idx_s, order, w_flat):
     """`_moe_combine_fold` から呼ばれる gate/up -> SwiGLU -> down。
 
     ``switch_mlp`` 以外は `_moe_combine_fold` が持っている並べ替えの材料:
@@ -3114,9 +3113,7 @@ def _moe_fold_block(switch_mlp, x_rows, row_src, idx_s, order, w_flat,
     # 「unsort + 重み掛け + 和」を 1 カーネルに畳む。カーネルは
     # (t, k) の並びで読むので、重みは**トークン順**の w_flat をそのまま渡す
     out_sorted = mgg.qmm_segmented(act, w_dn, s_dn, b_dn, None, **kw_dn)
-    if inv is None:
-        inv = _inv_perm(order)
-    return mc.combine(out_sorted, inv, w_flat, rows, top_k)
+    return mc.combine(out_sorted, _inv_perm(order), w_flat, rows, top_k)
 
 
 def _inv_perm(order):

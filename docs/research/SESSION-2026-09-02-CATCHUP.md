@@ -2830,3 +2830,20 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - 判定: 段階投入は代金ゼロ (値が変わらず、遅くなる文脈なし) → 既定 on。capture のモジュール化は写しが 1 つ減る利点だけで速度は無く、幅 5+ のずれが未解明なので既定 off。**移植した族の prefill Metal 再帰は既定 off に** (`enable_gdn_port`、明示 `MLXTURBO_GDN_METAL=1` だけ。27B で取り分なし + KLD 0.00027)。
 - テストの罠: `bench/test_fusions_other_family.py` の module 直下 `mx.set_default_device(mx.cpu)` が同じ pytest プロセスの他ファイルの GPU 判定を収集時に False にし、一致検査が 1 つも走っていなかった → fixture に直した。
 - **第 2 段の的**: 1 リンク 10 ms (lm_head 0.64 GB の読み 1.5 ms + MTP 層 0.5 ms の下限に対して 8 ms の同期と糊) と固定費の +8 ms。
+
+### 2026-09-04 10:20 融合もどき (カーネルを書かずにバイトと同期を減らす) の一覧: **Flash-Next と 27B には的が無い、Gemma 4 型 (稼働率 80%) だけ窓がある** (監査エージェント、`scratchpad/agent-pseudo-fusion-audit.md`、`bench/results/pseudo-fusion-0904/`、道具 `tools/decode_glue_probe.py`)
+
+| | Flash-Next 短 | Flash-Next 17k | 27B S=1 | Gemma4-26B S=1 |
+|---|---|---|---|---|
+| 壁 ms/step | 34.7 | 30.1 | 43.1 | 12.0 |
+| dispatch/step | 3183 | 3436 | 1152 | 1459 |
+| 稼働率 | 94.8% | 93.8% | **98.7%** | **79.8%** |
+| 隙間 ms/step | 1.8 (5%) | 1.9 (6%) | 0.5〜3.6 | **2.4 (20%)** |
+| 重み読みの下限 | (MoE) | | 37.0 ms (dense 15.1 GB) = 壁の 92% | |
+
+- 上位 5 項目 (router の top-k gather / softmax / MoE 出力の f32 昇格 copy / x の top-k 複製 / f32 の contiguous 化、split-cb 配分で 5.9 ms/round) が実際に動かすバイトは **4.1 MB/round = 0.010 ms**。配分値の 590 分の 1。27B も同じ (残差 add 128 本 3.8 MB = 0.009 ms、norm 129 本 2.6 MB)。**dtype 統一・layout・重みへの畳み込みで「バイトを減らす」種類の融合には、どの族にも取り分が無い** (9/3 22:00 の対照 -192 本 ±0.0% と整合)。値段が付いているのは起動と直列の側だけ。
+- **27B は既に帯域の壁の 92%、稼働率 98.7%。糊の予算 5 ms。的は round の形 (B1 / B2) のみ。**「27B にも生きる」の見立ては外れ。
+- **Gemma 4 だけ**稼働率 79.8%、隙間 2.4 ms (20%)、RMSNorm が 331 本/step (30 層 × 11)。本数がタダでない唯一の帯で、norm を層あたり 3〜4 本に畳めれば 0.5〜1.5 ms (4〜12%) の見込み。ただし物差しが 1 step ごとの `mx.eval` なので本番の生成ループより隙間が広く出ている疑いあり (generate 経路で取り直しが先)。
+- 族 × 糊の種類 (コード読み、mlx_lm の全族): MoE 族は `switch_layers.py` の並べ替え一式 (argsort ×2、x 複製、unsort、`arange`) を全族が共有 (Flash-Next だけ自前で畳み済み) → **35B-A3B には 1〜9 がそのまま当てはまる**。DeepSeek / Kimi / GLM-DSA の MLA は `pe_scores` (128 head × kv × f32、4 MB/層) を sdpa の mask に渡していて、**唯一バイトが本当に大きい項目** (机上)。`scores * routed_scaling_factor` (deepseek_v3 系 8 族) と Gemma 4 の 4 種のスケールは重みに畳める (読み込み時)。minimax は自前 norm (3〜4 本)。
+- **判定: 融合もどきレーンは Flash-Next / 27B では閉じる。**Gemma 4 は Gemma レーンの中で norm の本数削減として扱う。MLA 族は将来の的。
+- 副産物 (別件、要即対応): `fused._moe_fold_block` の combine 分岐で `inv` が未束縛 → `MOE_DOWN_EPI` 既定 on × 行数 ≥ 64 = **Flash-Next の実 prefill 全部が落ちる**回帰。13f0d21 (族の回帰修正) で計数ソートの hunk を除外したときに `if inv is None:` の 5 行だけ紛れ込んだ (キーワードで hunk を選別した副作用)。10:20 に直す。
