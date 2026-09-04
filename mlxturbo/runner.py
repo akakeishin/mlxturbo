@@ -2012,6 +2012,17 @@ def _build_base_runner(
         print(f"{log_prefix} MoE compile の温め: {_n_g} グラフ / {_warm_s:.2f}s"
               f" (発火 {_warm_fire})")
 
+    # 計測用: 投機ゼロの経路 (FallbackRunner = mlx_lm の stream_generate、
+    # 融合は上で有効化したまま) を強制する口。`--no-mtp` は lookup (SAM) で
+    # 投機が残るので、「エンジンの素の効率」の行 (COMPARE-QUEUE) はこれで取る。
+    forced = os.environ.get("MLXTURBO_RUNNER", "").strip().lower()
+    if forced == "fallback":
+        reason = "MLXTURBO_RUNNER=fallback (投機なしを強制、計測用)"
+        print(f"{log_prefix} {reason}")
+        return FallbackRunner(model, tokenizer, fallback_reason=reason)
+    if forced and forced != "auto":
+        raise ValueError(f"MLXTURBO_RUNNER={forced!r} は不明 (fallback / auto)")
+
     # Qwen3.8-Flash-Next (qwen4_exp) + MTP (explicit or auto-discovered) ->
     # the FlashSpecEngine path (docs/MTP-FLASH.md). The 27B (qwen3_5) has a
     # different model_type, so it never enters the branch below at all and

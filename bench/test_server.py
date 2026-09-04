@@ -8369,6 +8369,36 @@ def test_build_runner_does_not_wrap_when_lookup_spec_flag_is_false():
     assert not isinstance(runner, LookupSpecRunner)
 
 
+def test_build_runner_env_forces_fallback(monkeypatch):
+    """`MLXTURBO_RUNNER=fallback` は投機ゼロ (FallbackRunner) を強制する計測用の口。
+    理由文字列に env の名前が入り、/health の fallback_reason で見分けられる。
+    不明な値は ValueError。"""
+    model = SimpleNamespace(
+        args=SimpleNamespace(model_type="llama"), layers=[object(), object()]
+    )
+    args = SimpleNamespace(
+        model="fake-llama",
+        original="fake-original",
+        mtp_bits=4,
+        no_mtp=True,
+        no_fused=True,
+        lookup_spec=False,
+    )
+    monkeypatch.setenv("MLXTURBO_RUNNER", "fallback")
+    runner = build_runner(model, tokenizer=object(), config={}, args=args)
+    assert isinstance(runner, FallbackRunner)
+    assert "MLXTURBO_RUNNER=fallback" in runner.fallback_reason
+
+    monkeypatch.setenv("MLXTURBO_RUNNER", "auto")
+    runner = build_runner(model, tokenizer=object(), config={}, args=args)
+    assert isinstance(runner, FallbackRunner)
+    assert "MLXTURBO_RUNNER" not in (runner.fallback_reason or "")
+
+    monkeypatch.setenv("MLXTURBO_RUNNER", "spec")
+    with pytest.raises(ValueError):
+        build_runner(model, tokenizer=object(), config={}, args=args)
+
+
 def test_build_runner_lookup_spec_does_not_apply_when_flash_spec_selected(monkeypatch):
     """spec/flash_spec が選ばれた場合、--lookup-spec を指定しても何もしない
     (既にモデル専用の投機が効いているため、build_runner の docstring 参照)。"""
