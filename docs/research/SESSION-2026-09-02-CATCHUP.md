@@ -2920,3 +2920,11 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 
 - 固定費: 1 グラフ 3〜6 ms のトレース × 48 層 × 形。短文脈 prefill の初回 +0.6 s (98 グラフ)、本番は S=1〜4 で ≈ 240 グラフ ≈ 1.5 s → **起動時の warm-up で払う** (TTFT に乗せない)。
 - 判定: 判定線 (-3%) には届かないが代金ゼロ (ビット一致、遅くなる文脈なし) → 既定 on に配線 (エージェント、`scratchpad/agent-fn-moe-compile.md`)。レーン 9 (層単位 compile) はこれで最終回答 = 「層は不可、MoE ブロックだけ」。
+
+### 2026-09-04 12:31 小 M (2〜8 行) の量子化行列積の自前カーネル `kernels/qmv_small_m.py` (`scratchpad/agent-27b-verify-width.md`): **各行が MLX の qmv (M=1) とビット一致** = 「検証幅で丸めが変わらない保証」を達成。速度は in-model で小勝ち (ms/tok -1.6 / -2.3%)、冷 micro では負け
+
+- 超線形の出所 (実機 27B の部品 × S、`tools/verify_width_cost_27b.py`、`bench/results/width-cost-27b-0904.json`): S=1→4 の +21.3 ms のうち **MLP の量子化行列積だけで +18.6 ms**。行列積でない部品 (conv / rms / layernorm) は S に平坦。実効帯域 M=1 372 / M=2 312 / **M=3 218 / M=4 216 GB/s**。重みは M ≤ 5 なら 1 回しか読まないので、落ちているのは **ALU 側** (重み 4 バイトあたり逆量子化 ≈ 32 演算の固定 + M × 8 FMA)。GDN の capture の `states_all` は S=4 で +1.8 ms (第 2 の的)。
+- カーネル: mlx の `qmv_fast_impl` (bits 4、values_per_thread 16、block 512、simd_sum) の構造を写し、M 行のアキュムレータを足したもの。**`qmv_small_m(x)[v] == quantized_matmul(x[v:v+1])` が M=1..8 × bf16 / fp16 で全要素ビット一致** (要は `load_vector` の和を T (bf16) のまま足してから float に上げること。float で足すと bias × sum が 1 ulp ずれる)。適格は mlx が qmv_fast を選ぶ条件と同じ (K%512、N%8、gs%16、bits 4、2 次元、M ≤ 8)。配線は `kernels/dispatch.py` の `SMALLM` 経路 + `MLXTURBO_SMALL_M_ROUTE` (**既定 off**、M=2..5・N ≥ 1024・K ≥ 1024)。テスト 37 件 (`bench/test_qmm_smallm.py`)。
+- in-model (27B、`bench/results/ab-smallm-kernel-short-0904.json`): 短 case 0 **ms/tok 32.88 対 33.40 (-1.6%)**、case 1 **28.39 対 29.07 (-2.3%)**。ms/round は tok/round が動く (素は幅ごとに丸めが違い、自前は変わらない) ので比較にならず、ms/tok で見る。残り (case 2、4k) は走行中。
+- 冷 micro (`tools/qmv_small_m_micro.py`): 1 forward 合計 M=4 で stock 46.5 対 自前 47.9 = **負け** (lm_head だけ 0.78〜0.87x)。**micro と in-model が逆** (孤立では M カーブ 1.14〜1.32x、実機 1.72x)。仮説は forward 全体で多数の qmv が重なったときの ALU / 発行率の飽和。**この的はカーネル単体の micro では判定できない。**
+- 判定は残りの A/B (複数プロンプト × 512 の ms/tok 平均) の後。「同じ挙動の保証」は取れているので、遅くならなければ既定 on の候補 (代金: bits 8 と gs≠64 は委譲、Flash-Next には未配線)。次の手: M=2..5 に `mma` (8 行に水増し) / `nocap` の経路も同じ A/B で比べる。
