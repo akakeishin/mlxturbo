@@ -861,3 +861,32 @@ MLX の `quantized_matmul` は M=1 (qmv) で 400 GB/s 級なのに M=2〜8 (fast
 
 NOSYNC は draft を「引いてから捨てる」のをやめて同期ゼロで引く = **提案する draft が変わるだけで、採否は target の verify が決める**。貪欲の verify では出力は target の argmax の列で、draft は速さにしか効かない。
 生成列が素と分岐するのは検証幅が変わる分の丸め (方針 12:40 の「丸め級」) で、品質ゲート (KLD) の対象ではない。安価な裏取りとして 17k の recall (12/12 型) を 1 回取っておくとよい (未実施)。
+
+## P0: 27B の深さ controller の意味を参照実装へ戻す (2026-09-04 14:48、blindspot 監査)
+
+`GATE_ROLLBACK_COST` の上下掃引は下方向 +5.5〜+8.1%、上方向の最良 `h=0.30` も
+-1.6%で採択線に届かなかった。ただし、現在の `_gate_depth` / `_plan_depth` は cited source と
+Flash 側 `DepthController` に対して3点ずれている。
+
+1. 現在までに積んだ expected でなく、未来 `d+1..cap` の積を current threshold に入れる。
+2. threshold を割った位置も `keep` に含める。
+3. acceptance の最初の miss より深い、条件付きで未観測の位置まで 0 で EMA 更新する。
+
+実際、全位置の受理率が0.95でも深さ1になる非単調性を既存テストが固定している。まず trace に
+decision 前の EMA / obs、選んだ深さ、accepted、round ms を載せ、参照側の censoring / 累積 /
+stop semantics へ直す。短3本 × 512の1プロセス A/Bで速度を見て、出力差は通常の丸め級 / KLD
+ゲートで扱う。ここが決着するまで、h=0.19 は維持するが27Bレーンは閉じない。
+
+## P0候補: 27B の MTP cache repair で先頭1行を再利用する (2026-09-04 14:48)
+
+draft 時に積んだ先頭の `_mtp_append` を repair が trim し、同じ token / hidden / 直前 cache から
+もう一度積んでいる。上限は eligible round あたり約1.24 ms。速度より先に、rejection / partial /
+full acceptance / D7 / EOS で full rebuild と retain-first の cache tensor と次 proposal が一致する
+直接テストを置く。一致しなければ畳む。一致したときだけ短 A/B。
+
+## P1候補: 27B proposal-only q2 top-32 rerank (2026-09-04 14:48、未測)
+
+exact q4 lm_head の matvec は帯域天井の97〜99%なので、カーネル高速化は再開しない。一方、MTP の
+proposal-only call は1リンク約1.88 msで、Flash と vendored Swift には q2 coarse top-32 + exact
+row rerank の先例がある。まず exact proposal に対する top-32 recall trace だけを取る。recall が
+十分でなければ実装しない。十分でも追加の常駐重み、warm-up、品質、net ms/tok を別々に審査する。

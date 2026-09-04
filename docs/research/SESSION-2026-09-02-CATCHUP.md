@@ -3027,3 +3027,41 @@ head4、depth 2 固定、回文順、burn-in 済み。A = compile / B = 素 (`be
 
 - `--no-mtp` (lookup のみ) は投機ゼロと同じ数字 = この文では lookup の取り分ゼロ。`MLXTURBO_RUNNER=fallback` は `_build_base_runner` の先頭で FallbackRunner に落とす計測用の口 (融合は有効のまま)。
 - **mlx-serve との差 (4k で 43.2 対 32.1) は素の効率ではなく投機の取り分** (相手は MTP で 1.71 倍、うち 1.40 倍。相手は depth 6 で per_draft 30%、うちは max_draft 8 の gated chain で平均 3.3 本/round)。同じ MTP 頭なので、的は gated chain の閾値 (`GATE_ROLLBACK_COST`、EMA) と chain の入力の質。小 M で verify 幅の代金が下がった今、閾値を掃引し直す (深く引く方が償却しやすくなった)。
+
+### 2026-09-04 14:44 27B gate の上方向 (`h=0.30/0.45/0.60`) は採択線に届かず。`0.19` を維持するが、controller の意味不整合を直すまでレーンは閉じない
+
+`decode_ab_generic.py`、短 3 本 × 512 × 2 回文、1 プロセス内交互測定
+(`bench/results/gate-h-up-27b-short-0904.json`)。基準は現行 `h=0.19`。
+
+| h | ms/tok | 対 0.19 | ms/round | tok/round |
+|---|---:|---:|---:|---:|
+| 0.19 | 28.498 | — | 85.847 | 3.038 |
+| 0.30 | 28.056 | **-1.6%** | 73.005 | 2.597 |
+| 0.45 | 28.755 | +0.9% | 68.138 | 2.364 |
+| 0.60 | 28.208 | -1.0% | 56.818 | 2.013 |
+
+- 事前に置いた採択線は短3本平均 -2%。最良の `0.30` も -1.6%で届かないため、4k / 17k と
+  `MAX_DRAFT` 掃引へ進めない。`0.45/0.60` は verify を軽くする一方、tok/round を
+  22.2 / 33.7%失う。入力別では `h=0.60` が現行比 -4.1 / -4.1 / **+5.8%** と反転する。
+- `0.30` は1ケースで生成列が63トークン目から分岐。幅依存の4bit丸めの範囲だが、速度の
+  採択線にも届かない。**当面の既定は 0.19 のまま**。
+- blindspot 監査で、掃引対象の `_gate_depth` / `_plan_depth` に参照実装と異なる3点を確認した。
+  (1) threshold が現在までの期待受理長ではなく未来 `d+1..cap` の積を使う、(2) 価格判定に
+  失敗した位置も `keep` に含める、(3) 最初の miss より深い未観測位置まで0で EMA 更新する。
+  その結果、`bench/test_spec_draft_chain_qwen3_5.py` は全位置の受理率が0.95でも深さ1になる
+  非単調性を「既存仕様」として固定している。vendored Swift と Flash 側 `DepthController` は、
+  first miss で観測を止め、失敗位置を選ばない。**h の上下だけでは正しい深さ価格を測れていない。**
+- 次は controller の入力・選択・結果を1回の trace に残し、意味を参照側へ直した短3本だけを
+  A/Bする。品質は出力一致ではなく通常の丸め級 / KLD ゲートで見る。掃引用 env はこの再測定の
+  口として一時的に残す。
+
+### 2026-09-04 14:48 blindspot 監査で残った次の2本: MTP cache 先頭行の再利用と proposal-only head
+
+- **確定、先に正しさを検査**: 27B は draft の先頭で `_mtp_append(y, _mtp_base(h_last),
+  mtp_cache)` を積んだ後、repair でその行まで trim し、同じ token / hidden / cache から先頭行を
+  再計算する。単体計測の上限は eligible round あたり約1.24 ms。rejection / partial / full /
+  D7 / EOS で cache tensor と次 proposal が一致することを検査し、一致した場合だけ短 A/Bへ進む。
+- **未決、trace から**: exact q4 の lm_head matvec 自体は帯域天井の97〜99%で、書き直す的ではない。
+  ただし proposal-only の MTP head まで全語彙 q4 を読む必然はない。Flash と vendored Swift にある
+  q2 coarse top-32 + exact rerank を、まず exact proposal の top-32 recall を変えずに測る。
+  recall が十分な場合だけ速度 A/Bへ進む。追加重み・warm-up・品質の代金があるため既定化は別判定。

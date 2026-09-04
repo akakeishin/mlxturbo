@@ -450,3 +450,64 @@ sed -n '1,180p' docs/research/PRODUCT-DIRECTION-2026-09.md
 - Flash-Next のフルベンチと overnight tier。フルベンチはユーザーの明示指示があるまで走らせない。
 - 畳んだ融合、疎 attention、計数ソート、層まるごとの compile、capture-module を再開しない。
 - 途中差分を混ぜて部分 commit しない。採否が出た論点ごとに、実経路のテスト後に扱う。
+
+## Blindspot 監査と追加 A/B 後の更新 (2026-09-04 14:48 JST)
+
+この節を上の P0-A / P0-B より新しい正本とする。
+
+### 完了: gate の h 掃引
+
+- 下方向 `0.10 / 0.05 / 0.02` は現行 `0.19` より +5.5 / +6.8 / +8.1%。
+- 上方向 `0.30 / 0.45 / 0.60` の短3本平均は -1.6 / +0.9 / -1.0%。採択線 -2%に
+  届かず、4k / 17k と `MAX_DRAFT` 掃引は行わなかった。
+- 既定は `h=0.19` のまま。ただし controller 自体の意味不整合が見つかったので、27Bレーンは
+  閉じず、次の P0 を先に行う。`MLXTURBO_SPEC_GATE_H` の口はその A/B 用に当面残す。
+
+### 新 P0-A: 27B controller の semantics を直して短 A/B
+
+現在の `_gate_depth` / `_plan_depth` は、vendored Swift と Flash の `DepthController` に対し、
+未来利得の使い方、失敗位置の keep、first miss より深い EMA 更新が異なる。全位置の受理率0.95で
+深さ1になる既存テストは正しい仕様ではなく、欠陥を固定している。
+
+作業順:
+
+1. round trace に decision 前の位置別 EMA / obs、選択深さ、accepted、round ms を追加する。
+2. acceptance 更新を「accepted prefix の1、それに続く最初の miss の0まで。以深は未観測」へ直す。
+3. 深さ walk を参照側の累積順と stop semantics にそろえる。Swift の位置別 price vector を
+   scalar `h` にどう写すかは、式を変える前に単体テストの表で明示する。
+4. 純関数テストで、高い条件付き受理率ほど選択深さが短くならないこと、miss 以深を更新しないこと、
+   failed marginal link を数えないことを固定する。
+5. 短3本 × 512 × 2だけ A/B。勝つ場合だけ 4k / 17k と KLDへ進む。
+
+再開の1コマンド:
+
+```bash
+rg -n "_expected_future_gain|_gate_depth|_plan_depth|pos_accept_ema|observed =" mlxturbo/spec.py bench/test_spec_draft_chain_qwen3_5.py tools/reference/e120/Qwen36MTPBlockSession.swift
+```
+
+### 新 P0-B: MTP cache repair の先頭1行再利用
+
+controller の後に、別論点として扱う。先に rejection / partial / full / D7 / EOS の合成ケースで、
+full rebuild と retain-first の cache tensor と次 proposal を比較する。一致した場合だけ一時 knob を
+作り、短3本 A/B。理論上限は eligible round あたり約1.24 msなので、広い抽象化は作らない。
+
+再開の1コマンド:
+
+```bash
+rg -n "mtp_off0|mtp_cache.trim|_mtp_append\(window|chain_head" mlxturbo/spec.py bench/test_spec_draft_chain_qwen3_5.py
+```
+
+### P1: proposal-only q2 top-32 recall trace
+
+exact q4 lm_head のカーネルは帯域天井なので触らない。Flash / vendored Swift の proposal-only
+shortlist を27Bへ移せるか、まず exact proposal を変えず top-32 recall だけ取る。recall が十分な
+ときだけ q2 常駐重み・warm-up・速度・品質を審査する。
+
+再開の1コマンド:
+
+```bash
+rg -n "_build_rerank|_draft_argmax|DRAFT_RERANK|applyDraftLMHead|_head\(h_mtp" mlxturbo/spec_flash.py mlxturbo/spec.py tools/reference/e120
+```
+
+その後の順序は既存どおり、qwen4_exp の汎用分岐 → Qwen3.6-35B-A3B → Gemma 4 温 TTFT →
+製品 P0。フルベンチと overnight は引き続きユーザーの明示指示待ち。
