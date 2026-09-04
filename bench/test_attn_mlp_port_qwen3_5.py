@@ -296,6 +296,87 @@ def test_qmm_wide_decode_width_falls_back():
     assert mx.array_equal(got, ref)
 
 
+def test_qmm_wide_survives_spec_engine_dispatch_swap():
+    """`SpecEngine.__init__` の後でも qmm_wide が発火する (2026-09-04 の回帰)。
+
+    27B は `SpecEngine.__init__` が `enable_quantized_dispatch(text,
+    active=False)` を呼び、全 `nn.QuantizedLinear` の `__class__` を
+    `DispatchedQuantizedLinear` にする。あちらが自前の `__call__` を持つので、
+    `enable_qmm_wide` が基底クラスに当てた `_qmm_wide_dispatch` が
+    シャドーされ、**印は 368 本付いているのに一度も発火しない**状態だった
+    (`scratchpad/probe-dispatch-shadow-before.log`)。ここは出荷と同じ順
+    (融合 -> dispatch の差し替え) で組んで、発火数と素との一致を見る。
+    """
+    if not GPU:
+        return
+    mx.random.seed(0)
+    mlp = _quantized_mlp()
+    model = _StubModel([_StubLayer(mlp=mlp)])
+    x = (mx.random.normal((1024, 1024)) * 0.5).astype(mx.bfloat16)
+    mx.eval(x)
+
+    from mlxturbo import fused as F
+    from mlxturbo.kernels import dispatch
+
+    F._QMM_WIDE_ON = False
+    ref = mlp(x)
+    mx.eval(ref)
+
+    tile = "qmm_wide_m64n32k32w2x2r8"
+    n = fused.enable_qmm_wide(model, mode="on")
+    try:
+        assert n == 3, f"印を付けた射影が 3 本でない: {n}"
+        # SpecEngine.__init__ と同じ操作 (mlxturbo/spec.py の
+        # `enable_quantized_dispatch(self.text, active=False)`)
+        dispatch.enable(model, active=False)
+        assert type(mlp.gate_proj).__name__ == "DispatchedQuantizedLinear"
+        _fire.reset()
+        got = mlp(x)
+        mx.eval(got)
+    finally:
+        F._QMM_WIDE_ON = False
+
+    fired = _fire.snapshot().get(tile, 0)
+    assert fired == 3, f"dispatch の差し替え後に qmm_wide が発火していない ({fired}/3)"
+    assert got.dtype == ref.dtype
+    assert mx.array_equal(got, ref), "dispatch 経由の qmm_wide が素とビット一致しない"
+
+
+def test_dispatch_scope_still_routes_after_delegation():
+    """`dispatch_scope()` の中 (検証フォワード / lm_head) の経路表は不変。
+
+    非活性で基底に委ねるようにしたので、活性の枝が生きていることを別に見る。
+    経路表に載っている形 (5120 -> 17408 の M=6) を通すと MMA が選ばれる。
+    """
+    from mlxturbo.kernels import dispatch
+
+    assert dispatch.select_route(5120, 17408, 6) == dispatch.MMA
+    calls = []
+    old = dispatch.quantized_matmul
+
+    def spy(x, w, scales, biases, **kw):
+        calls.append(kw.get("table"))
+        return old(x, w, scales, biases, **kw)
+
+    if not GPU:
+        return
+    mx.random.seed(0)
+    mlp = _quantized_mlp(dim=256, hidden=512)
+    model = _StubModel([_StubLayer(mlp=mlp)])
+    dispatch.enable(model, active=False)
+    x = (mx.random.normal((6, 256)) * 0.5).astype(mx.bfloat16)
+    mx.eval(x)
+    dispatch.quantized_matmul = spy
+    try:
+        mx.eval(mlp(x))                       # 非活性: 基底に委ねる (spy は通らない)
+        assert calls == []
+        with dispatch.dispatch_scope():
+            mx.eval(mlp(x))                   # 活性: 経路表 (table=None) を渡す
+        assert calls and all(t is None for t in calls), calls
+    finally:
+        dispatch.quantized_matmul = old
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     ok = True

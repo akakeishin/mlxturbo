@@ -2903,3 +2903,9 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - #4416 (hd256 + array mask の prefill を NAX 融合 attention へ、`MLXTURBO_SDPA_ROWTILE` と的が重なる、NAX 限定)、#4380 (sdpa_vector の GQA 12/16 化は head_dim 128 限定 = うちには当たらない)。
 - 速度: Flash-Next 短 512 (プロセスを分けた A,B,B,A) 16.08 対 16.08 ms/tok、ms/round 34.84 対 34.85 → **差なし**。17k は depth 適応の controller が混んだ機体で別の深さを選んで比較にならず打ち切り (`--depth 2` 固定が要る)。ユーザーの判断で速度 A/B はスキップ。
 - 判定: いま上げるものは無い。0.32.3 が出たら上げる価値は速度ではなく NAX の正しさ。mlx-lm の次版 0.32.0 は `_mlx_compat` の上限外で import 時に落ちる (設計どおり): そのときの作業は `spec_flash._staged_forward` の写しの PipelineMixin 追随、`layers`→`pipeline_layers`、`BatchKVCache.state` の 3 タプル化、上流の packed gated delta kernel (Dk=128) と自前 GDN の取り直し。
+
+### 2026-09-04 12:16 27B: qmm_wide のシャドーを直して発火 (prefill **4k -7.0% / 17k -5.6%**、生成列一致)。lm_head の 139 GB/s は帰属のアーチファクト (単体は天井の 97〜99%)
+
+- 修正 (`kernels/dispatch.py:290-301`): `DispatchedQuantizedLinear.__call__` の先頭で、非活性 (`dispatch_scope()` の外) なら `super().__call__(x)` に委ねる → 基底の `enable_qmm_wide` の差し替えが効く。活性の枝 (経路表) は不変。修正前の実機: 印 368 本、発火 **0**。修正後: 4k 736 / 17k 2944。
+- A/B (`decode_ab_generic --knob MLXTURBO_QMM_WIDE=auto,off`、`bench/results/qmm-wide-27b-fix-{4k,17k}.json`): prefill_s **17.28 対 18.58 (-7.0%)**、**84.09 対 89.03 (-5.6%、4 本とも)**、tok/round ±0、生成列 64 トークン全長一致 (ビット一致の設計どおり)。修正前は +0.4% (差なし)。Flash-Next は指紋一致で無影響。テスト 2 本追加 (修正を外すと落ちる)。
+- lm_head の切り分け (`tools/probe_lm_head_bw.py` 一般化、715 MB): 非常駐 335 GB/s / 常駐アイドル 344 / decode 直後 341 = **その状態の天井の 97〜99%**。Flash-Next の「常駐時 109 GB/s」は 27B では再現しない (常駐量 98 対 15〜17 GB の差)。第 2 段の「lm_head 4.6 ms = 139 GB/s」は単体 2.1 ms なので、差 2.5 ms は trace の per-kernel の帰属 (CB 按分) の側。**27B の lm_head は的ではない。**

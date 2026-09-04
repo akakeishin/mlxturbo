@@ -178,6 +178,17 @@ def _get_dispatched_class():
 
             def __call__(self, x):
                 active = self._fastmlx_dispatch_always or _DISPATCH_ACTIVE.get()
+                if not active:
+                    # 非活性 (`dispatch_scope()` の外) では基底クラスに委ねる。
+                    # ここで自前の「素と同じ写し」を通すと、基底の
+                    # `nn.QuantizedLinear.__call__` に当たっている差し替え
+                    # (`fused.enable_qmm_wide` / `enable_hc_qmm_wide` の
+                    # `_qmm_wide_dispatch`) を丸ごとシャドーしてしまう。
+                    # `SpecEngine.__init__` が `enable(..., active=False)` で
+                    # 全射影のクラスを差し替えるので、27B では prefill/decode の
+                    # 全部がこの枝を通る (2026-09-04 の回帰: 印は 368 本
+                    # 付いているのに `_fire` の `qmm_wide_*` が 0 だった)。
+                    return super().__call__(x)
                 out = quantized_matmul(
                     x,
                     self["weight"],
