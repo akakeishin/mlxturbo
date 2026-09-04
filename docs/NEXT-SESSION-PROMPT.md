@@ -399,8 +399,9 @@ rg -n "qwen4_exp|_staged_forward|_hidden_forward|enable_default_fusions" mlxturb
 ### P2: Qwen3.6-35B-A3B を 3 本目の試験台にする
 
 27B → qwen4_exp の汎用ルートが安定した後に着手する。対象は
-`mlx-community/Qwen3.6-35B-A3B-4bit` と `...-MTP-5bit`。まだ未ダウンロードなので、
-GPU 計測が無い時間に取得し、取得と計測を並走させない。最初に AR 対 MTP を測り、MoE 部品の
+`mlx-community/Qwen3.6-35B-A3B-4bit` と `...-MTP-5bit`。2026-09-04 18:15時点で本体は
+4 shard・約19GBを取得済み。MTPはconfig/indexだけで、重み`model.safetensors`約581MBが未取得。
+許可後、GPU計測が無い時間にMTPだけ取得し、取得と計測を並走させない。最初に AR 対 MTP を測り、MoE 部品の
 契約がどこまで自動で当たるかを対応表にする。5bit MTP は 1 層なので、そのまま読む。
 
 再開の 1 コマンド:
@@ -617,7 +618,8 @@ rg -n "_build_rerank|_draft_argmax|RERANK_BITS|RERANK_TOP|topk" mlxturbo/spec_fl
 - **prompt別**: 53.88% / 99.17% / 80.51% / 98.02% / 94.17% / 99.66%。各prompt 99.5%線は1/6。
 - **実装しない**: support外は必ずdraft missになるため、Q8 headの構築・A/Bへ進む価値がない。
 - **ANEも閉じる**: FR-Spec headの置換を開始条件にしていたため、現時点で対象headが無い。
-- **次**: ローカルモデルがあるGemma 26B/31Bの速度レーンへ進む。Qwen3.6-35Bは未取得。
+- **次**: ローカルモデルがあるGemma 26B/31Bの速度レーンへ進む。Qwen3.6-35B本体は取得済み、
+  MTP重み約581MBだけ未取得。
 
 再開の1コマンド:
 

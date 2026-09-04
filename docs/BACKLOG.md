@@ -831,6 +831,12 @@ MLX の `quantized_matmul` は M=1 (qmv) で 400 GB/s 級なのに M=2〜8 (fast
 - 第 2 段: **TurboQuant (実装確定、ユーザー 2026-09-04 11:48。計画 `docs/research/TURBOQUANT-PLAN.md`)** (ランダム回転 + Lloyd-Max 3 bit + QJL の残差補正、学習不要、ICLR 2026、llama.cpp / ollama に実装あり)。量子化そのものは MLX の op で書けるが、**取り分は packed 3 bit の KV を直接読む decode 用 attention カーネル (S ≤ 8、qmv 型)** に懸かる (K2b の QSA decode カーネルと同型)。品質は KLD (対 bf16 KV) で審査。
 - Flash-Next / 27B は GDN 混成で KV が小さい (50k で 0.6 / 1.6 GB) ので優先度は低い。順序: Gemma 4 の drafter エンジン → norm の本数削減 → KV 量子化 (第 1 段 → 第 2 段)。
 
+## Qwen3.6-35B-A3B の取得状態 (2026-09-04 18:15)
+
+本体`mlx-community/Qwen3.6-35B-A3B-4bit`は4 shard・約19GBを取得済み。MTP-5bitは
+config/indexだけ取得済みで、index記載の`model.safetensors`は580,704,640 bytes、未取得。
+モデル取得は追加権限項目なので、許可後にGPU計測と重ならない時間帯でMTPだけ取得する。
+
 ## 畳んだ: Flash-Next の「飛ばす / 積む」(2026-09-04 11:43、`scratchpad/agent-fn-skip-stack.md`)
 
 - 「結果を使わない仕事」で実在したのは GDN の `state_out` の二度書き (113 MB/forward) だけで、in-model ±0.0% (隣の行列積と重なって隠れている = **バイトを消しても壁時計が動かない**直接の例)。indexer の q 側 512 列は 8.8 MB / 0.017 ms。他 (prime の MTP 層、pooled / top-k、mask、未受理行の lm_head) は MLX の遅延で既に飛んでいる。「積む」に新しい的は無し。
