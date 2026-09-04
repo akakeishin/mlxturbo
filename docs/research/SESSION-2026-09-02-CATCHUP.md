@@ -3517,3 +3517,20 @@ GDN direct/captureを実機形 (n_k=16、bf16) に揃え、prefill-attnは正し
 `MLXTURBO_PREFILL_ATTN_MIN_KV=0`にした。再走はGDN direct/capture各30回、prefill-attn 2回、
 gdn-blocked 6回、MoE/HC/RMS系も全て発火。最大差は各カーネルの宣言済みゲート内で
 **総合合格**。発火0を無条件で落とす方針は維持し、BACKLOG B6を閉じる。
+
+### 2026-09-04 21:21 MTPLX 2.11.1でfixed-M4 graphbankを再開
+
+手元の比較環境を2.9.2から2.11.1へ更新し、release wheelの`qwen4_fixed_verify.py`、
+`graphbank.py`、`generation.py`、`ple_prefill_lookahead.py`を確認した。新版のcompiled fixed-M4は
+GDN/PLE/QSA/KV/HCをcaptureしてstate planをinstallし、accept済み長をhost ledgerで進め、
+capacity generation単位でbankを成長・切替する。既存depthを幅4へ固定するだけの案ではない。
+
+相手のM5 Max 128GB・専用pack・temperature 1・copy lane onの同時刻比較では、compiled lane単体が
+16k round -12%（52.6→60.3 tok/s）、100k -18.5%（47.5→51.8）、後半のexact小物込みで
+16k 68.4、100k 60.9 tok/s。cold TTFTは16k 15.1→14.3秒、100k 117.0→113.2秒なので、
+主戦果はdecodeとsession reuseであり、cold本体の演算は引き続き別レーンで攻める。
+
+**判定**: 17:28の「fixed幅4直接port不採用」は維持するが、state-pure adapter後のgraphbankは再開。
+first-chunk gather at arrivalは現行のrunner内同期waitとの差として独立A/Bする。既存chunk lookaheadは
+50k cold -7.5%で同型を採用済み。FR-Spec Q8は手元coverage 89.02%なので棄却を変えない。
+詳細は`docs/research/MTPLX-2.11-GAP-2026-09-04.md`。

@@ -994,6 +994,18 @@ state-in/state-outになっていない。既存compile試験もpureなMoE以外
 component replacementで全状態を明示するadapterを先に作り、幅4のlogits・全cache・rollback
 keep=1/3/4を既存経路と一致させる。group32 pack専用checkやoffsetだけのgraph keyは移植しない。
 
+## 再開: MTPLX 2.11.1のstateful fixed-M4 graphbank (2026-09-04 21:21)
+
+上の棄却は「既存depthを4行へ固定するだけ」の案に限る。MTPLX 2.11.1はGDN/PLE/QSA/KV/HCを
+明示captureし、prefill後にstate planをinstall、host ledgerとcapacity generationで更新する別設計を
+出荷した。相手の同時刻比較ではcompiled laneだけで16k round -12%、100k -18.5%。したがって
+state-pure adapter完了後のgraphbankは再開する。詳細と重複監査は
+`docs/research/MTPLX-2.11-GAP-2026-09-04.md`。
+
+同releaseのcold側ではfirst-chunk gatherをrequest到着時に始めて0.62→0.013秒。現行はrunner内で
+最初のspanを同期waitするので、warm bank hit時に無駄起動しない条件を先に固定して独立A/Bする。
+既存のchunk lookaheadは50k cold wall -7.5%で採用済みなので重ねて移植しない。
+
 ## 畳んだ: PR同梱FR-Spec Q8 65,536-row head (2026-09-04 17:36)
 
 公式sidecar（commit `a5e38bb7`、SHA-256 `950adf…c1fba`）を、既存Flash top-k traceの本走行

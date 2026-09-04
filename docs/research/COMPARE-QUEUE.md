@@ -8,7 +8,8 @@ docs/research/PLAN.md Phase E2「mlx-lm 素 vs fastmlx vs MTPLX の同一マシ�
 ## やったこと
 
 1. **MTPLX インストール**: `tools/compare/mtplx-venv/`（独立 venv、Python 3.13）
-   に PyPI 版 `mtplx==2.9.2` を `[server]` extra 込みで pip install した。
+   に PyPI 版をインストールした。初回比較は`mtplx==2.9.2`、2026-09-04 21:21 JSTに
+   `mtplx==2.11.1`へ更新済み。下記の2.9.2の実測表は歴史的比較として残す。
    `/private/tmp/.../scratchpad/mtplx/` の clone とバージョン一致を確認済み
    （どちらも 2.9.2。clone は参照のみ、コードはコピーしていない）。
    fastmlx 本体の `.venv` には一切触れていない。
@@ -43,7 +44,8 @@ docs/research/PLAN.md Phase E2「mlx-lm 素 vs fastmlx vs MTPLX の同一マシ�
   （mtplx clone の `TROUBLESHOOTING.md`・`tests/test_tail_profile_truth.py` 等
   複数箇所で一致。HF API `/api/models/...` でも実在・非 gated を確認済み）
 - 同 FP16 版: `Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed-FP16`（M1/M2 用。今回は未使用）
-- PyPI `mtplx` 最新版 = 2.9.2 = clone の `pyproject.toml` と同一
+- 手元のPyPI `mtplx`比較環境 = 2.11.1（2026-09-04 21:21 JST）
+- 2.11.1のFlash-Next差分は`docs/research/MTPLX-2.11-GAP-2026-09-04.md`
 
 ## 注意: docs/research/KERNEL-INTEL.md に「KLD 計測レーン」という見出しは無かった
 

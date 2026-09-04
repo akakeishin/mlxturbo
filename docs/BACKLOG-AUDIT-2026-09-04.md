@@ -18,7 +18,7 @@
 |---:|---|---|---|
 | 0 | hot prefill P0後半 | 実行可 | tokenize、LCP探索、restore、batchで捨てたreuse、preemption再計算tokenをdebug時だけ記録。通常経路の同期を増やさず、server全testと実Flash煙試験 |
 | 1 | Qwen3.6-35B-A3B MTP最終表 | 実行可 | 現行常用冷却でfull、長文脈、KLD/課題品質をARとMTPで比較。MTP読込と4k温TTFT修復は完了済み |
-| 2 | qwen4 component replacementの汎用化 | 実行可 | `arch.py`の契約で部品を発見し、qwen4 hardcodeを減らす。Flash-Nextの速度・cache/rollbackを非退行にする |
+| 2 | qwen4 state-pure adapter + fixed-M4 graphbank | 実行可 | MTPLX 2.11.1でexact経路の16k round -12%を確認。まず汎用component replacementで全状態とrollbackを明示し、その後だけ幅4 graphを試す |
 | 3 | 継続batchの残制限 A2/A4/A5 | 実行可 | prefix reuse、temperature 0.7分布、HTTP同時要求の3件。solo非退行、品質ゲート、実server throughput |
 | 4 | streaming logprobs / tool token対応 | 実行可 | 現在400で拒否するstream logprobsを実装し、ThinkingRouter/tool_callsのtoken対応を含め4 API経路を検証 |
 | 5 | Gemma KV量子化 | 実行可 | full/rotating cacheの契約を先に固定し、cold/warm/qualityとメモリを比較。既存Gemma warm修復とは別件 |
@@ -105,7 +105,9 @@ wall -7.5%、約535→578 tok/s (+8.1%)、出力3/3一致で既定onを確定し
 | モデル / 案 | 判定 | 根拠 / 残り |
 |---|---|---|
 | Flash-Next full / GuideLLM | 完了 | 常用冷却fullと外部形式の結果あり |
-| Flash fixed-M4 direct port | 棄却 | 幅4自体は遅く、graphbankにはstate-in/out契約が先に必要 |
+| Flash fixed幅4の直接port | 棄却 | 幅4自体は遅い。MTPLX 2.11.1のstateful graphbankとは別案 |
+| Flash fixed-M4 graphbank | 実行可 | 2.11.1で出荷・exact検査・16k round -12%。state-pure adapterとrollback一致が前提 |
+| Flash first-chunk gather at request arrival | 実行可 | 現行はrunner内で同期wait。warm bank hit時に起動しない条件を先に固定してA/B |
 | Flash FR-Spec Q8 head | 棄却 | 手元trace coverage 89.02%、宣言線99.9%未達 |
 | ANE coarse head | 依存あり | FR-Spec成立が開始条件だったため停止。新しい小headができた場合だけ再評価 |
 | Qwen3.6 MTP読込 / warm checkpoint | 完了 | 短/4k decode +51〜57%、4k温TTFT -73.5% |
@@ -145,6 +147,6 @@ wall -7.5%、約535→578 tok/s (+8.1%)、出力3/3一致で既定onを確定し
 
 1. hot prefill P0後半を実装し、固定suffix harnessで計測を閉じる。
 2. Qwen3.6 MTPの最終full/quality表を常用冷却で確定する。
-3. qwen4汎用component replacementを最小の1部品から進める。
+3. qwen4汎用component replacementをstate-pure adapterへ進め、MTPLX 2.11.1のfixed-M4 graphbankを再検証する。
 4. batch A2/A4/A5、streaming logprobs、Gemma KVの順に、各1論点1commitで閉じる。
 5. モデル/artifact/NAX/公開権限が要る項目だけ、必要物と代替検証を具体化して確認する。

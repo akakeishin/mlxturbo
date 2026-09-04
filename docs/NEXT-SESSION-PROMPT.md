@@ -808,3 +808,19 @@ HC、gdn-blocked、MoE verify、RMS norm、MoE routeを含む全8系統が対照
 ```bash
 MLXTURBO_MIN_FREE_GB=4 BIGLOCK_PRIO=1 tools/biglock.sh .venv/bin/python tools/gpu_fingerprint.py
 ```
+
+## MTPLX 2.11.1でfixed-M4 graphbankを再開 (2026-09-04 21:21 JST)
+
+- 手元の独立比較環境を2.9.2→2.11.1へ更新した。Flash-Next専用packは約115GBで、取得後に
+  相手の推奨設定を同じ常用冷却で測る。ダウンロード中はGPUベンチを走らせない。
+- 17:28に棄却したのは既存depthを固定するだけの案。2.11.1はGDN/PLE/QSA/KV/HCをcaptureし、
+  state plan、host ledger、capacity generationを持つ別設計で、16k round -12%を出荷している。
+- 先にhot P0へbank hit時の不要gather、cache identity、postcommit待ちを照合する。cold側は
+  first-chunk gather at arrivalを独立A/B。その後、state-pure adapter→全cache/rollback一致→graphbank。
+- 詳細は`docs/research/MTPLX-2.11-GAP-2026-09-04.md`。
+
+再開の1コマンド:
+
+```bash
+rg -n "capture|rollback|cache_offset|state|_verify|_staged_forward" mlxturbo/spec_flash.py mlxturbo/runner.py mlxturbo/arch.py
+```
