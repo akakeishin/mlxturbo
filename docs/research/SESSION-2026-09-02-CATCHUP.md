@@ -2847,3 +2847,4 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - 族 × 糊の種類 (コード読み、mlx_lm の全族): MoE 族は `switch_layers.py` の並べ替え一式 (argsort ×2、x 複製、unsort、`arange`) を全族が共有 (Flash-Next だけ自前で畳み済み) → **35B-A3B には 1〜9 がそのまま当てはまる**。DeepSeek / Kimi / GLM-DSA の MLA は `pe_scores` (128 head × kv × f32、4 MB/層) を sdpa の mask に渡していて、**唯一バイトが本当に大きい項目** (机上)。`scores * routed_scaling_factor` (deepseek_v3 系 8 族) と Gemma 4 の 4 種のスケールは重みに畳める (読み込み時)。minimax は自前 norm (3〜4 本)。
 - **判定: 融合もどきレーンは Flash-Next / 27B では閉じる。**Gemma 4 は Gemma レーンの中で norm の本数削減として扱う。MLA 族は将来の的。
 - 副産物 (別件、要即対応): `fused._moe_fold_block` の combine 分岐で `inv` が未束縛 → `MOE_DOWN_EPI` 既定 on × 行数 ≥ 64 = **Flash-Next の実 prefill 全部が落ちる**回帰。13f0d21 (族の回帰修正) で計数ソートの hunk を除外したときに `if inv is None:` の 5 行だけ紛れ込んだ (キーワードで hunk を選別した副作用)。10:20 に直す。
+- 追記 (10:38): 回帰修正 (d8c2c69) 後の Flash-Next 4k prefill 煙試験 OK (`decode_ab --knob null --only long --ctx 4000`、prefill 5.6〜6.0 s、0903h の 5.74 と同じ水準)。
