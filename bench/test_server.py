@@ -7961,10 +7961,11 @@ def test_spec_runner_downgrades_non_identity_sampling_params_instead_of_400(clie
     state = _install_state(primary, tokenizer=tok, downgrade_runner=downgrade)
     state.debug_log = True
 
-    resp = client.post(
-        "/v1/chat/completions",
-        json={"messages": [{"role": "user", "content": "hi"}], "top_p": 0.9},
-    )
+    with mock.patch.object(server, "_log_gen_stats") as log_stats:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={"messages": [{"role": "user", "content": "hi"}], "top_p": 0.9},
+        )
     assert resp.status_code == 200, resp.text
     assert not primary.calls
     assert len(downgrade.calls) == 1
@@ -7973,6 +7974,9 @@ def test_spec_runner_downgrades_non_identity_sampling_params_instead_of_400(clie
     assert body["choices"][0]["message"]["content"] == "fallback-out"
     assert "downgrade_reason" in body
     assert "top_p" in body["downgrade_reason"]
+    logged = log_stats.call_args.args[0]
+    assert logged["_session_selection"]["match_kind"] == "miss"
+    assert logged["_session_selection"]["template_tokenize_s"] >= 0.0
     assert state.session_telemetry["template_tokenize_s"] >= 0.0
     assert state.session_telemetry["timed_requests"] == 1
 
@@ -8047,18 +8051,22 @@ def test_spec_runner_downgrade_streaming_sets_response_header(client):
     state = _install_state(primary, tokenizer=tok, downgrade_runner=downgrade)
     state.debug_log = True
 
-    resp = client.post(
-        "/v1/chat/completions",
-        json={
-            "messages": [{"role": "user", "content": "hi"}],
-            "top_p": 0.9,
-            "stream": True,
-        },
-    )
+    with mock.patch.object(server, "_log_gen_stats") as log_stats:
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "top_p": 0.9,
+                "stream": True,
+            },
+        )
     assert resp.status_code == 200, resp.text
     assert "X-Mlxturbo-Downgrade-Reason" in resp.headers
     assert not primary.calls
     assert downgrade.calls
+    logged = log_stats.call_args.args[0]
+    assert logged["_session_selection"]["match_kind"] == "miss"
+    assert logged["_session_selection"]["template_tokenize_s"] >= 0.0
     assert state.session_telemetry["template_tokenize_s"] >= 0.0
     assert state.session_telemetry["timed_requests"] == 1
 
@@ -9589,7 +9597,6 @@ def test_debug_batch_route_does_not_claim_incompatible_primary_reuse(batch_env):
         [1, 2, 3, 4],
         4,
         request_telemetry={"template_tokenize_s": 0.001},
-        session_compatible=False,
     )
     assert route[:2] == (batch_env.coordinator, "pool")
     assert route[2]["batch_probe_status"] == "incompatible"

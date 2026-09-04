@@ -3226,6 +3226,12 @@ def _resolve_batch_route(
     if logprobs_requested:
         return None
 
+    # The pool belongs to the runner selected at startup.  A request-level
+    # downgrade (for example, speculative primary -> FallbackRunner) must not
+    # let a caller-provided flag make the primary runner's sessions look
+    # reusable by the different runner.
+    session_compatible = session_compatible and gen_runner is STATE.runner
+
     def with_probe(coordinator, tier):
         if not STATE.debug_log:
             return coordinator, tier
