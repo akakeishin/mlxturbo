@@ -437,6 +437,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="本番既定 (runner.build_runner)")
     ap.add_argument("--max-draft", type=int, default=8,
                     help="本番既定 (runner.build_runner)")
+    ap.add_argument("--lookup-len", type=int, default=None,
+                    help="SpecEngineのlookup幅。未指定は従来既定16、0で無効")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--prefill-once", action="store_true",
                     help="長文脈で prefill を 1 回に畳む。"
@@ -608,14 +610,14 @@ def main() -> int:
         t0 = time.perf_counter()
         set_variant(baseline)
         for _kind, ids in build_cases(tok, 0):
-            run_once(eng, ids, 32, eos_ids, nd, md)
+            run_once(eng, ids, 32, eos_ids, nd, md, args.lookup_len)
         print(f"[ab_gen] 空焼き 1 本を捨てた ({time.perf_counter() - t0:.1f}s)")
 
     # 2) variant ごとの空焼き。mx.fast.metal_kernel は初回発火で JIT する
     for v in variants:
         set_variant(v)
         for _kind, ids in cases:
-            run_once(eng, ids, 32, eos_ids, nd, md)
+            run_once(eng, ids, 32, eos_ids, nd, md, args.lookup_len)
     set_variant(baseline)
 
     order = (variants + variants[::-1]) * args.reps
@@ -632,18 +634,21 @@ def main() -> int:
         # 3) ケースごとの空焼き。キャッシュを組み直す 1 本目に段差が出る
         set_variant(baseline)
         if shared is None:
-            run_once(eng, ids, 32, eos_ids, nd, md)
+            run_once(eng, ids, 32, eos_ids, nd, md, args.lookup_len)
         else:
             run_resumed(eng, ids, *shared, n_tokens=32, eos_ids=eos_ids,
-                        n_draft=nd, max_draft=md)
+                        n_draft=nd, max_draft=md, lookup_len=args.lookup_len)
         for v in order:
             set_variant(v)
             _fire.reset()
             if shared is None:
-                row = run_once(eng, ids, args.tokens, eos_ids, nd, md)
+                row = run_once(
+                    eng, ids, args.tokens, eos_ids, nd, md, args.lookup_len
+                )
             else:
                 row = run_resumed(eng, ids, *shared, n_tokens=args.tokens,
-                                  eos_ids=eos_ids, n_draft=nd, max_draft=md)
+                                  eos_ids=eos_ids, n_draft=nd, max_draft=md,
+                                  lookup_len=args.lookup_len)
             row.update(kind=kind, ctx=n, case_idx=case_idx, variant=v)
             row["fired"] = _fire.snapshot()
             if args.round_trace:
@@ -685,6 +690,7 @@ def main() -> int:
             "ctx": args.ctx,
             "tokens": args.tokens,
             "reps": args.reps,
+            "lookup_len": args.lookup_len,
             "source_sha256": {
                 str(path.relative_to(REPO_ROOT)): hashlib.sha256(
                     path.read_bytes()

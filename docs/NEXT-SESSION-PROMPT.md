@@ -980,3 +980,18 @@ rg -n "max_sessions|session_pool|evict|allocated_bytes|session_id" mlxturbo/serv
 ```bash
 rg -n "persistent streaming MoE|MTPLX 2.11.1|mixed KV" docs/BACKLOG.md
 ```
+
+## Qwen3.6 KV q8を棄却 (2026-09-05 04:46 JST)
+
+- full-attention 10層だけをq8/group64へ変換する最小試作は、17k ABBAでms/round +10.9%、
+  tok/round -6.7%、ms/token +18.9%。生成列は19 token目で分岐した。
+- 現行の汎用SDPA幅分割を失うため、KV容量半減では逆量子化費用を回収できない。50kは走らせず、
+  製品コードとtestを撤回。`tools/decode_ab_generic.py`の`--lookup-len`だけ、製品の3/3/0条件を
+  正しく再現する測定口として残した。
+- 次はFlash-Next cold prefill。過去の5%未満棄却も、代償ゼロなら再監査して採用候補へ戻す。
+
+再開の1コマンド:
+
+```bash
+git show --stat --oneline HEAD && rg -n "棄却|既定 off" docs/research/SESSION-2026-09-02-CATCHUP.md | tail -n 80
+```

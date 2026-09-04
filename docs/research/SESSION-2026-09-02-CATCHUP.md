@@ -3934,3 +3934,24 @@ trace補助2 testは通ったものの、これは生成tok/sを上げる変更�
 複雑さに対する便益を示せないため、実モデルtraceをserver起動中に中止し、試作・専用trace・testを
 commit前に撤回した。既定count-8は変更しない。再開条件は、既存telemetryで8本超の再利用missが
 実運用の支配項だと確認できた場合だけ。速度研究はcold prefillと長文decodeへ戻す。
+
+### 2026-09-05 04:46 Qwen3.6 full-attention KV q8は17k +18.9%で棄却
+
+mlx-lm組み込みの`KVCache.to_quantized(group_size=64, bits=8)`を使い、Qwen3.6のfull-attention
+10層だけをprefill後にq8化した。GDNの`ArraysCache`は変更していない。製品と同じ長文
+`n_draft/max_draft/lookup_len=3/3/0`を再現できるよう、`decode_ab_generic.py`に
+`--lookup-len`を追加して同一processの8/0 ABBAを取った。
+
+| 文脈 | q8 / bf16 ms/token | q8 / bf16 ms/round | q8 / bf16 tok/round | 判定 |
+|---:|---:|---:|---:|---|
+| 短3 prompt | 8.243 / 7.260 | 19.110 / 18.610 | 2.378 / 2.623 | round +2.7%、総+13.5% |
+| 16,832 | 12.547 / 10.557 | 26.992 / 24.347 | 2.151 / 2.306 | **round +10.9%、総+18.9%** |
+
+短文は3ケースとも先頭24 token一致だが28〜44 tokenで分岐。17kは19 token目で分岐した。
+量子化cacheは`scaled_dot_product_attention`へtupleを渡すため、現行の汎用SDPA幅分割が意図どおり
+素通しになり、逆量子化費用と受理率低下が約1.02GB→0.54GBのKV削減を上回った。50kへ進む
+事前根拠を失ったため打ち切り、製品実装とtestは撤回した。結果は
+`bench/results/qwen36-kv-q8-{short-smoke,17k}-0905.json`（gitignore）。
+
+以後は5%線を有償変更の目安として扱い、値・出力が同一、追加メモリ/JIT/hot-path分岐なしの
+無償変更は5%未満でも複数runで符号が再現すれば採用する。過去の棄却記録もこの基準で再監査する。
