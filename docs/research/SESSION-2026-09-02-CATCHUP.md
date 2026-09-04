@@ -2864,3 +2864,8 @@ GDN の前処理が読む重みは 36 層で 3 MB しか無く、100 MB の冷�
 - 固定費の内訳 (`scratchpad/b2_fixed_cost_micro.py`): 幅 1 の round 45.1 ms = trunk forward **42.0** + lm_head **4.6** + 糊 ≈ 0。帯域下限との差は trunk の 64 層ループに +8.6、**lm_head に +3.0 (0.64 GB を 4.6 ms = 139 GB/s、下限の 2.9 倍遅い)**。MTP のリンク 1 本 3.2 ms (append 1.24 + lm_head 1.88)。「固定費 +8 ms」は同期でも Python でもない。
 - 数値: 貪欲でも生成列が変わる (検証幅が変わると 4bit `quantized_matmul` の丸めが変わる = prefill チャンクの注記と同じ性質)。ビット一致では受けられないが、どちらも同じモデルの正当な貪欲出力。tok/round は 3〜6% 落ちる (事前の深さ決めが事後より粗い) が、ms/tok は -12%。**判定: 既定 on** (`MLXTURBO_SPEC_DRAFT_NOSYNC=0` が逃げ道)。PREFETCH はコードごと削除。
 - **第 3 段の的**: (1) lm_head 4.6 ms (139 GB/s、draft のリンクにも効く)、(2) 幅を 1 増やす 11.6 ms の中身 (GDN の行ごと逐次 48 層が疑い)、(3) trunk の層ループの +8.6 ms、(4) tok/round の -3〜6% を取り返す深さ決め (`DepthController` の E(m)/T(m) 最大化、費用モデルの代金あり)。
+
+### 2026-09-04 10:55 27B: qmm_wide は SpecEngine 経路で一度も発火していなかった (scout)。lm_head 139 GB/s は環境 (直前の重みトラフィック) が疑い
+
+- `SpecEngine.__init__` (`spec.py:314`) の `enable_quantized_dispatch(self.text, active=False)` が全 `nn.QuantizedLinear` の `__class__` を `DispatchedQuantizedLinear` に上書きし、自前の `__call__` が `enable_qmm_wide` の差し替え (`_qmm_wide_dispatch`) をシャドーする。`dispatch_scope()` の外では常に STOCK。**起動ログの「qmm_wide 有効 (368 射影)」は印を付けただけで、27B の A/B が ±0 だったのはこれ** (今朝の移植の取り分の評価は取り直し)。Flash-Next は `enable_quantized_dispatch` を通らないので無関係。修正をエージェントに (`scratchpad/agent-27b-dispatch-fix.md`)。
+- lm_head (M=1、0.64 GB、4.6 ms = 139 GB/s): 自前カーネルは通らず stock の qmv。Flash-Next でも常駐時の孤立計測は 109 GB/s (KERNEL-BRIEF-MOE-GDN.md 2026-08-28、原因は直前の重みトラフィック、N の分割やカーネル選択では直らない)。CATCHUP 21:10 の「lm_head 0.83 ms」はバイト按分の推定値で孤立計測ではない。27B での切り分け (非常駐 / 常駐 / decode 直後) は同じエージェントに。
