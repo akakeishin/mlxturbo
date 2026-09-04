@@ -87,3 +87,8 @@ round ≒ **43 ms + 10 ms × draft 本数**。mlx-serve は draft 2 本で 52 ms
 verify 幅 S=2〜8 の trunk forward で、dense 射影 (`nn.QuantizedLinear`、MLX の `fast_qmm` 経路) が重みを M=1 の半分の帯域でしか読めていない → S=4 の +32 ms (75 対 43) の正体。既存の自前 3 本 (qmm_wide / skinny_mma / nocap、M_MIN=6) では届かない。
 **判断 (ユーザー 11:30): 自前で作る価値がある** (投機デコードの verify 幅全般 = 27B の dense 射影、Flash-Next の GDN in_proj / attention / lm_head / MTP に効く共通項)。設計: MLX の qmv と同じ形を保ち、M 行の入力を同じ重みタイルに同時に掛ける (重みは 1 回だけ読む、行ごとのアキュムレータをレジスタに)。配線口は `kernels/dispatch.py` の経路表 (m=2..8)。判定線: 冷 micro で M=4 が素の 0.6 倍以下、数値は fp32 参照との距離が素以下。
 見込み: 27B の verify S=4 が 75 → 48 ms 級なら round 67 → 40 ms、decode 36 → 55 tok/s 級 (mlx-serve 43 を抜く)。
+
+## 天井監査からの追記 (2026-09-04 12:10)
+
+- 27B の sdpa (d256、gqa 6) の S=4 (本番の 65%) は達成率 24%、7.6 ms/round の差だが、**幅を割っても直らない** (4 × S=1 = 964 us > S=4 の 718 us)。幅分割 (走行中) が効くのは崖の向こう (S ≥ 6、43 ms/round) だけ。S=2〜4 の取り分には **GQA の小幅専用の decode attention カーネル** (K2b `qsa_attn_decode` と同型、KV を 1 回読んで S 行 × gqa 6 head を同時に) が要る = 小 M qmv の次の的。
+- `quantized_matmul` の谷は M=4〜24 (M=8〜12 で 17〜35%)。小 M qmv は M ≤ 8 を第 1 目標、M=12〜31 の帯 (行を水増しした方が速い) はバッチ × 投機のレーンで。
