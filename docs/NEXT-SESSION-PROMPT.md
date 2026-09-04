@@ -653,3 +653,17 @@ rg -n "QuantizedKVCache|RotatingKVCache|to_quantized|make_cache" .venv/lib/pytho
 18:07の強冷却直後診断はFlash-Next短文59.5 tok/s、固定GEMM 12.05 TFLOPS。通常条件53.6 tok/s比
 約+11%。数分継続後の再測は**61.5 tok/s**、直後GEMM **12.72 TFLOPS**で既往上限13.05の
 97.5%まで到達した。現在の設定は普段の常時冷却として合格。追加の強冷却は正式ベンチ時だけ使う。
+
+## Qwen3.6 MTP読込修復後の更新 (2026-09-04 18:28 JST)
+
+- 本体4bit約19GBとMTP-5bit 572MiBは取得済み。
+- MoE `SwitchLinear`を量子化対象へ含め、実サーバーで`MTP: あり`を確認。短文64 tokenの入口確認は
+  119.8 tok/s、tok/step 3.0〜3.5。合成6/6、CLI 7/7。
+- 91.0 tok/sのAR煙試験とはthinking指定と熱履歴が違うため、31.7%差は採否に使わない。
+- 次は通常冷却で同じthinking指定、複数prompt × 512 token、短/4kのAR対MTPを揃えて測る。
+
+再開の1コマンド:
+
+```bash
+rg -n "MTP: あり|tok/step" scratchpad/log-qwen36-mtp-fixed-smoke-0904.txt && git show --stat --oneline HEAD
+```

@@ -66,6 +66,11 @@ _SHIFT_NORM_KEYS = (
 )
 
 
+def _quantizable_projection(_, module: nn.Module) -> bool:
+    """Quantize dense and MoE projections, but no unrelated module state."""
+    return hasattr(module, "to_quantized")
+
+
 def load_mtp(
     original_repo_path: str, args: TextModelArgs, quantize: dict | None = None
 ) -> MTPModule:
@@ -94,7 +99,7 @@ def load_mtp(
             (name, value.shape[-1])
             for name, value in tree_flatten(mtp.parameters())
             if name.endswith(".weight")
-            and value.ndim == 2
+            and value.ndim >= 2
             and value.shape[-1] % group_size
         ]
         if incompatible:
@@ -108,7 +113,7 @@ def load_mtp(
             group_size=group_size,
             bits=bits,
             mode="affine",
-            class_predicate=lambda _, m: isinstance(m, nn.Linear),
+            class_predicate=_quantizable_projection,
         )
     mtp.eval()
     return mtp
@@ -207,7 +212,7 @@ def load_mtp_file(
             group_size=packed["group_size"],
             bits=packed["bits"],
             mode=packed["mode"],
-            class_predicate=lambda _, m: isinstance(m, nn.Linear),
+            class_predicate=_quantizable_projection,
         )
         mtp.load_weights(list(weights.items()))
         mtp.eval()
@@ -222,7 +227,7 @@ def load_mtp_file(
             group_size=group_size,
             bits=bits,
             mode="affine",
-            class_predicate=lambda _, m: isinstance(m, nn.Linear),
+            class_predicate=_quantizable_projection,
         )
     mtp.eval()
     return mtp

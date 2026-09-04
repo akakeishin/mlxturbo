@@ -1003,3 +1003,12 @@ keep=1/3/4を既存経路と一致させる。group32 pack専用checkやoffset�
 PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスクへは移らない。新しい汎用rankを
 学習する案はユーザー保留中の学習レーンに属し、この外部artifact移植とは別論点。FR-Spec完成後だけ
 行う予定だったANE coarse-head置換も開始条件を失ったため、現時点では実施しない。
+
+## 進行中: Qwen3.6-35B-A3B MTP-5bit (2026-09-04 18:28)
+
+- **取得済み**: 本体4bit約19GB、MTP-5bit 572MiB。
+- **読込修復済み**: MoEの`SwitchLinear` 3本を量子化対象に含め、sidecarの6個の
+  `scales`/`biases`を受け取れるようにした。合成6/6、CLI 7/7、実機で`MTP: あり`を確認。
+- **入口の速度**: 短文64 token 1本で119.8 tok/s、tok/step 3.0〜3.5。比較条件が未統一なので暫定値。
+- **残り**: 通常冷却、同じthinking指定・prompt・生成長でAR対MTPを複数prompt × 512 token、4kまで
+  比較する。target verify後の生成品質と受理率も記録し、そこで既定採用を判定する。

@@ -49,6 +49,16 @@ def tiny_args() -> TextModelArgs:
     )
 
 
+def tiny_moe_args() -> TextModelArgs:
+    """Qwen3.6 と同じ MoE 経路を小さい形で再現する。"""
+    args = tiny_args()
+    args.num_experts = 4
+    args.num_experts_per_tok = 2
+    args.moe_intermediate_size = 64
+    args.shared_expert_intermediate_size = 64
+    return args
+
+
 def quantized_reference(args: TextModelArgs, group_size: int, bits: int) -> MTPModule:
     mtp = MTPModule(args)
     nn.quantize(
@@ -56,7 +66,7 @@ def quantized_reference(args: TextModelArgs, group_size: int, bits: int) -> MTPM
         group_size=group_size,
         bits=bits,
         mode="affine",
-        class_predicate=lambda _, m: isinstance(m, nn.Linear),
+        class_predicate=lambda _, m: hasattr(m, "to_quantized"),
     )
     mx.eval(mtp.parameters())
     return mtp
@@ -131,6 +141,30 @@ def test_sidecar_quantization_wins_over_argument():
     )
 
 
+def test_quantized_moe_sidecar_roundtrip_and_forward():
+    """MoE の SwitchLinear 3 本にも scales/biases の受け皿を作る。"""
+    args = tiny_moe_args()
+    ref = quantized_reference(args, group_size=64, bits=5)
+    d = save_sidecar(
+        ref, _TMP_ROOT / "moe_q5g64", {"group_size": 64, "bits": 5, "mode": "affine"}
+    ).parent
+    loaded = load_mtp_file(str(d), args)
+    assert_same_params(ref, loaded, "MoE 5bit サイドカー")
+
+    params = dict(tree_flatten(loaded.parameters()))
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        prefix = f"layers.0.mlp.switch_mlp.{proj}"
+        assert f"{prefix}.scales" in params, f"{prefix}.scales が無い"
+        assert f"{prefix}.biases" in params, f"{prefix}.biases が無い"
+
+    embeds = mx.random.normal((1, 5, args.hidden_size)).astype(mx.bfloat16)
+    hiddens = mx.random.normal((1, 5, args.hidden_size)).astype(mx.bfloat16)
+    out = loaded(embeds, hiddens)
+    mx.eval(out)
+    assert out.shape == (1, 5, args.hidden_size), f"出力の形が違う: {out.shape}"
+    assert bool(mx.all(mx.isfinite(out.astype(mx.float32)))), "出力に NaN/Inf がある"
+
+
 def test_quantized_sidecar_without_config():
     """config.json が無い単一ファイルでも fc の形から group_size/bits を割り出す。"""
     args = tiny_args()
@@ -161,7 +195,7 @@ def test_bf16_sidecar_path_unchanged():
         group_size=64,
         bits=4,
         mode="affine",
-        class_predicate=lambda _, m: isinstance(m, nn.Linear),
+        class_predicate=lambda _, m: hasattr(m, "to_quantized"),
     )
     mx.eval(expect.parameters())
     loaded = load_mtp_file(str(f), args, quantize={"bits": 4, "group_size": 64})
@@ -188,6 +222,7 @@ def main() -> int:
     tests = [
         test_quantized_sidecar_roundtrip,
         test_sidecar_quantization_wins_over_argument,
+        test_quantized_moe_sidecar_roundtrip_and_forward,
         test_quantized_sidecar_without_config,
         test_bf16_sidecar_path_unchanged,
         test_loaded_sidecar_runs_forward,

@@ -3322,3 +3322,18 @@ onは+21.1%遅い。off側同士、on側同士の生成列は一致したが、o
 `mx.fast.rms_norm`と自前simd縮約の順序差がRouterのtop-kへ入り、expert選択以降を変えたと考えられる。
 標準3 dispatchを1 dispatchへ減らしても自前kernelの固定費が上回り、品質側の代金もある。512 tokenや
 強冷却へ進む事前線を満たさないため不採用。実験コード、knob、harnessは削除し、記録だけ残す。
+
+### 2026-09-04 18:28 Qwen3.6-35B-A3BのMTP-5bit読込を修復、短煙試験119.8 tok/s
+
+本体4bit（約19GB）とMTP-5bit（572MiB）は取得済み。最初の起動ではMTP側の
+`switch_mlp.{gate,up,down}_proj`にある6個の`scales`/`biases`を受け取れず、MTP無しのlookup-onlyへ
+fallbackしていた。原因は、`MTPModule`の量子化predicateが通常の`nn.Linear`だけを対象にし、
+MoE専門家の`SwitchLinear` 3本を量子化していなかったことだった。
+
+量子化可能なprojection（`to_quantized`を持つleaf）を対象に直し、3次元の専門家weightもgroup sizeの
+整合検査へ含めた。小型MoEの5bit sidecarを保存・読込・forwardする回帰を追加し、既存を含む6/6 test、
+CLI周辺7 testが通った。実サーバーも`投機デコード有効 (MTP: あり / lookup: 有効)`で起動した。
+
+64 token・短文1本の入口確認は**119.8 tok/s**、server側tok/stepは3.0〜3.5。先に別条件で取った
+投機なし91.0 tok/sより31.7%高いが、thinking指定と熱履歴を揃えた同一条件A/Bではないため、これは
+採否の数字にしない。次は通常冷却でAR/MTPの条件を揃え、複数prompt・512 tokenと4kを測る。
