@@ -1075,6 +1075,15 @@ GDN 29.3%、attention 21.3%、HC read 10.5%だった。先読みはcold全体tok
 出力をarray equalで比較し、丸め差が出る場合はそこで止める。速度採用線は同じ常用冷却ABBAで
 17k wall 27.215→25.854秒以下（-5%）。MTPLX 2.11.1のexact部品監査より後の研究レーンとする。
 
+## 保留: MTPLX 2.11.1 Flash-Next製品経路の実機比較 (2026-09-04 21:55)
+
+専用Optimized-Speed packは取得・inspect済みで、ARは正常に動く。一方、推奨の
+`ask --profile turbo --mtp`はqwen4_expの層に存在しない`input_layernorm`をcapture経路が参照して
+停止する。`MTPLX_COMPILED_VERIFY=off`でもeager captureが同じ箇所で停止するため、graphbankだけの
+問題ではない。改変なしの`batched`診断はD3 52.79 tok/s、AR 28.38 tok/s（128 token、短文1本）で
+動いたが、製品のcapture-commit経路ではないので公式勝敗には使わない。上流修正版が出るまで比較は
+保留し、移植候補の設計監査だけ続ける。詳細は`docs/research/MTPLX-2.11-GAP-2026-09-04.md`。
+
 ## 完了: hot prefill P0の段階時間・batch損失・preemption再計算 (2026-09-04 21:46)
 
 debug requestにtokenize/LCP探索/restore時間を追加し、batchで失う再利用可能LCPとspec batchの

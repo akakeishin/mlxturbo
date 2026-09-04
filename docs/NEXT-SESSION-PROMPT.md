@@ -859,3 +859,21 @@ rg -n "def _group_prefill_forward|class SparseMoeBlock|def _moe_fold_block|def q
 ```bash
 BIGLOCK_PRIO=1 tools/biglock.sh .venv/bin/python bench/hot_prefill_bench.py --help
 ```
+
+## MTPLX 2.11.1専用packの起動判定 (2026-09-04 21:55 JST)
+
+- **packは正常**: 19 shard + 30 GiB n-gram、ローカル107 GiB。inspectはnative qwen4_exp、
+  `can_run=true`、MTP対応、推奨turbo。AR smokeは正常。
+- **製品MTPは上流不具合で停止**: turbo/compiledとcompiled-off/eagerの両方が、qwen4_expに無い
+  `DecoderLayer.input_layernorm`を`gdn_capture`から参照して落ちる。
+- **診断経路だけ動作**: `--verify-strategy batched`のD3は128 tokenで52.79 tok/s、同process AR
+  28.38 tok/s、受理率100/93.8/78.1%。`eager_plain`なので製品比較には使わない。
+- **次**: 上流修正版が出るまでは第三者wheelを直して公式値を作らない。first-gatherとstate-pure
+  adapterは設計候補として継続し、MTPLXの再ベンチは修正版取得後にする。
+
+再確認の1コマンド:
+
+```bash
+jq '.depths[0].summary | {mean_decode_tok_s,mean_end_to_end_tok_s,mean_speedup_vs_ar}' \
+  bench/results/mtplx211-flashnext-d3-batched-strongcool-0904.json
+```

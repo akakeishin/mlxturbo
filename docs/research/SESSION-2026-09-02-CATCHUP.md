@@ -3569,3 +3569,17 @@ spec batchのrecompute型preemptionは、退避した時点ではなく復帰pre
 同時にMTPLX 2.11.1用Flash-Next Optimized Speed packを取得した。公称115.1GB、ローカル表示107GiB、
 19 shardと30GiB n-gram sidecarが揃い、`mtplx inspect`は`can_run=true`、native qwen4_exp、
 MTP対応を返した。次は強冷却枠で起動確認と短い比較を行う。
+
+### 2026-09-04 21:55 MTPLX 2.11.1の製品MTP経路はqwen4 capture不整合で保留
+
+取得済みOptimized-Speed packはAR smokeで正常に`OK`を返したが、推奨の
+`ask --profile turbo --mtp`は最初のverifyで`DecoderLayer.input_layernorm`を参照して停止した。
+`MTPLX_COMPILED_VERIFY=off`でもeager captureが同じ`gdn_capture`実装を通り、同じ例外になった。
+qwen4_expのDecoderLayerにはこの属性が無いため、pack欠損や冷却ではなく2.11.1の公開quickstartと
+family model構造の不整合である。
+
+改変なしの公開診断`mtp-depth-sweep --verify-strategy batched`は動作した。強冷却、短文1本、
+temperature 1、D3、128 tokenでAR 28.38、MTP 52.79 tok/s（1.86倍）、end-to-endは
+26.84→47.57 tok/s。D3受理率は100.0 / 93.8 / 78.1%、検証2/2合格、routeは`eager_plain`。
+製品のturbo/capture-commitではないため勝敗表には載せず、上流修正版が出るまで再比較を保留する。
+結果は`bench/results/mtplx211-flashnext-d3-batched-strongcool-0904.json`（gitignore）。

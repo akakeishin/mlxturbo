@@ -68,3 +68,33 @@ component replacement契約へ状態を明示する順で進める。
 
 Flash-Next専用packはdry-runで約115GB（本体約80GB、n-gram 32GB、MTP 1.7GB）。取得後に
 MTPLX 2.11.1を相手の推奨設定で走らせる。ダウンロード中はGPUベンチを並走させない。
+
+## 手元packの起動結果（2026-09-04 21:55 JST）
+
+`Youssofal/Qwen3.8-Flash-Next-MTPLX-Optimized-Speed`をローカルへ取得した。19 shard、
+30 GiBの`ngram-table.safetensors`を含み、ローカル表示は107 GiB。`mtplx inspect`は
+`can_run=true`、native `qwen4_exp`、MTP対応、推奨profile `turbo`を返した。
+
+しかし2.11.1の公開`ask --profile turbo --mtp`は、最初のMTP verifyで
+`DecoderLayer.input_layernorm`を参照して停止した。compiled verifyを公式kill switchの
+`MTPLX_COMPILED_VERIFY=off`で切っても、`eager_capture`が同じ
+`gdn_capture.forward_with_gdn_capture`を通るため同じ例外になる。ARだけの`--no-mtp`は正常に
+`OK`を返したので、packの欠損や熱ではなく、公開quickstartがqwen3-next用capture構造を
+qwen4_expへ当てている互換性不具合である。
+
+改変なしで動く公開診断の`mtp-depth-sweep --verify-strategy batched`も確認した。短文1本、
+temperature 1、D3、128 token、強冷却で次の値だった。
+
+| 経路 | decode | end-to-end | 備考 |
+|---|---:|---:|---|
+| AR | 28.38 tok/s | 26.84 tok/s | 同じpack・同じprocess |
+| MTP D3 batched | 52.79 tok/s | 47.57 tok/s | AR比1.86倍、`eager_plain` |
+
+D3の受理率は100.0 / 93.8 / 78.1%、平均2.67 draft/cycle、検証は2/2合格。ただし
+これは相手が推奨するturbo/capture-commit経路ではないため、製品間の勝敗には使わない。
+pack内の73.47 tok/sも別機体・正常なfamily-serve経路のforge記録で、手元の再現値とはしない。
+第三者wheelを局所修正した値も公式比較には載せない。
+
+**判定**: MTPLX製品経路の比較は上流修正版が出るまで保留。設計監査は継続するが、
+mlxturboへ移す候補の優先順位は実測可能なfirst-gatherとstate-pure adapterのまま変えない。
+手元結果は`bench/results/mtplx211-flashnext-d3-batched-strongcool-0904.json`（gitignore）。
