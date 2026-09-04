@@ -81,3 +81,9 @@ round ≒ **43 ms + 10 ms × draft 本数**。mlx-serve は draft 2 本で 52 ms
 - S の費用 (trunk forward + lm_head + eval、中央値): S=1 43〜45 / S=2 48 (1.07x) / **S=4 74〜76 (1.7x)** / S=8 105 (capture) ・ **137 (staged、3.08x)**。S=1→2 は +4.7 ms なのに S=2→4 で +27 ms と**超線形**。S=8 では staged (2 層ごとの async_eval) のほうが 30% 遅い。
 - probe: dispatch 1,989/round、**command buffer 168/round**、稼働率 98.3%、カーネル平均 36 us (rms_looped 47 us、copy 33 us、Add 43 us = 小さい elementwise が 30〜50 us ずつ = CB の固定費の按分)。
 - 的の候補: (1) 段階投入の粒度 (`MLXTURBO_STAGE_EVERY`、既定 2 = 64 層で 32 回の async_eval = CB 168 本/round)。掃引 2 / 4 / 8 / 16 を投入 (10:50)。(2) S=2→4 の超線形 (GDN の行ごと逐次か、attention の S>2 の経路か)。(3) lm_head 139 GB/s (読み中)。
+
+## 第 3 段の的が絞れた (2026-09-04 11:30): **小 M (2〜8 行) の量子化行列積が 209 GB/s の天井** (M=1 の qmv は 400 GB/s 級)
+
+verify 幅 S=2〜8 の trunk forward で、dense 射影 (`nn.QuantizedLinear`、MLX の `fast_qmm` 経路) が重みを M=1 の半分の帯域でしか読めていない → S=4 の +32 ms (75 対 43) の正体。既存の自前 3 本 (qmm_wide / skinny_mma / nocap、M_MIN=6) では届かない。
+**判断 (ユーザー 11:30): 自前で作る価値がある** (投機デコードの verify 幅全般 = 27B の dense 射影、Flash-Next の GDN in_proj / attention / lm_head / MTP に効く共通項)。設計: MLX の qmv と同じ形を保ち、M 行の入力を同じ重みタイルに同時に掛ける (重みは 1 回だけ読む、行ごとのアキュムレータをレジスタに)。配線口は `kernels/dispatch.py` の経路表 (m=2..8)。判定線: 冷 micro で M=4 が素の 0.6 倍以下、数値は fp32 参照との距離が素以下。
+見込み: 27B の verify S=4 が 75 → 48 ms 級なら round 67 → 40 ms、decode 36 → 55 tok/s 級 (mlx-serve 43 を抜く)。
