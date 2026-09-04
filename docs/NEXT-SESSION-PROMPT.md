@@ -691,6 +691,8 @@ rg -n "MTP: あり|tok/step" scratchpad/log-qwen36-mtp-fixed-smoke-0904.txt && g
   `bench/guidellm_bench.py`、`docs/GUIDELLM-BENCHMARK.md`を追加し、実serverで2/2成功。
 - 次はhot prefill telemetry。LCP、checkpoint位置、reused/new、各段階時間、sessionごとの
   allocated bytes、eviction、batch-forfeited reuseを出してからbyte-budget LRUを比較する。
+- 無制限保持は不採用。50kは下限2.189 GiB/session、8本で17.52 GiBなので、観測と合格線は
+  `docs/research/HOT-PREFILL-DESIGN-2026-09.md`を正本にする。
 
 再開の1コマンド:
 

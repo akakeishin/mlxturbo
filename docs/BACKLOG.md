@@ -1030,3 +1030,5 @@ PRの99.64%はcode-ranked corpus側のcoverageで、日本語・混合タスク�
 
 次はhot prefillの観測を先に直し、suffix 0/16/64/256、pure append/retokenized、
 byte実測、eviction、batchで捨てたreuseを分離する。無制限cacheは入れない。
+設計判断、50kで下限2.189 GiB/sessionとなる容量見積もり、段階別の合格線は
+`docs/research/HOT-PREFILL-DESIGN-2026-09.md`を正本にする。
