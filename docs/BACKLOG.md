@@ -890,12 +890,14 @@ off-by-oneがあり、その高速値は採択根拠から除外した。optimis
 拡大実行は526 passed / 10 failedだが、失敗3ファイルは個別processで5 / 12 / 13 passed。
 CPU固定をfixture内で保存・復元し、CPUテストとGPUテストを同一processで再実行する。
 
-## P0候補: 27B の MTP cache repair で先頭1行を再利用する (2026-09-04 14:48)
+## 完了・採用: 27B の MTP cache repair は rejection の先頭1行を再利用 (2026-09-04 16:25)
 
 draft 時に積んだ先頭の `_mtp_append` を repair が trim し、同じ token / hidden / 直前 cache から
-もう一度積んでいる。上限は eligible round あたり約1.24 ms。速度より先に、rejection / partial /
-full acceptance / D7 / EOS で full rebuild と retain-first の cache tensor と次 proposal が一致する
-直接テストを置く。一致しなければ畳む。一致したときだけ短 A/B。
+もう一度積んでいた。partial / fullで先頭だけ保持するとappend幅が変わり、合成float32 cacheに
+最大9.54e-7の差が出るため不採用。`draft_rows > 0 and consumed == 1`だけを保持し、rejection / partial /
+full / D7 / EOS / direct lookupの8ケースでcacheと次proposalのbit一致を固定した。短3本 × 512 ×
+2回文はms/tok -0.9%、ms/round -0.9%、3/3 prompt非悪化、生成列一致。代金ゼロなので既定採用。
+結果と熱ドリフトはCATCHUP 16:25節。
 
 ## P1候補: 27B proposal-only q2 top-32 rerank (2026-09-04 14:48、未測)
 

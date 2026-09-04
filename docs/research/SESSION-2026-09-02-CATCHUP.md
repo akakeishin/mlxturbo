@@ -3118,3 +3118,28 @@ source SHA256を保存した。本番差分はEMA更新を挙動不変のmethod�
 `bench/test_ngram_stream.py` がcollection時に `mx.set_default_device(mx.cpu)` を実行し、同じprocessで
 後から走るGPUテストをCPU判定にする既存のtest isolation欠陥だった。controllerの故障ではないが、
 別論点として直す。
+
+### 2026-09-04 16:25 27B MTP cache repair は rejection round の先頭1行だけ保持。短文 -0.9%で採用
+
+draft の先頭行と repair の先頭行は token / hidden / 直前cacheが同じ。ただし accepted prefix が
+2行以上ある場合、全再構築の一括appendと「先頭を保持して残りだけappend」ではGEMM幅が変わり、
+合成float32 cacheに最大 `9.536743e-7` の差が出た。strict equivalenceを守るため、先頭draftを
+引いていて `consumed == 1` のときだけ保持する。これはfirst-link rejectionと、最初のdraftがEOSの
+場合。partial / full / EOSの2位置目以降は従来どおり全再構築する。
+
+合成qwen3_5で rejection / partial / full / D7 rejection / D7 lookup partial / EOS先頭 / EOS後段 /
+direct lookupを通し、active K/V cacheと次MTP hidden・proposalをbit一致で確認した (8 passed)。
+実モデルは `mtp-repair-reject-retain-27b-short-0904.json`、短3本 × 512 × 2回文、同一processのABBA。
+
+| 短文 | retain ms/tok | legacy | 差 | eligible round |
+|---|---:|---:|---:|---:|
+| case 0 | 37.491 | 37.850 | -0.9% | 61 / 217 |
+| case 1 | 45.571 | 45.927 | -0.8% | 28 / 164 |
+| case 2 | 39.148 | 39.570 | -1.1% | 16 / 95 |
+| **全体** | **40.737** | **41.115** | **-0.9%** | — |
+
+ms/roundも124.300対125.462で-0.9%。tok/round、受理数、round数は両側同一で、生成列は
+512 / 512 / 345 tokenすべて一致した。走行中に34.3→48.2 ms/tokの熱ドリフトがあり、回文ごとの
+符号は一部揺れたが、prompt別平均は3/3で非悪化。品質・メモリの代金がなく、実装も既存repairの
+局所methodだけなので、1%未満の代金ゼロ改善の規則に従い採用する。A/B専用wrapperとmeta JSONの
+source SHA256を残した。

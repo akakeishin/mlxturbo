@@ -499,6 +499,11 @@ controller の後に、別論点として扱う。先に rejection / partial / f
 full rebuild と retain-first の cache tensor と次 proposal を比較する。一致した場合だけ一時 knob を
 作り、短3本 A/B。理論上限は eligible round あたり約1.24 msなので、広い抽象化は作らない。
 
+**完了・採用 (2026-09-04 16:25)。**partial / fullはappend幅が変わり最大9.54e-7ずれるため畳み、
+bit一致する`consumed == 1`だけを保持。合成8ケースがbit一致、短3本はms/tok / ms/roundとも-0.9%、
+3/3 prompt非悪化、生成列一致。A/B中は34.3→48.2 ms/tokの熱ドリフトがあったため、絶対値でなく
+同一processのABBAとprompt別平均で判定した。
+
 再開の1コマンド:
 
 ```bash
@@ -531,4 +536,17 @@ rg -n "_build_rerank|_draft_argmax|DRAFT_RERANK|applyDraftLMHead|_head\(h_mtp" m
 
 ```bash
 rg -n "mtp_off0|mtp_cache.trim|_mtp_append\(window|chain_head" mlxturbo/spec.py bench/test_spec_draft_chain_qwen3_5.py
+```
+
+## MTP cache repair 決着後の更新 (2026-09-04 16:25 JST)
+
+- **完了・採用**: rejection roundだけ先頭MTP cache行を保持。短ms/tok -0.9%、3/3非悪化、bit一致。
+- **次**: 27B proposal-only q2 top-32は、exact proposalを変えないrecall traceから始める。
+- **並行しない後続**: qwen4_expの汎用分岐とK/V slice SDPA、Qwen3.6-35B、Gemma温TTFT、製品P0。
+- **テスト基盤**: `test_ngram_stream` のcollection時CPU固定をfixtureへ局所化する。
+
+再開の1コマンド:
+
+```bash
+rg -n "_build_rerank|_draft_argmax|DRAFT_RERANK|applyDraftLMHead|_head\(h_mtp" mlxturbo/spec_flash.py mlxturbo/spec.py tools/reference/e120
 ```

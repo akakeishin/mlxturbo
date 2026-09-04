@@ -659,6 +659,44 @@ class SpecEngine:
         e = self.inner.embed_tokens(tok_ids[None])
         return self.mtp(e, hiddens, cache=mtp_cache)
 
+    def _repair_mtp_cache(
+        self,
+        mtp_cache,
+        mtp_off0: int,
+        window: mx.array,
+        consumed: int,
+        h_last: mx.array,
+        hs: mx.array,
+        *,
+        reuse_first: bool = True,
+    ) -> None:
+        """Commit accepted MTP rows, retaining the identical first draft row.
+
+        Every MTP/D7 proposal starts by appending ``(window[0], h_last)``.
+        Repair used to trim that row together with the rejected tail and append
+        the same pair again.  Keep it when present, then append only the later
+        accepted pairs.  ``reuse_first=False`` is the exact legacy path used by
+        the A/B harness and equivalence tests.
+        """
+        draft_rows = mtp_cache.offset - mtp_off0
+        # With a longer accepted prefix, rebuilding all committed rows in one
+        # call and appending only the suffix use different GEMM shapes.  Even
+        # though the mathematical K/V inputs match, MLX may then round the
+        # suffix differently.  A first-link rejection is the useful strict-
+        # equivalence case: both paths use the same one-token append shape.
+        retain = int(reuse_first and draft_rows > 0 and consumed == 1)
+        mtp_cache.trim(draft_rows - retain)
+        if retain:
+            tok_ids = window[1:consumed]
+            true_hiddens = hs[:, : consumed - 1]
+        else:
+            tok_ids = window[:consumed]
+            true_hiddens = mx.concatenate(
+                [h_last, hs[:, : consumed - 1]], axis=1
+            )
+        if tok_ids.shape[0] > 0:
+            self._mtp_append(tok_ids, self._mtp_base(true_hiddens), mtp_cache)
+
     def _draft_chain(self, y, h_last, mtp_cache, keep: int, first=None) -> list:
         """Draw ``keep`` MTP links with no host sync at all
         (MLXTURBO_SPEC_DRAFT_NOSYNC, on by default; the dense counterpart of
@@ -1471,11 +1509,9 @@ class SpecEngine:
 
             self._rollback(caches, sink, len(window_l), consumed)
             if use_mtp:
-                mtp_cache.trim(mtp_cache.offset - mtp_off0)
-                true_hiddens = mx.concatenate(
-                    [h_last, hs[:, : consumed - 1]], axis=1
+                self._repair_mtp_cache(
+                    mtp_cache, mtp_off0, window, consumed, h_last, hs
                 )
-                self._mtp_append(window[:consumed], self._mtp_base(true_hiddens), mtp_cache)
 
             h_last = hs[:, consumed - 1 : consumed]
             if accepted_eos is not None:

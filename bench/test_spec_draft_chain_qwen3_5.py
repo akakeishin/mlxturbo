@@ -31,7 +31,7 @@ if str(REPO_ROOT) not in sys.path:
 import mlx.core as mx  # noqa: E402
 import mlxturbo  # noqa: E402,F401 -- sys.meta_path フック
 from mlx_lm.models import qwen3_5 as Q35  # noqa: E402
-from mlxturbo._mlx_compat import TextModelArgs  # noqa: E402
+from mlxturbo._mlx_compat import KVCache, TextModelArgs  # noqa: E402
 from mlxturbo.mtp import MTPModule  # noqa: E402
 from mlxturbo.spec import (  # noqa: E402
     ChatSession,
@@ -203,6 +203,97 @@ def test_mtp_cache_length_does_not_depend_on_the_draft():
                             session=session)
             lens.append(session.mtp_cache.offset)
     assert lens[0] == lens[1], f"MTP キャッシュの長さが knob で変わった: {lens}"
+
+
+def _active_cache(cache):
+    n = cache.offset
+    return cache.keys[..., :n, :], cache.values[..., :n, :]
+
+
+def _assert_same_cache(a, b, name):
+    assert a.offset == b.offset
+    for got, want in zip(_active_cache(a), _active_cache(b)):
+        diff = mx.max(mx.abs(got.astype(mx.float32) - want.astype(mx.float32)))
+        mx.eval(diff)
+        assert float(diff.item()) == 0.0, f"{name}: cache max_abs={diff.item()}"
+
+
+def test_retain_first_mtp_repair_matches_full_rebuild_for_all_boundaries():
+    """先頭行保持と全再構築で K/V と次 proposal が一致する。
+
+    repair が区別する状態は「この round に MTP 行があるか」と accepted
+    prefix の長さだけ。拒否・部分受理・全受理、D7 から lookup へ移った場合、
+    accepted EOS の代表値をすべて通す。
+    """
+    model, mtp = _build()
+    engine = SpecEngine(model, mtp=mtp)
+    cases = {
+        "rejection": (3, 1),
+        "partial": (3, 2),
+        "full": (3, 4),
+        "d7_rejection": (1, 1),
+        "d7_lookup_partial": (1, 3),
+        "accepted_eos_first": (3, 1),
+        "accepted_eos_later": (3, 2),
+        "direct_lookup": (0, 3),
+    }
+    for case_i, (name, (draft_rows, consumed)) in enumerate(cases.items()):
+        mx.random.seed(100 + case_i)
+        prefix_tokens = mx.array([3, 5, 7, 9])
+        prefix_h = mx.random.normal((1, 4, HIDDEN))
+        window = mx.array([(11 + case_i + i) % VOCAB for i in range(4)])
+        h_last = mx.random.normal((1, 1, HIDDEN))
+        hs = mx.random.normal((1, 4, HIDDEN))
+
+        legacy = KVCache()
+        retained = KVCache()
+        for cache in (legacy, retained):
+            engine._mtp_append(prefix_tokens, engine._mtp_base(prefix_h), cache)
+        mtp_off0 = legacy.offset
+        assert retained.offset == mtp_off0
+
+        if draft_rows:
+            draft_h = mx.concatenate(
+                [h_last, mx.random.normal((1, draft_rows - 1, HIDDEN))], axis=1
+            )
+            for cache in (legacy, retained):
+                # Production drafting appends one link per MTP call.  Keeping
+                # that call shape here is essential to the bit-exact check.
+                for i in range(draft_rows):
+                    engine._mtp_append(
+                        window[i : i + 1],
+                        engine._mtp_base(draft_h[:, i : i + 1]),
+                        cache,
+                    )
+
+        engine._repair_mtp_cache(
+            legacy, mtp_off0, window, consumed, h_last, hs,
+            reuse_first=False,
+        )
+        engine._repair_mtp_cache(
+            retained, mtp_off0, window, consumed, h_last, hs,
+            reuse_first=True,
+        )
+        _assert_same_cache(retained, legacy, name)
+
+        next_tok = mx.array([(31 + case_i) % VOCAB])
+        next_h = hs[:, consumed - 1 : consumed]
+        legacy_out = engine._mtp_append(
+            next_tok, engine._mtp_base(next_h), legacy
+        )
+        retained_out = engine._mtp_append(
+            next_tok, engine._mtp_base(next_h), retained
+        )
+        mx.eval(legacy_out, retained_out)
+        diff = mx.max(mx.abs(
+            legacy_out.astype(mx.float32) - retained_out.astype(mx.float32)
+        ))
+        assert float(diff.item()) == 0.0, f"{name}: next hidden max_abs={diff.item()}"
+        legacy_tok = mx.argmax(engine._head(legacy_out, engine.mtp.norm), axis=-1)
+        retained_tok = mx.argmax(engine._head(retained_out, engine.mtp.norm), axis=-1)
+        mx.eval(legacy_tok, retained_tok)
+        assert legacy_tok.tolist() == retained_tok.tolist(), name
+        _assert_same_cache(retained, legacy, name)
 
 
 # ------------------------------------------- 3. 掃引用の env の口 (h / max_draft)
