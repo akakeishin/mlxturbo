@@ -3112,6 +3112,8 @@ def _log_gen_stats(res: dict) -> None:
         line += f" | phase/round: {parts} (rounds={rounds})"
     ttft_phase = res.get("_ttft_phase")
     if isinstance(ttft_phase, dict):
+        if ttft_phase.get("status") == "runner_unsplit":
+            line += " | ttft-phase: runner_unsplit (prefill+first_token)"
         parts = " ".join(
             f"{key.removeprefix('runner_').removesuffix('_s')}={ttft_phase[key] * 1000:.1f}ms"
             for key in ("runner_prefill_s", "runner_first_token_s")
@@ -3151,6 +3153,25 @@ def _log_gen_stats(res: dict) -> None:
             f" recomputed={int(res.get('preemption_recomputed_tokens', 0))}"
         )
     print(line)
+
+
+def _attach_ttft_phase_status(result, runner):
+    """Debug-only marker for runners that cannot expose the internal split.
+
+    The server-level ``gen→first_token`` interval is still measured for
+    streaming requests, but only FlashSpecRunner has a boundary between model
+    prefill and its first decode round.  An explicit marker keeps a missing
+    ``_ttft_phase`` from being mistaken for a zero-duration phase or telemetry
+    failure.  Normal requests remain untouched.
+    """
+
+    if (
+        STATE.debug_log
+        and isinstance(result, dict)
+        and not getattr(runner, "SUPPORTS_TTFT_PHASES", False)
+    ):
+        result.setdefault("_ttft_phase", {"status": "runner_unsplit"})
+    return result
 
 
 def _log_ttft_trace(t: dict) -> None:
@@ -3565,6 +3586,7 @@ async def _run_generate(
             raise
         if cancelled is not None:
             raise cancelled
+        result = _attach_ttft_phase_status(result, chosen_runner)
         return _attach_selection_to_result(
             result,
             prompt_ids,
@@ -3791,6 +3813,7 @@ def _start_generation(
                 **trace_kwargs,
                 **sampling_kwargs,
             )
+            res = _attach_ttft_phase_status(res, chosen_runner)
             res = _attach_selection_to_result(
                 res,
                 prompt_ids,

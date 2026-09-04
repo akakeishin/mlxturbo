@@ -2650,6 +2650,32 @@ def test_nonstream_debug_requests_ttft_phase_only_from_capable_runner():
     assert result["tokens"] == [10]
     assert runner.calls[0]["trace_timing"] is True
 
+    plain_runner = FakeRunner([11])
+    state.runner = plain_runner
+    plain = asyncio.run(
+        server._run_generate([1, 2], 1, 0.0, state.eos_ids, None, None)
+    )
+    assert "trace_timing" not in plain_runner.calls[0]
+    assert plain["_ttft_phase"] == {"status": "runner_unsplit"}
+
+
+def test_stream_debug_marks_runner_ttft_phases_as_unsplit():
+    runner = FakeRunner([10])
+    state = _install_state(runner)
+    state.debug_log = True
+
+    q, future, _cancel_event, _raw_token_count = server._start_generation(
+        [1, 2], 1, 0.0, None
+    )
+    assert q.get(timeout=1) == ("content_delta", "<10>")
+    kind, result = q.get(timeout=1)
+    future.result(timeout=1)
+    state.executor.shutdown(wait=True)
+
+    assert kind == "done"
+    assert "trace_timing" not in runner.calls[0]
+    assert result["_ttft_phase"] == {"status": "runner_unsplit"}
+
 
 def test_stream_cancel_wakes_blocking_queue_get_with_internal_sentinel():
     started = threading.Event()
@@ -4711,6 +4737,20 @@ def test_generation_log_includes_session_selection_fields():
     assert "restore=3.00ms" in line
     assert "batch-forfeited lcp=7 probe=ok" in line
     assert "batch-preemptions=1 recomputed=19" in line
+
+
+def test_generation_log_marks_runner_ttft_phases_as_unsplit():
+    result = {
+        "prefill_reused": 0,
+        "prefill_new": 2,
+        "_ttft_phase": {"status": "runner_unsplit"},
+    }
+    with mock.patch("builtins.print") as emit:
+        server._log_gen_stats(result)
+    assert (
+        "ttft-phase: runner_unsplit (prefill+first_token)"
+        in emit.call_args.args[0]
+    )
 
 
 # ---------- 12b. バグ修正: チェックポイントによる部分一致からの復元 ----------
