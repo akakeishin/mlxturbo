@@ -107,7 +107,8 @@
   現行比 +0.0005 (bench/quant_eval.py compare)。
   **decode 幅 (行数 ≤ 8) にしか発火しない非ビット一致のカーネル**は、prefill 幅で走る通常の compare では数値が 1 度も通らない。既定に入れる条件は 3 つ
   (2026-09-04、fused:1 で確立): (i) 本番の重み・routing での逆量子化 fp32 参照への距離が素以下 (`tools/moe_decode_fused_ref_model.py` の型、反転する層が 0)、
-  (ii) 変更が丸め回数を減らす方向、(iii) `bench/quant_eval.py compare --fusions --step 1` (S=1 で 1 トークンずつ) の on/off 同一条件の Δ KLD ≤ +0.0005。
+  (ii) `bench/quant_eval.py compare --fusions --step 1` (S=1 で 1 トークンずつ) の on/off 同一条件の Δ KLD ≤ +0.0005。
+  **決定性 (検証幅で丸めが変わらないこと) は条件にしない** (ユーザー 2026-09-04 12:40: 量子化モデルに決定性を求める人はいない。品質に影響が無ければよい)。決定性は A/B の計測が楽になる性質としてだけ扱う。
   S=1 の基準は `bench/results/quant-eval/compare-step1-base-0904.json` の 0.01796。
   **本番のパックは lm_head も 4bit (`~/models/ddalcu-mlxlm-head4`、真 bf16 から g64 で焼いたもの) にした** (ユーザー 2026-09-03 18:20。
   相手の一律 4bit と条件を揃える。代金は KLD 0.01326 → 0.01794 (+0.0047)、top-1 一致 0.966 → 0.962 で、これは了承済み)。
