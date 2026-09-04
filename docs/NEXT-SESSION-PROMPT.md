@@ -1074,3 +1074,18 @@ rg -n "state-pure|fixed-M4|graphbank|component replacement" docs/BACKLOG.md docs
 ```bash
 rg -n "LookupSpecRunner|_safe_draft_cap|async_eval" mlxturbo/lookup_spec.py docs/BACKLOG.md
 ```
+
+## fixed-M4 Gate A: QSA 5葉tensor stateの合成検査通過 (2026-09-05 07:21 JST)
+
+- `[K, V, array_offset, raw_index, pooled_index]` の固定shape state-in/state-outを
+  `mx.compile`で2回replayし、逐次期待値と完全一致した。
+- rollback keep=1/3/4も5葉すべてとshapeが一致。Python整数offsetをclosureへ閉じ込めた対照は
+  2回目にstaleとなり、現行cache objectの直接compileが安全でないことも再現した。
+- まだ合成更新だけで、実Attention、GDN/PLEを含む134葉、速度は未検証。次はQSA 1層だけを
+  実入力でadapter化し、eagerとのlogits/cache一致を先に取る。graphbank本体はその後。
+
+再開の1コマンド:
+
+```bash
+tools/biglock.sh .venv/bin/python tools/qwen4_state_adapter_poc.py
+```

@@ -4080,3 +4080,18 @@ Gemma 4 26B・4k、回転KV飽和後のdraft 0条件で64 tokenを`旧, 新, 新
 
 これはdraft 0時の1-token loopを改善した値であり、過去の自然文ベンチ367→245 tok/s (-32%)を
 同じpromptで再測したものではない。`--lookup-spec`の既定offは引き続き維持する。
+
+### 2026-09-05 07:21 fixed-M4のQSA 5葉tensor stateは合成Gate Aを通過
+
+現行QSA cacheの最小状態を `[K, V, array_offset, raw_index, pooled_index]` とし、全葉を
+固定容量で明示的に入出力する合成検査を作った。同一shapeのcompiled graphを2回replayした結果、
+tensor offset版は1回目・2回目とも逐次host期待値と完全一致した。keep=1/3/4のrollbackも
+5葉すべてとshapeが一致した。
+
+比較用にPython整数offsetをclosureへ閉じ込めた版では、1回目だけ一致し、2回目はtrace時の位置へ
+再度書いて不一致になった。したがって現行`_AttnCache` / `_IndexerCache`のoffsetをPythonのまま
+graphbankへ入れる案は棄却し、tensor state境界を前提にする。
+
+この結果は合成配列の更新規約だけを検証しており、実QSA Attention、GDN/PLEを含む134 state leaves、
+hyper出力、MTP cache、速度は未検証である。次のgateは実QSA 1層でeagerとadapterの
+logits/cache一致。そこを通る前にgraphbank本体は作らない。

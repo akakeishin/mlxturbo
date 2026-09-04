@@ -1013,6 +1013,17 @@ state-pure adapter完了後のgraphbankは再開する。詳細と重複監査�
 最初のspanを同期waitするので、warm bank hit時に無駄起動しない条件を先に固定して独立A/Bする。
 既存のchunk lookaheadは50k cold wall -7.5%で採用済みなので重ねて移植しない。
 
+### Gate A通過: QSA 5葉のtensor state境界 (2026-09-05 07:21)
+
+合成固定容量で `[K, V, array_offset, raw_index, pooled_index]` を明示的な
+state-in/state-outにした。同じcompiled graphを2回replayして逐次期待値と一致し、rollback
+keep=1/3/4でも5葉すべてとshapeが一致した。対照のPython整数offsetは2回目に古い位置へ書いたため、
+現行cache objectをそのままclosureへ閉じ込める方式は不可と確定した。
+
+これは実Attentionや134葉全体の一致、速度をまだ証明しない。次はQSA 1層の実入力で5葉adapterと
+eager経路のlogits/cacheを一致させる。ここを通るまでgraphbank本体は実装しない。検査器は
+`tools/qwen4_state_adapter_poc.py`。
+
 ## 畳んだ: PR同梱FR-Spec Q8 65,536-row head (2026-09-04 17:36)
 
 公式sidecar（commit `a5e38bb7`、SHA-256 `950adf…c1fba`）を、既存Flash top-k traceの本走行
