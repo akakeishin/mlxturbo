@@ -39,3 +39,12 @@
 順 (取り分の根拠つき): (0) 82/95/111 が draft 本数 (depth) の差なら 1 リンク ≈ 10 ms (帯域下限 1.5 ms) で draft chain が第 1 の的、(1) capture 経路の自前部品の素通しの是正 (ビット一致)、(2) 段階投入を S>1 に (`_hidden_forward` に層コールバックを足して `staged.py` の写しを消す、ビット一致)、(3) `mx.eval(*confidences)` の廃止 (挙動が変わる: 複数プロンプト平均の tok/round + KLD で判定)、(4) 次 round の draft の先行投入 (verify の eval → MTP 追いつき → 次 draft を async_eval → rollback + 後始末の順)、(5) capture の軽量化、(6) prime 窓は最後 (TTFT 側)。
 反転条件: 内訳が「同期 + 糊 < 10 ms/round、draft chain < 8 ms」なら B の項目ごと捨てて帯域レーンへ。mlx-serve の 4k の tok/round が 4 以上なら差は draft の質 (rerank / depth 適応を先に)。rerank / depth-adapt / presync が単体で移せないと分かったら A。3 族目が同じ工数窓に入るなら A。
 守り: `spec_flash.py` に入れる変更は `_arch()` の族解決の 1 点だけ (それも Flash-Next の 17k A/B の再走を掛ける)。共有ヘルパーは spec.py 側だけが使う状態で着地。ゲートは (1)(2) = 生成列の完全一致、(3)(4) = 複数プロンプト平均の tok/round + KLD、混ぜない。
+
+## コード読みで確定した事実 (anatomy エージェント 2026-09-04 09:25、計測は列待ち)
+
+- 段階投入は本番の decode に効いていない: `spec.py:1078-1096` は S>1 なら必ず `capture=True` の分岐で、`staged` は S=1 だけ。MTP がある限り S ≥ 2。
+- 同期は 1 round に 2〜3 回: `mx.eval(*confidences)` (1067)、verify の `mx.eval(preds, window, ent_row)` (1108/1111)、D7 発火時の `mx.eval(d1)` (1019)。spec_flash は貪欲で 1 回。
+- **draft を引いてから捨てる**: `cap_base = max_draft = 8` (本番既定) なので最大 8 本引いてから `_gate_depth` が事後に切る (1053-1071)。各本に lm_head (語彙 248,320 × 5120、4bit ≒ 0.64 GB) の射影が付く → 8 本で読みだけで ≈ 12 ms + MTP 層。「1 リンク ≈ 10 ms」の正体の候補。
+- maint (rollback と MTP の積み直し) に同期が無いので、その GPU 費用は次 round の draft の同期に乗る (相の帰属が歪む)。
+- `_gate_depth` の rollback コストは固定定数 0.19 (spec.py:63)。prime / presync / DepthController は spec_flash 側だけ。
+- 道具: `tools/decode_round_anatomy_generic.py` (spec.mx の proxy で eval の回数と待ち、5 メソッドを包んで相ごとに sync / build / glue、GPU は `decode_gpu_trace.Probe`)。結果は `bench/results/round-anatomy-27b-0904.json` / `scratchpad/anatomy-27b-0904.log`。
