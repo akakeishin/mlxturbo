@@ -762,6 +762,7 @@ def _session_telemetry_snapshot() -> dict[str, Any]:
             pool_unknown_sessions += 1
         else:
             pool_known_bytes += nbytes
+    last = STATE.last_session_selection
     return {
         "requests": telemetry["requests"],
         "match_kind_counts": dict(telemetry["match_kind_counts"]),
@@ -783,6 +784,7 @@ def _session_telemetry_snapshot() -> dict[str, Any]:
         "pool_known_allocated_bytes": pool_known_bytes,
         "pool_unknown_sessions": pool_unknown_sessions,
         "pool_processed_tokens": pool_processed_tokens,
+        "last_selection": dict(last) if isinstance(last, dict) else None,
     }
 
 

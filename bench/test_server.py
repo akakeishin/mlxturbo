@@ -1170,6 +1170,7 @@ def test_api_status_reports_model_and_runner(client):
     }
     assert body["session_telemetry"]["pool_allocated_bytes"] == 0
     assert body["session_telemetry"]["pool_unknown_sessions"] == 0
+    assert body["session_telemetry"]["last_selection"] is None
     assert body["uptime_s"] >= 0
     assert body["n_sessions"] == 0
     assert body["queue_depth"] == 0
