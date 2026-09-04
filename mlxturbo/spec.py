@@ -971,6 +971,16 @@ class SpecEngine:
         ``n_draft=0, max_draft=0, lookup_len=0`` is the non-speculative
         baseline contract used by ``bench/gate.py``.
         """
+        # 掃引用の口。`tools/decode_ab_generic.py` は generate() の外で
+        # os.environ を書き換えるので、import 時ではなく入口で 1 回だけ読む。
+        # MLXTURBO_SPEC_MAX_DRAFT: max_draft の上書き (空なら引数のまま)。
+        # MLXTURBO_SPEC_GATE_H: 深さのゲートの閾値 h (空なら
+        # GATE_ROLLBACK_COST)。
+        _md = os.environ.get("MLXTURBO_SPEC_MAX_DRAFT")
+        if _md:
+            max_draft = int(_md)
+        _gh = os.environ.get("MLXTURBO_SPEC_GATE_H")
+        gate_h = float(_gh) if _gh else GATE_ROLLBACK_COST
         if min(max_tokens, n_draft, max_draft, lookup_len, lookup_ngram) < 0:
             raise ValueError("generation limits must be non-negative")
         eos = set(eos_ids)
@@ -1242,7 +1252,9 @@ class SpecEngine:
                 if chain_head is not None:
                     _, d1, dh1 = chain_head
                     first = (d1, dh1)
-                keep = self._plan_depth(pos_accept_ema, pos_obs_count, cap)
+                keep = self._plan_depth(
+                    pos_accept_ema, pos_obs_count, cap, h=gate_h
+                )
                 if first is not None:
                     keep = max(keep, 1)  # D7 で既に引いた 1 本は捨てない
                 drafts = self._draft_chain(y, h_last, mtp_cache, keep, first=first)
@@ -1279,6 +1291,7 @@ class SpecEngine:
                         [float(c.item()) for c in confidences],
                         pos_accept_ema,
                         pos_obs_count,
+                        h=gate_h,
                     )
                     drafts = drafts[:keep]
                 n_drafts = len(drafts)

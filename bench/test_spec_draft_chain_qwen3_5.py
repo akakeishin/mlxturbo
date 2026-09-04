@@ -33,7 +33,12 @@ import mlxturbo  # noqa: E402,F401 -- sys.meta_path フック
 from mlx_lm.models import qwen3_5 as Q35  # noqa: E402
 from mlxturbo._mlx_compat import TextModelArgs  # noqa: E402
 from mlxturbo.mtp import MTPModule  # noqa: E402
-from mlxturbo.spec import ChatSession, GATE_EMA_WARMUP, SpecEngine  # noqa: E402
+from mlxturbo.spec import (  # noqa: E402
+    ChatSession,
+    GATE_EMA_WARMUP,
+    GATE_ROLLBACK_COST,
+    SpecEngine,
+)
 
 N_K, N_V, DK, DV, K = 2, 6, 128, 128, 4
 HIDDEN, VOCAB, N_LAYERS = 256, 64, 4
@@ -186,3 +191,70 @@ def test_mtp_cache_length_does_not_depend_on_the_draft():
                             session=session)
             lens.append(session.mtp_cache.offset)
     assert lens[0] == lens[1], f"MTP キャッシュの長さが knob で変わった: {lens}"
+
+
+# ------------------------------------------- 3. 掃引用の env の口 (h / max_draft)
+
+def _record_depth_calls(name: str):
+    """`SpecEngine` の深さ決定 (`_plan_depth` / `_gate_depth`) を包んで、
+    呼ばれた引数を記録する。返り値は (記録リスト, 戻す関数)。
+
+    記録は `(位置引数, キーワード引数)` の組。`generate()` は cap を位置で、
+    h をキーワードで渡すので、どちらの形でも拾えるようにしておく。
+    """
+    orig_desc = SpecEngine.__dict__[name]      # classmethod の記述子そのもの
+    orig = getattr(SpecEngine, name)           # 呼べる形 (cls 束縛済み)
+    calls: list[tuple] = []
+
+    def spy(*a, **kw):
+        calls.append((a, kw))
+        return orig(*a, **kw)
+
+    setattr(SpecEngine, name, staticmethod(spy))
+    return calls, lambda: setattr(SpecEngine, name, orig_desc)
+
+
+def test_generate_reads_gate_h_and_max_draft_from_env():
+    """`MLXTURBO_SPEC_GATE_H` と `MLXTURBO_SPEC_MAX_DRAFT` が generate() の
+    入口で読まれ、深さの決定にそのまま渡る。"""
+    model, mtp = _build()
+    prompt = [(i * 7 + 3) % VOCAB for i in range(32)]
+    calls, restore = _record_depth_calls("_plan_depth")
+    try:
+        engine = SpecEngine(model, mtp=mtp)
+        with _env(MLXTURBO_SPEC_DRAFT_NOSYNC="1",
+                  MLXTURBO_SPEC_GATE_H="0.05",
+                  MLXTURBO_SPEC_MAX_DRAFT="5"):
+            engine.generate(prompt, max_tokens=16, n_draft=3, max_draft=8,
+                            lookup_len=16, lookup_ngram=4, temp=0.0)
+    finally:
+        restore()
+    assert calls, "_plan_depth が 1 回も呼ばれていない (対照が死んでいる)"
+    assert all(kw["h"] == 0.05 for _a, kw in calls), [kw for _a, kw in calls]
+    # cap = min(max_draft, 残りトークン数) なので、序盤は上書きした 5 が出る
+    caps = [a[2] for a, _kw in calls]
+    assert max(caps) == 5, caps
+
+
+def test_generate_falls_back_to_the_built_in_gate_h_and_the_argument():
+    """env が無ければ h は GATE_ROLLBACK_COST、cap は引数の max_draft。
+    NOSYNC=0 の側 (`_gate_depth`) にも同じ h が渡る。"""
+    model, mtp = _build()
+    prompt = [(i * 7 + 3) % VOCAB for i in range(32)]
+    for nosync, name in (("1", "_plan_depth"), ("0", "_gate_depth")):
+        calls, restore = _record_depth_calls(name)
+        try:
+            engine = SpecEngine(model, mtp=mtp)
+            with _env(MLXTURBO_SPEC_DRAFT_NOSYNC=nosync,
+                      MLXTURBO_SPEC_GATE_H=None,
+                      MLXTURBO_SPEC_MAX_DRAFT=None):
+                engine.generate(prompt, max_tokens=16, n_draft=3, max_draft=6,
+                                lookup_len=16, lookup_ngram=4, temp=0.0)
+        finally:
+            restore()
+        assert calls, f"{name} が 1 回も呼ばれていない (対照が死んでいる)"
+        assert all(kw["h"] == GATE_ROLLBACK_COST for _a, kw in calls), [
+            kw for _a, kw in calls]
+        if name == "_plan_depth":
+            caps = [a[2] for a, _kw in calls]
+            assert max(caps) == 6, caps
