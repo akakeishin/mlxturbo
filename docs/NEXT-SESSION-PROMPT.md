@@ -291,3 +291,4 @@ Flash-Next のフルベンチは後回し (ユーザーの指示があるまで�
   **最大の的は decode 経路**: 27B の round は 82〜112 ms (重み読みの下限 35 ms) で、mlx-serve は同じ MTP 頭で 4k 43 tok/s 対 27。round の内訳を測定中 → 設計 (spec_flash の仕組みを族 adapter で汎用化するか) を advisor と決める。
 - **35B-A3B (ユーザー 09:07)**: 35B-A3B は **Qwen3.6** (3.8 ではない)。MTP もあるはず。27B 最優先で、35B-A3B は参考までに後で (MoE 部品の契約の試験台。ダウンロードは計測の合間に、パック名は要確認)。
   パック (HF、未ダウンロード): `mlx-community/Qwen3.6-35B-A3B-4bit`、MTP は `mlx-community/Qwen3.6-35B-A3B-MTP-5bit` (4bit の MTP は無し。mtp.py は scales から bits を推定するので 5bit のまま読める見込み)。
+  補足 (09:15): 4bit の MTP サイドカーは mlx-community に無い (本体 `Qwen3.6-35B-A3B-4bit` は 2090 テンソルに `mtp.*` 無し、MoE の gate は 8bit の混合)。MLX 形式で MTP を持つのは `…-MTP-5bit` (qwen3_5_mtp、1 層、46 テンソル) と、第三者の OptiQ 系 (`oQ4e-mtp` 等、別レシピ) だけ。5bit の頭をそのまま使う (bits は scales から推定、1 層なので速度差は無視できる)。
