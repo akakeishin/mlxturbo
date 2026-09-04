@@ -3955,3 +3955,29 @@ mlx-lm組み込みの`KVCache.to_quantized(group_size=64, bits=8)`を使い、Qw
 
 以後は5%線を有償変更の目安として扱い、値・出力が同一、追加メモリ/JIT/hot-path分岐なしの
 無償変更は5%未満でも複数runで符号が再現すれば採用する。過去の棄却記録もこの基準で再監査する。
+
+### 2026-09-05 05:21 過去の小幅案を再監査、段階投入1とpersistent MoEは不採用
+
+「5%未満でも実害がなければ採る」という基準で、過去に小幅として畳んだ案を再点検した。
+未採用のG=8は17k prefill -1.2%が1記録だけで一時メモリとcheckpoint粒度が増える。
+PLE hoistは短文+0.6%、17k prefill +0.1%。counting sortは4kで+0.1%、8k/17kで-0.7%だが、
+本体寄与が約0.04%なのに3 kernelとtable copyを増やす。いずれも「代償なし」ではなく、複数runで
+非悪化とも言えないため復活させない。反復で-2.0〜-2.4%だったGDN fusedなど、条件を満たした
+小幅案はすでに既定onであり、取りこぼしは見つからなかった。
+
+未記録だった`MLXTURBO_STAGE_EVERY=1`も、現行2との同一process交互A/Bで確認した。短文は
+先頭armだけがcold n-gram cacheを負うため順逆を取り、warm同士では1が約0.3%遅い。17kは
+ms/token 22.791/22.801で同着、ms/round -0.1%、tok/round同一、prefillは31.559/31.419秒で
+1が+0.4%遅かった。生成列は一致したが速度符号がなく、現行2を維持する。結果は
+`bench/results/stage-every1-{short,short-reverse,17k}-0905.json`（gitignore）。
+
+persistent streaming MoEは、成立する最小形をBM16・activation全保持・外部決定的combineとして
+見積もり直した。既存q4 weightを複製せずarray-equalを狙える一方、BM16化でGEMM床が
+69.5→約71.8 ms/callになる。新kernel、barrier、占有低下をすべてゼロとした楽観上限でも、
+全48層の17k wallは27.215→25.873秒（-4.93%）で採用線25.854秒を19 ms外す。実装すれば必ず
+この上限より遅くなるため試作は撤回し、このレーンを閉じる。
+
+次のcold prefill直接候補は、現在最初のgroup直前で約1.067秒待っているn-gram first gatherを、
+session再利用が見込めないrequestの到着直後から始めること。既存prefetchを再利用し、並行request間で
+payloadを共有しない最小設計に限る。短文/17kの同一process順逆A/Bで非悪化と重なり量を確認してから
+既定化する。

@@ -995,3 +995,19 @@ rg -n "persistent streaming MoE|MTPLX 2.11.1|mixed KV" docs/BACKLOG.md
 ```bash
 git show --stat --oneline HEAD && rg -n "棄却|既定 off" docs/research/SESSION-2026-09-02-CATCHUP.md | tail -n 80
 ```
+
+## 完了: 過去の小幅棄却案を再監査 (2026-09-05 05:21 JST)
+
+- 未採用のG=8、PLE hoist、counting sortにはメモリ、分岐、kernel追加、または実測非再現の代償があり、
+  「値も資源も同一で速度だけ上がる」復活候補は0件だった。条件を満たしたGDN fused等は既定済み。
+- 段階投入間隔1も追加測定したが、短文warm約+0.3%、17k prefill +0.4%で現行2を上回らない。
+- persistent streaming MoEは、実装費をゼロ扱いした楽観上限でも17k -4.93%に留まり、事前の
+  5%線を19 ms外すため閉じた。
+- 次はFlash-Next cold prefillのfirst n-gram gatherをrequest到着時に開始する最小案。warm session
+  restoreが見込める時とqueue競合時は起動せず、既存の同期waitとの差だけを測る。
+
+再開の1コマンド:
+
+```bash
+rg -n "_prefetch_ngram_span|class StreamNGram|_resolve_runner_for_request|_probe_best_session_lcp" mlxturbo
+```

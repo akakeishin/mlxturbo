@@ -1178,3 +1178,12 @@ ms/round **+10.9%**、tok/round **-6.7%**、ms/token **+18.9%**。生成列も19
 
 一方、今後の棄却判断は「全体5%未満」だけでは決めない。値・出力が同一で、追加メモリ、JIT、
 hot-path分岐などの代償が無い変更は、小幅でも複数runで符号が再現すれば採用対象へ戻す。
+
+## 完了: 過去棄却案の代償ゼロ再監査 (2026-09-05 05:21 JST)
+
+G=8、PLE hoist、counting sortを再点検したが、未採用のまま復活できる代償ゼロ案は0件だった。
+段階投入間隔1も短文warm約+0.3%、17k prefill +0.4%で不採用。persistent streaming MoEは
+BM16の楽観上限でも17k -4.93%で、新kernel費用を入れる前に採用線を外すため閉じた。
+
+未決はcold prefill最初のn-gram gatherをrequest到着時から重ねる案。既存prefetchを使い、
+warm restore候補とqueue競合を避ける最小実装に限定し、短文/17k順逆A/Bで採否を決める。
