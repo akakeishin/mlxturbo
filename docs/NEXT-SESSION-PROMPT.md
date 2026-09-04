@@ -635,8 +635,8 @@ rg -n "Gemma|warm TTFT|QuantizedKVCache|TurboQuant|assistant" docs/BACKLOG.md do
   `bench/test_server.py` + `bench/test_fusions_other_family.py` は437 passed。
 - **normは完了・不採用**: 30層で共通統計Metalを発火したが、128-token短文3本で
   off 11.454対on 13.871 ms/token (**+21.1%**)かつ生成列3/3分岐。実装は残さない。
-- **次**: 組み込み`QuantizedKVCache`のGemma混成cacheへの適用可否と実メモリ効果を再計算し、
-  速度/KLD/長文正答率を測る。その後TurboQuant。
+- **後続更新**: 組み込み`QuantizedKVCache`は2026-09-05 06:58にfull 5層だけで測定し、
+  17k decode +3.9%・平均KLD 0.000991で棄却した。TurboQuant第2段は別候補として残る。
 
 再開の1コマンド:
 
@@ -1036,4 +1036,22 @@ git show --stat --oneline HEAD && rg -n "未決|保留|調査継続" docs/BACKLO
 
 ```bash
 git show --stat --oneline HEAD && rg -n "保留|未決" docs/BACKLOG.md | tail -n 60
+```
+
+## 棄却: Gemma 4 26Bの組み込みfull-attention KV q8 (2026-09-05 06:58 JST)
+
+- sliding 25層をbf16のまま残し、full 5層だけをprefill後にq8/group64へ変換してABBA測定した。
+- 4kはdecode +3.0%、17kは+3.9%。17k cacheは556→394 MB (-29.2%)だが速度へ戻らない。
+- 17kのteacher-forced全語彙KLDは平均0.000991（基準0.0005）、最大0.005747。生成も38 token目で分岐。
+- full層の実形はHk 2 / head_dim 512で、合計20 KiB/token、128k 2.5 GiB。旧5.2 GB概算を訂正した。
+- q4はq8より誤差が大きいため省略。製品配線と実験器は残さない。TurboQuantの専用3bit kernelは別候補。
+- 過去の小幅棄却再監査も完了しており、無償で復活できる既存棄却案は0件のまま。
+
+次の速度直結優先は、MTPLX 2.11.1のstate-pure component replacementを先に合成検査し、
+全cache/rollback一致を満たした場合だけfixed-M4 graphbankへ進むこと。
+
+再開の1コマンド:
+
+```bash
+rg -n "state-pure|fixed-M4|graphbank|component replacement" docs/BACKLOG.md docs/research/MTPLX-2.11-GAP-2026-09-04.md mlxturbo/spec_flash.py
 ```

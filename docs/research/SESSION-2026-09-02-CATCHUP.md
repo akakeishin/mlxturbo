@@ -4018,3 +4018,26 @@ roundを安くするが、一致長4の有用なSAM draftも捨てるため、�
 そのまま外挿できなかった。開始前に5分クールダウンし、50k prefillは363.9秒。
 実験口は撤回し、既定4を維持する。結果は
 `bench/results/lookup-ngram-5-vs4-27b-{17k,50k}-0905.json`（gitignore）。
+
+### 2026-09-05 06:58 Gemma 4 26Bの組み込みfull-attention KV q8は17k +3.9%、KLD超過で棄却
+
+mlx-lmの`QuantizedKVCache` q8/group64を、Gemma 4のsliding 25層には触れず、文脈長で伸びる
+full-attention 5層だけprefill後に変換した。出荷経路と同じ融合を当て、各文脈幅で両armを空焼きしてから
+fresh cacheのbf16/q8を同一process ABBAで測った。
+
+| 文脈 | q8 / bf16 ms/token | q8 / bf16 tok/s | cache q8 / bf16 | 判定 |
+|---:|---:|---:|---:|---|
+| 3,834 | 15.127 / 14.691 (**+3.0%**) | 66.11 / 68.07 | 251 / 288 MB (-12.8%) | 遅い、20 token目で分岐 |
+| 16,834 | 17.250 / 16.608 (**+3.9%**) | 57.97 / 60.21 | 394 / 556 MB (-29.2%) | 遅い、38 token目で分岐 |
+
+17kはbf16 greedyの同一履歴を両cacheへteacher-forceし、全語彙で
+`KL(P_bf16 || P_q8)`を16 token測った。top-1は16/16一致したが、平均KLD **0.000991**、
+最大 **0.005747**で、受け入れ幅+0.0005を超えた。変換そのものは平均5.1 msだったため、主因は
+`quantized_scaled_dot_product_attention`のdecode費用で、29%のcache削減では回収できない。
+
+構造の再確認で、26Bのfull層はsliding層と同じHk 8 / head_dim 256ではなく、
+`attention_k_eq_v=true`、Hk 2 / head_dim 512だった。full 5層は合計20 KiB/token、128kで
+2.5 GiBであり、従来の41 KB/token・5.2 GBは2倍の過大概算だった。q8より誤差が大きいq4は
+同じ組み込み経路で速度・品質を逆転する根拠がないため走らせない。製品配線と実験器は残さず、
+TurboQuant第2段のpacked 3 bit専用kernelは別候補として扱う。結果は
+`bench/results/gemma4-kv-q8-{4k,17k}-0905.json`（gitignore）。

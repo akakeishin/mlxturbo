@@ -10,10 +10,10 @@ Google の TurboQuant (ICLR 2026、学習不要の KV cache 量子化) を mlxtu
 
 ## どこに入るか (mlxturbo)
 
-- 第 1 段 (カーネル不要、先にやる): mlx-lm 組み込みの `QuantizedKVCache` (affine 4 / 8 bit、g64、`mlx_lm/models/cache.py:232`) + `quantized_scaled_dot_product_attention` (`base.py:64`) を Gemma 4 で有効化して測る (速度、KLD、長文脈の正答率、容量)。これが TurboQuant の取り分の上限の目安。
+- 第 1 段 (2026-09-05完了・不採用): mlx-lm 組み込みの `QuantizedKVCache` q8/g64をGemma 4のfull 5層だけに適用。4k decode +3.0%、17k +3.9%、17k cache -29.2%、平均KLD 0.000991（基準0.0005）だった。q4は同じ経路で誤差が増えるため省いた。組み込みquantized attentionをそのまま使う案は閉じるが、packed 3 bitを直接読む専用kernelを作る第2段の可否とは分ける。
 - 第 2 段 (本体): 新しい cache クラス `TurboQuantKVCache` (mlx-lm の `_BaseCache` の契約: `update_and_fetch` / `state` / `trim` / `to_quantized`、mlxturbo の `snapshot_untrimmable_caches` / checkpoint / tail と両立)。書き込み時に回転 + Lloyd-Max + QJL を MLX の op で (prefill 幅は素の op でよい)。
 - **速度の取り分は読み側**: packed 3 bit の K/V を直接読んで q との内積 (QJL の補正込み) と softmax・V の和を出す **decode 用 attention カーネル (S ≤ 8、qmv 型、`mx.fast.metal_kernel`)**。`mlxturbo/kernels/qsa_attn_decode.py` (K2b、選択ブロックの attention) と `prefill_attn.py` (uint4 の段階 load) が手本。prefill 幅は dequantize して素の sdpa (取り分は容量だけ)。
-- 対象の族: Gemma 4 (full attention 5 層、Hk 8、head_dim 256) が最初。Flash-Next / 27B は GDN 混成で KV が小さいので後 (50k で 0.6 / 1.6 GB)。sliding window 層は 1024 トークンで頭打ちなので対象外でよい。
+- 対象の族: Gemma 4 26B (full attention 5層はHk 2、head_dim 512、K=Vの別norm。合計20 KiB/token) が最初。Flash-Next / 27B は GDN 混成で KV が小さいので後 (50k で 0.6 / 1.6 GB)。sliding window 層は 1024 トークンで頭打ちなので対象外でよい。
 
 ## ゲート (CLAUDE.md の作法)
 

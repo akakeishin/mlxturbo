@@ -827,10 +827,10 @@ MLX の `quantized_matmul` は M=1 (qmv) で 400 GB/s 級なのに M=2〜8 (fast
 
 ## Gemma レーン: KV cache の量子化 (TurboQuant 含む) (ユーザー 2026-09-04 11:43「Gemma を扱いたいから TurboQuant を入れたいかも」)
 
-- Gemma 4 26B の形: 30 層、Hq 16 / Hk 8、head_dim 256、sliding window 1024 (6 層に 1 回 full attention)。KV は full 層 (5 層) だけ文脈長で伸びる: 1 トークン 41 KB → 128k で 5.2 GB。sliding 層は 1024 トークンで頭打ち。**KV の帯域と容量が効くのは 100k 級の文脈と多セッション。**
-- 第 1 段 (安い): mlx-lm 組み込みの `QuantizedKVCache` (affine 4 / 8 bit、g64) + `quantized_scaled_dot_product_attention` (`mlx_lm/models/base.py:64`、`cache.py:232`) を Gemma 4 で測る (速度、KLD、長文脈の正答率)。カーネルを書かずに済む。
+- Gemma 4 26B の形: 30 層、sliding は Hk 8 / head_dim 256・window 1024、full は `attention_k_eq_v=true` かつ Hk 2 / head_dim 512 (6 層に 1 回、計5層)。文脈長で伸びるfull KVは合計1トークン20 KiB、128kで2.5 GiB。以前の「Hk 8 / head_dim 256、41 KB、5.2 GB」はfull層にもslidingの形を当てた2倍の概算だった。**KV の帯域と容量が効くのは長文脈と多セッション。**
+- 第 1 段 (完了・不採用): mlx-lm 組み込みの `QuantizedKVCache` (affine q8 / g64) + `quantized_scaled_dot_product_attention`をfull 5層だけに適用。4k decode +3.0%、17k +3.9%、17k cache -29.2%だが平均KLD 0.000991で基準0.0005を超えた。q4はq8より誤差が大きく、同じ経路を追加測定する根拠がないため省いた。
 - 第 2 段: **TurboQuant (実装確定、ユーザー 2026-09-04 11:48。計画 `docs/research/TURBOQUANT-PLAN.md`)** (ランダム回転 + Lloyd-Max 3 bit + QJL の残差補正、学習不要、ICLR 2026、llama.cpp / ollama に実装あり)。量子化そのものは MLX の op で書けるが、**取り分は packed 3 bit の KV を直接読む decode 用 attention カーネル (S ≤ 8、qmv 型)** に懸かる (K2b の QSA decode カーネルと同型)。品質は KLD (対 bf16 KV) で審査。
-- Flash-Next / 27B は GDN 混成で KV が小さい (50k で 0.6 / 1.6 GB) ので優先度は低い。Gemma 26Bのdrafterとnorm共有は棄却済み。次はKV量子化 (第 1 段 → 第 2 段)。
+- Flash-Next / 27B は GDN 混成で KV が小さい (50k で 0.6 / 1.6 GB) ので優先度は低い。Gemma 26Bのdrafter、norm共有、組み込みKV量子化は棄却済み。次はTurboQuant第2段の専用kernel。
 
 ## Qwen3.6-35B-A3B の取得状態 (2026-09-04 18:15)
 
