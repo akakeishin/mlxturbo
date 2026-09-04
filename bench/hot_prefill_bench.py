@@ -154,6 +154,15 @@ def _selection(status: dict) -> dict:
     return selected
 
 
+def _input_tps(tokens: int, ttft_s: float) -> float:
+    """TTFTに含まれる入力処理の粗い tok/s。
+
+    first-tokenの費用も含むのでkernel単体のprefill tok/sではない。
+    HTTPから見えるcold/warmを同じ定義で継続比較するための値。
+    """
+    return tokens / ttft_s if ttft_s > 0 else 0.0
+
+
 def main() -> int:
     install_term_handler()
     parser = argparse.ArgumentParser()
@@ -199,6 +208,7 @@ def main() -> int:
         argv += shlex.split(args.turbo_extra)
     argv += ["--max-sessions", "1", "--log-level", "debug"]
 
+    cold_rows = []
     rows = []
     case_id = 0
     started = time.time()
@@ -237,6 +247,33 @@ def main() -> int:
                             f"coldがcache hitした: ctx={ctx} rep={rep} mode={mode} "
                             f"selection={cold_selection} usage={cold['usage']}"
                         )
+                    cold_row = {
+                        "ctx": ctx,
+                        "rep": rep,
+                        "mode": mode,
+                        "prompt_tokens": len(base),
+                        "ttft_s": cold["ttft_s"],
+                        "wall_s": cold["wall_s"],
+                        "input_tokens_per_ttft_s": _input_tps(
+                            len(base), cold["ttft_s"]
+                        ),
+                        "selection": cold_selection,
+                        "pool_allocated_bytes": cold_status["session_telemetry"].get(
+                            "pool_allocated_bytes"
+                        ),
+                        "pool_known_allocated_bytes": cold_status[
+                            "session_telemetry"
+                        ].get("pool_known_allocated_bytes"),
+                        "active_memory_bytes": cold_status.get("active_memory_bytes"),
+                        "cache_memory_bytes": cold_status.get("cache_memory_bytes"),
+                        "rss_bytes": cold_status.get("rss_bytes"),
+                    }
+                    cold_rows.append(cold_row)
+                    log(
+                        f"ctx={ctx} rep={rep} {mode} cold "
+                        f"TTFT={cold_row['ttft_s']:.3f}s "
+                        f"input={cold_row['input_tokens_per_ttft_s']:.1f}tok/s"
+                    )
 
                     current = base
                     for suffix in suffixes:
@@ -261,6 +298,9 @@ def main() -> int:
                             "ttft_s": measured["ttft_s"],
                             "wall_s": measured["wall_s"],
                             "cached_tokens": cached,
+                            "new_input_tokens_per_ttft_s": _input_tps(
+                                selected["new_tokens"], measured["ttft_s"]
+                            ),
                             "selection": selected,
                             "pool_allocated_bytes": status["session_telemetry"].get(
                                 "pool_allocated_bytes"
@@ -289,6 +329,7 @@ def main() -> int:
         "reps": args.reps,
         "rewrite_tail": args.rewrite_tail,
         "max_sessions": 1,
+        "cold_rows": cold_rows,
         "rows": rows,
         "argv": argv,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from bench.hot_prefill_bench import _lcp, _next_prompt, _replacement_tail
+from bench.hot_prefill_bench import _input_tps, _lcp, _next_prompt, _replacement_tail
 
 
 def test_pure_append_uses_exact_requested_delta():
@@ -32,3 +32,8 @@ def test_replacement_tail_rejects_invalid_width():
 
 def test_replacement_tail_skips_duplicate_old_tokens_in_palette():
     assert _replacement_tail([1, 2, 3], 1, [3, 3, 8]) == [8]
+
+
+def test_input_tps_handles_fixed_cost_and_zero_time():
+    assert _input_tps(50_000, 80.0) == 625.0
+    assert _input_tps(50_000, 0.0) == 0.0
