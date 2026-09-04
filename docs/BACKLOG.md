@@ -813,3 +813,7 @@ Mirai / uzu (`docs/research/EXTERNAL-MIRAI-UZU-2026-09.md`) の 105 tok/s の半
 27B の decode 経路 (spec.py) から同期と写しを剥がす (B) を先に。それが着地したら、`spec_flash.py` の qwen4_exp 依存 (`capture()` の `__call__` 差し替え、`_staged_forward` の層呼び出し規約、
 HC 型の MTP 頭、QSA cache、`_arch()` の決め打ち) も同じ形 (モジュール呼び出し + 状態の取り出し口 + `arch.py` の duck typing) に寄せていく。
 順序はユーザー: 27B → そのうち Flash-Next。Flash-Next 側は 17k の A/B と fingerprint を毎回のゲートに。
+
+## そのうち: 看板の架け替え (ユーザー 2026-09-04 11:17「多分普通に掛け替える」)
+
+位置づけを「皆が使う推論エンジン (製品が中に入れるバックエンド)」に寄せるのに合わせて、名前と看板を掛け替える。対象: パッケージ名 (PyPI `mlxturbo`)、モジュール名、HF のパック名 (`ddalcu/…`)、README の位置づけ、docs の自称。決めるときは一括で。時期はユーザーの判断。
