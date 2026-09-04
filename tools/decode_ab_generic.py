@@ -66,6 +66,7 @@ Flash-Next の一式 (`FlashSpecEngine`) を抱えるので、27B の `SpecEngin
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -655,7 +656,35 @@ def main() -> int:
         p = Path(args.out)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps(rows, ensure_ascii=False, indent=1))
-        print(f"\n書き出し: {p}")
+        source_paths = [Path(__file__), REPO_ROOT / "mlxturbo/spec.py"]
+        program_path = Path(sys.argv[0]).resolve()
+        if (
+            program_path != Path(__file__).resolve()
+            and program_path.is_relative_to(REPO_ROOT)
+        ):
+            source_paths.append(program_path)
+        meta = {
+            "version": "decode-ab-generic/v1",
+            "argv": sys.argv,
+            "cwd": os.getcwd(),
+            "knob": env_name,
+            "variants": variants,
+            "baseline": baseline,
+            "model": args.model,
+            "mtp": args.mtp,
+            "ctx": args.ctx,
+            "tokens": args.tokens,
+            "reps": args.reps,
+            "source_sha256": {
+                str(path.relative_to(REPO_ROOT)): hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+                for path in source_paths
+            },
+        }
+        meta_path = p.with_suffix(p.suffix + ".meta.json")
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=1))
+        print(f"\n書き出し: {p} / {meta_path}")
 
     # 計測ツールなので後始末は要らない。interpreter shutdown 待ちで Metal の
     # メモリを握ったまま残った実測があるので、書き終えたら即落とす

@@ -130,6 +130,18 @@ def test_plan_depth_matches_gate_on_the_same_acceptance_rates():
                     f"ema={ema} cap={cap} entropy={h}: plan={plan} gate={gate}")
 
 
+def test_record_pos_accept_preserves_legacy_tail_zero_updates():
+    """A/B用のmethod抽出後も、出荷policyのEMA更新は従来どおり。"""
+    ema = {d: 0.5 for d in range(1, 5)}
+    obs = {d: 7 for d in range(1, 5)}
+    SpecEngine._record_pos_accept(ema, obs, accepted=1, drafted=4)
+    assert abs(ema[1] - 0.6) < 1e-12
+    assert abs(ema[2] - 0.4) < 1e-12
+    assert abs(ema[3] - 0.4) < 1e-12
+    assert abs(ema[4] - 0.4) < 1e-12
+    assert obs == {1: 8, 2: 8, 3: 8, 4: 8}
+
+
 def test_plan_depth_cuts_the_chain_that_the_gate_would_have_thrown_away():
     """事前値 (FastMTP の k=1 70% / k=2 11% / k=3 2%) のままなら、
     cap=8 でも 2 本しか引かない (= 引いてから捨てる 6 本が消える)。"""

@@ -877,6 +877,19 @@ decision 前の EMA / obs、選んだ深さ、accepted、round ms を載せ、�
 stop semantics へ直す。短3本 × 512の1プロセス A/Bで速度を見て、出力差は通常の丸め級 / KLD
 ゲートで扱う。ここが決着するまで、h=0.19 は維持するが27Bレーンは閉じない。
 
+**完了・不採用 (2026-09-04 16:10)。**最初の試作はdepth 2の恒久上限とcost denominatorの
+off-by-oneがあり、その高速値は採択根拠から除外した。optimism transfer / EOS censoringまで含む
+参照版を再実装し、`h=0.005 / 0.01 / 0.02 / 0.05` を再探索。最良0.05もlegacy h=0.19比で
+短 ms/tok **+6.0%**、ms/round +6.7%、tok/round +1.6%。本番は現行を維持し、このレーンを閉じる。
+再現wrapperとsource hash付き結果を残した。数字はCATCHUP末尾。
+
+## テスト基盤: `test_ngram_stream` の collection 時CPU固定を局所化する (2026-09-04 15:38、未着手)
+
+`bench/test_ngram_stream.py:25` の `mx.set_default_device(mx.cpu)` がmodule import時にprocess全体へ残り、
+同じpytest invocationで後からcollectionされるGDN / qmm GPUテストがGPUを無効と誤判定する。
+拡大実行は526 passed / 10 failedだが、失敗3ファイルは個別processで5 / 12 / 13 passed。
+CPU固定をfixture内で保存・復元し、CPUテストとGPUテストを同一processで再実行する。
+
 ## P0候補: 27B の MTP cache repair で先頭1行を再利用する (2026-09-04 14:48)
 
 draft 時に積んだ先頭の `_mtp_append` を repair が trim し、同じ token / hidden / 直前 cache から

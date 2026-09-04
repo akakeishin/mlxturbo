@@ -828,6 +828,32 @@ class SpecEngine:
             return 0
         return cls._gate_depth(None, pos_accept_ema, pos_obs_count, h=h, cap=cap)
 
+    @staticmethod
+    def _record_pos_accept(
+        pos_accept_ema: dict,
+        pos_obs_count: dict,
+        accepted: int,
+        drafted: int,
+        stopped_early: bool = False,
+    ) -> None:
+        """Fold a round into the legacy per-position EMA.
+
+        ``stopped_early`` is intentionally unused by the shipped legacy policy.
+        Keeping the update behind one method lets the controller A/B harness
+        replace the whole policy without retaining an experimental branch in
+        the generation loop.
+        """
+        del stopped_early
+        for d in range(1, drafted + 1):
+            observed = 1.0 if accepted >= d else 0.0
+            pos_accept_ema[d] = (
+                (1 - GATE_EMA_ALPHA) * pos_accept_ema.get(
+                    d, _pos_accept_prior(d)
+                )
+                + GATE_EMA_ALPHA * observed
+            )
+            pos_obs_count[d] = pos_obs_count.get(d, 0) + 1
+
     # ---------- D3: context lookup (SAM) + ReSpec arbitration ----------
 
     @staticmethod
@@ -1435,14 +1461,13 @@ class SpecEngine:
                 ) + RESPEC_EMA_ALPHA * r
             elif n_drafts:
                 # D1: per-position acceptance-rate EMA feeding _gate_depth.
-                for d in range(1, n_drafts + 1):
-                    observed = 1.0 if a >= d else 0.0
-                    pos_accept_ema[d] = (
-                        1 - GATE_EMA_ALPHA
-                    ) * pos_accept_ema.get(
-                        d, _pos_accept_prior(d)
-                    ) + GATE_EMA_ALPHA * observed
-                    pos_obs_count[d] = pos_obs_count.get(d, 0) + 1
+                self._record_pos_accept(
+                    pos_accept_ema,
+                    pos_obs_count,
+                    accepted=a,
+                    drafted=n_drafts,
+                    stopped_early=accepted_eos is not None,
+                )
 
             self._rollback(caches, sink, len(window_l), consumed)
             if use_mtp:

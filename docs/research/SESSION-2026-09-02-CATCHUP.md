@@ -3088,3 +3088,33 @@ head4、depth 2 固定、回文順、burn-in 済み。A = compile / B = 素 (`be
   `FileNotFoundError` で終了した。上の値は harness が書き出し直前に表示した集計。終了コード1を
   成功扱いにはせず、保存事故込みで記録するが、不採用判定は short の非改善だけで決まるため
   再走しない。
+
+### 2026-09-04 16:10 27B controller の参照semanticsは短文 +6.0%。不採用で現行維持
+
+旧実装と参照側には、未来利得 / 失敗位置keep / first miss以深の更新に差がある。最初の試作は
+source-order walkとcensoringだけを移し、`h=0.02` で短 -7.4% / 4k -12.0% / 17k -15.1%を
+出したが、独立レビューで未到達位置のcold priorがdepth 2を恒久上限にする欠陥を発見した。
+またsourceのcost denominatorは最初が1.0で、試作は1+hから始めるoff-by-oneだった。この3結果は
+不完全実装の探索値であり、採択根拠から除外する。
+
+参照どおり、full accept時に次位置へ0.95上限のoptimismを移し、最初のdenominatorを1.0にし、
+EOS停止をmissにもoptimismにも数えない版を実装した。実事前値からdepth 2→3へ開くことを純関数で
+確認。`h=0.005 / 0.01 / 0.02 / 0.05` の短探索では0.05が最良だったため、実験専用
+`tools/controller_ab_27b.py` で reference h=0.05 と legacy h=0.19 を比較した。
+
+| 短3本 × 512 × 2 | reference | legacy | 差 |
+|---|---:|---:|---:|
+| ms/tok | 32.327 | 30.484 | **+6.0%** |
+| ms/round | 99.640 | 93.343 | **+6.7%** |
+| tok/round | 3.086 | 3.038 | +1.6% |
+
+referenceは受理を1.6%増やすがround単価が6.7%上がり、短の採択線 -2%に届かない。4k / 17k / KLD
+へ進めず、**本番はlegacy walk + h=0.19を維持**する。最終結果は
+`controller-reference-h005-vs-legacy-h019-27b-short-final-0904.json`。隣のmeta JSONにコマンド、arm、
+source SHA256を保存した。本番差分はEMA更新を挙動不変のmethodへ抽出しただけで、legacy更新の
+直接テストを追加した。
+
+拡大pytestは 526 passed / 10 failed。3つの失敗ファイルは個別processで 5 / 12 / 13 passed。
+`bench/test_ngram_stream.py` がcollection時に `mx.set_default_device(mx.cpu)` を実行し、同じprocessで
+後から走るGPUテストをCPU判定にする既存のtest isolation欠陥だった。controllerの故障ではないが、
+別論点として直す。

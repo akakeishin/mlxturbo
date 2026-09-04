@@ -519,3 +519,16 @@ rg -n "_build_rerank|_draft_argmax|DRAFT_RERANK|applyDraftLMHead|_head\(h_mtp" m
 
 その後の順序は既存どおり、qwen4_exp の汎用分岐 → Qwen3.6-35B-A3B → Gemma 4 温 TTFT →
 製品 P0。フルベンチと overnight は引き続きユーザーの明示指示待ち。
+
+## Controller 決着後の更新 (2026-09-04 16:10 JST)
+
+- **完了・不採用**: 完全な参照semantics + 再較正h=0.05は、現行legacy h=0.19比で短
+  ms/tok +6.0% / ms/round +6.7% / tok/round +1.6%。本番は現行維持。再現wrapperとmetaを追加。
+- **次**: P0-B の MTP cache repair先頭1行再利用。正しさの合成ケースを先に置き、一致時だけ短A/B。
+- **別件**: `bench/test_ngram_stream.py` のcollection時CPU固定がGPUテストへ漏れる。fixtureで局所化する。
+
+再開の1コマンド:
+
+```bash
+rg -n "mtp_off0|mtp_cache.trim|_mtp_append\(window|chain_head" mlxturbo/spec.py bench/test_spec_draft_chain_qwen3_5.py
+```
