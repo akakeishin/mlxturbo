@@ -8984,10 +8984,12 @@ def test_build_runner_draft_model_takes_precedence_over_qwen4_exp_selection(monk
     DraftSpecRunner が選ばれる。"""
 
     import mlx_lm as mlx_lm_pkg
+    import mlxturbo.runner as runner_module
 
     monkeypatch.setattr(
         mlx_lm_pkg, "load", lambda path: (object(), SimpleNamespace(vocab_size=100))
     )
+    monkeypatch.setattr(runner_module, "enable_default_fusions", lambda *args, **kwargs: None)
     model = _fake_qwen4_exp_model()
     tokenizer = SimpleNamespace(vocab_size=100)
     args = SimpleNamespace(

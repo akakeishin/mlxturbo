@@ -33,6 +33,9 @@ def _restore_compile_state():
     old_orig = fused._MOE_COMPILE_ORIG
     try:
         fused.disable_moe_block_compile()
+        # 別ファイルが先に実クラスへcompileを有効化していても、このテストが
+        # 差し替える契約用クラスを独立に検査できるようにする。
+        fused._MOE_COMPILE_ORIG = None
         yield
     finally:
         fused._MOE_COMPILE_ON = old_on
