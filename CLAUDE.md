@@ -77,6 +77,7 @@
   `MLXTURBO_GDN_DECODE_FUSED=1` (2026-09-03 21:05 から既定 on: decode/verify 幅の GDN の非行列積を 16 -> 3 dispatch、短 ms/round -2.4% / 17k -2.0%、micro でビット一致。`=0` で off)
   `MLXTURBO_GDN_DECODE_ALL=1` (2026-09-05 17:31 から既定 on: qwen4_exp の非MTP S=1だけ、conv・GDN再帰・gated RMSNormを1 dispatchへ融合。通常冷却の短文ARは38.46→39.56 tok/s、+2.84%。step=1 KLDは0.01832→0.01843、Δ+0.00011。`=0`でoff。MTP capture / S>1、mask、ragged batch、学習、sharding、未初期化cacheは素へ戻る)
   `MLXTURBO_GEMMA_GREEDY_ONE_SYNC=1` (2026-09-05 18:06 から既定 on: Gemma 4 31B assistantのprocessor無しgreedyだけ、draft token列とtarget verifyのargmaxを各1回の同期へ畳む。通常冷却の同一process ABBAで短+0.76%、4k +1.18%、17k +3.58%。全出力・tok/step一致。`=0`で従来の行ごとの同期へ戻る)
+  `MLXTURBO_QMM_E120=auto` (2026-09-05 19:09 から既定 auto: モデル名ではなくq4/group64 affineの実測shape `(K,N,M)=(21504,5376,4)` を共通dispatcherからE120 table QMVへ送る。Gemma 4 31B assistantで短+4.94%、4k +2.09%、cold 17k +0.29%かつTTFT -1.27%。4k/17kの生成列は一致。実測根拠のあるM3/M4だけautoでon、未計測のM1/M2/M5/M6以降はstock。`=force`で診断、`=0`で全機種stock。未計測shapeは素のまま)
   は本番の既定値そのもので、値を変えると本番の挙動が変わる。
   `MLXTURBO_GDN_METAL` (既定 on、`=0` で off) も同様に本番の既定値で、
   2026-09-02 の in-model A/B (17k prefill -1.3〜-4.5%、KLD +0.00014) で

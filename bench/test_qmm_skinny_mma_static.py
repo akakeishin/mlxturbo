@@ -124,6 +124,7 @@ def test_source_is_e120_no_table_and_respects_prohibitions():
     # Phase 2 and every empirically failed design stay absent.
     assert "USE_TABLE" not in joined
     assert "xsums" not in joined
+    assert "sums[m] += a0[m] + a1[m] + a2[m] + a3[m]" in joined
     assert "simdgroup_matrix" not in joined
     assert "threadgroup_barrier" not in joined
     assert "threadgroup float" not in joined
@@ -144,7 +145,10 @@ def test_table_sources_match_e120_and_respect_prohibitions():
     assert "sums[m] = st[m]" in header
     assert "sums[m] +=" not in header
     assert "xsums[(xs_kb * 32 + xs_lane) * xs_stride + xs_row] = s" in XSUMS_SOURCE
-    assert "s += xv[0] + xv[1] + xv[2] + xv[3]" in XSUMS_SOURCE
+    # bf16 4要素を先に足すと、K方向の各blockで丸めが積み上がる。
+    # 要素ごとにfloatへ上げてから足すことを固定する。
+    assert "s += static_cast<float>(xv[0])" in XSUMS_SOURCE
+    assert "static_cast<float>(xv[3])" in XSUMS_SOURCE
     assert "qmv_stride = qmv_m <= 8 ? 8 : 16" in source
 
     # Runtime K/N is the vendored E120 and KERNEL-INTEL contract.

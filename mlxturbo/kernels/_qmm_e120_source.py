@@ -140,7 +140,7 @@ inline void fastmlx_e120_qmv_wide(
                 a1[m] = static_cast<float>(xv[1]);
                 a2[m] = static_cast<float>(xv[2]);
                 a3[m] = static_cast<float>(xv[3]);
-                sums[m] += xv[0] + xv[1] + xv[2] + xv[3];
+                sums[m] += a0[m] + a1[m] + a2[m] + a3[m];
             }
             for (int r = 0; r < rows_per_simd; r++) {
                 partial[r] += (a0 * (packed[r][i] & 0x000f) +
@@ -346,7 +346,8 @@ XSUMS_SOURCE = r"""
     for (int i = 0; i < 4; i++) {
         const vec<bfloat16_t, 4> xv =
             *reinterpret_cast<const device vec<bfloat16_t, 4>*>(xm + 4 * i);
-        s += xv[0] + xv[1] + xv[2] + xv[3];
+        s += static_cast<float>(xv[0]) + static_cast<float>(xv[1]) +
+             static_cast<float>(xv[2]) + static_cast<float>(xv[3]);
     }
     xsums[(xs_kb * 32 + xs_lane) * xs_stride + xs_row] = s;
 """

@@ -1,4 +1,4 @@
-"""GPU correctness, occupancy-record, and performance gates for A2 v5.
+"""GPU correctness and performance gates for A2 v5 and E120.
 
 Run serially: ``uv run python bench/test_qmm_skinny_mma.py``.
 Absolute timings are reference observations; final measurement needs a quiet
@@ -16,7 +16,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import mlx.core as mx
 
 from mlxturbo.kernels._qmm_skinny_mma_source import SPLIT_K
-from mlxturbo.kernels.qmm_skinny_mma import M_MAX, M_MIN, qmm_skinny_mma
+from mlxturbo.kernels._qmm_e120_source import M_MAX as E120_M_MAX
+from mlxturbo.kernels._qmm_e120_source import M_MIN as E120_M_MIN
+from mlxturbo.kernels.qmm_skinny_mma import (
+    E120_V4_IMPLEMENTATION,
+    M_MAX,
+    M_MIN,
+    qmm_skinny_mma,
+)
 
 BF16_CORRECTNESS_THRESHOLD = 8e-3
 M8_DEPENDENCY_CHAIN_SPEEDUP = 1.5
@@ -89,6 +96,36 @@ def correctness(dtype):
             }
             assert normalized < BF16_CORRECTNESS_THRESHOLD, (
                 f"K={k}, N={n}, M={m}: "
+                f"threshold={BF16_CORRECTNESS_THRESHOLD}, {shape_results[m]}"
+            )
+        results[f"k{k}_n{n}"] = shape_results
+    return results
+
+
+def e120_correctness(dtype):
+    """Exercise both E120 no-table and table widths on generic layouts."""
+
+    results = {}
+    for k, n in CORRECTNESS_SHAPES:
+        q = _make_quantized(n, k, dtype)
+        shape_results = {}
+        for m in range(E120_M_MIN, E120_M_MAX + 1):
+            x = (mx.random.normal((m, k)) * 0.1).astype(dtype)
+            expected = _stock(x, q)
+            actual = qmm_skinny_mma(
+                x,
+                *q,
+                implementation=E120_V4_IMPLEMENTATION,
+                use_table=True,
+            )
+            mx.eval(expected, actual)
+            max_abs, normalized = _normalized_max_error(actual, expected)
+            shape_results[m] = {
+                "max_abs": max_abs,
+                "normalized_max": normalized,
+            }
+            assert normalized < BF16_CORRECTNESS_THRESHOLD, (
+                f"E120 K={k}, N={n}, M={m}: "
                 f"threshold={BF16_CORRECTNESS_THRESHOLD}, {shape_results[m]}"
             )
         results[f"k{k}_n{n}"] = shape_results
@@ -191,6 +228,7 @@ def main():
         "kernel": "A2 v5 direct-load 8x8 MMA",
         "correctness_threshold": BF16_CORRECTNESS_THRESHOLD,
         "correctness": correctness(dtype),
+        "e120_correctness": e120_correctness(dtype),
         "occupancy": occupancy_record(
             args.v5_max_tptg, args.reference_max_tptg
         ),

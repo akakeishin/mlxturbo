@@ -4522,3 +4522,49 @@ samplingやlogit processorがある場合は従来経路を維持する。
 
 全測定文脈が非退行で、追加の品質近似を導入せず同期だけを減らすため採用する。
 `MLXTURBO_GEMMA_GREEDY_ONE_SYNC`は既定on、`=0`で従来経路へ戻る。
+
+### 2026-09-05 19:09 E120 QMMをGemma専用にせず共通shape routeで採用
+
+Layr Labs E120由来のq4/group64 affine QMVはK/Nをtemplate固定しておらず、対応layoutなら
+モデル族を問わず動く。そこでGemma専用tableと環境変数を置かず、共通QMM dispatcherの
+`(K,N,M)` 表へ、実測済み `(21504,5376,4)` だけを追加した。Gemma runnerはtarget verifyの
+間だけ共通scopeを開き、Gemmaでは未計測のbroad small-M routeを同時に有効化しない。
+
+E120の入力和をbf16の4要素加算後ではなく、各要素をfloatへ上げてから加算するよう修正した。
+その後の本番60層・実activationのfp32参照距離はstock比平均0.999996、最大1.000104、
+最小0.999611。teacher-forced 192行はKLD平均0.000309、最大0.005168、top-1一致率
+0.994792で、projectのKLD差+0.0005以内を満たした。
+
+Gemma 4 31B assistantの同一process ABBAは次の通り。
+
+| 文脈 | stock | E120 | 差 | 補足 |
+|---|---:|---:|---:|---|
+| 短文3本×128 | 34.218 tok/s | 35.908 tok/s | +4.94% | ms/round -3.24%、tok/step +1.59% |
+| 4k×256 | 23.327 tok/s | 23.814 tok/s | +2.09% | ms/round -2.06%、出力hash一致 |
+| cold 17k×128 | 17.515 tok/s | 17.567 tok/s | +0.29% | TTFT 112.91→111.47秒 (-1.27%)、出力hash一致 |
+
+17kはoff/on/on/offの各走行間を60秒休止し、全4本でtok/step 2.702128、生成hash
+`ae324e7a2028c6e4`が一致した。長文ではattention/KV読み出しが支配的になるためQMMの
+decode寄与は薄いが、品質近似を追加せず非退行なので採用する。`MLXTURBO_QMM_E120=0`で
+このrouteだけstockへ戻る。
+
+ローカルpackのshapeも確認した。Qwen 27Bはdense MLPが `(17408,5120)`、Flash-Nextは
+MoE expertが主に `(640,2560)` で、今回の実測shapeは存在しない。共通化とは未測定shapeへ
+盲目的に広げることではなく、今後Qwen側で勝ったshapeを同じroute表へ足せることを指す。
+
+その後、別shapeでもE120自体を直接試した。Qwen 27B down `(17408,5120,M=4)` は実重みmicroで
+stock比-9.5%、既存small-M比-7.3%だったが、短文3本×128 tokenの全体ABBAでは
+ms/round 82.015→80.564 (-1.8%)に対しtok/round 3.346→3.268 (-2.3%)、最終ms/tokenは
+25.717→25.979 (+1.0%)。3条件中2条件で生成列も分岐し、route追加を撤回した。
+Flash-Nextの2D linear-attention qkv `(2560,10240,M=4)` はmicroの時点でstock比+17.3%、
+既存small-M比+16.7%遅く棄却した。局所autotuneだけでは全体勝者を選べない実例になった。
+
+通常のmodel loadは計測せず、著名shapeの検証済み表を選ぶだけにする。将来未知shapeを扱う場合は
+明示的なoffline calibrationとversion/device別cacheへ分ける。ビット一致kernelは速度で選べるが、
+E120のように丸めが変わる候補はmodel-level品質検査済みの表だけで有効化する。E120の外部実測は
+M4 Pro、今回の実測はM3 MaxなのでautoはM3/M4だけonにする。未測定のM1/M2/M5/NAX/M6以降は
+stock、`force`だけ診断用とする。
+
+汎用kernel契約のGPU検査も、合成q4/group64の `(K,N)=(512,1024)` と
+`(5120,4096)`、M=2〜9（no-table/table両帯）で通した。stockとのnormalized max errorは
+最大0.000488で、既存しきい値0.008以内だった。

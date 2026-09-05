@@ -206,6 +206,19 @@ _KERNELS: dict[tuple, Any] = {}
 ENV_KNOB = "MLXTURBO_MOE_GEMM"
 
 
+def apple_gpu_family() -> tuple[int, bool] | None:
+    """Return ``(generation, is_phone)`` from MLX's architecture string."""
+
+    try:
+        info = getattr(mx, "device_info", None) or mx.metal.device_info
+        arch = str(info().get("architecture", ""))
+    except Exception:
+        return None
+    if len(arch) < 3 or not arch[-3:-1].isdigit():
+        return None
+    return int(arch[-3:-1]), arch[-1] == "p"
+
+
 def is_nax_device() -> bool:
     """この機が MLX の NAX カーネルを持つ世代か。**機種判定はここだけ。**
 
@@ -216,15 +229,11 @@ def is_nax_device() -> bool:
     保守側へ入る。
     """
 
-    try:
-        info = getattr(mx, "device_info", None) or mx.metal.device_info
-        arch = str(info().get("architecture", ""))
-    except Exception:
+    family = apple_gpu_family()
+    if family is None:
         return False
-    if len(arch) < 3 or not arch[-3:-1].isdigit():
-        return False
-    gen = int(arch[-3:-1])
-    return gen >= (18 if arch[-1] == "p" else 17)
+    gen, is_phone = family
+    return gen >= (18 if is_phone else 17)
 
 
 def enabled() -> bool:
@@ -1059,6 +1068,7 @@ def qmm_segmented(
 
 __all__ = [
     "ENV_KNOB",
+    "apple_gpu_family",
     "counts_from_sorted_ids",
     "dense_eligible",
     "enabled",

@@ -1,8 +1,8 @@
 """Shape-by-M routing for affine quantized linear layers.
 
-Only shapes observed in the target Qwen3.8 model are eligible for custom
-kernels.  Unknown shapes and unsupported quantization modes always retain the
-MLX implementation.
+Routes are keyed only by the quantized matmul geometry, not by model family.
+Only production shapes with measured results are eligible for custom kernels;
+unknown shapes and unsupported quantization modes retain the MLX path.
 """
 
 import os
@@ -15,7 +15,8 @@ STOCK = "stock"
 NOCAP = "nocap"
 MMA = "mma"
 SMALLM = "small_m"
-_ROUTES = frozenset((STOCK, NOCAP, MMA, SMALLM))
+E120 = "e120"
+_ROUTES = frozenset((STOCK, NOCAP, MMA, SMALLM, E120))
 
 
 def _routes(overrides: dict[int, str] | None = None) -> tuple[str, ...]:
@@ -43,6 +44,15 @@ def _routes(overrides: dict[int, str] | None = None) -> tuple[str, ...]:
     return tuple(row)
 
 
+def _exact_routes(overrides: dict[int, str]) -> tuple[str, ...]:
+    """Build a stock row with only explicitly measured widths overridden."""
+
+    row = [STOCK] * 17
+    for m, route in overrides.items():
+        row[m] = route
+    return tuple(row)
+
+
 # Explicit candidate table for the real model shapes recorded by
 # bench/op_curve.py.  A3's GPU gate compares every selected entry with both
 # alternatives before acceptance.
@@ -52,10 +62,41 @@ DEFAULT_ROUTE_TABLE: dict[tuple[int, int], tuple[str, ...]] = {
     (17408, 5120): _routes({m: MMA for m in range(10, 17)}),  # MLP down
     (5120, 12288): _routes({5: MMA} | {m: MMA for m in range(9, 17)}),   # attention q
     (5120, 248320): _routes({5: MMA} | {m: MMA for m in range(9, 17)}),  # lm_head
+    # Gemma 4 31B で測った形だが、route の契約はモデル名ではなくこの
+    # q4/g64 affine geometry。M=4 以外へは実測を外挿しない。
+    (21504, 5376): _exact_routes({4: E120}),
 }
 
 _DISPATCHED_CLASS = None
 _DISPATCH_ACTIVE = ContextVar("fastmlx_quantized_dispatch_active", default=False)
+_E120_ACTIVE = ContextVar("fastmlx_qmm_e120_active", default=True)
+_UNLISTED_SMALL_M_ACTIVE = ContextVar(
+    "fastmlx_unlisted_small_m_active", default=True
+)
+
+
+def _apple_gpu_family() -> tuple[int, bool] | None:
+    from .moe_grouped_gemm import apple_gpu_family
+
+    return apple_gpu_family()
+
+
+def _e120_enabled() -> bool:
+    """Resolve the E120 policy once at enable/scope entry, never per layer."""
+
+    mode = os.environ.get("MLXTURBO_QMM_E120", "auto").strip().lower()
+    if mode in ("1", "on", "true", "yes", "force"):
+        return True
+    if mode in ("0", "off", "false", "no", "stock"):
+        return False
+    if mode not in ("", "auto"):
+        raise ValueError(
+            "MLXTURBO_QMM_E120 must be auto, on, force, or off"
+        )
+    # Local evidence is M3 Max; the imported E120 profile was measured on
+    # M4 Pro. Other generations stay on stock until measured on that family.
+    family = _apple_gpu_family()
+    return family is not None and family[0] in (15, 16) and not family[1]
 
 
 def select_route(
@@ -90,6 +131,7 @@ def _load_nn():
 
 _KERNELS = None
 _SMALL_M_KERNEL = None
+_E120_KERNEL = None
 
 
 def _load_kernels():
@@ -144,6 +186,31 @@ def _load_small_m():
 
     _SMALL_M_KERNEL = small_m
     return _SMALL_M_KERNEL
+
+
+def _load_e120():
+    """小 M の E120 QMV を必要になった時だけ読み込む。"""
+
+    global _E120_KERNEL
+    if _E120_KERNEL is not None:
+        return _E120_KERNEL
+
+    from .qmm_skinny_mma import E120_V4_IMPLEMENTATION, qmm_skinny_mma
+
+    def e120(flat, w, scales, biases, *, group_size, bits):
+        return qmm_skinny_mma(
+            flat,
+            w,
+            scales,
+            biases,
+            group_size=group_size,
+            bits=bits,
+            implementation=E120_V4_IMPLEMENTATION,
+            use_table=True,
+        )
+
+    _E120_KERNEL = e120
+    return _E120_KERNEL
 
 
 # --------------------------------------------------------------------------
@@ -224,7 +291,9 @@ def _small_m_row(k: int, n: int) -> tuple[str, ...] | None:
     base = DEFAULT_ROUTE_TABLE.get((k, n))
     new = list(base) if base is not None else [STOCK] * 17
     for mm in range(_SMALL_M_MIN, _SMALL_M_MAX + 1):
-        new[mm] = _SMALL_M_ROUTE
+        # shape単位で実測済みのrouteは、全shape向けのsmall-M方針より強い。
+        if new[mm] == STOCK:
+            new[mm] = _SMALL_M_ROUTE
     row = tuple(new)
     _SMALL_M_ROWS[(k, n)] = row
     return row
@@ -267,6 +336,7 @@ def quantized_matmul(
     if (
         _SMALL_M_ROUTE is not None
         and table is None
+        and _UNLISTED_SMALL_M_ACTIVE.get()
         and _SMALL_M_MIN <= m <= _SMALL_M_MAX
     ):
         row = _small_m_row(k, n)
@@ -278,11 +348,17 @@ def quantized_matmul(
         return stock()
 
     flat = x if x.ndim == 2 else x.reshape((m, k))
+    if route == E120 and not _E120_ACTIVE.get():
+        return stock()
     if route == SMALLM:
         # 行ごとに幅 1 の素とビット一致する (kernels/qmv_small_m.py)。
         # 形が外れたら関数の中で `mx.quantized_matmul` に落ちる。
         out = _load_small_m()(flat, w, scales, biases,
                               group_size=group_size, bits=bits)
+        return out if x.ndim == 2 else out.reshape((*x.shape[:-1], n))
+    if route == E120:
+        out = _load_e120()(flat, w, scales, biases,
+                           group_size=group_size, bits=bits)
         return out if x.ndim == 2 else out.reshape((*x.shape[:-1], n))
 
     nocap, mma = _load_kernels()
@@ -348,15 +424,24 @@ def _get_dispatched_class():
 
 
 @contextmanager
-def dispatch_scope():
-    """Temporarily activate verification-only dispatched layers."""
+def dispatch_scope(*, unlisted_small_m: bool = True):
+    """Temporarily activate verification-only dispatched layers.
+
+    ``unlisted_small_m=False`` keeps only exact shape/width entries from the
+    common measured route table.  Runners can therefore adopt a newly measured
+    common route without also opting into the broad small-M fallback.
+    """
 
     refresh_small_m_route()
-    token = _DISPATCH_ACTIVE.set(True)
+    active_token = _DISPATCH_ACTIVE.set(True)
+    e120_token = _E120_ACTIVE.set(_e120_enabled())
+    small_m_token = _UNLISTED_SMALL_M_ACTIVE.set(unlisted_small_m)
     try:
         yield
     finally:
-        _DISPATCH_ACTIVE.reset(token)
+        _UNLISTED_SMALL_M_ACTIVE.reset(small_m_token)
+        _E120_ACTIVE.reset(e120_token)
+        _DISPATCH_ACTIVE.reset(active_token)
 
 
 def enable(model: Any, *, active: bool = True):
@@ -369,6 +454,7 @@ def enable(model: Any, *, active: bool = True):
     """
 
     nn = _load_nn()
+    _E120_ACTIVE.set(_e120_enabled())
     dispatched = _get_dispatched_class()
     for _, module in model.named_modules():
         if isinstance(module, nn.QuantizedLinear) and not isinstance(
@@ -387,6 +473,7 @@ __all__ = [
     "SMALLM",
     "STOCK",
     "dispatch_scope",
+    "E120",
     "enable",
     "quantized_matmul",
     "refresh_small_m_route",

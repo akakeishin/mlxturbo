@@ -1,5 +1,7 @@
 """Small synthetic checks for the Gemma 4 assistant cache contract."""
 
+import inspect
+
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +15,7 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from mlxturbo.gemma4_mtp import (
     Gemma4AssistantModel,
+    Gemma4AssistantRunner,
     _restore_prompt_boundary,
     _rollback,
     _sample,
@@ -24,6 +27,13 @@ def _tokens(start, count):
     values = mx.arange(start, start + count, dtype=mx.float32)
     keys = values.reshape(1, 1, count, 1)
     return keys, keys + 100
+
+
+def test_verify_uses_common_measured_qmm_routes():
+    source = inspect.getsource(Gemma4AssistantRunner.generate)
+    assert "dispatch_scope(unlisted_small_m=False)" in source
+    assert "MLXTURBO_GEMMA_QMM_E120" not in source
+    assert "_GEMMA_VERIFY_QMM_ROUTES" not in source
 
 
 def test_rollback_handles_wrapped_rotating_cache():

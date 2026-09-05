@@ -19,6 +19,7 @@ import mlx.nn as nn
 
 from .runner import FallbackSession, PREFILL_STEP_SIZE
 from .spec import restore_untrimmable_caches, snapshot_untrimmable_caches
+from .kernels.dispatch import dispatch_scope
 
 
 GEMMA4_ASSISTANT_KIND = "gemma4_assistant_spec"
@@ -620,11 +621,14 @@ class Gemma4AssistantRunner:
             draft_rng_state = _copy_rng_state()
             _restore_rng_state(target_rng_state)
             verify_input = [pending, *draft]
-            raw_hidden, _, verify_logits, _ = _target_forward(
-                self.model,
-                mx.array([verify_input], dtype=mx.uint32),
-                cache,
-            )
+            # E120 は共通のshape routeとして使う。Gemmaで未計測の他shapeまで
+            # broad small-M fallbackへ広げない。
+            with dispatch_scope(unlisted_small_m=False):
+                raw_hidden, _, verify_logits, _ = _target_forward(
+                    self.model,
+                    mx.array([verify_input], dtype=mx.uint32),
+                    cache,
+                )
             target_tokens = []
             accepted = 0
             emitted = []
@@ -713,6 +717,9 @@ def build_gemma4_runner(target_model, tokenizer, assistant_path, block_size=None
     is an error, not a reason to silently benchmark the non-assistant runner.
     """
     assistant = load_gemma4_assistant(assistant_path, target_model)
+    from .kernels.dispatch import enable as enable_quantized_dispatch
+
+    enable_quantized_dispatch(target_model, active=False)
     size = DEFAULT_DRAFT_BLOCK_SIZE if block_size is None else int(block_size)
     runner = Gemma4AssistantRunner(target_model, tokenizer, assistant, size)
     print(

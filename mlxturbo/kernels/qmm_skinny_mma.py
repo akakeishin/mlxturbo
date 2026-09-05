@@ -1,4 +1,4 @@
-"""A2 v5 skinny BF16 MMA kernel with an explicit legacy-v4 switch."""
+"""Skinny BF16 quantized matmul kernels with explicit implementations."""
 
 from typing import Any
 
@@ -221,9 +221,10 @@ def qmm_skinny_mma(
 ):
     """Compute ``x[M,K] @ dequant(w[N,K]).T`` or use stock fallback.
 
-    ``v5`` is the production default and accepts BF16 M=6..16.  The retired
-    ``e120_v4`` backend remains explicitly selectable for diagnosis; its
-    ``use_table`` switch retains the v4 table/no-table A/B path.
+    ``v5`` is the direct-call default and accepts BF16 M=6..16. ``e120_v4``
+    accepts compatible affine q4/group64 layouts at M=2..9; production use is
+    selected independently by the measured shape table in ``dispatch.py``.
+    Its ``use_table`` switch retains the table/no-table diagnostic path.
     """
 
     if implementation not in _IMPLEMENTATIONS:

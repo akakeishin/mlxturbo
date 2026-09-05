@@ -1417,6 +1417,28 @@ MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gdn_decode_all.py && rg 
 - `MLXTURBO_GEMMA_GREEDY_ONE_SYNC`は既定on、`=0`で旧同期へ戻る。Qwen系は既に
   device上のdraft連鎖と一括argmaxを持つため、この変更はGemma 4 31B assistant固有。
 
+## 採用: E120 QMMを共通shape routeへ一般化 (2026-09-05 19:09 JST)
+
+Gemma専用のpatchや環境変数は作らず、q4/group64 affineの `(K,N,M)=(21504,5376,4)` を
+共通QMM dispatcherの実測表へ追加した。カーネル自体は対応layout全般を処理できるが、速度を
+未計測shapeへ外挿しない。Gemma 4 31B assistantの同一process ABBAは短+4.94%、4k +2.09%、
+cold 17k +0.29%で、17k TTFTも-1.27%。4k/17kの出力列とtok/stepは一致した。
+
+本番60層のfp32参照距離はstock比平均0.999996、最悪1.000104。teacher-forced 192行の
+KLDは平均0.000309、top-1一致率0.994792で受け入れ幅内。`MLXTURBO_QMM_E120=0`で
+このrouteだけ素へ戻る。現行Qwen 27Bは `(17408,5120)`、Flash-NextのMoE expertは主に
+`(640,2560)` で、この実測shapeには一致しない。Qwen向けは同じdispatcherへ別の実測shapeを
+追加する課題であり、Gemma分岐にはしない。Qwen 27B downへ直接当てると局所では既存small-M比
+-7.3%だったが、短文3本×128の全体ABBAはms/round -1.8%に対しtok/round -2.3%、最終
+ms/token +1.0%で棄却した。Flash-Nextのlinear qkvは局所で既存small-M比+16.7%遅く、
+全体測定へ進めなかった。
+
+通常ロード中の暗黙autotuneは行わない。著名shapeの検証済み表を同梱し、未知shapeの自動化が
+必要になったら明示的なoffline calibrationでprofileを作る。ビット一致候補だけ速度で自動選択し、
+丸めが変わる候補はmodel-level品質検査済みの表だけで使う。E120のautoは実測根拠がある
+M3/M4だけon。未測定のM1/M2/M5/NAX/M6以降はstockへ戻し、
+`MLXTURBO_QMM_E120=force`だけ診断用に許す。
+
 再開の1コマンド:
 
 ```bash

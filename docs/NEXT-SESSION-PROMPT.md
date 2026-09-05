@@ -1381,3 +1381,24 @@ MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gdn_decode_all.py && rg 
 ```bash
 MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gemma4_mtp.py bench/test_server.py -k 'gemma4 or assistant' && rg -n "qmv_small_m|fast_qmm|M=3|M=4|M=5" mlxturbo/kernels mlxturbo/fused.py
 ```
+
+## E120 QMMをモデル非依存の実測shape routeで採用 (2026-09-05 19:09 JST)
+
+- q4/group64 affineの `(K,N,M)=(21504,5376,4)` を共通dispatcherへ載せた。Gemma名で
+  分岐せず、未知shape・量子化条件・M幅はstockへ戻る。
+- Gemma 4 31B assistantのABBAは短+4.94%、4k +2.09%、cold 17k +0.29%。17kの
+  TTFTは112.91→111.47秒（-1.27%）。4k/17kの生成列とtok/stepは一致した。
+- 本番60層のfp32参照距離はstock比平均0.999996、最悪1.000104。teacher-forced
+  192行のKLD平均0.000309、top-1一致率0.994792。
+- 現行Qwen 27B/Flash-Nextに同一shapeは無い。Qwen 27B downは局所-7.3%でも全体
+  ms/token +1.0%・tok/round -2.3%で棄却、Flash linear qkvは局所+16.7%で棄却した。
+- `MLXTURBO_QMM_E120=auto`は実測根拠があるM3/M4だけrouteを使い、未測定M1/M2と
+  M5/NAX/M6以降はstock。`=force`は診断用、`=0`は全機種でstock。
+- 通常ロードでは既知shape表を引くだけ。未知shapeの自動化は将来の明示offline calibrationへ
+  分け、丸めが変わるkernelを局所速度だけで自動採用しない。
+
+再開の1コマンド:
+
+```bash
+MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_dispatch_static.py bench/test_qmm_skinny_mma_static.py bench/test_gemma4_mtp.py
+```

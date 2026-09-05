@@ -308,4 +308,5 @@ def test_nax_generation_is_forward_compatible(monkeypatch, architecture, expecte
     from mlxturbo.kernels import moe_grouped_gemm as mgg
 
     monkeypatch.setattr(mgg.mx, "device_info", lambda: {"architecture": architecture})
+    assert mgg.apple_gpu_family() == (int(architecture[-3:-1]), False)
     assert mgg.is_nax_device() is expected

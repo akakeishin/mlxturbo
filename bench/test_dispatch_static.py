@@ -40,6 +40,9 @@ def test_shape_by_m_table_and_unknown_fallback():
     assert dispatch.select_route(5120, 17408, 4) == dispatch.STOCK
     assert dispatch.select_route(5120, 17408, 5) == dispatch.MMA
     assert dispatch.select_route(17408, 5120, 5) == dispatch.STOCK
+    assert dispatch.select_route(21504, 5376, 4) == dispatch.E120
+    assert dispatch.select_route(21504, 5376, 3) == dispatch.STOCK
+    assert dispatch.select_route(21504, 5376, 5) == dispatch.STOCK
     assert dispatch.select_route(5120, 17408, 17) == dispatch.STOCK
 
 
@@ -138,6 +141,48 @@ def test_custom_routes_flatten_and_restore_prefix_shape():
     assert not fake_mx.calls
 
 
+def test_e120_default_table_uses_only_selected_shape_and_width():
+    fake_mx = _FakeMX()
+    calls = []
+
+    def e120(x, w, scales, biases, **kwargs):
+        calls.append((x.shape, w.shape, kwargs))
+        return _Array((x.shape[0], w.shape[0]), "e120")
+
+    old_mx = dispatch._load_mx
+    old_e120 = dispatch._load_e120
+    dispatch._load_mx = lambda: fake_mx
+    dispatch._load_e120 = lambda: e120
+    try:
+        w = _Array((5376, 2688))
+        scales = biases = _Array((5376, 336))
+        out = dispatch.quantized_matmul(
+            _Array((1, 4, 21504)),
+            w,
+            scales,
+            biases,
+            group_size=64,
+            bits=4,
+        )
+        dispatch.quantized_matmul(
+            _Array((1, 3, 21504)),
+            w,
+            scales,
+            biases,
+            group_size=64,
+            bits=4,
+        )
+    finally:
+        dispatch._load_mx = old_mx
+        dispatch._load_e120 = old_e120
+
+    assert out.shape == (1, 4, 5376)
+    assert calls == [
+        ((4, 21504), (5376, 2688), {"group_size": 64, "bits": 4})
+    ]
+    assert len(fake_mx.calls) == 1
+
+
 class _QuantizedLinear:
     def __init__(self):
         self.marker = object()
@@ -184,6 +229,67 @@ def test_enable_is_in_place_identity_preserving_and_idempotent():
     finally:
         dispatch._load_nn = old_nn
         dispatch._DISPATCHED_CLASS = old_class
+
+
+def test_e120_route_is_generic_and_has_common_rollback(monkeypatch):
+    assert dispatch.select_route(21504, 5376, 4) == dispatch.E120
+
+    monkeypatch.setenv("MLXTURBO_SMALL_M_ROUTE", "small_m")
+    dispatch.refresh_small_m_route()
+    row = dispatch._small_m_row(21504, 5376)
+    assert row[3] == dispatch.SMALLM
+    assert row[4] == dispatch.E120
+    assert row[5] == dispatch.SMALLM
+
+    monkeypatch.setenv("MLXTURBO_QMM_E120", "0")
+    with dispatch.dispatch_scope(unlisted_small_m=False):
+        assert dispatch._E120_ACTIVE.get() is False
+        assert dispatch._UNLISTED_SMALL_M_ACTIVE.get() is False
+    assert dispatch._E120_ACTIVE.get() is True
+    assert dispatch._UNLISTED_SMALL_M_ACTIVE.get() is True
+
+
+@pytest.mark.parametrize(
+    ("family", "expected"),
+    [
+        ((13, False), False),  # M1: 未測定
+        ((14, False), False),  # M2: 未測定
+        ((15, False), True),   # M3: この開発機で実測
+        ((16, False), True),   # M4: E120公開計測あり
+        ((17, False), False),  # M5/NAX: 未測定
+        ((18, False), False),  # M6: M5の保守側を継承
+        (None, False),
+    ],
+)
+def test_e120_auto_uses_only_measured_gpu_families(
+    monkeypatch, family, expected
+):
+    monkeypatch.delenv("MLXTURBO_QMM_E120", raising=False)
+    monkeypatch.setattr(dispatch, "_apple_gpu_family", lambda: family)
+    assert dispatch._e120_enabled() is expected
+
+    monkeypatch.setenv("MLXTURBO_QMM_E120", "force")
+    assert dispatch._e120_enabled() is True
+
+    monkeypatch.setenv("MLXTURBO_QMM_E120", "off")
+    assert dispatch._e120_enabled() is False
+
+
+def test_enable_refreshes_e120_policy_for_always_active(monkeypatch):
+    fake_nn = SimpleNamespace(QuantizedLinear=_QuantizedLinear)
+    old_nn = dispatch._load_nn
+    old_class = dispatch._DISPATCHED_CLASS
+    token = dispatch._E120_ACTIVE.set(True)
+    dispatch._load_nn = lambda: fake_nn
+    dispatch._DISPATCHED_CLASS = None
+    monkeypatch.setenv("MLXTURBO_QMM_E120", "off")
+    try:
+        dispatch.enable(_Model())
+        assert dispatch._E120_ACTIVE.get() is False
+    finally:
+        dispatch._load_nn = old_nn
+        dispatch._DISPATCHED_CLASS = old_class
+        dispatch._E120_ACTIVE.reset(token)
 
 
 def main():
