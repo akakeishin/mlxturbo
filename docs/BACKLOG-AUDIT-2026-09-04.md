@@ -12,6 +12,42 @@
 - **実行可**: 現在の機体・モデル・テストで次へ進める。
 - **依存あり**: モデル、artifact、NAX機、公開権限など、手元に無いものが要る。
 
+## 2026-09-05 16:28 現行HEADでの差分監査
+
+現行HEADは`4005e01`。下の2026-09-04表は当時の判断を残すが、実行順はこの節を優先する。
+古いA1の2048上限、A3のclosed batch、B8/C10、n-gram、Gemma warm、Qwen3.6の起動と
+長文depth、Flash fixed-M4 graphbank、QSA blocks一律棄却は、その後の実装・測定で決着済み。
+
+### 速度の主線
+
+| 順 | 項目 | 状態 | 次の判定 |
+|---:|---|---|---|
+| 1 | Qwen3.6-35B-A3B depth prior | 実行可 | 通常冷却で位置別採択率を1回診断。差が大きいときだけ短文ABBA。Qwen 27B候補は-1.6%、1条件+1.8%で棄却済み |
+| 2 | Flash cold/miss prefill | 実行可 | 17kの既知内訳（MoE 34.8%、GDN 29.3%、attention 21.3%、HC 10.5%）から全体5%を説明できる案だけmicroへ進める |
+| 3 | LookupSpec自然文/lookahead | 実行可 | 既存hitless条件は-32%。自然文のhit率と長さ別上限を先に測り、勝つ条件だけ既定候補にする |
+| 4 | spec-batch実server | 実行可 | late join、temperature 0.7 KLD、HTTP aggregate tok/sを別々に検証。単体速度ではなく同時要求の主線 |
+| 5 | 27Bの公開比較差 | 実行可・診断 | 現行4k 32.1対同条件比較先43.2。部品の再包装をせず、verify単価と採択利得のどちらが残差かを現行traceで再確認 |
+
+Qwen 35Bの診断後は、GPUを使う項目ごとに休止を置く。正式な横並びと最終絶対値はまとめて
+強冷却で行い、開始前にユーザーへ単独で依頼して確認を待つ。
+
+### 今は速度主線に入れない項目
+
+| 項目 | 状態 | 再開条件 |
+|---|---|---|
+| hot prefill byte-budget LRU | 保留 | 8 session超のmissまたはswapが実telemetryで支配的と分かったとき |
+| streaming logprobs / tool token | 実行可・機能 | 速度主線を閉じた後。現在はAPI機能で、decode速度の改善ではない |
+| VLM画像・音声・動画 / LoRA | 実行可・機能 | text速度の主線後。LoRAはruntime適用とoffline fuseの方針決定後 |
+| Gemma TurboQuant packed3 KV | 保留 | cache micro、品質、実モデルA/Bの順で勝ち筋が出たとき |
+| qwen4_exp seam整理 / capture module ULP | 保留 | mlx-lm更新または同じ変更で測定可能な速度差が出るとき |
+| fixed-M4 graphbank | 棄却 | 同一条件whole-model診断がeager比10.5%以上かつ40 ms/round以下を示したときだけ |
+| `_segments_gpu` / `_max_seg_bound` | 棄却 | 対象の既定off MoE verify kernel自体が再採用候補になったときだけ |
+| QSA offset rescue / Gemma previous_kvs batch | 条件未成立 | 現行既定で到達可能な入力または失敗例が出たとき |
+| compatible generic drafter | 依存あり | 互換tokenizerの既存artifactが手元に来たとき。モデル固有の自作学習は当面しない |
+| NAX sorted gather / MTPLX 2.11.1製品capture | 依存あり | NAX機と修正版MLX、またはMTPLX上流修正が必要 |
+| HF 4bit lm_head公開 / 看板変更 | 依存あり | 外部writeの対象とタイミングをユーザーが確定したとき |
+| GuideLLM公開表 | 後続 | 最初はFlash-Next 1モデル。速度改善の主線後に同一pack・prompt・sampling・冷却で作る |
+
 ## 今すぐ残っている主線
 
 | 優先 | 項目 | 状態 | 完了条件 / 次の一手 |
