@@ -1240,15 +1240,19 @@ tok/round同一の同着だが、50kはround -3.5%に対しtok/round -5.9%で、
 ms/token **+2.5%**。一致長4の有用なSAM draftを捨てる代償があり、無償変更ではない。
 測定口は撤回して既定4を維持。代償ゼロの過去棄却案に未採用の残件はない。
 
-## 部分通過: Flash fixed-M4 Gate B1 (2026-09-05 09:48 JST)
+## 通過: Flash fixed-M4 Gate B (2026-09-05 10:11 JST)
 
-- 実QSA layer 3のQKV/RoPEと固定5葉更新を、cache objectなしの同一compiled callableへ移した。
-- 連続offset、同形replay、offset mod 4全位相、rollback keep=1/3/4と継続は全葉最大差0。
-- まだQSA block top-k、sparse SDPA、gate/o_projを含まず、Attention出力のGate Bではない。
-- 次はこの3段だけを足す。通る前に全134葉やgraphbank本体へ広げない。
+- 実QSA layer 3のQKV/RoPE、固定5葉更新、K2a block選択、K2b attention、gate/o_projを
+  cache objectなしの同一compiled callableへ移した。
+- 連続offset、同形replay、offset mod 4全位相、rollback keep=1/3/4と継続で、Attention出力と
+  全5葉は最大差0。対象層を差し替えたfull logitsも2 stepともKLD 0・top-1 100%。
+- K2のoffset・KV長・block数はtensor paramsで渡し、容量bucket内のSDPA block geometryが
+  固定の場合だけ通す。既定K2の17k -4.1%を捨てず、Python整数offsetも閉じ込めない。
+- 次は残りstate葉を機械的に列挙し、Qwen固有adapter内だけでwhole-model fixed-M4 state planを作る。
+  共通側はadapter選択とopaque state/commitだけに留める。
 
 再開の1コマンド:
 
 ```bash
-rg -n "_block_scores|_pooled_and_top|scaled_dot_product_attention|def pure_step" mlxturbo/_vendor/qwen4_exp.py tools/qwen4_qsa_pure_gate.py
+rg -n "make_cache|ArraysCache|capture\(|rollback|state" mlxturbo/spec_flash.py mlxturbo/_vendor/qwen4_exp.py tools/qwen4_qsa_pure_gate.py
 ```

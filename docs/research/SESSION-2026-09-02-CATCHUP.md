@@ -4243,3 +4243,18 @@ full logits KLD 0、rollback全件一致で再通過した。
 
 判定はGate B1の部分通過であり、Attention出力やlogitsの純関数化はまだ主張しない。次は同じ境界へ
 QSA block top-k選択とsparse SDPA・gate/o_projを入れ、実Attention出力をeagerと比較する。
+
+### 2026-09-05 10:11 既定K2を保った実QSA Gate Bを厳密通過
+
+固定pool全体への通常SDPAでは、可視集合とstateは一致したが、論理2052〜2056列に対して物理2304列を
+maskしたためreduction tileが変わり、Attention最大差0.0039〜0.0059が出た。full logitsの直接KLDは
+0.000221/0.000171で受入幅内だったが、速度目標のために既定K2a/K2bを外す理由はない。
+
+そこでK2aの可視block数とK2bの`N/NB/OFF` paramsをtensor offsetから組み、Metal kernel本体と
+出力shapeだけを容量bucketごとに固定した。capacity 2304では、試した全logical length
+2052〜2056でMLX SDPA相当のblock geometryは128のまま。`mx.compile`内からcustom kernelを呼べた。
+
+結果は、連続2 offset、同形replay、offset mod 4全位相、rollback keep=1/3/4＋継続の全件で、
+Attention出力と5葉stateが最大差0。対象層を純関数出力へ差し替えたfull logitsも2 stepとも
+KLD 0、top-1 100%だった。判定はGate B厳密通過。次は残りstate葉をQwen固有adapter内で機械的に
+列挙し、whole-model fixed-M4へ進む。共通側は登録・選択とopaque state/commitだけに留める。
