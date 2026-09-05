@@ -32,7 +32,7 @@
 
 | | mlx-serve | MTPLX | mlxturbo |
 |---|---|---|---|
-| ライセンス | MIT | Apache-2.0 | — |
+| ライセンス | MIT | Apache-2.0 | Apache-2.0 |
 | OpenAI 互換 | ○ | ○ | ○ |
 | Anthropic (`/v1/messages`) | ○ | ○ | ○ |
 | Ollama (`/api/chat`) | ○ | — | — |

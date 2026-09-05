@@ -3,7 +3,8 @@ name = "mlxturbo"
 version = "0.1.0"
 description = "A fast MLX inference engine and OpenAI/Anthropic-compatible server for Apple Silicon"
 readme = "README.en.md"
-license = "MIT"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [
     { name = "akakeishin", email = "mizururi_22@gmail.com" },
 ]
@@ -61,6 +62,7 @@ packages = ["mlxturbo"]
 only-include = [
     "mlxturbo",
     "LICENSE",
+    "NOTICE",
     "README.md",
     "README.en.md",
 ]

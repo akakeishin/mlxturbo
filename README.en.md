@@ -106,3 +106,7 @@ Acceptance rate also varies by task type (code / prose / step-by-step instructio
 - [`docs/RELEASE.md`](docs/RELEASE.md) — what to do before publishing
 
 Everything under `docs/` besides this README's translation is Japanese-only for now.
+
+## License
+
+mlxturbo is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for copyright and license notices covering incorporated third-party code.

@@ -6,7 +6,7 @@
 # m=6 is 1.25x. The real cause of the m-curve tax (the 5-row cap in qmv_wide,
 # which re-reads the weights ceil(M/5) times) is avoided here with an 8x8 MMA
 # tile + dequantization per quantization group + split-K.
-# Copyright © 2026 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 """Small-M quantized matmul that amortizes the weight read.
 

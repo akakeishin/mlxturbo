@@ -17,7 +17,7 @@
       (測定記録の中のパスは事実なので書き換えない)
 - [ ] `pip install fastmlx` で本プロジェクトとは無関係な Prince Canuma (Blaizzy) 氏の既存
       パッケージが入ることを README 等で明記済みか再確認 (名前衝突の周知)
-- [ ] LICENSE (MIT, akakeishin, 2026) の年・氏名が実態と合っているか確認
+- [ ] LICENSE (Apache-2.0) と NOTICE (akakeishin, 2026／第三者帰属) が実態と合っているか確認
 - [ ] README の実測値に「どのコマンドで再現できるか」が併記されているか確認
 
 ## 1. GitHub remote を追加する

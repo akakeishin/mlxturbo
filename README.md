@@ -110,3 +110,7 @@ uv run mlxturbo-serve --model <path-or-repo-id> --served-model-name mymodel --po
 - [`docs/MTP-FLASH.md`](docs/MTP-FLASH.md) — Flash-Next の MTP 投機デコード設計
 - [`docs/BACKLOG.md`](docs/BACKLOG.md) — やりたいが未着手のもの
 - [`docs/RELEASE.md`](docs/RELEASE.md) — 公開時にやること
+
+## ライセンス
+
+mlxturbo は [Apache License 2.0](LICENSE) で提供する。取り込んだ第三者コードの著作権表示とライセンスは [NOTICE](NOTICE) を参照。
