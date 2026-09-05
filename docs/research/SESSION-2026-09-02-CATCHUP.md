@@ -4352,3 +4352,17 @@ QSA K2bだけをMLXの表（17k=256、50k=512）から64 blocksへ変え、QSA�
 recall 8/8、quote 6/8（既定blocksは8/8、5/8）で非退行。一方50kはrecall 6/6でも
 quoteが6/6→4/6へ落ちた。partialsの再結合順を変える品質代償が出たため、速度があっても棄却する。
 実験用env、A/B knob、製品分岐は撤回し、既定はMLXのblocks表を維持する。
+
+### 2026-09-05 14:17 Flash fixed-M4 whole-model graphbankは事前速度線4.665%対10.5%で棄却
+
+正しさ側はQSA/GDN/PLE/ngramのstate-pure Gateと134葉state planまで通った。一方、製品実装へ
+進む前の速度線はeager fixed-M4比10.5%以上、かつ40 ms/round以下と定めていた。MTPLX 2.11.1の
+同一モデルロード内A/Bは54.785→57.341 tok/s（+4.665%）で、compile固定費、fallback、demotionが
+無い条件でも線の半分未満だった。現行53.5 tok/sへ機械的に掛けても約56.0 tok/sに留まり、同じ
+受理率で100 tok/sに必要な24.4 ms/roundから遠い。短文の固定depth 3は現行depth 2より11.7%遅い
+既往もあり、この利得では差し引きで退行する可能性が高い。
+
+48層adapter、218葉capture、capacity遷移、mirror commitを追加するのは便益に対して過剰なので、
+製品実装を開始せず棄却する。既存のGate道具は正しさの再利用可能な検査器として残す。再開条件は、
+新しい同一条件whole-model診断が10.5%以上を示すこと。次は既に製品へ配線済みのGemma 4 31B
+assistantを、追加の専用基盤なしで既存HTTPベンチから4k検証する。

@@ -1230,3 +1230,18 @@ quoteが2問落ちたため棄却し、実験コードは撤回した。次はfi
 ```bash
 rg -n "fixed-M4|graphbank|persistent decoder" docs/BACKLOG.md docs/research/SESSION-2026-09-02-CATCHUP.md
 ```
+
+## Flash fixed-M4 whole-model graphbankを速度ゲートで棄却 (2026-09-05 14:17 JST)
+
+- 事前線はeager fixed-M4比10.5%以上、かつ40 ms/round以下。MTPLX 2.11.1の同一ロードA/Bは
+  54.785→57.341 tok/s（+4.665%）で未達だった。
+- 現行53.5 tok/sへ外挿しても約56.0 tok/s。固定depth 3の既知の+11.7%も回収できない。
+- Gate Bと134葉planは検査器として残すが、48層adapter、capture、mirror commitは実装しない。
+- 10.5%以上を示す新しいwhole-model診断が出た場合だけ再開する。次は既に配線済みの
+  Gemma 4 31B assistantを、専用基盤を増やさず既存HTTPベンチで4kから検証する。
+
+再開の1コマンド:
+
+```bash
+tools/biglock.sh .venv/bin/python bench/bench_http_engine.py --help
+```

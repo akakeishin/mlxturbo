@@ -1288,3 +1288,22 @@ tools/biglock.sh .venv/bin/python tools/qwen4_ple_ngram_pure_gate.py
 ```bash
 rg -n "fixed-M4|graphbank|persistent decoder" docs/BACKLOG.md docs/research/SESSION-2026-09-02-CATCHUP.md
 ```
+
+## 棄却: Flash fixed-M4 whole-model graphbankの製品実装 (2026-09-05 14:17 JST)
+
+実装前に定めた採用線は、eager fixed-M4比でroundを10.5%以上短縮し、かつ40 ms/round以下へ
+入れることだった。MTPLX 2.11.1の同一モデルロード内A/Bは54.785→57.341 tok/s
+（+4.665%）で、compile固定費、fallback、demotionが無い条件でも採用線の半分未満だった。
+現行53.5 tok/sへそのまま掛けても約56.0 tok/sで、100 tok/sへ必要な24.4 ms/roundには届かない。
+さらに短文の固定depth 3は現行depth 2より11.7%遅く、同じ傾向ならgraphbankの利得を相殺する。
+
+QSA/GDN/PLE/ngramのstate-pure Gateと134葉state planは正しさの検査器として残すが、48層adapter、
+218葉capture、capacity遷移、mirror commitを製品へ追加する作業は開始しない。新しい同一条件の
+whole-model診断で10.5%以上が示された場合だけ再開する。Flash 100 tok/sの次候補は、局所compileや
+既棄却案の再包装ではなく、whole-round persistent decoder/kernelの速度上限を先に測れる場合に限る。
+
+再開条件の確認:
+
+```bash
+rg -n "10\.5%|40 ms/round|24\.4ms/round|persistent decoder" docs/BACKLOG.md docs/research/SESSION-2026-09-02-CATCHUP.md
+```
