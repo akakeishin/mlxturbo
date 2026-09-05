@@ -1825,7 +1825,10 @@ class FlashSpecEngine:
         if topk_records is not None:
             topk_records.append({**rec, "topk": topk, "true": true_vals})
 
-    def _verify(self, cap, lg, drafts, temp, precomputed=None, sampler=None):
+    def _verify(
+        self, cap, lg, drafts, temp, precomputed=None, sampler=None,
+        draft_values=None,
+    ):
         """検証フォワードの結果から、採用するトークンと hyper を取り出す。
 
         ``pair`` は [cur, d1, ..., dk]。位置 j の logits は pair[j] の次の
@@ -1863,7 +1866,8 @@ class FlashSpecEngine:
             else:
                 samp = mx.random.categorical(
                     lg.astype(mx.float32) / temp).reshape(1, k + 1)
-            dv = mx.concatenate(drafts, axis=1)
+            dv = (draft_values if draft_values is not None
+                  else mx.concatenate(drafts, axis=1))
             mx.eval(samp, dv)
             all_vals = samp[0].tolist()
             dvals = dv[0].tolist()
@@ -1891,7 +1895,8 @@ class FlashSpecEngine:
             nxt_all, dv = precomputed
         else:
             nxt_all = mx.argmax(lg, axis=-1)          # (1, k+1)
-            dv = mx.concatenate(drafts, axis=1)       # (1, k)
+            dv = (draft_values if draft_values is not None
+                  else mx.concatenate(drafts, axis=1))  # (1, k)
             mx.eval(nxt_all, dv)
         all_vals = nxt_all[0].tolist()
         dvals = dv[0].tolist()
@@ -2014,7 +2019,8 @@ class FlashSpecEngine:
                 lg = model(pair, cache=caches)
                 mx.eval(lg)
             rounds += 1
-            toks, hypers, hit, vals = self._verify(cap, lg, drafts, 0.0)
+            toks, hypers, hit, vals = self._verify(
+                cap, lg, drafts, 0.0, draft_values=pair[:, 1:])
             accepted += hit
             if _adapt_eligible:
                 round_ms = (time.perf_counter() - _round_t0) * 1000.0
@@ -2629,7 +2635,7 @@ class FlashSpecEngine:
             presync = None
             if temp <= 0 and sampler is None and drafts:
                 nxt_all = mx.argmax(lg, axis=-1)
-                dv = mx.concatenate(drafts, axis=1)
+                dv = pair[:, 1:]
                 if _DRAFT_PRESYNC and _MTP_CACHE_APPEND and pipeline == 0:
                     # 案 D1: 次ラウンドの draft の 1 段目 (と、受理済み中間
                     # トークンの MTP キャッシュへの追いつき) を、この検証と

@@ -1424,7 +1424,7 @@ class BatchSpecGenerator:
             # 単独に負ける (実測 0.82x)。計算内容は同じ。
             lg = _staged_forward(self.model, pair, self.caches)
             nxt = self._sample_rows(lg)            # (B, T+1)
-            dv = mx.concatenate(drafts, axis=1) if drafts else None  # (B, T)
+            dv = pair[:, 1:] if drafts else None  # (B, T)
             if dv is None:
                 mx.eval(nxt, cap.hyper)
             else:

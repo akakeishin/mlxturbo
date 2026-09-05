@@ -4587,3 +4587,14 @@ O(L²)になるため、mlx-lmの `BatchKVCache` と同じ256列単位の予約�
 だけに効く。`tools/verify_batch_spec.py` の不揃いbatch、chunked prefill、途中join、compaction、
 preemption、QSA活性を含む全ケースがCPUで一致した。容量再利用とtrim後の追記を固定する3 testを
 追加し、正式集合は758 passed / 3 skippedだった。
+
+### 2026-09-05 20:21 投機verifyの重複draft連結を除去
+
+単独生成、stream、`--max-batch-spec` は、検証入力 `pair=[cur,d1,...,dk]` を作った後、
+採択判定用の `dv=[d1,...,dk]` を同じdraft listからもう一度 `mx.concatenate` していた。
+`pair[:, 1:]` は同じ値・shapeのviewなので、3経路とも既存pairのsliceを再利用するようにした。
+同期点、sampling、rollback、採択判定は変更していない。
+
+モデル全体では小さい削減と見込まれるため長時間A/Bは行わず、無駄なGPU演算を増やさないという
+構造上の判定で採用した。投機・server関連510 testsと、QSA、途中join、preemptionを含む
+`tools/verify_batch_spec.py` のGPU全ケースが一致した。
