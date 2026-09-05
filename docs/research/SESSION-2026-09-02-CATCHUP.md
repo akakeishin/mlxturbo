@@ -4598,3 +4598,8 @@ preemption、QSA活性を含む全ケースがCPUで一致した。容量再利�
 モデル全体では小さい削減と見込まれるため長時間A/Bは行わず、無駄なGPU演算を増やさないという
 構造上の判定で採用した。投機・server関連510 testsと、QSA、途中join、preemptionを含む
 `tools/verify_batch_spec.py` のGPU全ケースが一致した。
+
+同じ監査で、ライブラリ直呼び・ベンチ用の `FlashSpecEngine.generate()` だけが、検証forwardの
+`mx.eval(lg)` と、その直後の greedy argmax の `mx.eval` を別々に同期していることも確認した。
+serverが使う `generate_stream()` と同じく、target logits、argmax、draft viewを1回のevalへまとめた。
+draft無しの非投機経路は従来のまま。関連485 testsが通過した。

@@ -2017,10 +2017,18 @@ class FlashSpecEngine:
             pre = snapshot_pre(model, caches)
             with capture(model) as cap:
                 lg = model(pair, cache=caches)
-                mx.eval(lg)
+                if drafts:
+                    nxt_all = mx.argmax(lg, axis=-1)
+                    draft_values = pair[:, 1:]
+                    mx.eval(lg, nxt_all, draft_values)
+                    precomputed = (nxt_all, draft_values)
+                else:
+                    mx.eval(lg)
+                    draft_values = precomputed = None
             rounds += 1
             toks, hypers, hit, vals = self._verify(
-                cap, lg, drafts, 0.0, draft_values=pair[:, 1:])
+                cap, lg, drafts, 0.0, precomputed=precomputed,
+                draft_values=draft_values)
             accepted += hit
             if _adapt_eligible:
                 round_ms = (time.perf_counter() - _round_t0) * 1000.0
