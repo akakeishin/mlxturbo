@@ -1053,7 +1053,8 @@ def disable_gdn_metal_kernel() -> None:
 #      そのまま呼ぶ)。クラスパッチではなく関数の差し替えで、契約に合う GDN が
 #      1 層でも見つかったときだけ入れる。
 #
-# qwen4_exp はシームを持っているので**この経路の対象外** (二重に当てない)。
+# 本体に同じシームを持つクラスは能力マーカーで**この経路の対象外**にする
+# (二重に当てない)。qwen4_exp というモデル名そのものには依存しない。
 # 環境変数は上と共用: `MLXTURBO_GDN_METAL` (既定 on) が 4、
 # `MLXTURBO_GDN_DECODE_FUSED` (既定 1) が 2 と 3 を切る。
 
@@ -1422,14 +1423,14 @@ def _gdn_patch_update(mod) -> bool:
 
 
 def enable_gdn_port(model=None) -> dict:
-    """qwen4_exp 以外の族の GDN 層に、GDN の自前部品を当てる (2026-09-04)。
+    """本体に高速シームを持たない GDN 層へ自前部品を当てる (2026-09-04)。
 
     戻り値は当たった数の内訳 ``{"metal": 0/1, "prework": 層数,
     "norm": 層数, "layers": 契約の合った層数}``。契約が合う層が 1 つも
     無ければ全部 0 で、モデルには何も起きない。
 
-    qwen4_exp は `_vendor/qwen4_exp.py` の `GatedDeltaNet.__call__` に
-    シームを持っていて上の 4 つの enable_gdn_* が当たるので、ここでは
+    `_mlxturbo_native_gdn_seam` を持つクラスは `GatedDeltaNet.__call__` 本体に
+    同じ高速シームがあり、上の 4 つの enable_gdn_* が当たるので、ここでは
     **対象外にする** (二重に当てない)。
 
     切り方は Flash-Next と共用:
@@ -1467,8 +1468,8 @@ def enable_gdn_port(model=None) -> dict:
         base = type(gdn)
         if getattr(base, "_mlxturbo_gdn_base", None) is not None:
             base = base._mlxturbo_gdn_base   # 既に当たっている (idempotent)
-        if base.__module__ == "mlx_lm.models.qwen4_exp":
-            continue                          # シーム持ち。ここでは触らない
+        if getattr(base, "_mlxturbo_native_gdn_seam", False):
+            continue                          # 本体にシームあり。ここでは触らない
         spec = _gdn_spec(gdn)
         if spec is None:
             continue
@@ -1956,8 +1957,8 @@ def enable_sdpa_split_generic(model=None, mode: str = None) -> int:
 
     n = 0
     for modname, ns, count in _sdpa_rowtile_attn_namespaces(model, min_head_dim=0):
-        if modname == "mlx_lm.models.qwen4_exp":
-            continue  # 従来のシーム (`enable_sdpa_split`) の担当
+        if ns.get("_MLXTURBO_NATIVE_SDPA_SPLIT_SEAM", False):
+            continue  # 本体のシーム (`enable_sdpa_split`) の担当
         _sdpa_rowtile_patch(ns, modname)
         if modname in _SDPA_ROWTILE_ORIGS:
             n += count

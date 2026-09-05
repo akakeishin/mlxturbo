@@ -671,6 +671,9 @@ class QSAIndexer(nn.Module):
         )
 
 
+_MLXTURBO_NATIVE_SDPA_SPLIT_SEAM = True
+
+
 class Attention(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -1440,6 +1443,11 @@ def _tail_window(cache, arr: mx.array, n_keep: int) -> mx.array:
 
 
 class GatedDeltaNet(nn.Module):
+    # fused.enable_gdn_port() が構造だけで別族へ高速経路を移植するとき、
+    # このクラスには同じシームが本体に既にあることを明示する。モジュール名で
+    # qwen4_exp を特別扱いすると、同じ契約を持つ後継アーキで二重適用になる。
+    _mlxturbo_native_gdn_seam = True
+
     def __init__(self, args: TextArgs):
         super().__init__()
         self.n_v = args.linear_num_value_heads

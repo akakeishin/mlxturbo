@@ -160,13 +160,32 @@ def test_enable_ignores_head_dim():
 
 
 def test_enable_skips_qwen4_exp():
-    """qwen4_exp は従来のシームの担当なので汎用版は数えない。"""
+    """qwen4_exp は本体シームを明示するので汎用版は数えない。"""
     import mlx_lm.models.qwen4_exp as Q4
 
+    assert Q4.Attention.__call__.__globals__["_MLXTURBO_NATIVE_SDPA_SPLIT_SEAM"] is True
     found = fused._sdpa_rowtile_attn_namespaces(_attn_model(n_attn=2),
                                                 min_head_dim=0)
     assert [m for m, _, _ in found] == [QWEN3_NEXT]
     assert Q4.__name__ not in [m for m, _, _ in found]
+
+
+def test_enable_skips_any_native_sdpa_seam_capability():
+    """定義元が能力を宣言すれば、モジュール名によらず二重patchしない。"""
+    ns = Q35.Attention.__call__.__globals__
+    marker = "_MLXTURBO_NATIVE_SDPA_SPLIT_SEAM"
+    missing = object()
+    old = ns.get(marker, missing)
+    ns[marker] = True
+    try:
+        assert fused.enable_sdpa_split_generic(_attn_model(n_attn=2), mode="1") == 0
+        assert fused._SDPA_SPLIT_GENERIC is False
+    finally:
+        fused.disable_sdpa_split_generic()
+        if old is missing:
+            ns.pop(marker, None)
+        else:
+            ns[marker] = old
 
 
 def test_enable_empty_model():

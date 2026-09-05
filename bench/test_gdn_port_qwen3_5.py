@@ -180,6 +180,21 @@ def test_enable_skips_qwen4_exp():
     assert fused.disable_gdn_port(model)["prework"] == 0
 
 
+def test_enable_skips_any_native_seam_capability():
+    """モデル名によらず、本体シームを宣言した GDN へ二重適用しない。"""
+    gdn = _make_gdn()
+    base = type(gdn)
+
+    class NativeSeamGDN(base):
+        _mlxturbo_native_gdn_seam = True
+
+    gdn.__class__ = NativeSeamGDN
+    model = _StubModel([gdn])
+    got = fused.enable_gdn_port(model)
+    assert got == {"metal": 0, "prework": 0, "norm": 0, "layers": 0}
+    assert type(gdn) is NativeSeamGDN
+
+
 def test_enable_no_op_without_contract():
     """契約が合わない (GDN を持たない・層が無い) モデルでは何もしない。"""
     for model in (_StubNoGdn(), None):
