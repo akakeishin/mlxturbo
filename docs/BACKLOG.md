@@ -1407,3 +1407,18 @@ BIGLOCK_NO_WORKER=1 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py
 ```bash
 MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gdn_decode_all.py && rg -n "GDN全段融合|round \+0.4%" docs/research/SESSION-2026-09-02-CATCHUP.md
 ```
+
+## 採用: Gemma 4 assistantのgreedy同期を各列1回へ集約 (2026-09-05 18:06 JST)
+
+- processor無し・temperature 0だけ、draft tokenをGPU arrayのまま連鎖し、draft列とtarget
+  verifyのargmaxを各1回の同期へ畳んだ。sampling／processor経路は変更しない。
+- 通常冷却・同一process ABBAで短文3本+0.76%、4k +1.18%、17k +3.58%。生成tokenと
+  tok/stepは全条件で一致した。
+- `MLXTURBO_GEMMA_GREEDY_ONE_SYNC`は既定on、`=0`で旧同期へ戻る。Qwen系は既に
+  device上のdraft連鎖と一括argmaxを持つため、この変更はGemma 4 31B assistant固有。
+
+再開の1コマンド:
+
+```bash
+MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gemma4_mtp.py bench/test_server.py -k 'gemma4 or assistant'
+```

@@ -1367,3 +1367,17 @@ rg -n "fused GDN|deferred PLE|compressed-key|coarse.*rerank" docs/BACKLOG.md doc
 ```bash
 MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gdn_decode_all.py && rg -n "GDN全段融合|round \+0.4%" docs/research/SESSION-2026-09-02-CATCHUP.md
 ```
+
+## Gemma 4 assistant greedy同期削減を採用 (2026-09-05 18:06 JST)
+
+- processor無し・temperature 0だけ、draft token列とtarget verify argmaxの同期を各1回へ集約。
+- 通常冷却・同一process ABBAは短+0.76%、4k +1.18%、17k +3.58%。全条件で生成tokenと
+  tok/step一致。`MLXTURBO_GEMMA_GREEDY_ONE_SYNC=0`で旧経路へ戻る。
+- Qwen系は既に同じ同期削減済み。次の共通大口は、M=3〜5の量子化行列積で実効帯域が落ちる
+  実shapeを1本選び、現行small-M棄却案と重複しないkernel／dispatch差だけを測る。
+
+再開の1コマンド:
+
+```bash
+MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gemma4_mtp.py bench/test_server.py -k 'gemma4 or assistant' && rg -n "qmv_small_m|fast_qmm|M=3|M=4|M=5" mlxturbo/kernels mlxturbo/fused.py
+```

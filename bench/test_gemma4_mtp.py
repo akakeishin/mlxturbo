@@ -1,5 +1,7 @@
 """Small synthetic checks for the Gemma 4 assistant cache contract."""
 
+from types import SimpleNamespace
+
 import pytest
 
 try:
@@ -10,6 +12,7 @@ except ImportError as exc:
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 
 from mlxturbo.gemma4_mtp import (
+    Gemma4AssistantModel,
     _restore_prompt_boundary,
     _rollback,
     _sample,
@@ -55,6 +58,44 @@ def test_greedy_sample_skips_full_vocabulary_normalization():
         raise AssertionError("temperature-zero sampling must not call the sampler")
 
     assert _sample(mx.array([[1.0, 4.0, 2.0]]), stochastic_sampler, greedy=True) == 1
+
+
+def test_greedy_draft_one_sync_is_default_and_preserves_token_ids(monkeypatch):
+    monkeypatch.delenv("MLXTURBO_GEMMA_GREEDY_ONE_SYNC", raising=False)
+
+    def embed(ids):
+        return ids.astype(mx.float32)[..., None]
+
+    def forward_one(inputs, _shared_kv, _position, _valid_len):
+        hidden = inputs[..., -1:]
+        return hidden, hidden
+
+    fake = SimpleNamespace(
+        _target_embed=embed,
+        _target_embed_scale=1.0,
+        forward_one=forward_one,
+        model=SimpleNamespace(
+            embed_tokens=SimpleNamespace(
+                as_linear=lambda _hidden: mx.array([[[0.0, 3.0, 1.0]]])
+            )
+        ),
+    )
+
+    tokens = Gemma4AssistantModel.draft_block(
+        fake,
+        0,
+        mx.zeros((1, 1, 1)),
+        {},
+        0,
+        1,
+        4,
+        lambda _logits: (_ for _ in ()).throw(AssertionError("sampler called")),
+        True,
+        [],
+        [],
+    )
+
+    assert tokens == [1, 1, 1]
 
 
 def test_prompt_boundary_restores_full_and_wrapped_sliding_caches():

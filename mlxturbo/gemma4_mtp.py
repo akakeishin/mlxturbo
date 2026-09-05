@@ -10,6 +10,7 @@ existing runners unchanged.
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -183,18 +184,38 @@ class Gemma4AssistantModel(nn.Module):
     ) -> list[int]:
         if self._target_embed is None:
             raise RuntimeError("assistant is not bound to the target embedding")
+        one_sync = (
+            greedy
+            and not processors
+            and os.environ.get("MLXTURBO_GEMMA_GREEDY_ONE_SYNC", "1") != "0"
+        )
         token = int(last_token)
+        token_array = None
         h_prev = hidden
         out: list[int] = []
+        out_arrays = []
         for _ in range(block_size - 1):
-            token_embed = self._target_embed(mx.array([[token]], dtype=mx.uint32))
+            ids = (
+                token_array
+                if one_sync and token_array is not None
+                else mx.array([[token]], dtype=mx.uint32)
+            )
+            token_embed = self._target_embed(ids)
             token_embed = token_embed * self._target_embed_scale
             inputs = mx.concatenate([token_embed.astype(h_prev.dtype), h_prev], axis=-1)
             h_prev, h_norm = self.forward_one(inputs, shared_kv, position, valid_len)
             logits = self.model.embed_tokens.as_linear(h_norm)
+            if one_sync:
+                token_array = mx.argmax(logits[:, -1, :], axis=-1).reshape(1, 1)
+                out_arrays.append(token_array)
+                continue
             logits = _apply_processors(logits[:, -1, :], processors, history + out)
             token = _sample(logits, sampler, greedy=greedy)
             out.append(token)
+        if one_sync and out_arrays:
+            packed = mx.concatenate(out_arrays, axis=1)
+            mx.eval(packed)
+            return [int(value) for value in packed.reshape(-1).tolist()]
         return out
 
 
@@ -604,16 +625,32 @@ class Gemma4AssistantRunner:
                 mx.array([verify_input], dtype=mx.uint32),
                 cache,
             )
-            mx.eval(raw_hidden, verify_logits)
             target_tokens = []
             accepted = 0
             emitted = []
             verify_history = list(history)
+            one_sync = (
+                greedy
+                and not processors
+                and os.environ.get("MLXTURBO_GEMMA_GREEDY_ONE_SYNC", "1") != "0"
+            )
+            if one_sync:
+                greedy_tokens = mx.argmax(verify_logits, axis=-1)
+                mx.eval(raw_hidden, greedy_tokens)
+                greedy_values = [
+                    int(value) for value in greedy_tokens.reshape(-1).tolist()
+                ]
+            else:
+                mx.eval(raw_hidden, verify_logits)
+                greedy_values = []
             for row in range(len(verify_input)):
-                row_logits = _apply_processors(
-                    verify_logits[:, row, :], processors, verify_history
-                )
-                target_token = _sample(row_logits, sampler, greedy=greedy)
+                if one_sync:
+                    target_token = greedy_values[row]
+                else:
+                    row_logits = _apply_processors(
+                        verify_logits[:, row, :], processors, verify_history
+                    )
+                    target_token = _sample(row_logits, sampler, greedy=greedy)
                 target_tokens.append(target_token)
                 verify_history.append(target_token)
                 if row < len(draft) and target_token == draft[row]:

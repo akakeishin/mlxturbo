@@ -4506,3 +4506,19 @@ S=2で+3.4%、主要なS=3で+16.3%、S=4で+15.3%。conv状態は完全一致�
 （-2.3%）、ms/tokenは16.199→16.671（+2.9%）。局所dispatch削減はwhole-modelの
 実行重なりと必須state書き出しの中で壁時計へ移らず、丸め差は採択率も下げた。速度ゲートを
 破ったため長文・KLDへ進まず、MTP試作とknobを削除した。非MTP S=1の採用は独立して維持する。
+
+### 2026-09-05 18:06 Gemma 4 assistantのgreedy同期削減を採用
+
+Gemma 4 31Bのassistant経路は、block 4のdraftを作る途中で3回、target verify後も行ごとに
+`mx.eval`とCPU転送を行っていた。processor無し・temperature 0だけ、draft tokenをGPU arrayの
+まま次段へ渡し、draft列とtargetの一括argmaxをそれぞれ最後に1回だけ同期する候補を実装した。
+samplingやlogit processorがある場合は従来経路を維持する。
+
+通常冷却・同一processのoff/on/on/offで、短文3本×128 tokenは33.773→34.028 tok/s
+（+0.76%、prompt別+0.73% / +0.24% / +1.38%）。凍結長文をprompt境界から毎回復元し、
+追加1 tokenだけをprefillした比較では、4kが25.398→25.698 tok/s（+1.18%）、17kが
+17.759→18.396 tok/s（+3.58%）だった。4kは3,825 token、17kは16,825 tokenを各runで
+再利用した。全条件で生成tokenのhashとtok/stepが一致した。
+
+全測定文脈が非退行で、追加の品質近似を導入せず同期だけを減らすため採用する。
+`MLXTURBO_GEMMA_GREEDY_ONE_SYNC`は既定on、`=0`で従来経路へ戻る。
