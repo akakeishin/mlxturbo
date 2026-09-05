@@ -27,8 +27,6 @@ import numpy as np  # noqa: E402
 
 from mlxturbo.kernels.qsa_prefill_attn import build_union_blocks  # noqa: E402
 
-mx.set_default_device(mx.cpu)
-
 
 def _keep_block(rng, B, S, n_blocks, cr, offset, block_topk):
     """QSA の規約どおりの ``keep_block`` を作る。
@@ -216,4 +214,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    mx.set_default_device(mx.cpu)
     raise SystemExit(main())

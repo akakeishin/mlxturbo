@@ -55,8 +55,6 @@ if str(REPO_ROOT) not in sys.path:
 
 import mlx.core as mx  # noqa: E402
 
-mx.set_default_device(mx.cpu)
-
 import mlxturbo  # noqa: E402,F401 -- sys.meta_path フックを入れて mlx_lm.models.qwen4_exp を
 # mlxturbo/_vendor/qwen4_exp.py へリダイレクトする (相対 import `.base` 等は
 # mlx_lm.models パッケージ配下として import しないと解決しないので、
@@ -210,4 +208,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    mx.set_default_device(mx.cpu)
     raise SystemExit(main())

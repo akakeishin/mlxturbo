@@ -34,8 +34,6 @@ if str(REPO_ROOT) not in sys.path:
 import mlx.core as mx  # noqa: E402
 import numpy as np  # noqa: E402
 
-mx.set_default_device(mx.cpu)
-
 # Flash-Next の形 (mlxturbo/_vendor/qwen4_exp.py の TextArgs 既定)。
 N_HEADS = 24
 N_KV_HEADS = 2
@@ -198,4 +196,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    mx.set_default_device(mx.cpu)
     raise SystemExit(main())
