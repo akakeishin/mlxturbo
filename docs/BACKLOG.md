@@ -855,7 +855,7 @@ MLX の `quantized_matmul` は M=1 (qmv) で 400 GB/s 級なのに M=2〜8 (fast
 
 ## 畳んだ: Flash-Next の「飛ばす / 積む」(2026-09-04 11:43、`scratchpad/agent-fn-skip-stack.md`)
 
-- 「結果を使わない仕事」で実在したのは GDN の `state_out` の二度書き (113 MB/forward) だけで、in-model ±0.0% (隣の行列積と重なって隠れている = **バイトを消しても壁時計が動かない**直接の例)。indexer の q 側 512 列は 8.8 MB / 0.017 ms。他 (prime の MTP 層、pooled / top-k、mask、未受理行の lm_head) は MLX の遅延で既に飛んでいる。「積む」に新しい的は無し。
+- 「結果を使わない仕事」で実在したのは GDN の `state_out` の二度書き (113 MB/forward) だけだった。当時のin-modelは±0.0%で保留したが、2026-09-05に「理論上の代金が無ければ5%未満も採る」という基準で再判定した。同一process ABBAのカーネル実寸はT=1/4/8で12.33%/3.10%/11.13%短縮、出力一致だったため `a0a856c` で採用済み。indexer の q 側 512 列は 8.8 MB / 0.017 ms。他 (prime の MTP 層、pooled / top-k、mask、未受理行の lm_head) は MLX の遅延で既に飛んでいる。「積む」に残る新しい的は無し。
 - 27B でも同じ死んだ書き出しが `spec.py:566` の `_linear_capture` 経由で起きる (48 層 × 3.1 MB = 150 MB/verify)。稼働率 98.7% の 27B なら 1:1 で効く可能性 (≈0.4 ms、1% 未満) があるが、代金 (カーネル変種 4 本) があるので保留。
 
 ## NAX 機の本番で踏む疑い: MLX 0.32.2 の sorted gather_qmm が 32K 行超で壊れる (#3922、2026-09-04 12:15)

@@ -443,7 +443,7 @@ sed -n '1,180p' docs/research/PRODUCT-DIRECTION-2026-09.md
 - continuous batching は製品採用には必要だが、単独レイテンシの現在レーンには混ぜない。
 - NAX 機では MLX 0.32.2 の sorted `gather_qmm` が 32K 行超で壊れる疑いが最優先。
   0.32.3 が無ければ `MLXTURBO_PREFILL_GROUP=1` または 32K 行の分割ゲートから始める。
-- HF 公開パックの lm_head 4bit 化、27B の state_out スキップ、GQA 小幅 attention、
+- HF 公開パックの lm_head 4bit 化、GQA 小幅 attention、
   n-gram 先読みの 50k、sdpa 分割の幅 9/10 と 50k は、上の主線を止めず BACKLOG から拾う。
 
 ### 今回は行わないこと
@@ -706,7 +706,7 @@ rg -n "def _select_session|prefill_reused|ttft-trace|memory|session_pool" mlxtur
 - 現行17k解剖を常時冷却で取り直した。中間2048 tokenは壁時3.530秒、MoE 1.410、
   GDN 0.950、attention 0.891、HC 0.355秒。部品和は壁時計+3.2%で整合。
 - 単純chunk 4096/8192、causal mask融合、small-kv QSA、K/V prefix trim、HC elem拡張、
-  GDN state_out削減は棄却済みなので再開しない。
+  GDN state_out削減は `a0a856c` で採用済みなので再開しない。
 - 常用冷却、`FASTMLX_NGRAM_NOCACHE=1`、49,870〜49,873 token、3ケースのABBAを完走。
   prefetch onは平均86.255秒、offは93.252秒で、wall **-7.5%**、入力速度は約535→578 tok/s
   (**+8.1%**)。「5%以上かつ出力一致」の採用線を通り、3ケースすべて生成列が一致した。
