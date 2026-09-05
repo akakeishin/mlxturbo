@@ -1976,6 +1976,14 @@ def build_runner(
                 " 含む) である必要があります。終了します。"
             )
             raise SystemExit(1)
+        # ``--draft-model`` は _build_base_runner() より手前で返るため、ここで
+        # 明示しないと target / draft の両方が共有の高速化入口を一度も通らない。
+        # DraftSpecRunner は mlx_lm の通常 forward を両モデルへ呼ぶので、同じ
+        # shape/capability gate を両方へ適用する。対象外の族は従来どおり0層で
+        # 素通りし、--no-fused も両モデルへ同じように効く。
+        no_fused = getattr(args, "no_fused", False)
+        enable_default_fusions(model, log_prefix, no_fused)
+        enable_default_fusions(draft_model, f"{log_prefix} draft:", no_fused)
         print(
             f"{log_prefix} draft-model 投機デコード有効 (DraftSpecRunner, "
             f"draft={draft_model_path})"

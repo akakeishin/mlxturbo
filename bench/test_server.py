@@ -8921,6 +8921,7 @@ def test_enforce_required_runner_rejects_mismatched_draft_spec_requirement():
 
 def test_build_runner_selects_draft_spec_runner_when_draft_model_given(monkeypatch):
     import mlx_lm as mlx_lm_pkg
+    import mlxturbo.runner as runner_module
 
     draft_model_obj = object()
     draft_tokenizer_obj = SimpleNamespace(vocab_size=100)
@@ -8931,6 +8932,14 @@ def test_build_runner_selects_draft_spec_runner_when_draft_model_given(monkeypat
         return draft_model_obj, draft_tokenizer_obj
 
     monkeypatch.setattr(mlx_lm_pkg, "load", fake_load)
+    fusion_calls = []
+    monkeypatch.setattr(
+        runner_module,
+        "enable_default_fusions",
+        lambda model, log_prefix="", no_fused=False: fusion_calls.append(
+            (model, log_prefix, no_fused)
+        ),
+    )
 
     model = object()
     tokenizer = SimpleNamespace(vocab_size=100)
@@ -8939,6 +8948,7 @@ def test_build_runner_selects_draft_spec_runner_when_draft_model_given(monkeypat
         draft_model="some/draft-path",
         num_draft_tokens=6,
         lookup_spec=False,
+        no_fused=True,
     )
     runner = build_runner(model, tokenizer, config={}, args=args)
     assert isinstance(runner, DraftSpecRunner)
@@ -8948,6 +8958,10 @@ def test_build_runner_selects_draft_spec_runner_when_draft_model_given(monkeypat
     assert runner.num_draft_tokens == 6
     assert runner.fallback_reason is None
     assert captured["path"] == "some/draft-path"
+    assert fusion_calls == [
+        (model, "[mlxturbo]", True),
+        (draft_model_obj, "[mlxturbo] draft:", True),
+    ]
 
 
 def test_build_runner_draft_model_vocab_mismatch_exits(monkeypatch):
