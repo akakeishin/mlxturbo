@@ -1126,6 +1126,22 @@ tools/biglock.sh .venv/bin/python tools/qwen4_full_state_plan.py
 tools/biglock.sh .venv/bin/python tools/qwen4_gdn_pure_gate.py
 ```
 
+## Flash実PLE/ngram 2葉のstate-pure Gate通過 (2026-09-05 10:48 JST)
+
+- 唯一のPLE layer 1で、disk/CPU sidecarの疎な行取得は既存hoist境界の外に残し、
+  固定embedding `(1,4,2560)`をcompiled callableへ渡した。
+- PLE GPU本体、conv state `(1,9,10240)`、ngram context `(1,2)`の更新を同じ
+  callableに入れ、連続2回・replayはeagerと全項目最大差0。
+- keep=1/3/4のcommitと既存rollback、直後の幅4継続も出力・2葉・conv素材が最大差0。
+- QSA、GDN、PLE/ngramの全state種類が通った。次は134葉をまとめる全48層の
+  whole-model component replacementを診断実装し、品質通過後だけgraphbank速度A/Bへ進む。
+
+再開の1コマンド:
+
+```bash
+tools/biglock.sh .venv/bin/python tools/qwen4_ple_ngram_pure_gate.py
+```
+
 ## Flash fixed-M4 Gate B通過、state planへ進む (2026-09-05 10:11 JST)
 
 実QSA layer 3は、QKV/RoPE、固定5葉更新、既定K2a/K2b、gate/o_projまでPython可変cacheを

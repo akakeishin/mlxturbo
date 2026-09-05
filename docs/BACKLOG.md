@@ -1253,11 +1253,13 @@ ms/token **+2.5%**。一致長4の有用なSAM draftを捨てる代償があり�
   keep=1/3/4比較、その直後の幅4継続は134葉・logitsとも最大差0だった。
 - PLEなしの実GDN layer 0もstate-pureな同一compiled callableで通過した。連続2回、
   replay、出力、conv、fp32 recurrent state、rollback keep=1/3/4と直後の継続は最大差0。
-- 次は単一PLE/ngram層の2葉を純関数化する。ここを通したら134葉を使うwhole-model
-  component replacementへ進む。共通側はadapter選択とopaque state/commitだけに留める。
+- 単一PLE/ngram層の2葉も通過した。sidecar行取得は既存hoist境界の外、固定embedding
+  `(1,4,2560)`を入力にし、PLE本体・conv/ngram更新・rollback/継続は最大差0。
+- 134葉の全種類が通ったので、次は全48層を使うwhole-model component replacementへ進む。
+  共通側はadapter選択とopaque state/commitだけに留める。
 
 再開の1コマンド:
 
 ```bash
-tools/biglock.sh .venv/bin/python tools/qwen4_gdn_pure_gate.py
+tools/biglock.sh .venv/bin/python tools/qwen4_ple_ngram_pure_gate.py
 ```

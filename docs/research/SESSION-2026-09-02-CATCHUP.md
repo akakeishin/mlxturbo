@@ -4288,3 +4288,17 @@ GDN prework、位置別state kernel、norm/out projectionを同じ`mx.compile` c
 判定はGDN単層Gate通過。QSA 5葉とGDN 2葉の反復構造はどちらも実重み・compiled callableで
 通った。次はモデル内で1組だけのPLE conv/ngram contextを純関数化し、その後に134葉をまとめる
 whole-model component replacementへ進む。
+
+### 2026-09-05 10:48 実PLE/ngram 2葉のstate-pure Gateを通過
+
+唯一のPLE layer 1では、巨大ngram表の疎な行取得が`StreamNGram.__call__`でGPUからCPUへ
+同期するため、ここは既存PLE hoistと同じくcompiled graphの外に残した。取得済みの固定embedding
+`(1,4,2560)`を入力にし、PLEのGPU本体、conv state `(1,9,10240)`、ngram context `(1,2)`の
+更新を同一`mx.compile` callableへ入れた。
+
+連続2回と同形replayは、eager PLE出力、new conv、new context、rollback用conv素材の全項目で
+最大差0。keep=1/3/4の計画commitは既存rollbackと一致し、直後の幅4継続も全項目最大差0だった。
+
+判定はPLE/ngram Gate通過。QSA、GDN、PLE/ngramと、134葉を構成する全種類が実重み・実入力で
+state-pure callableを通った。次は全48層のwhole-model component replacementを診断実装し、
+全logits/state/rollback一致後だけgraphbank速度A/Bへ進む。
