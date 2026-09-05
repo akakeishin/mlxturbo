@@ -3438,6 +3438,37 @@ _QMM_WIDE_TARGETS = (
     ("mlp", ("gate_proj", "up_proj", "down_proj")),
 )
 
+# 上の既存roleから名前だけ外れる他族の射影。広タイルは任意shapeで正しくても
+# 常に速いわけではないため、モデル名ではなく実測済みの(role, K, N)だけを足す。
+# 2026-09-05、M=2048・8組巡回ABBAでstock比:
+# GLM gate/up 0.947、旧Qwen MLP up/down 0.936/0.915、
+# DeepSeek MLA q_b/kv_a 0.989/0.988。全shapeでstockとビット一致。
+_QMM_WIDE_KNOWN_EXTRA = {
+    ("mlp", "gate_up_proj"): frozenset({(4096, 27392)}),
+    ("mlp", "w1"): frozenset({(2048, 5504)}),
+    ("mlp", "w2"): frozenset({(2048, 5504)}),
+    ("mlp", "c_proj"): frozenset({(5504, 2048)}),
+    ("self_attn", "q_b_proj"): frozenset({(1536, 6144)}),
+    ("self_attn", "kv_a_proj_with_mqa"): frozenset({(4096, 576)}),
+}
+
+
+def _qmm_wide_candidates(layer):
+    """Yield measured dense projections as ``(linear, allowed_shapes)``."""
+    for holder, names in _QMM_WIDE_TARGETS:
+        mod = getattr(layer, holder, None)
+        if mod is None:
+            continue
+        for name in names:
+            lin = getattr(mod, name, None)
+            if lin is not None:
+                yield lin, None
+    for (holder, name), shapes in _QMM_WIDE_KNOWN_EXTRA.items():
+        mod = getattr(layer, holder, None)
+        lin = getattr(mod, name, None) if mod is not None else None
+        if lin is not None:
+            yield lin, shapes
+
 
 def _qmm_wide_dispatch(self, x):
     """`nn.QuantizedLinear.__call__` の身代わり。素通しの判定を先に済ませる。"""
@@ -3527,29 +3558,26 @@ def enable_qmm_wide(model, mtp=None, mode: str | None = None,
 
     n = 0
     for layer in each_layer():
-        for holder, names in _QMM_WIDE_TARGETS:
-            mod = getattr(layer, holder, None)
-            if mod is None:
+        for lin, allowed_shapes in _qmm_wide_candidates(layer):
+            if not isinstance(lin, nn.QuantizedLinear):
                 continue
-            for name in names:
-                lin = getattr(mod, name, None)
-                if lin is None or not isinstance(lin, nn.QuantizedLinear):
-                    continue
-                if "bias" in lin or getattr(lin, "mode", "affine") != "affine":
-                    continue
-                w, scales = lin["weight"], lin["scales"]
-                biases = lin.get("biases")
-                if biases is None:
-                    continue
-                # `eligible` は x の dtype / K だけを見るので、形を合わせた
-                # 空の probe で判定できる (実際の x は (行, K) の bf16)
-                x_probe = mx.zeros(
-                    (1, w.shape[1] * 32 // lin.bits), dtype=scales.dtype)
-                if not qw.eligible(x_probe, w, scales, biases, tile,
-                                   lin.group_size, lin.bits):
-                    continue
-                lin._qmm_wide = tile
-                n += 1
+            if "bias" in lin or getattr(lin, "mode", "affine") != "affine":
+                continue
+            w, scales = lin["weight"], lin["scales"]
+            biases = lin.get("biases")
+            if biases is None:
+                continue
+            K, N = w.shape[1] * 32 // lin.bits, w.shape[0]
+            if allowed_shapes is not None and (K, N) not in allowed_shapes:
+                continue
+            # `eligible` は x の dtype / K だけを見るので、形を合わせた
+            # 空の probe で判定できる (実際の x は (行, K) の bf16)
+            x_probe = mx.zeros((1, K), dtype=scales.dtype)
+            if not qw.eligible(x_probe, w, scales, biases, tile,
+                               lin.group_size, lin.bits):
+                continue
+            lin._qmm_wide = tile
+            n += 1
     # Eligibility lives on each QuantizedLinear instance, but this gate is
     # process-wide.  Preserve an earlier model's marked projections when the
     # other half of a DraftSpec pair contributes none.

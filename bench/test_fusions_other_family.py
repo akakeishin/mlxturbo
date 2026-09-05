@@ -152,6 +152,32 @@ def test_model_layers_empty_when_no_layers():
     assert fused._model_body(_StubNoLayers()) is None
 
 
+def test_qmm_wide_extra_shapes_are_role_and_shape_gated():
+    """他族の追加routeは、同名でも未測定shapeへ外挿しない。"""
+    cases = {
+        ("mlp", "gate_up_proj"): (4096, 27392),
+        ("mlp", "w1"): (2048, 5504),
+        ("mlp", "w2"): (2048, 5504),
+        ("mlp", "c_proj"): (5504, 2048),
+        ("self_attn", "q_b_proj"): (1536, 6144),
+        ("self_attn", "kv_a_proj_with_mqa"): (4096, 576),
+    }
+    assert set(fused._QMM_WIDE_KNOWN_EXTRA) == set(cases)
+    for role, shape in cases.items():
+        assert shape in fused._QMM_WIDE_KNOWN_EXTRA[role]
+        assert (shape[0], shape[1] + 32) not in fused._QMM_WIDE_KNOWN_EXTRA[role]
+
+    glm = object()
+    deepseek = object()
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(gate_up_proj=glm),
+        self_attn=SimpleNamespace(q_b_proj=deepseek),
+    )
+    got = list(fused._qmm_wide_candidates(layer))
+    assert (glm, fused._QMM_WIDE_KNOWN_EXTRA[("mlp", "gate_up_proj")]) in got
+    assert (deepseek, fused._QMM_WIDE_KNOWN_EXTRA[("self_attn", "q_b_proj")]) in got
+
+
 def test_structure_walkers_no_op_on_other_family():
     """他の族では構造を舐める enable_* が全部 0 / None を返す (例外を出さない)。"""
     for model in (_StubOtherFamily(n_layers=4), _StubNoLayers()):

@@ -4722,3 +4722,27 @@ block classに別途記録されているため、対象外モデルが誤って
 1.2〜1.3%（条件ごとの値であり単純加算しない）。適格target→対象外draftの回帰testを
 3経路へ追加し、対象外側の適用数は0のままprocess gateだけが保持されることを確認した。
 正式集合は768 passed / 3 skippedだった。
+
+### 2026-09-05 21:15 QMM-wideをGLM・DeepSeek・旧Qwenの実測shapeへ拡張
+
+QMM-wideのkernel適格性はモデル名に依存しないが、load時に印を付ける射影名は
+Flash/Qwen3.5系の `q_proj`、`in_proj_qkv`、`gate_proj` などに限られていた。
+mlx-lmのGLM 4、DeepSeek V2/V3系MLA、旧Qwen実装を読み、名前だけ違う候補を実shapeの
+q4/group64、M=2048で8組の重みを巡回するABBAへ掛けた。
+
+| 経路 | `(K,N)` | stock比 | 判定 |
+|---|---:|---:|---|
+| GLM 結合gate/up | `(4096,27392)` | 0.947 | 採用 |
+| DeepSeek MLA q_b | `(1536,6144)` | 0.989 | 採用 |
+| DeepSeek MLA kv_a | `(4096,576)` | 0.988 | 採用 |
+| 旧Qwen MLP w1/w2 | `(2048,5504)` | 0.936 | 採用 |
+| 旧Qwen MLP c_proj | `(5504,2048)` | 0.915 | 採用 |
+| DeepSeek MLA q_a | `(4096,1536)` | 1.006 | 棄却 |
+| 旧Qwen attention c_proj | `(2048,2048)` | 1.147 | 棄却 |
+
+採用shapeはすべてstockとビット一致した。既存の共通QMM入口へ、モデル名ではなく
+`(holder, projection, K, N)` の実測表として追加し、同名の未測定shapeには外挿しない。
+GLMのdownは既存 `mlp.down_proj`、attention q/oも既存 `self_attn.q_proj/o_proj` で
+既に対象だったため、新表には重複させていない。DeepSeek q_aと旧Qwen attention出力は
+遅かったので印を付けない。これは各射影の局所値で、モデル全体の改善率ではない。
+候補選択の契約testと正式集合769 passed / 3 skippedが通過した。
