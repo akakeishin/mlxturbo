@@ -4614,3 +4614,24 @@ MTPロードと重み評価が成功した直後に、同じ `warmup_moe_block_c
 定常時の演算と出力は変わらず、初回要求から起動時へ費用を移すだけ。`--no-fused` または
 `MLXTURBO_MOE_COMPILE_WARMUP=0` では従来どおり温めない。target→MTPの順で両方が呼ばれる
 配線testを追加し、server 474 testsが通過した。
+
+### 2026-09-05 20:31 gated-delta captureの捨てる最終状態出力を除去
+
+Flash系の投機verifyで使う `gated_delta_states` は、全位置の再帰状態
+`states_all` に加えて、同じ最終状態を別の `state_out` にもう一度書き出していた。
+この低レベル関数の呼び手はモジュール内の2か所だけで、どちらも `state_out` を即座に
+捨て、巻き戻しに必要な `states_all` だけを使っていた。そこでMetal出力buffer、pointer、
+最終store loopを削除し、fallbackも同じ2出力契約に揃えた。
+
+実寸 `B=1, Hk=16, Hv=48, Dk=Dv=128` の旧3出力版と新2出力版を同一processへ
+同時に読み込み、各80回のtrimmed meanをABBA/BAABで比較した。
+
+| verify幅 | 旧 | 新 | カーネル短縮 |
+|---:|---:|---:|---:|
+| 1 | 0.2055 ms | 0.1830 ms | 12.33% |
+| 4 | 0.2093 ms | 0.2031 ms | 3.10% |
+| 8 | 0.2575 ms | 0.2317 ms | 11.13% |
+
+`out` と `states_all` は新旧で一致した。正式なGPU検査でもT=1/4/8、mask、shape guard、
+ops fallback、mask=falseの決定性がすべてbit-exactだった。関連するGDN/spec 41 testsも通過。
+割当と書き込みを純粋に減らし、未使用値や推論結果を変えないため採用する。

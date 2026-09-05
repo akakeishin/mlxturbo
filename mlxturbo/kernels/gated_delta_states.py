@@ -17,8 +17,10 @@ mlx_lm 側のソースからの変更点はこれだけ:
   - 時間ループの各ステップの末尾（ポインタを次の t へ進める直前）で、
     そのステップの state をレジスタから `states_all` へ書き出す
   - 上記に伴うポインタ (`sall_`) のセットアップと前進を追加
-それ以外のロジック（decay・delta 更新・出力射影・マスク処理・state_in/state_out
-の扱い）は mlx_lm の実装をそのまま踏襲している。
+それ以外のロジック（decay・delta 更新・出力射影・マスク処理・state_inの扱い）
+は mlx_lm の実装をそのまま踏襲している。最終状態は必ず
+``states_all[:, -1]`` に存在するため、同じ値を別の ``state_out`` に書く
+出力は持たない。
 """
 
 from typing import Optional, Tuple
@@ -62,9 +64,8 @@ def _make_gated_delta_states_kernel(has_mask: bool = False, vectorized: bool = F
         auto dk_idx = thread_position_in_threadgroup.x;
         auto dv_idx = thread_position_in_grid.y;
 
-        // state_in, state_out: [B, Hv, Dv, Dk]
+        // state_in: [B, Hv, Dv, Dk]
         auto i_state = state_in + (n * Dv + dv_idx) * Dk;
-        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
 
         // states_all: [B, T, Hv, Dv, Dk] (fp32). states_all[:, t] is the state
         // immediately after position t has been processed.
@@ -123,10 +124,6 @@ def _make_gated_delta_states_kernel(has_mask: bool = False, vectorized: bool = F
           {g_advance}
           beta_ += Hv;
         }}
-        for (int i = 0; i < n_per_t; ++i) {{
-          auto s_idx = n_per_t * dk_idx + i;
-          o_state[s_idx] = static_cast<StT>(state[i]);
-        }}
     """
     inputs = ["q", "k", "v", "g", "beta", "state_in", "T"]
     if has_mask:
@@ -141,7 +138,7 @@ def _make_gated_delta_states_kernel(has_mask: bool = False, vectorized: bool = F
     return mx.fast.metal_kernel(
         name=f"gated_delta_states_step{suffix}",
         input_names=inputs,
-        output_names=["y", "state_out", "states_all"],
+        output_names=["y", "states_all"],
         source=source,
     )
 
@@ -168,7 +165,7 @@ def gated_delta_kernel_with_states(
     beta: mx.array,
     state: mx.array,
     mask: Optional[mx.array] = None,
-) -> Tuple[mx.array, mx.array, mx.array]:
+) -> Tuple[mx.array, mx.array]:
     _validate_kernel_shapes(q, k, v, g, beta, state, mask)
     B, T, Hk, Dk = k.shape
     Hv, Dv = v.shape[2:]
@@ -176,7 +173,7 @@ def gated_delta_kernel_with_states(
         out, states_all = _gated_delta_ops_with_states(
             q, k, v, g, beta, state, mask
         )
-        return out, states_all[:, -1], states_all
+        return out, states_all
     input_type = q.dtype
     state_type = state.dtype
     if g.ndim == 4:
@@ -204,8 +201,8 @@ def gated_delta_kernel_with_states(
         ],
         grid=(32, Dv, B * Hv),
         threadgroup=(32, 4, 1),
-        output_shapes=[(B, T, Hv, Dv), state.shape, (B, T, Hv, Dv, Dk)],
-        output_dtypes=[input_type, state_type, mx.float32],
+        output_shapes=[(B, T, Hv, Dv), (B, T, Hv, Dv, Dk)],
+        output_dtypes=[input_type, mx.float32],
     )
 
 
@@ -321,9 +318,7 @@ def gated_delta_update_with_states(
     if state is None:
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    out, _state_out, states_all = gated_delta_kernel_with_states(
-        q, k, v, g, beta, state, mask
-    )
+    out, states_all = gated_delta_kernel_with_states(q, k, v, g, beta, state, mask)
     return out, states_all
 
 
@@ -362,7 +357,5 @@ def gated_delta_update_with_states_gb(
     if state is None:
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    out, _state_out, states_all = gated_delta_kernel_with_states(
-        q, k, v, g, beta, state, mask
-    )
+    out, states_all = gated_delta_kernel_with_states(q, k, v, g, beta, state, mask)
     return out, states_all
