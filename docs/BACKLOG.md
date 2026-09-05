@@ -1382,3 +1382,9 @@ rg -n "MTP|draft|採択|acceptance" docs/BACKLOG.md docs/research/SESSION-2026-0
 ```bash
 BIGLOCK_NO_WORKER=1 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py --model /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46 --mtp /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-MTP-5bit/snapshots/998d26dc27cc06baf60ff6e27d673b15f877f0b3 --knob MLXTURBO_PRIOR_PROBE=A,B --ctx 0 --tokens 512 --reps 1 --round-trace --out bench/results/prior-probe-qwen35-short-normalcool-0905.json
 ```
+
+### 追補: Qwen 35Bも棄却 (2026-09-05 16:47 JST)
+
+- 実測prior候補は短文3本平均でms/token +1.5%、tok/round -3.2%。prompt別最悪は+9.9%。
+- 採用線を破ったので4k / 17k / KLDには進まない。現行priorを維持する。
+- Qwen 27B/35B共通のprior較正は完了。今後は共通化を優先しつつ、競合コードで大きな実測効果があるモデル固有最適化も、能力判定で隔離して実装対象にする。

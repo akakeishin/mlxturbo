@@ -1336,3 +1336,17 @@ BIGLOCK_NO_WORKER=1 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py
 ```bash
 rg -n "65 tok/s|80 tok/s|100 tok/s|同一pack" docs/NEXT-SESSION-PROMPT.md docs/research/SESSION-2026-09-02-CATCHUP.md
 ```
+
+## Qwen 35Bのdepth prior候補を棄却 (2026-09-05 16:47 JST)
+
+- 位置別実測prior候補を、通常冷却・同一process・3プロンプト×512 tokenのABBAで測定した。
+- 平均ms/tokenは7.406→7.516で+1.5%、tok/roundは2.978→2.884で-3.2%。
+- prompt別は-1.1% / -2.5% / +9.9%。平均-2%と各prompt+1%以内の採用線を破った。
+- 4k / 17k / KLDには進まず、製品priorは変えない。実験wrapperは削除済み。
+- Qwen 27B/35Bのprior再較正は両方とも棄却で完了。次は最新競合コードの未移植大口候補を実装ゲートへ落とす。
+
+再開の1コマンド:
+
+```bash
+rg -n "fused GDN|deferred PLE|compressed-key|coarse.*rerank" docs/BACKLOG.md docs/research/SESSION-2026-09-02-CATCHUP.md
+```
