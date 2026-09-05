@@ -355,10 +355,18 @@ def _temporal_state(cache):
 
 def _shared_kv_from_cache(inner, caches) -> dict:
     selected = {}
-    for layer, cache in zip(inner.layers, caches):
+    # Assistant が読むのは各 attention 種別の最後の1バンクだけ。先頭から
+    # 全60層を走査すると、途中の値は直後に上書きされるのに、rotating cacheの
+    # `_temporal_order`（concatを含みうる）を毎round組み立ててしまう。
+    # 逆順で最初に見つかった2種だけを取り、従来と同じ最終バンクを返す。
+    for layer, cache in zip(reversed(inner.layers), reversed(caches)):
+        if layer.layer_type in selected:
+            continue
         state = _temporal_state(cache)
         if state is not None:
             selected[layer.layer_type] = state
+            if "sliding_attention" in selected and "full_attention" in selected:
+                break
     if "sliding_attention" not in selected or "full_attention" not in selected:
         raise RuntimeError("target cache did not produce both Gemma attention K/V banks")
     return selected

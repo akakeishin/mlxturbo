@@ -19,6 +19,7 @@ from mlxturbo.gemma4_mtp import (
     _restore_prompt_boundary,
     _rollback,
     _sample,
+    _shared_kv_from_cache,
     _snapshot_prompt_boundary,
 )
 
@@ -106,6 +107,35 @@ def test_greedy_draft_one_sync_is_default_and_preserves_token_ids(monkeypatch):
     )
 
     assert tokens == [1, 1, 1]
+
+
+def test_shared_kv_reads_only_last_bank_of_each_attention_type(monkeypatch):
+    layers = [
+        SimpleNamespace(layer_type=kind)
+        for kind in (
+            "sliding_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+        )
+    ]
+    caches = [SimpleNamespace(index=index) for index in range(len(layers))]
+    seen = []
+
+    def temporal(cache):
+        seen.append(cache.index)
+        return (cache.index, cache.index + 100)
+
+    monkeypatch.setattr("mlxturbo.gemma4_mtp._temporal_state", temporal)
+    shared = _shared_kv_from_cache(SimpleNamespace(layers=layers), caches)
+
+    assert shared == {
+        "sliding_attention": (5, 105),
+        "full_attention": (4, 104),
+    }
+    assert seen == [5, 4]
 
 
 def test_prompt_boundary_restores_full_and_wrapped_sliding_caches():

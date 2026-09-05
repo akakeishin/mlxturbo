@@ -4635,3 +4635,17 @@ Flash系の投機verifyで使う `gated_delta_states` は、全位置の再帰�
 `out` と `states_all` は新旧で一致した。正式なGPU検査でもT=1/4/8、mask、shape guard、
 ops fallback、mask=falseの決定性がすべてbit-exactだった。関連するGDN/spec 41 testsも通過。
 割当と書き込みを純粋に減らし、未使用値や推論結果を変えないため採用する。
+
+### 2026-09-05 20:43 Gemma assistantのshared-KV走査を60層から2層へ削減
+
+Gemma 4 31B assistantはtarget cacheから、各attention種別で最後に現れる
+`sliding_attention` と `full_attention` のK/Vだけを使う。従来はtarget 60層を先頭から
+全走査し、途中の58層は `_temporal_order` を呼んだ直後に同種の後続値で上書きしていた。
+逆順に走査し、末尾の2種が揃った時点で止めるようにした。選択されるcacheは従来と同一で、
+assistantの計算、丸め、出力には変更がない。
+
+60層の実配置（sliding 5層＋full 1層の反復）と、ring wrap時のconcatを再現した同一process
+ABBA microでは、shared-KV取得の中央値が489.714→16.408µs（29.85倍、roundあたり
+473.306µs削減）だった。これはモデル全体tok/sではなくPython/MLX graph構築部分の値。
+選択K/Vの完全一致と、末尾2cache以外へ触れない契約testを追加した。正式集合は
+760 passed / 3 skippedだった。
