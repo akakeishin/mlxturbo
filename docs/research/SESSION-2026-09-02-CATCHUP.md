@@ -4149,3 +4149,66 @@ sessionの二重claim、freshから次turnへの公開、checkpoint継承、inse
 同時にGemma 4 dense 31Bの対象を確認した。`gemma4-31b-4bit`はq4/group64・60層・MoEなし、
 `gemma4-31b-assistant`は4層hidden 1024のBF16 shared-KV drafterで、ローカルMTPLX validatorはPASS。
 26B MoEのassistant回帰とは別レーンとして、block size 2/4/6/8を短文・4k・17kで測る。
+
+### 2026-09-05 08:33 Gemma B=2の物差しを訂正し、2ms合流窓を採用候補にした
+
+直前のB=1 88.3 tok/s、B=2 aggregate 88.5 tok/sという診断値は、クライアントが
+`ignore_eos=true`を付けたためcontinuous batchを通っていなかった。通常EOSかつ128 tokenを
+完走するpromptへ直して再測した。
+
+| cohort wait | B=1 | B=2 aggregate | 倍率 |
+|---|---:|---:|---:|
+| 0 ms | 88.88 tok/s | 63.30 tok/s | 0.712x |
+| 2 ms | 89.52 tok/s | 136.02 tok/s | 1.519x |
+
+0msでは2件目が最初のMLX tick後に途中参加し、各要求のserver-side decodeが約34.5 tok/sへ
+落ちた。cohort開始時だけ2ms待つと2件とも最初のtick前に入り、各約74 tok/sになった。
+B=1のclient wallは1.44秒対1.43秒で非退行。2ms窓は既定候補として回帰テストを追加する。
+
+同時にFable 5.1 xhighを3本、読み取り専用で走らせて全体、Gemma B=2、100 tok/sの現実性を
+別々に監査した。旧B=2値に基づくfp32第一容疑は上の訂正で優先度を下げる。モデル別の統合判断は
+`docs/research/FABLE-PERFORMANCE-AUDIT-2026-09-05.md`に残した。
+
+### 2026-09-05 08:53 Gemma 4 dense 31Bのshared-KV assistantをB=1へ接続
+
+`gemma4-31b-4bit`（dense、60層、hidden 5,376）と`gemma4-31b-assistant`
+（BF16、4層、hidden 1,024）の明示pairだけを受けるtarget-verified runnerを追加した。
+assistantはtarget最終段のsliding/full K/Vと正規化済みhiddenを共有し、2/4/6/8のverify幅、
+回転KV wrap後のrollback、session appendを持つ。明示したpairの破損・不一致は通常runnerへ
+黙って落とさず起動エラーにする。targetは他runnerと同じ既定fusionを通す。
+
+短文96 tokenを同一モデル・同一promptで測った初回掃引:
+
+| 経路 | decode | tok/step | ARとのtoken一致 |
+|---|---:|---:|---:|
+| AR | 19.65 tok/s | 1.00 | 基準 |
+| assistant block 2 | 30.62 tok/s | 1.86 | 96/96 |
+| assistant block 4 | 39.46 tok/s | 3.39 | 95/96 |
+| assistant block 6 | 32.84 tok/s | 4.13 | 96/96 |
+| assistant block 8 | 32.66 tok/s | 5.00 | 96/96 |
+
+このpromptではblock 4がAR比2.01xで最速だったため暫定既定を4にした。greedy時はargmaxに
+不要な262k語彙logsumexpを省いた。逐次ARとS=8 verifyの8行比較は平均KLD 0.000281、
+最大0.001138、top-1 8/8一致で、平均の受入幅+0.0005以内。回転KV/連続KV rollbackと
+greedy sampler検査3件、serverを含む全473 testが通過した。
+
+これは短文の一次採用で、看板値ではない。4k/17k、複数prompt、temp>0 seeded sampling、
+block 2/4/6/8の反復は未測。独立reviewのRNG過剰消費と共通fusion迂回の指摘は修正済み。
+回転KVはproductionと同じmulti-token appendでMetal実機検査を通し、復元不能という静的指摘は
+実装の`_update_concat`保持を見落としていたため採らなかった。
+
+### 2026-09-05 09:03 GuideLLMの固定出力長をcontinuous batchへ通した
+
+GuideLLMが送る`ignore_eos=true`は従来、chat/completionsのstream/non-stream全4経路で
+continuous batchを迂回していた。このため固定output lengthの公開ベンチで、同時接続だけ
+直列化される不公平があった。FallbackのBatchGeneratorへ要求単位の空SequenceStateMachineを
+渡し、EOS停止なしの要求も同じcohortへ入るようにした。要求別EOS方針を持たないFlash投機batchは
+従来どおり直列へ残す。
+
+EOSをvocab全体に設定したtiny実BatchGeneratorで、通常要求は0〜1 tokenで停止し、
+`ignore_eos`要求だけ指定5 tokenを完走した。endpoint/router/state machineの対象7件と
+server全473件が通過した。
+
+初回公開はユーザー判断によりQwen3.8 Flash Next 1モデルへ絞る。stock mlx-lm AR、mlxturbo AR、
+mlxturbo MTP、最新MTPLX MTPを4k/長文脈で並べる。ただし公開予備測定は100 tok/s研究目標の後へ
+回し、今は公平に測れる状態までを完成させる。

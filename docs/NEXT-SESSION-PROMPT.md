@@ -1118,3 +1118,19 @@ git show --stat --oneline HEAD && rg -n "実行可|未決|保留" docs/BACKLOG-A
 ```bash
 rg -n "gemma4_assistant|shared.kv|DraftSpecRunner|BatchCoordinator" mlxturbo docs/BACKLOG.md /Users/ht/models/gemma4-31b-assistant/config.json
 ```
+
+## 公開予備測定は100 tok/s研究の後へ回す (2026-09-05 09:03 JST)
+
+- 初回公開はQwen3.8 Flash Nextだけ。stock mlx-lm AR / mlxturbo AR / mlxturbo MTP /
+  最新MTPLX MTPの4行を、4kと長文脈でGuideLLMから測る。llama.cppと5モデル一括は入れない。
+- GuideLLMの`ignore_eos=true`はFallback continuous batchでも要求別state machineで扱える。
+  Flash投機batchだけは要求別EOS未対応なので直列のまま。
+- 予備測定と強冷却の正式測定はまだ走らせない。先にFlash Nextの100 tok/sを追う。
+- 固定M graphbankは、共通の登録・選択層とモデル固有state adapterを分離する。Flashを最初の
+  adapterにし、将来のGDN/SSM/hybrid attention系を同じ口へ足せるようにする。
+
+再開の1コマンド:
+
+```bash
+tools/biglock.sh .venv/bin/python tools/qwen4_state_adapter_poc.py
+```
