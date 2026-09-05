@@ -4406,7 +4406,7 @@ dense attentionの範囲に収まるため、この配線はno-opとして試作
 
 14:01の一律blocks=64は50k長文課題のquoteを6/6→4/6へ落としたため棄却したが、17kは
 recall 8/8、quote 6/8で既定の8/8、5/8に対して非退行だった。そこでK2bのQSA decodeだけ、
-KV長2,049〜18,000では64 blocks、それより長い場合はMLXの機種別blocks表へ戻す最小分岐にした。
+KV長16,000〜18,000では64 blocks、それ以外はMLXの機種別blocks表へ戻す最小分岐にした。
 
 同一process・3プロンプト×512 tokenのABBAで再測し、17kはms/token 19.790→18.850
 （-4.8%）、ms/round 38.823→38.450（-1.0%）、tok/round 1.964→2.045（+4.1%）。
@@ -4417,3 +4417,8 @@ KV長2,049〜18,000では64 blocks、それより長い場合はMLXの機種別b
 使わない。64 blocksを同じ参照SDPAへ設定したGPU検査は16/16でbit一致、境界CPU testは3件、
 関連testは13件通過。明示した`MLX_SDPA_BLOCKS`を最優先し、`MLXTURBO_QSA_BLOCKS64=0`で
 従来表だけへ戻せる。Flash MTPの512-token cacheにはQSA自体が発火しないため影響しない。
+
+追補: 採用直後に範囲の下端を検査し、4kはms/token +6.5%、ms/round +0.3%、tok/round
+-6.3%と明確に退行した。2k〜18kへ広げた最初のcommitは広すぎたため、4kを従来表へ戻して
+実測済みの16k〜18kだけに狭めた。修正後の4kガードは3プロンプトすべてで生成列、採択数、
+round数、kernel発火数がA/B一致した。

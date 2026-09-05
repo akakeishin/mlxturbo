@@ -1278,9 +1278,11 @@ git status --short && rg -n "MTP|draft|採択|acceptance" docs/BACKLOG.md | tail
 
 ## Flash QSA blocks=64を18k以下だけ採用 (2026-09-05 15:32 JST)
 
-- 一律64の50k品質低下を避け、QSA K2bだけをKV長2,049〜18,000で64 blocksにした。
+- 一律64の50k品質低下と4k速度低下を避け、QSA K2bだけをKV長16,000〜18,000で64 blocksにした。
 - 17kの3プロンプト×512 token再測はms/token -4.8%、round -1.0%、tok/round +4.1%。
 - 50kは3プロンプトで生成列・採択・round・発火数がA/B同一となり、従来表への復帰を確認した。
+- 4kはms/token +6.5%、round +0.3%、tok/round -6.3%だったため従来表へ戻した。
+  修正後の4kガードは生成列・採択数・round数・発火数が3/3で同一。
 - GPU参照16/16 bit一致、境界CPU 3件、関連13 test、vendor fingerprint通過。
 - 100 tok/sを埋める次の大口は現存runtime knobではなく、互換tokenizerの小型drafter artifact。
   学習を始めるまでは、公開予備測定か既存Gemma 31B assistantのHTTP実運用確認へ進む。

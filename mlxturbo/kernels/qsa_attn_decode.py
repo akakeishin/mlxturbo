@@ -65,7 +65,7 @@ threadgroup 数は本家の S 倍になるので、並列度は落ちない。
 (b) このカーネルが実際に読む列は budget 2048 + 端数で頭打ちなので、
 ``blocks`` を減らしても 1 threadgroup の仕事は kv ではなく budget で決まる。
 本家は逆に全キーの mask バイトを走査するので kv に比例して伸びる。
-製品経路は :func:`decode_blocks` で、QSAの疎なdecodeに限りKV長18,000以下を
+製品経路は :func:`decode_blocks` で、QSAの疎なdecodeに限りKV長16,000〜18,000を
 64へ縮める。17kの実モデルA/Bでround -1.2%、長文課題も非退行だった範囲だけを
 使い、品質低下が出た50kは本家の表へ戻す。``MLXTURBO_QSA_BLOCKS64=0`` で
 本家の表だけに戻せる。
@@ -224,7 +224,7 @@ def decode_blocks(n_kv: int, gqa: int, s_len: int, devc: str | None = None):
     if (
         not pinned
         and os.environ.get("MLXTURBO_QSA_BLOCKS64", "1") != "0"
-        and 2048 < n_kv <= 18000
+        and 16000 <= n_kv <= 18000
     ):
         return 64
     return blocks
