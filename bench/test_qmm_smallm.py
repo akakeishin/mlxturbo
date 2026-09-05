@@ -289,3 +289,23 @@ def test_dispatch_default_is_auto():
         else:
             os.environ["MLXTURBO_SMALL_M_ROUTE"] = prev
         D.refresh_small_m_route()
+
+
+@pytest.mark.parametrize(
+    ("architecture", "expected"),
+    [
+        ("applegpu_g13s", False),  # M1
+        ("applegpu_g14s", False),  # M2
+        ("applegpu_g15s", False),  # M3
+        ("applegpu_g16s", False),  # M4
+        ("applegpu_g17s", True),   # M5
+        ("applegpu_g18s", True),  # M6: M5 の保守設定を継承
+        ("applegpu_g19s", True),  # 後続世代も未知扱いで有効化しない
+    ],
+)
+def test_nax_generation_is_forward_compatible(monkeypatch, architecture, expected):
+    """M6以降を未知世代として非NAX側へ誤配線しない。"""
+    from mlxturbo.kernels import moe_grouped_gemm as mgg
+
+    monkeypatch.setattr(mgg.mx, "device_info", lambda: {"architecture": architecture})
+    assert mgg.is_nax_device() is expected

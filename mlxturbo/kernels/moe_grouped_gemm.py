@@ -155,7 +155,7 @@ steel の `simdgroup_matrix` 経路だけで、`nax.h` / `gemm_nax.h` /
 ただし NAX 機では MLX 自身が別物のカーネル (`gather_qmm_rhs_nax`、
 bm 32/64 + simdgroup 単位の `sg_active` スキップ) を持っていて、相手の形が
 こちらと違う。**NAX 機での A/B はまだ取っていない** (この開発機は
-applegpu_g15s = gen 15 で NAX 非対応)。**M5 系が手に入ったら
+applegpu_g15s = gen 15 で NAX 非対応)。**M5 以降の実機が手に入ったら
 `tools/decode_ab.py` の knob として配線した上で取り直すこと**
 (配線は第 2 段で入れる)。それまでは
 既定 (`auto`) で NAX 機だけ off にしておく --- 未計測のものを既定で
@@ -163,8 +163,9 @@ applegpu_g15s = gen 15 で NAX 非対応)。**M5 系が手に入ったら
 
 機種の判定は :func:`is_nax_device` の 1 箇所だけ。MLX 本体
 (`metal/device.cpp:947-965`) と同じく architecture 文字列の世代 (末尾 3 文字
-の手前 2 桁) で見る。MLX 側はこれに macOS 26.2 以降の条件も掛けているので、
-古い OS の M5 では MLX が非 NAX 経路に落ちる一方こちらは `auto` で off に
+の手前 2 桁) で見る。M6 は M5 の後継として同じ保守側へ入る。MLX 側はこれに
+macOS 26.2 以降の条件も掛けているので、古い OS の M5 では MLX が非 NAX 経路に
+落ちる一方こちらは `auto` で off に
 なる。取りこぼす側なので害は無い。
 """
 
@@ -211,7 +212,8 @@ def is_nax_device() -> bool:
     MLX 本体 (`metal/device.cpp:594-601, 947-965`) と同じ読み方:
     architecture 文字列 (`applegpu_g15s` など) の末尾から 3 文字目と 2 文字目を
     世代の 10 の位・1 の位として読み、末尾が `p` (phone) なら 18、それ以外は
-    17 以上を NAX 世代とする。
+    17 以上を NAX 世代とする。上限を置かないため、M6 以降も M5 と同じ
+    保守側へ入る。
     """
 
     try:
