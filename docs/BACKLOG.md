@@ -1034,6 +1034,17 @@ eager経路のlogits/cacheを一致させる。ここを通るまでgraphbank本
 1層だけの最小patchにはならない。134葉graphbankへ直行せず、component replacementを
 独立した製品設計として扱う。
 
+### Gate B0通過: 実QSA 1層の5葉adapter境界 (2026-09-05 09:26)
+
+`tools/qwen4_qsa_state_gate.py`で実modelの最初のfull-attention層（layer 3）、QSA有効境界
+（prefix 2048、width 4）を検査した。5葉のpack/unpack後もattention出力差0、full logits KLD 0、
+top-1 100%、同shape replay、rollback keep=1/3/4の論理stateがすべて一致した。
+
+これは既存eager Attentionを復元cacheから呼ぶ境界検査であり、state-pure compileのGate Bではない。
+次は `F(x4, K, V, offset, raw, pooled) -> (y, K', V', offset', raw', pooled')` をQSA 1層だけで
+実装し、連続offsetとrollback後の継続まで同一compiled callableで一致させる。そこを通る前に
+134葉の全model graphbankへ進まない。
+
 ## 畳んだ: PR同梱FR-Spec Q8 65,536-row head (2026-09-04 17:36)
 
 公式sidecar（commit `a5e38bb7`、SHA-256 `950adf…c1fba`）を、既存Flash top-k traceの本走行

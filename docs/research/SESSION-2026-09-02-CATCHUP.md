@@ -4212,3 +4212,19 @@ server全473件が通過した。
 初回公開はユーザー判断によりQwen3.8 Flash Next 1モデルへ絞る。stock mlx-lm AR、mlxturbo AR、
 mlxturbo MTP、最新MTPLX MTPを4k/長文脈で並べる。ただし公開予備測定は100 tok/s研究目標の後へ
 回し、今は公平に測れる状態までを完成させる。
+
+### 2026-09-05 09:26 実QSA 1層のadapter境界を通過、純関数Gate Bへ進む
+
+`tools/qwen4_qsa_state_gate.py`を実Qwen3.8 Flash Nextで走らせた。最初のfull-attention層はlayer 3、
+QSA budgetは2048、固定capacity 2304、verify幅4。attention出力の最大差は2 replayとも0、
+full logitsはKLD 0・top-1 100%、5葉の論理cacheとrollback keep=1/3/4も全件一致した。
+
+判定はGate B0通過。これはpack/unpack後に既存eager Attentionを呼ぶため、state-pure graphの証明では
+ない。Fable 5.1 xhighとSol xhighの独立判断も、graphbankを時間制限付きで続行するが、QSA 1層の
+純関数Gate Bより前に全134葉へ進まない点で一致した。
+
+100 tok/sの算数も訂正した。現行45.6ms/round・2.44 tok/roundは53.5 tok/sで、同じ受理率なら
+24.4ms/roundが必要。過去の7.3msは現在の丸ごとidleではなく、後続traceはGPU 93〜96%稼働を示す。
+固定M4は完全受理でも45.6msなら87.7 tok/sなので、whole-model最初の絶対ゲートは40ms/round以下。
+graphbankがeager fixed-M4比10.5%以上縮まらなければ、短文で測ったdepth 3の+11.7%を回収できないため
+性能レーンを畳む。
