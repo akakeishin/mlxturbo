@@ -4568,3 +4568,22 @@ stock、`force`だけ診断用とする。
 汎用kernel契約のGPU検査も、合成q4/group64の `(K,N)=(512,1024)` と
 `(5120,4096)`、M=2〜9（no-table/table両帯）で通した。stockとのnormalized max errorは
 最大0.000488で、既存しきい値0.008以内だった。
+
+### 2026-09-05 20:19 batch-specのragged KV追記を2.38倍化
+
+`--max-batch-spec` の `RaggedAttnCache` と `RaggedDraftCache` は、1列追加するたびに
+keys/valuesの過去全長を `mx.concatenate` していた。decodeを続けるほど累積コピーが
+O(L²)になるため、mlx-lmの `BatchKVCache` と同じ256列単位の予約領域を両cacheで共有し、
+容量境界の間はbacking arrayへ直接追記するようにした。呼び手には論理長までのviewだけ返す。
+
+通常冷却、B=2/Hkv=4/D=256、bf16 K/Vを1列ずつ同期評価するmicroでは次の通り。
+
+| 追記回数 | 旧全長concat | 予約領域 | 差 |
+|---:|---:|---:|---:|
+| 2,048 | 0.716秒 | 0.392秒 | 1.83倍 |
+| 4,096 | 1.791秒 | 0.753秒 | 2.38倍 |
+
+これはモデル全体tok/sではなくKV追記部分だけの値。通常の単独推論には入らず、ragged batch投機
+だけに効く。`tools/verify_batch_spec.py` の不揃いbatch、chunked prefill、途中join、compaction、
+preemption、QSA活性を含む全ケースがCPUで一致した。容量再利用とtrim後の追記を固定する3 testを
+追加し、正式集合は758 passed / 3 skippedだった。

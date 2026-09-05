@@ -341,6 +341,7 @@ class RaggedLedger:
                 continue
             c.keys = _gather_cols(c.keys, idx, axis=2)
             c.values = _gather_cols(c.values, idx, axis=2)
+            c._idx = new_L
             if c.indexer.keys is not None:
                 c.indexer.keys = _gather_cols(c.indexer.keys, idx, axis=1)
 
@@ -405,6 +406,40 @@ def _qsa_map_from_alive(alive: mx.array, max_len: int) -> _QSAMap:
 # --------------------------------------------------------- attention cache
 
 
+_KV_CACHE_STEP = 256
+
+
+def _append_kv(cache, keys: mx.array, values: mx.array):
+    """ragged KV cacheへ予約領域を使って追記する。
+
+    1列ごとの ``concatenate`` は過去全長を毎roundコピーしてO(L²)になる。
+    mlx-lmの ``BatchKVCache`` と同じく256列単位で領域を増やし、容量境界の間は
+    backing arrayへ直接書く。呼び手へ返すのは論理長までのviewだけ。
+    """
+    prev = cache._idx
+    end = prev + keys.shape[2]
+    if cache.keys is None or end > cache.keys.shape[2]:
+        B, n_kv, _, k_dim = keys.shape
+        v_dim = values.shape[3]
+        capacity = ((end + _KV_CACHE_STEP - 1) // _KV_CACHE_STEP) * _KV_CACHE_STEP
+        grow = capacity - prev
+        new_k = mx.zeros((B, n_kv, grow, k_dim), dtype=keys.dtype)
+        new_v = mx.zeros((B, n_kv, grow, v_dim), dtype=values.dtype)
+        if cache.keys is None:
+            cache.keys, cache.values = new_k, new_v
+        else:
+            # compact/join/trimの直後は容量がstep境界とは限らない。未使用の
+            # 末尾を持ち越さず、論理prefixだけに新しい予約領域を足す。
+            old_k = cache.keys[..., :prev, :]
+            old_v = cache.values[..., :prev, :]
+            cache.keys = mx.concatenate([old_k, new_k], axis=2)
+            cache.values = mx.concatenate([old_v, new_v], axis=2)
+    cache.keys[..., prev:end, :] = keys
+    cache.values[..., prev:end, :] = values
+    cache._idx = end
+    return cache.keys[..., :end, :], cache.values[..., :end, :]
+
+
 class RaggedAttnCache:
     """full attention 用のバッチキャッシュ。
 
@@ -418,6 +453,7 @@ class RaggedAttnCache:
     def __init__(self, ledger: RaggedLedger):
         self.keys: mx.array | None = None
         self.values: mx.array | None = None
+        self._idx = 0
         self.ledger = ledger
         self.indexer = _arch()._IndexerCache()
         # `Attention.__call__` が QSA に渡すのは KV キャッシュではなく
@@ -427,15 +463,10 @@ class RaggedAttnCache:
         self.indexer.qsa_owner = self
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
-        if self.keys is None:
-            self.keys, self.values = keys, values
-        else:
-            self.keys = mx.concatenate([self.keys, keys], axis=2)
-            self.values = mx.concatenate([self.values, values], axis=2)
-        return self.keys, self.values
+        return _append_kv(self, keys, values)
 
     def size(self) -> int:
-        return 0 if self.keys is None else self.keys.shape[2]
+        return self._idx
 
     def round_mask(self, T: int) -> mx.array:
         """このラウンドの mask。``ragged_attention`` の ``_final_mask`` から
@@ -486,6 +517,7 @@ class RaggedAttnCache:
         """
         self.keys = _cat_left_padded([self] + others, "keys", new_L, axis=2)
         self.values = _cat_left_padded([self] + others, "values", new_L, axis=2)
+        self._idx = new_L
         idx = [c.indexer for c in [self] + others]
         if any(c.keys is not None for c in idx):
             self.indexer.keys = _cat_left_padded(idx, "keys", new_L, axis=1)
@@ -513,6 +545,8 @@ def _cat_left_padded(caches: list, attr: str, width: int, axis: int) -> mx.array
         arr = getattr(c, attr)
         if arr is None:
             raise ValueError(f"join する行の {attr} が空 (キャッシュの不整合)")
+        if axis == 2 and hasattr(c, "_idx"):
+            arr = arr[..., : c._idx, :]
         parts.append(_pad_left(arr, width - arr.shape[axis], axis))
     return mx.contiguous(mx.concatenate(parts, axis=0))
 
@@ -534,6 +568,7 @@ class RaggedDraftCache:
     def __init__(self, batch_size: int):
         self.keys: mx.array | None = None
         self.values: mx.array | None = None
+        self._idx = 0
         # base は全行 0。MTP ヘッドの位置は**priming 窓の先頭からの相対**で、
         # 本物のトークン位置ではない (単一系列の `_prime_draft_cache` も空の
         # キャッシュから始めて 0.. と数える)。窓幅を全行そろえれば列の意味も
@@ -555,15 +590,10 @@ class RaggedDraftCache:
         self.indexer.qsa_owner = self
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
-        if self.keys is None:
-            self.keys, self.values = keys, values
-        else:
-            self.keys = mx.concatenate([self.keys, keys], axis=2)
-            self.values = mx.concatenate([self.values, values], axis=2)
-        return self.keys, self.values
+        return _append_kv(self, keys, values)
 
     def size(self) -> int:
-        return 0 if self.keys is None else self.keys.shape[2]
+        return self._idx
 
     @property
     def offset(self) -> mx.array:
@@ -627,6 +657,7 @@ class RaggedDraftCache:
             keep = self.size() - n
             self.keys = mx.contiguous(self.keys[:, :, :keep])
             self.values = mx.contiguous(self.values[:, :, :keep])
+            self._idx = keep
         return n
 
     def is_trimmable(self) -> bool:
@@ -667,6 +698,7 @@ class RaggedDraftCache:
         if n:
             self.keys = _cat_left_padded(caches, "keys", n, axis=2)
             self.values = _cat_left_padded(caches, "values", n, axis=2)
+            self._idx = n
             idx = [c.indexer for c in caches]
             if any(c.keys is not None for c in idx):
                 self.indexer.keys = _cat_left_padded(idx, "keys", n, axis=1)

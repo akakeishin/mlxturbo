@@ -116,6 +116,10 @@ fastmlx/mlxturbo 側の現状:
 5. **「同時要求が直列に待たされないこと」を測る道具が無い。**
    `bench/batch_spec_throughput.py` は `BatchSpecGenerator` を直接叩く
    ライブラリ計測で、サーバー越しではない。判定基準そのものを測れていない。
+6. **解消 (2026-09-05 20:19): ragged KVの1列ごとの全長連結を廃止。**
+   full-attentionとMTP draftの両cacheを256列単位の予約領域へ共通化し、容量境界の
+   間はin-place appendにした。B=2/Hkv=4/D=256の4,096回追記microは
+   1.791→0.753秒 (2.38倍)。join/compact/trimを含む全正しさハーネスと正式758 testを通した。
 
 ### B. 一次検査の穴
 
