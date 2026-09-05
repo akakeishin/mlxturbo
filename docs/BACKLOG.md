@@ -1251,12 +1251,13 @@ ms/token **+2.5%**。一致長4の有用なSAM draftを捨てる代償があり�
 - 残りstate葉の機械的列挙も通過した。実モデルの永続状態はAttention 12層×5葉、
   GDN 36層×2葉、PLE 1葉、ngram 1葉の計134葉。固定容量pack/install、既存rollbackとの
   keep=1/3/4比較、その直後の幅4継続は134葉・logitsとも最大差0だった。
-- 次はPLEなしの実GDN layer 0だけをstate-pureな同一compiled callableへ移し、連続実行、
-  rollback、直後の継続を通す。whole-model graphbankはその後。共通側はadapter選択と
-  opaque state/commitだけに留める。
+- PLEなしの実GDN layer 0もstate-pureな同一compiled callableで通過した。連続2回、
+  replay、出力、conv、fp32 recurrent state、rollback keep=1/3/4と直後の継続は最大差0。
+- 次は単一PLE/ngram層の2葉を純関数化する。ここを通したら134葉を使うwhole-model
+  component replacementへ進む。共通側はadapter選択とopaque state/commitだけに留める。
 
 再開の1コマンド:
 
 ```bash
-tools/biglock.sh .venv/bin/python tools/qwen4_full_state_plan.py
+tools/biglock.sh .venv/bin/python tools/qwen4_gdn_pure_gate.py
 ```

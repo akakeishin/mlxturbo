@@ -1109,6 +1109,23 @@ tools/biglock.sh .venv/bin/python tools/qwen4_state_adapter_poc.py
 tools/biglock.sh .venv/bin/python tools/qwen4_full_state_plan.py
 ```
 
+## Flash実GDN単層のstate-pure Gate通過 (2026-09-05 10:35 JST)
+
+- PLEなしの実GDN layer 0で、入力をhidden幅4、GDN conv state
+  `(1,3,10240)` bf16、recurrent state `(1,48,128,128)` fp32だけにした。
+- production既定のfused prework、位置別state kernel、norm/out projectionを同一
+  `mx.compile` callableへ入れた。連続2回と同形replayは、eager captureの出力、
+  new conv/state、`conv_input`、`states_all`と全項目最大差0。
+- keep=1/3/4の計画commitは既存rollbackと完全一致し、その直後の幅4継続も全項目最大差0。
+- 次は単一PLE/ngram層の2葉Gate。その後に134葉をまとめるwhole-model component
+  replacementへ進む。
+
+再開の1コマンド:
+
+```bash
+tools/biglock.sh .venv/bin/python tools/qwen4_gdn_pure_gate.py
+```
+
 ## Flash fixed-M4 Gate B通過、state planへ進む (2026-09-05 10:11 JST)
 
 実QSA layer 3は、QKV/RoPE、固定5葉更新、既定K2a/K2b、gate/o_projまでPython可変cacheを

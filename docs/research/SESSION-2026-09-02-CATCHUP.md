@@ -4274,3 +4274,17 @@ captureから作ったkeep=1/3/4のcommitは既存`spec_flash.rollback`と全葉
 判定はstate plan通過。まだwhole-model `mx.compile`やgraphbankの速度を証明していない。
 次はPLEなしの実GDN layer 0をstate-in/state-outの同一compiled callableへ移し、連続2回、
 同形replay、rollback keep=1/3/4と直後の継続を完全一致させる。
+
+### 2026-09-05 10:35 実GDN layer 0のstate-pure Gateを厳密通過
+
+PLEを持たない実GDN layer 0を、hidden幅4、conv state `(1,3,10240)` bf16、recurrent
+state `(1,48,128,128)` fp32だけを入力に取る純関数へ移した。production既定のfused
+GDN prework、位置別state kernel、norm/out projectionを同じ`mx.compile` callable内で使う。
+
+連続2回、同形replayとも、eager captureに対する出力、new conv、new recurrent state、
+`conv_input`、`states_all`の最大差は0。captureから作ったkeep=1/3/4のcommitは既存rollbackと
+完全一致し、その直後の幅4継続も全項目最大差0だった。
+
+判定はGDN単層Gate通過。QSA 5葉とGDN 2葉の反復構造はどちらも実重み・compiled callableで
+通った。次はモデル内で1組だけのPLE conv/ngram contextを純関数化し、その後に134葉をまとめる
+whole-model component replacementへ進む。
