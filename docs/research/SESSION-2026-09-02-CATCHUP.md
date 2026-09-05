@@ -4687,3 +4687,18 @@ ms/tokenが旧17.747→新17.645（0.6%短縮）、ms/roundが37.437→37.226（
 tok/roundは2.125で不変。3条件すべて生成列が一致した。QSAが発火しない短文には影響しない。
 prefix objectと論理長を復元する契約test、旧来の任意trim後に再構築するbit一致検査も通過した。
 5%未満でも追加計算と品質差がない変更は採る方針に従い採用する。
+
+### 2026-09-05 21:04 MTP prime前のhyper連結を必要な末尾だけに限定
+
+Flash系のchunk prefillは、MTP draft cacheをprimeする直前に保持した2個のhyper chunkを
+いったん全連結し、その直後に必要な末尾513行だけへ切っていた。実shapeでは
+`(1, 2048, 10240)` のbf16 chunkを2個連結するため、最大約80MiBの一時結果を作っていた。
+最後のchunkだけで必要行数を満たす場合はそこから直接sliceし、短い最終chunkの場合だけ
+不足分を直前chunkから足す共通helperへ置き換えた。単発Flash推論とbatch-spec prefillの
+両経路で同じ実装を使う。
+
+実shapeの2 chunkを用いた同一process microでは、旧concat後sliceが0.7601ms、新しい
+末尾sliceが0.2283msで3.33倍、prime 1回あたり0.5318ms短縮した。値は完全一致した。
+これはTTFT内の末尾組み立てだけの値で、cold prefill全体のtok/sを3.33倍にする変更ではない。
+演算と保持範囲を増やさず、Qwen／DeepSeek／GLMを含むこの共通Flash MTP経路に追加負担が
+ないため採用する。

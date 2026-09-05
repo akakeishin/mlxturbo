@@ -1627,12 +1627,11 @@ class SpecPrefillLane:
             self._finish(logits)
 
     def _push_hyper(self, hyper: mx.array) -> None:
-        if self._hyper_tail is None:
-            self._hyper_tail = hyper
-        else:
-            self._hyper_tail = mx.concatenate([self._hyper_tail, hyper], axis=1)
-        if self._hyper_tail.shape[1] > self._keep:
-            self._hyper_tail = mx.contiguous(self._hyper_tail[:, -self._keep :])
+        from .spec_flash import _retain_hyper_tail
+
+        self._hyper_tail = _retain_hyper_tail(
+            self._hyper_tail, hyper, self._keep
+        )
 
     def _finish(self, logits: mx.array) -> None:
         first = sample_positions(logits[:, -1:], self.temp, self.sampler)

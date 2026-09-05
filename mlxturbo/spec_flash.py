@@ -87,6 +87,22 @@ PRIME_WINDOW = int(os.environ.get("MLXTURBO_PRIME_WINDOW", "512") or "512")  # 2
 # of PREFILL_STEP_SIZE always cover PRIME_WINDOW+1 positions.
 HYPER_KEEP_CHUNKS = 2
 
+
+def _retain_hyper_tail(previous, current, keep: int):
+    """Keep at most ``keep`` trailing hyper rows without a full-width concat."""
+    keep = max(int(keep), 0)
+    if keep == 0:
+        return current[:, :0]
+    current_len = int(current.shape[1])
+    if current_len >= keep:
+        return mx.contiguous(current[:, -keep:])
+    if previous is None:
+        return current
+    missing = keep - current_len
+    return mx.contiguous(
+        mx.concatenate([previous[:, -missing:], current], axis=1)
+    )
+
 # ドラフトを 1 ラウンドで何トークン引くか。1 = ヘッドを 1 回だけ回す。
 # 2 以上ではヘッド自身の hyper 状態を次段に渡して連鎖させる (_draft_chain)。
 # 受理率 r で depth d なら 1 ラウンドの期待トークン数は (1-r^(d+1))/(1-r) で、
@@ -2507,9 +2523,14 @@ class FlashSpecEngine:
                     _pf.mark_end()
                     _pf.summary()
                 return 0, 0, (logits_tail, hyper_tail0, None)
-            hyper_tail = (
-                hyper_chunks[0] if len(hyper_chunks) == 1
-                else mx.concatenate(hyper_chunks, axis=1)
+            # Priming consumes at most PRIME_WINDOW+1 rows.  Avoid first
+            # concatenating both retained 2048-row chunks (up to ~80 MiB)
+            # only to slice almost all of that result away in
+            # _prime_draft_cache.
+            hyper_tail = _retain_hyper_tail(
+                hyper_chunks[-2] if len(hyper_chunks) > 1 else None,
+                hyper_chunks[-1],
+                min(PRIME_WINDOW + 1, ids.shape[1]),
             )
             if _pf:
                 _t = time.perf_counter()
