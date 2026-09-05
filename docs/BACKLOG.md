@@ -1272,3 +1272,19 @@ tools/biglock.sh .venv/bin/python tools/qwen4_ple_ngram_pure_gate.py
 
 一方、MTPLX 2.11.1内の同一ロードA/Bではfixed-M4 graphbankが54.785→57.341 tok/s
 （**+4.665%**）。次は局所最適化を増やさず、既存forwardを呼ぶ固定state adapterへ進む。
+
+## 棄却: dense GQA共有kernelとFlash QSA blocks=64 (2026-09-05 14:01 JST)
+
+- Qwen3.8 27Bは冷連鎖-17.4%でも、実モデルround単価+3.6%。copy等を外す再試行は+16.0%。
+- Qwen3.6 35B-A3Bは冷連鎖-17.0%、1プロンプトround -6.3%だったが、3プロンプトでは
+  round +0.2%（2/3で悪化）。ms/token -1.5%は受理率+1.6%の混入だった。
+- 固定形状の製品kernelと配線は撤回した。Gemma 4 fullやFlash dense fallbackへは広げない。
+- Flash QSAはすでに選択済みK/VをGQA head間で共有している。QSA専用blocks=64は17kで
+  round -1.2%、50kで-3.0%と全6組改善したが、50k quote正答率が6/6→4/6へ低下したため棄却。
+- QSA blocks実験のenv、A/B knob、製品分岐も撤回した。既定はMLXのblocks表を維持する。
+
+再開の1コマンド:
+
+```bash
+rg -n "fixed-M4|graphbank|persistent decoder" docs/BACKLOG.md docs/research/SESSION-2026-09-02-CATCHUP.md
+```

@@ -4318,3 +4318,37 @@ fixed-M4 graphbank自体に速度の取り分があることは確認できた�
 
 これで「局所compileや単一output削減を積む」方向は閉じる。次はMTPLXのforwardを写さず、既存
 QSA/GDN/PLE実装へ固定tensor stateを渡す最小graphbank adapterだけを対象にする。
+
+### 2026-09-05 13:16 dense GQA共有読み込みは2モデルの製品A/Bで棄却
+
+Qwen3.8 27BのB=1/S=4/Hq=24/Hkv=4/D=256/KV=17,408を16層の冷連鎖で測ると、
+K/Vをthreadgroupへ載せる診断kernelは10.712→8.848 ms（-17.4%）だった。しかし実モデルでは
+ms/token -3.2%に対し、round単価は85.788→88.856 ms（+3.6%）。qのcopyとparams生成を
+外した再試行はround単価+16.0%まで悪化した。最初のms/token差はtok/round +7.0%の生成列差であり、
+kernel自体の改善ではなかった。
+
+直接再利用しやすいQwen3.6 35B-A3B（B=1/S=4/Hq=16/Hkv=2/D=256/KV=50k）では、
+10 full-attention層の冷連鎖が12.033→9.991 ms（-17.0%）。1プロンプトの製品A/Bは
+round -6.3%だったが、3プロンプトではms/token 13.513→13.305（-1.5%）に対し
+round 38.005→38.074 ms（+0.2%）、tok/round +1.6%。2/3プロンプトでroundが悪化し、
+3/3で生成列が分岐したため棄却した。製品配線、kernel、診断器は残さない。
+
+読み込み共有そのものはFlash-NextのQSA K2bですでに採用済みである。選択済みK/Vを
+threadgroupへ一度載せ、12 GQA headで共有するため、dense全KVを読む上の2案とは条件が違う。
+次はK2bだけのpartialsを減らすblocks=64を品質付きで判定する。
+
+### 2026-09-05 14:01 Flash QSA blocks=64は50k品質で棄却
+
+QSA K2bだけをMLXの表（17k=256、50k=512）から64 blocksへ変え、QSA以外のSDPAは
+そのままにした。同一process・3プロンプト×512 tokenの回文A/Bは全6組でroundが改善した。
+
+| 文脈 | ms/token | ms/round | tok/round |
+|---|---:|---:|---:|
+| 17k | 19.838→18.852（-5.0%） | 38.916→38.452（-1.2%） | 1.964→2.045（+4.1%） |
+| 50k | 21.639→20.436（-5.6%） | 43.040→41.762（-3.0%） | 1.994→2.058（+3.2%） |
+
+短いteacher-forced継続はQSA budget 2048未満で発火せず、KLD 0.01832対0.01832は判定材料に
+ならなかった。代わりに既存と同じseed 0の長文課題を使った。17kの出荷prefill経路は
+recall 8/8、quote 6/8（既定blocksは8/8、5/8）で非退行。一方50kはrecall 6/6でも
+quoteが6/6→4/6へ落ちた。partialsの再結合順を変える品質代償が出たため、速度があっても棄却する。
+実験用env、A/B knob、製品分岐は撤回し、既定はMLXのblocks表を維持する。

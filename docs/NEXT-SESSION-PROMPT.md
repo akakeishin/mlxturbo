@@ -1212,3 +1212,21 @@ tools/biglock.sh .venv/bin/python tools/qwen4_state_adapter_poc.py
 ```bash
 rg -n "CompiledVerifyBank|_make_verify_step|compiled_bank_m4" tools/compare/mtplx-venv/lib/python*/site-packages/mtplx mlxturbo tools
 ```
+
+## dense GQAとFlash QSA blocks=64を棄却 (2026-09-05 14:01 JST)
+
+Qwen3.8 27BとQwen3.6 35B-A3Bのdense GQA共有kernelは、冷連鎖では-17%でも
+3プロンプトの製品roundが非改善だったため撤回した。汎用A/Bには`--long-count`を追加し、
+3プロンプトを採否の最小単位にした（commit `1317212`、push済み）。
+
+Flash-NextのQSA K2bはすでにK/Vを12 GQA headで共有する。QSA kernelだけをblocks=64にすると、
+3プロンプト平均は17kでround -1.2% / ms-token -5.0%、50kでround -3.0% / ms-token -5.6%、
+各6回のA/Bで全てroundが改善した。17k長文課題は出荷prefill経路でrecall 8/8、quote 6/8
+（既定blocksは8/8、5/8）で非退行したが、50kはrecall 6/6、quote 4/6。既定の6/6、6/6から
+quoteが2問落ちたため棄却し、実験コードは撤回した。次はfixed-M4の最小whole-model速度Gateへ戻る。
+
+再開の1コマンド:
+
+```bash
+rg -n "fixed-M4|graphbank|persistent decoder" docs/BACKLOG.md docs/research/SESSION-2026-09-02-CATCHUP.md
+```
