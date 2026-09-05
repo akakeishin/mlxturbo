@@ -430,6 +430,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="まとめの分母にする値 (既定は --knob の最後の値)")
     ap.add_argument("--ctx", type=int, default=0,
                     help="0 = 短文脈 3 本 / N = 池から切った N トークンの窓 1 本")
+    ap.add_argument("--long-count", type=int, default=1,
+                    help="--ctx N の長文ケース数 (既定1、受理率の採否は3以上)")
     ap.add_argument("--tokens", type=int, default=512)
     ap.add_argument("--reps", type=int, default=1,
                     help="1 ケースあたりの回文の本数 (既定 1 = A,B,B,A)")
@@ -469,6 +471,8 @@ def parse_args(argv=None):
         ap.error(f"--baseline {baseline!r} は --knob の値に無い")
     if args.prefill_once and args.ctx <= 0:
         ap.error("--prefill-once は --ctx N (長文脈) のときだけ使う")
+    if args.long_count < 1:
+        ap.error("--long-count は1以上にすること")
     return args, name.strip(), variants, baseline
 
 
@@ -596,7 +600,7 @@ def main() -> int:
     from mlxturbo.kernels import _fire
 
     set_variant = make_set_variant(model, env_name, guard)
-    cases = build_cases(tok, args.ctx)
+    cases = build_cases(tok, args.ctx, long_count=args.long_count)
     nd, md = args.n_draft, args.max_draft
 
     print(f"\nknob {env_name}: {variants} (基準 {baseline or '(未設定)'})")

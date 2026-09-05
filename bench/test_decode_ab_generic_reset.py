@@ -1,4 +1,22 @@
+import pytest
+
 from tools import decode_ab_generic
+
+
+def test_parse_args_accepts_three_long_cases():
+    args, name, variants, baseline = decode_ab_generic.parse_args([
+        "--model", "dummy", "--knob", "FLAG=1,0", "--ctx", "17000",
+        "--long-count", "3",
+    ])
+    assert args.long_count == 3
+    assert (name, variants, baseline) == ("FLAG", ["1", "0"], "0")
+
+
+def test_parse_args_rejects_zero_long_cases():
+    with pytest.raises(SystemExit):
+        decode_ab_generic.parse_args([
+            "--model", "dummy", "--knob", "FLAG=1,0", "--long-count", "0",
+        ])
 
 
 def test_reset_fusions_disables_generic_sdpa_split(monkeypatch):
