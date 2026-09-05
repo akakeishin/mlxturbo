@@ -1962,7 +1962,10 @@ def enable_sdpa_split_generic(model=None, mode: str = None) -> int:
         _sdpa_rowtile_patch(ns, modname)
         if modname in _SDPA_ROWTILE_ORIGS:
             n += count
-    _SDPA_SPLIT_GENERIC = n > 0
+    # DraftSpec installs target and draft in sequence.  An unsupported second
+    # model must not switch off namespaces installed for the first one;
+    # explicit mode=0/disable remain the ways to lower this process-wide gate.
+    _SDPA_SPLIT_GENERIC = _SDPA_SPLIT_GENERIC or n > 0
     return n
 
 
@@ -3547,7 +3550,10 @@ def enable_qmm_wide(model, mtp=None, mode: str | None = None,
                     continue
                 lin._qmm_wide = tile
                 n += 1
-    _QMM_WIDE_ON = n > 0
+    # Eligibility lives on each QuantizedLinear instance, but this gate is
+    # process-wide.  Preserve an earlier model's marked projections when the
+    # other half of a DraftSpec pair contributes none.
+    _QMM_WIDE_ON = _QMM_WIDE_ON or n > 0
     return n
 
 
@@ -3972,8 +3978,8 @@ def enable_moe_block_compile(model=None, mode: str | None = None,
         if isinstance(block, Q.SparseMoeBlock)
     ]
     if not blocks:
-        # MoE ブロックを持たない族。差し替えを入れる意味が無い
-        _MOE_COMPILE_ON = False
+        # MoE ブロックを持たない族。target / draft のもう片方へ既に
+        # 入っているprocess-wide compile gateは下ろさない。
         return 0
     if max_rows is None:
         max_rows = int(os.environ.get("MLXTURBO_MOE_COMPILE_MAX_ROWS", "16"))

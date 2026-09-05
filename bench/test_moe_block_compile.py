@@ -54,6 +54,23 @@ def test_non_qwen4_structural_moe_is_not_counted(monkeypatch):
     assert not fused._MOE_COMPILE_ON
 
 
+def test_unsupported_draft_keeps_target_compile(monkeypatch):
+    """対象外draftを後から走査してもtargetのMoE compileを保つ。"""
+    from mlx_lm.models import qwen4_exp
+
+    qwen4_type = _block_type("_ContractQwen4Moe")
+    other_type = _block_type("_ContractOtherMoe")
+    monkeypatch.setattr(qwen4_exp, "SparseMoeBlock", qwen4_type)
+
+    assert fused.enable_moe_block_compile(
+        _model(qwen4_type()), mode="auto"
+    ) == 1
+    assert fused.enable_moe_block_compile(
+        _model(other_type()), mode="auto"
+    ) == 0
+    assert fused._MOE_COMPILE_ON is True
+
+
 def test_qwen4_blocks_are_counted_and_wrapped(monkeypatch):
     from mlx_lm.models import qwen4_exp
 

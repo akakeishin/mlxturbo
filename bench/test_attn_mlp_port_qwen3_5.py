@@ -272,6 +272,23 @@ def test_qmm_wide_marks_dense_mlp_and_is_bit_identical():
         assert mx.array_equal(a, b), "MLP の qmm_wide が素とビット一致しない"
 
 
+def test_qmm_wide_empty_draft_keeps_target_gate():
+    """対象外draftの走査で、印を付け済みのtargetを無効化しない。"""
+    if not GPU:
+        return
+    from mlxturbo import fused as F
+
+    model = _StubModel([_StubLayer(mlp=_quantized_mlp())])
+    empty = _StubModel([_StubLayer()])
+    F._QMM_WIDE_ON = False
+    try:
+        assert fused.enable_qmm_wide(model, mode="on") == 3
+        assert fused.enable_qmm_wide(empty, mode="on") == 0
+        assert F._QMM_WIDE_ON is True
+    finally:
+        F._QMM_WIDE_ON = False
+
+
 def test_qmm_wide_decode_width_falls_back():
     """行数 < `_QMM_WIDE_MIN_ROWS` は素の quantized_matmul のまま。"""
     if not GPU:

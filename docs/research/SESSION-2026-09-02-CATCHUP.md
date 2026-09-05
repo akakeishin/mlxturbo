@@ -4702,3 +4702,23 @@ Flash系のchunk prefillは、MTP draft cacheをprimeする直前に保持した
 これはTTFT内の末尾組み立てだけの値で、cold prefill全体のtok/sを3.33倍にする変更ではない。
 演算と保持範囲を増やさず、Qwen／DeepSeek／GLMを含むこの共通Flash MTP経路に追加負担が
 ないため採用する。
+
+### 2026-09-05 21:09 DraftSpecの異種draftによるtarget高速化解除を修正
+
+`--draft-model` 経路はtarget、draftの順に共通融合を設定する。QMM-wide、汎用SDPA幅分割、
+Qwen4 MoE block compileは適用対象をモデル内で探す一方、最後の有効/無効フラグだけを
+process全体で共有していた。そのため、Qwen／DeepSeek／GLMなど別アーキテクチャのdraftが
+該当部品を持たず適用数0になると、先にtargetへ付けた印やclass差し替えまで実行不能に
+なっていた。targetとdraftを逆にしても、今度はdraft側の高速化を同じ理由で失う。
+
+明示的な環境変数offと既存のdisable関数だけを無効化操作として残し、同じprocessで後から
+走査したモデルの適用数が0というだけでは、既に有効なprocess gateを下げないようにした。
+適格性はQMMでは各Linear、汎用SDPAでは差し替え済み名前空間、MoE compileではQwen4の
+block classに別途記録されているため、対象外モデルが誤って高速kernelへ入ることはない。
+
+これは新しい近似ではなく、既に採用・計測済みの経路を異種DraftSpecでも失わない修正。
+回収する上限の目安は、各経路を単独採用した既測値でQMM-wideが8k prefill 2.6%、
+汎用SDPA幅分割がQwen3-Next 17kで1.2%、Qwen4 MoE compileがdecode/verifyで
+1.2〜1.3%（条件ごとの値であり単純加算しない）。適格target→対象外draftの回帰testを
+3経路へ追加し、対象外側の適用数は0のままprocess gateだけが保持されることを確認した。
+正式集合は768 passed / 3 skippedだった。

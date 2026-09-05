@@ -199,6 +199,20 @@ def test_enable_empty_model():
         fused.disable_sdpa_split_generic()
 
 
+def test_empty_draft_does_not_disable_target_split():
+    """DraftSpecの2モデル目が対象外でもtarget側のprocess gateを保つ。"""
+    try:
+        assert fused.enable_sdpa_split_generic(
+            _attn_model(n_attn=2), mode="1"
+        ) == 2
+        assert fused.enable_sdpa_split_generic(
+            _StubModel([_StubLayer()]), mode="1"
+        ) == 0
+        assert fused._SDPA_SPLIT_GENERIC is True
+    finally:
+        fused.disable_sdpa_split_generic()
+
+
 def test_enable_sdpa_split_counts_seam_layers():
     """従来のシーム側は「qwen4_exp の Attention を持つ層」を数える。"""
     import mlx_lm.models.qwen4_exp as Q4
