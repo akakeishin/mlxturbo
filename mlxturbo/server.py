@@ -3291,6 +3291,7 @@ def _resolve_batch_route(
     sampling_kwargs: dict | None = None,
     request_telemetry: dict[str, float] | None = None,
     session_compatible: bool = True,
+    ignore_eos: bool = False,
 ):
     """``None`` means "not batch-eligible — route through STATE.lock exactly
     as before" (this is also what makes --max-batch/--max-batch-spec's default
@@ -3359,7 +3360,7 @@ def _resolve_batch_route(
             allow_session=True,
         )
     spec = STATE.spec_batch_coordinator
-    if spec is not None and can_batch_spec(gen_runner):
+    if spec is not None and can_batch_spec(gen_runner) and not ignore_eos:
         if spec_batch_eligible(spec, prompt_ids, max_tokens, sampling_kwargs or {}) and not _spec_batch_would_be_alone(spec):
             return with_probe(spec, "spec")
     return None
@@ -3555,7 +3556,13 @@ def _spec_batch_would_be_alone(spec) -> bool:
 
 
 async def _run_generate_batched(
-    route, prompt_ids, max_tokens, temp, on_tokens=None, **sampling_kwargs
+    route,
+    prompt_ids,
+    max_tokens,
+    temp,
+    on_tokens=None,
+    ignore_eos: bool = False,
+    **sampling_kwargs,
 ) -> dict:
     """The batched-path analogue of ``_run_generate`` — used instead of it
     (never both) whenever ``_resolve_batch_route`` returned non-``None``.
@@ -3598,6 +3605,7 @@ async def _run_generate_batched(
                     else None
                 ),
                 tier=tier,
+                ignore_eos=ignore_eos,
                 **sampling_kwargs,
             )
         except BaseException:
@@ -3631,6 +3639,7 @@ def _start_batched_generation(
     tool_calling_enabled: bool = False,
     tools_for_parsing=None,
     session=None,
+    ignore_eos: bool = False,
     **sampling_kwargs,
 ):
     """The batched-path analogue of ``_start_generation`` — same external
@@ -3695,6 +3704,7 @@ def _start_batched_generation(
                     else None
                 ),
                 tier=tier,
+                ignore_eos=ignore_eos,
                 **sampling_kwargs,
             )
         except BaseException:
@@ -4582,20 +4592,19 @@ async def chat_completions(request: Request):
                     runner=gen_runner,
                     t_trace=t_trace,
                     eos_ids=request_eos_ids,
+                    ignore_eos=ignore_eos,
                 )
             ),
             media_type="text/event-stream",
             headers=_downgrade_headers(downgrade_reason),
         )
 
-    # Existing batch coordinators capture EOS policy at construction time.
-    # An explicit per-request override must therefore stay on the serial path;
-    # silently routing it to a coordinator would stop at EOS despite the flag.
-    batch_route = None if ignore_eos else _resolve_batch_route(
+    batch_route = _resolve_batch_route(
         gen_runner, prompt_ids, max_tokens, logprobs_requested=logprobs_requested,
         sampling_kwargs=sampling_params,
         request_telemetry=t_trace,
         session_compatible=downgrade_reason is None,
+        ignore_eos=ignore_eos,
     )
     try:
         if batch_route is not None:
@@ -4603,7 +4612,13 @@ async def chat_completions(request: Request):
             # the continuous-batch route may carry one claimed session, while
             # the speculative route remains session-free.
             res = await _run_generate_batched(
-                batch_route, prompt_ids, max_tokens, temp, None, **sampling_params
+                batch_route,
+                prompt_ids,
+                max_tokens,
+                temp,
+                None,
+                ignore_eos=ignore_eos,
+                **sampling_params,
             )
         else:
             async with STATE.lock:
@@ -4721,6 +4736,7 @@ async def _openai_stream(
     runner=None,
     t_trace: dict | None = None,
     eos_ids: set | None = None,
+    ignore_eos: bool = False,
 ):
     # [ttft-trace]: caller (chat_completions) seeds t_trace with a_start/
     # b_template; normalize to a dict here so the rest of this function can
@@ -4756,17 +4772,14 @@ async def _openai_stream(
     # _queue_owned_stream, and ownership of the lock in the owned flag below.
     owned = [False]
     effective_eos_ids = STATE.eos_ids if eos_ids is None else eos_ids
-    batch_route = (
-        None
-        if not effective_eos_ids and STATE.eos_ids
-        else _resolve_batch_route(
-            runner or STATE.runner,
-            prompt_ids,
-            max_tokens,
-            sampling_kwargs=sampling_params or {},
-            request_telemetry=t_trace,
-            session_compatible=runner is None or runner is STATE.runner,
-        )
+    batch_route = _resolve_batch_route(
+        runner or STATE.runner,
+        prompt_ids,
+        max_tokens,
+        sampling_kwargs=sampling_params or {},
+        request_telemetry=t_trace,
+        session_compatible=runner is None or runner is STATE.runner,
+        ignore_eos=ignore_eos,
     )
     try:
         if batch_route is not None:
@@ -4792,6 +4805,7 @@ async def _openai_stream(
                 thinking_budget,
                 tool_enabled,
                 tools_for_parsing,
+                ignore_eos=ignore_eos,
                 **(sampling_params or {}),
             )
         else:
@@ -5770,22 +5784,30 @@ async def completions(request: Request):
                     runner=gen_runner,
                     eos_ids=request_eos_ids,
                     request_telemetry=request_telemetry,
+                    ignore_eos=ignore_eos,
                 )
             ),
             media_type="text/event-stream",
             headers=_downgrade_headers(downgrade_reason),
         )
 
-    batch_route = None if ignore_eos else _resolve_batch_route(
+    batch_route = _resolve_batch_route(
         gen_runner, prompt_ids, max_tokens, logprobs_requested=logprobs_requested,
         sampling_kwargs=sampling_params,
         request_telemetry=request_telemetry,
         session_compatible=downgrade_reason is None,
+        ignore_eos=ignore_eos,
     )
     try:
         if batch_route is not None:
             res = await _run_generate_batched(
-                batch_route, prompt_ids, max_tokens, temp, None, **sampling_params
+                batch_route,
+                prompt_ids,
+                max_tokens,
+                temp,
+                None,
+                ignore_eos=ignore_eos,
+                **sampling_params,
             )
         else:
             async with STATE.lock:
@@ -5863,20 +5885,18 @@ async def _completions_stream(
     runner=None,
     eos_ids: set | None = None,
     request_telemetry: dict[str, float] | None = None,
+    ignore_eos: bool = False,
 ):
     owned = [False]
     effective_eos_ids = STATE.eos_ids if eos_ids is None else eos_ids
-    batch_route = (
-        None
-        if not effective_eos_ids and STATE.eos_ids
-        else _resolve_batch_route(
-            runner or STATE.runner,
-            prompt_ids,
-            max_tokens,
-            sampling_kwargs=sampling_params or {},
-            request_telemetry=request_telemetry,
-            session_compatible=runner is None or runner is STATE.runner,
-        )
+    batch_route = _resolve_batch_route(
+        runner or STATE.runner,
+        prompt_ids,
+        max_tokens,
+        sampling_kwargs=sampling_params or {},
+        request_telemetry=request_telemetry,
+        session_compatible=runner is None or runner is STATE.runner,
+        ignore_eos=ignore_eos,
     )
     try:
         if batch_route is not None:
@@ -5890,7 +5910,12 @@ async def _completions_stream(
             # has_thinking), so reasoning_delta can never arrive.
             q, future, cancel_event, raw_token_count = _start_batched_generation(
                 batch_route,
-                prompt_ids, max_tokens, temp, 0, **(sampling_params or {})
+                prompt_ids,
+                max_tokens,
+                temp,
+                0,
+                ignore_eos=ignore_eos,
+                **(sampling_params or {}),
             )
         else:
             # Independent review C-8: wrapped in contextlib.aclosing so that if

@@ -833,6 +833,7 @@ class Admission:
     prefill_reused: int = 0
     checkpoints: list = field(default_factory=list)
     release_session: Callable[[], None] | None = None
+    ignore_eos: bool = False
 
 
 class BatchCoordinator:
@@ -1039,6 +1040,10 @@ class BatchCoordinator:
                     "samplers": [adm.sampler],
                     "logits_processors": [adm.logits_processors],
                 }
+                if adm.ignore_eos:
+                    from mlx_lm.generate import SequenceStateMachine
+
+                    insert_kwargs["state_machines"] = [SequenceStateMachine()]
                 prompt = adm.prefill_prompt_ids or adm.prompt_ids
                 if adm.caches is not None and adm.all_tokens is not None:
                     insert_kwargs["caches"] = [adm.caches]

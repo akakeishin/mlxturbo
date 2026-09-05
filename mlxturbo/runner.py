@@ -1008,6 +1008,7 @@ def start_batched_generation(
     session_reused: int = 0,
     release_session=None,
     tier: str | None = None,
+    ignore_eos: bool = False,
     **extra,
 ):
     """Build one ``mlxturbo.batch.Admission`` and submit it to ``coordinator``.
@@ -1071,6 +1072,7 @@ def start_batched_generation(
         session=session,
         session_reused=session_reused,
         release_session=release_session,
+        ignore_eos=ignore_eos,
     )
     try:
         coordinator.submit(admission)

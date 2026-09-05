@@ -24,9 +24,10 @@ mlxturboの実エンドポイントへ2 requestを送り、JSON出力まで確�
 
 GuideLLMが固定出力長のため送る`ignore_eos: true`は、chat/completionsのstream・
 non-stream全4経路で解釈する。これを明示したrequestはEOSで止めず、指定した
-`max_completion_tokens`まで生成する。起動時にEOS方針を固定するbatch coordinatorへは
-流さず、request単位の直列経路を使う。明示的なstop文字列、context上限、エラーは別なので、
-公開表には要求長に加えてGuideLLM JSONの実`output_tokens`も必ず載せる。
+`max_completion_tokens`まで生成する。非投機continuous batchでは要求ごとに停止state machineを
+差し替えるので、固定出力長でも通常どおり合流できる。投機batchはまだ要求ごとのEOS方針を
+持たないため直列へ残す。明示的なstop文字列、context上限、エラーは別なので、公開表には
+要求長に加えてGuideLLM JSONの実`output_tokens`も必ず載せる。
 
 ```bash
 BIGLOCK_PRIO=0 BIGLOCK_NO_WORKER=1 tools/biglock.sh \
@@ -81,6 +82,23 @@ requestごとに変える。`prefix-count`を増やすと複数の共有prefix�
 - p50とp95。反復2回の値を分布として扱わない。
 - server logの`prefill reused/new`。hot値をcold値のように見せない。
 - JSONを正本とし、CSV/HTMLは閲覧用とする。
+
+## 初回公開の範囲
+
+初回はQwen3.8 Flash Nextの単独requestだけを主表にする。4kと長文脈の2条件で、同一weight、
+同一量子化、同一prompt/output token列を使い、次の4本を並べる。
+
+| 行 | 役割 |
+|---|---|
+| stock mlx-lm AR | 誰でも再現しやすい公開ベースライン |
+| mlxturbo AR | エンジン単体の増分とMTPの純増分を分離する |
+| mlxturbo MTP | 公開する実装 |
+| 最新MTPLXの推奨MTP設定 | Flash Next専用の強い外部比較 |
+
+`mlx-serve`は汎用サーバー比較を公開する回で加える。初回から5モデル、同時接続sweep、
+異なるGGUF量子化のllama.cppまで
+広げない。開発中は短い代表caseで候補を絞り、公開値だけ通常冷却の予備測定後に強冷却で
+測る。測定順はAR/MTP/MTPLXを回文にし、各条件の最初の1回を捨てる。
 
 結果は既定で`bench/results/guidellm/`へ出る。公開前には`--dry-run`で生成された
 `*.scenario.json`を目視し、比較する全エンジンで同一scenarioになっていることを

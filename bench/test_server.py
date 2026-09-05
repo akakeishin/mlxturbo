@@ -1398,7 +1398,7 @@ def test_cached_tokens_reflects_prefill_reused_non_stream(client):
     assert resp.json()["usage"]["prompt_tokens_details"]["cached_tokens"] == 7
 
 
-def test_chat_completions_ignore_eos_bypasses_eos_and_batch_route(client):
+def test_chat_completions_ignore_eos_reaches_batch_router_and_serial_runner(client):
     runner = FakeRunner(tokens_to_emit=[10, 999, 11])
     _install_state(
         runner,
@@ -1406,10 +1406,8 @@ def test_chat_completions_ignore_eos_bypasses_eos_and_batch_route(client):
     )
 
     with mock.patch.object(
-        server,
-        "_resolve_batch_route",
-        side_effect=AssertionError("ignore_eos must stay on the serial path"),
-    ):
+        server, "_resolve_batch_route", wraps=server._resolve_batch_route
+    ) as resolve_batch_route:
         resp = client.post(
             "/v1/chat/completions",
             json={
@@ -1423,6 +1421,7 @@ def test_chat_completions_ignore_eos_bypasses_eos_and_batch_route(client):
     assert choice["message"]["content"] == "a<eos>b"
     assert choice["finish_reason"] == "length"
     assert runner.calls[0]["eos_ids"] == set()
+    assert resolve_batch_route.call_args.kwargs["ignore_eos"] is True
 
 
 def test_chat_completions_ignore_eos_stream_runs_to_max_tokens(client):
@@ -9814,6 +9813,28 @@ def test_resolve_batch_route_pool_vs_solo(batch_env):
     assert server._resolve_batch_route(batch_env.runner, [1] * 6, 4)[1] == "solo"  # 6+4=10 > 8
 
 
+def test_resolve_batch_route_allows_ignore_eos_only_for_continuous_batch(
+    batch_env, monkeypatch
+):
+    _install_state(batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4)
+    route = server._resolve_batch_route(
+        batch_env.runner, [1, 2, 3], 4, ignore_eos=True
+    )
+    assert route[:2] == (batch_env.coordinator, "pool")
+
+    spec = SimpleNamespace()
+    _install_state(FakeSpecRunner([10]), spec_batch_coordinator=spec, max_batch_spec=4)
+    monkeypatch.setattr(server, "can_batch_spec", lambda _runner: True)
+    monkeypatch.setattr(server, "spec_batch_eligible", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(server, "_spec_batch_would_be_alone", lambda _spec: False)
+    assert (
+        server._resolve_batch_route(
+            server.STATE.runner, [1, 2, 3], 4, ignore_eos=True
+        )
+        is None
+    )
+
+
 def test_debug_batch_route_claims_reusable_session(batch_env):
     state = _install_state(
         batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4
@@ -9905,6 +9926,26 @@ def test_two_concurrent_batched_requests_complete(batch_env):
     assert len(res2["tokens"]) == 5
     assert res1["prefill_reused"] == 0 and res1["prefill_new"] == 4
     assert res2["prefill_reused"] == 0 and res2["prefill_new"] == 4
+
+
+def test_batched_ignore_eos_runs_to_max_tokens(batch_env):
+    """Per-request no-stop state overrides the coordinator's EOS policy."""
+
+    _install_state(batch_env.runner, batch_coordinator=batch_env.coordinator, max_batch=4)
+    batch_env.coordinator.eos_ids = list(range(_TINY_BATCH_CFG["vocab_size"]))
+    route = (batch_env.coordinator, "pool")
+
+    normal = asyncio.run(
+        server._run_generate_batched(route, [1, 2, 3, 4], 5, 0.0)
+    )
+    ignored = asyncio.run(
+        server._run_generate_batched(
+            route, [1, 2, 3, 4], 5, 0.0, ignore_eos=True
+        )
+    )
+
+    assert len(normal["tokens"]) <= 1
+    assert len(ignored["tokens"]) == 5
 
 
 def test_batched_streaming_end_to_end(batch_env):
@@ -10244,6 +10285,64 @@ def test_batch_coalescing_window_collects_second_request_before_first_tick(
 
     assert sleep_calls == [pytest.approx(0.002)]
     assert FakeBatchGenerator.last.first_tick_rows == 2
+
+
+def test_batch_ignore_eos_inserts_request_without_stop_transitions(monkeypatch):
+    import concurrent.futures as cf
+    import sys
+    import types
+
+    from mlxturbo import batch as batch_module
+
+    class FakeSequenceStateMachine:
+        def __init__(self):
+            self.transitions = "none"
+
+    class Response:
+        uid = 0
+        token = 8
+        finish_reason = "length"
+        prompt_cache = None
+        all_tokens = None
+
+    class FakeBatchGenerator:
+        last = None
+
+        def __init__(self, *_args, **_kwargs):
+            self.insert_kwargs = None
+            FakeBatchGenerator.last = self
+
+        def insert(self, _prompts, _max_tokens, **kwargs):
+            self.insert_kwargs = kwargs
+            return [0]
+
+        def next(self):
+            return [], [Response()]
+
+        def close(self):
+            pass
+
+    fake_pkg = types.ModuleType("mlx_lm")
+    fake_generate = types.ModuleType("mlx_lm.generate")
+    fake_generate.BatchGenerator = FakeBatchGenerator
+    fake_generate.SequenceStateMachine = FakeSequenceStateMachine
+    fake_pkg.generate = fake_generate
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake_pkg)
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", fake_generate)
+    monkeypatch.setattr(batch_module, "_indexer_budget", lambda _model: None)
+    monkeypatch.setenv("MLXTURBO_BATCH_WAIT_MS", "0")
+
+    admission = _batch_admission_for_session([1, 2, 3])
+    admission.ignore_eos = True
+    executor = cf.ThreadPoolExecutor(max_workers=1)
+    coordinator = batch_module.BatchCoordinator(object(), executor, 1, 2, [99])
+    coordinator.submit(admission)
+    admission.future.result(timeout=5)
+    executor.shutdown(wait=True)
+
+    state_machines = FakeBatchGenerator.last.insert_kwargs["state_machines"]
+    assert len(state_machines) == 1
+    assert isinstance(state_machines[0], FakeSequenceStateMachine)
 
 
 def test_batch_stale_claim_falls_back_after_invalidating_old_session(monkeypatch):
