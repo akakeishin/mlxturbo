@@ -1199,3 +1199,16 @@ rg -n "gemma4_assistant|shared.kv|DraftSpecRunner|BatchCoordinator" mlxturbo doc
 ```bash
 tools/biglock.sh .venv/bin/python tools/qwen4_state_adapter_poc.py
 ```
+
+## fixed-M4局所GDN案の決着 (2026-09-05 11:08 JST)
+
+局所GDN tail compileはms/round +1.0%、重複final-state出力削除も512 tokenで+0.3%となり、
+速度で棄却して試作を撤回した。MTPLX 2.11.1内のcompiled verifier同一ロードA/Bだけは
+54.785→57.341 tok/s（+4.665%）だったため、次は局所案を足さずfixed-M4 graphbank adapterへ進む。
+既存QSA/GDN/PLE forwardを使い、共通側は固定stateの選択・commitだけに限定する。
+
+再開の1コマンド:
+
+```bash
+rg -n "CompiledVerifyBank|_make_verify_step|compiled_bank_m4" tools/compare/mtplx-venv/lib/python*/site-packages/mtplx mlxturbo tools
+```

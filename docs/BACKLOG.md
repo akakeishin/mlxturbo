@@ -1263,3 +1263,12 @@ ms/token **+2.5%**。一致長4の有用なSAM draftを捨てる代償があり�
 ```bash
 tools/biglock.sh .venv/bin/python tools/qwen4_ple_ngram_pure_gate.py
 ```
+
+## 棄却: fixed-M4前の局所GDN 2案 (2026-09-05 11:08 JST)
+
+- 検証GDNのstate-pure tailだけを`mx.compile`: 短128 tokenでms/round **+1.0%**。
+- kernelの未使用final-state出力を削除: 短128 token **+0.1%**、512 token **+0.3%**。
+- 両案とも出力・tok/roundは完全一致したが速度が負。試作は撤回し、再訪しない。
+
+一方、MTPLX 2.11.1内の同一ロードA/Bではfixed-M4 graphbankが54.785→57.341 tok/s
+（**+4.665%**）。次は局所最適化を増やさず、既存forwardを呼ぶ固定state adapterへ進む。

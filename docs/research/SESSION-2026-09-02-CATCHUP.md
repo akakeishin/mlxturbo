@@ -4302,3 +4302,19 @@ whole-model component replacementへ進む。
 判定はPLE/ngram Gate通過。QSA、GDN、PLE/ngramと、134葉を構成する全種類が実重み・実入力で
 state-pure callableを通った。次は全48層のwhole-model component replacementを診断実装し、
 全logits/state/rollback一致後だけgraphbank速度A/Bへ進む。
+
+### 2026-09-05 11:08 fixed-M4前の局所GDN案は速度で棄却
+
+MTPLX 2.11.1の同一モデルロード内でcompiled verifierをoff/onした予備A/Bでは、128 tokenの
+平均が54.785→57.341 tok/s（+4.665%）だった。on側は`compiled_bank_m4`、state 134葉、
+capture 218葉、fallback/demotion 0。compile固定費を除いたwarm測定であり、公開比較値ではないが、
+fixed-M4 graphbank自体に速度の取り分があることは確認できた。
+
+その前に小さい変更で取れるかを2案試した。検証GDNのtensor-only tailだけを`mx.compile`した案は、
+短文3本×128 tokenでms/round 35.097→35.441（+1.0%）。GDN kernelが`states_all[:, -1]`と
+同じ最終stateを別出力にも書く処理を省いた案は、128 tokenで+0.1%、512 tokenで
+35.099→35.212 ms/round（+0.3%）。いずれもtok/roundと出力は全件同一だったが、速度が負なので
+実験コードを撤回した。
+
+これで「局所compileや単一output削減を積む」方向は閉じる。次はMTPLXのforwardを写さず、既存
+QSA/GDN/PLE実装へ固定tensor stateを渡す最小graphbank adapterだけを対象にする。
