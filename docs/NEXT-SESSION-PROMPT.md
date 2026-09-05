@@ -1090,17 +1090,36 @@ rg -n "LookupSpecRunner|_safe_draft_cap|async_eval" mlxturbo/lookup_spec.py docs
 tools/biglock.sh .venv/bin/python tools/qwen4_state_adapter_poc.py
 ```
 
-## Flash fixed-M4 Gate B通過、次はwhole-model state plan (2026-09-05 10:11 JST)
+## Flash fixed-M4の134葉state plan通過、次はGDN単層Gate (2026-09-05 10:21 JST)
 
-実QSA layer 3は、QKV/RoPE、固定5葉更新、既定K2a/K2b、gate/o_projまでPython可変cacheを
-持たない同一compiled callableで通過した。連続offset・4位相・rollback 1/3/4＋継続の
-Attention出力とstateは最大差0、full logitsもKLD 0。次はQwen固有adapter内で残りstate葉を
-機械的に列挙し、whole-model fixed-M4 state planを作る。共通層へGDN/QSA固有知識を出さない。
+- 実Qwen3.8 Flash Nextの永続stateを、Attention 12層×5、GDN 36層×2、PLE×1、
+  ngram×1の計134 tensor葉として機械的に列挙した。
+- prefix 2,048、幅4、Attention capacity 2,304、pool capacity 576で、固定容量
+  pack/installは134葉最大差0。keep=1/3/4の計画commitと既存rollback、その直後の
+  幅4継続も134葉最大差0・logits最大差0だった。
+- 実測した主要形状はGDN conv `(1,3,10240)` bf16、GDN recurrent
+  `(1,48,128,128)` fp32、PLE conv `(1,9,10240)` bf16、ngram `(1,2)` int32。
+- これはstate planの検査であり、whole-model compileや速度向上ではない。次はPLEなしの
+  実GDN layer 0を純関数化し、同一compiled callableの連続2回・replay・rollback
+  keep=1/3/4＋継続を完全一致させる。
 
 再開の1コマンド:
 
 ```bash
-rg -n "make_cache|ArraysCache|capture\(|rollback|state" mlxturbo/spec_flash.py mlxturbo/_vendor/qwen4_exp.py tools/qwen4_qsa_pure_gate.py
+tools/biglock.sh .venv/bin/python tools/qwen4_full_state_plan.py
+```
+
+## Flash fixed-M4 Gate B通過、state planへ進む (2026-09-05 10:11 JST)
+
+実QSA layer 3は、QKV/RoPE、固定5葉更新、既定K2a/K2b、gate/o_projまでPython可変cacheを
+持たない同一compiled callableで通過した。連続offset・4位相・rollback 1/3/4＋継続の
+Attention出力とstateは最大差0、full logitsもKLD 0。次はQwen固有adapter内で残りstate葉を
+機械的に列挙する。結果は直前の10:21節で通過済み。共通層へGDN/QSA固有知識を出さない。
+
+再開の1コマンド:
+
+```bash
+tools/biglock.sh .venv/bin/python tools/qwen4_full_state_plan.py
 ```
 
 ## 棄却: Flash prefill最終logitsのhost同期除去 (2026-09-05 07:32 JST)

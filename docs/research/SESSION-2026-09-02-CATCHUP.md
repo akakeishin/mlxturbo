@@ -4258,3 +4258,19 @@ maskしたためreduction tileが変わり、Attention最大差0.0039〜0.0059�
 Attention出力と5葉stateが最大差0。対象層を純関数出力へ差し替えたfull logitsも2 stepとも
 KLD 0、top-1 100%だった。判定はGate B厳密通過。次は残りstate葉をQwen固有adapter内で機械的に
 列挙し、whole-model fixed-M4へ進む。共通側は登録・選択とopaque state/commitだけに留める。
+
+### 2026-09-05 10:21 fixed-M4の全134永続state葉を実機で列挙
+
+`tools/qwen4_full_state_plan.py`で、実Qwen3.8 Flash Nextの永続stateを固定shape tensorへ
+写す計画を検査した。内訳はfull Attention 12層×5葉（K/V/tensor offset/raw index/
+pooled index）=60、GDN 36層×2葉=72、PLE conv 1葉、ngram context 1葉で計134。
+
+prefix 2,048、verify幅4、Attention capacity 2,304、pool capacity 576。実測形状は
+GDN conv `(1,3,10240)` bf16、GDN recurrent `(1,48,128,128)` fp32、PLE conv
+`(1,9,10240)` bf16、ngram `(1,2)` int32だった。固定容量pack/installは134葉最大差0。
+captureから作ったkeep=1/3/4のcommitは既存`spec_flash.rollback`と全葉最大差0で、
+それぞれをinstallした直後の幅4継続も134葉最大差0・logits最大差0だった。
+
+判定はstate plan通過。まだwhole-model `mx.compile`やgraphbankの速度を証明していない。
+次はPLEなしの実GDN layer 0をstate-in/state-outの同一compiled callableへ移し、連続2回、
+同形replay、rollback keep=1/3/4と直後の継続を完全一致させる。
