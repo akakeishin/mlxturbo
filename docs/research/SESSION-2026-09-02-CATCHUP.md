@@ -4382,3 +4382,22 @@ session poolへ複製保持しない。修正後の温TTFTは4k 1.96秒、17k 2.
 再利用した。別の4k promptで同じ2ターン目をcacheありとslot追放後のcold再構築へ流すと、62 tokenの
 ID・本文が完全一致し、TTFTは22.85→0.83秒だった。`bench/test_gemma4_mtp.py`とserver全体は
 477 passed、vendor fingerprintも一致した。
+
+### 2026-09-05 15:14 Flash MTPのQSA配線は不発、3bitは18.4%遅く棄却
+
+MTP層にも採用済みQSA decode kernelを有効化できるか17kで確認した。しかしFlash MTPの
+draft cacheは直近512 tokenだけを持ち、QSA kernelの発火条件はKV長2,048超である。実測の
+kernel発火数も12 target full-attention層ぶんだけで、MTP層では0回だった。MTP層は常に
+dense attentionの範囲に収まるため、この配線はno-opとして試作を撤回した。
+
+次に同じbf16 sidecarからMTP 1層だけを3bit/group64へ量子化し、出荷既定4bit/group64と
+同一process・短文3本×512 tokenのABBAで比較した。
+
+| MTP量子化 | ms/token | ms/round | tok/round |
+|---|---:|---:|---:|
+| 3bit | 19.272 | 35.460 | 1.857 |
+| 4bit（既定） | 16.275 | 35.264 | 2.186 |
+
+3bitはround単価が+0.6%で、draft計算を速くできなかったうえ、tok/roundが-15.1%になり、
+最終的なms/tokenは+18.4%悪化した。旧teacher-forcedの単一点ではt+2的中率が同着圏でも、
+実生成の連続採択には移らなかった。長文へ進まず棄却し、実験knobを削除した。出荷既定は4bitを維持する。

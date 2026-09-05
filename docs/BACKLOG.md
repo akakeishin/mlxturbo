@@ -1332,3 +1332,17 @@ vendor fingerprintも通過した。
 ```bash
 git show --stat --oneline HEAD && rg -n "未決|保留|調査継続" docs/BACKLOG.md | tail -n 80
 ```
+
+## 棄却: Flash MTP QSA配線と3bit量子化 (2026-09-05 15:14 JST)
+
+- Flash MTP cacheは512 token窓で、QSA decode kernelの発火条件2,048 tokenを超えない。
+  17k実測でもMTP層の追加発火は0回だったため、配線案はno-opとして撤回した。
+- MTPだけを3bit/group64にした短文3本×512 tokenのABBAは、4bit比でms/round +0.6%、
+  tok/round -15.1%、ms/token +18.4%。帯域削減がround短縮にならず採択率だけ落ちたため棄却した。
+- 実験knobは残さず、4bit/group64を維持する。
+
+再開の1コマンド:
+
+```bash
+rg -n "MTP|draft|採択|acceptance" docs/BACKLOG.md docs/research/SESSION-2026-09-02-CATCHUP.md | tail -n 100
+```

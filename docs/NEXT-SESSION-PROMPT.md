@@ -1261,3 +1261,17 @@ tools/biglock.sh .venv/bin/python bench/bench_http_engine.py --help
 ```bash
 git show --stat --oneline HEAD && rg -n "未決|保留|調査継続" docs/BACKLOG.md | tail -n 80
 ```
+
+## Flash MTPのQSA配線と3bitを棄却 (2026-09-05 15:14 JST)
+
+- MTP cacheは512 token窓なので、2,048 token超で発火するQSA decode kernelはMTP層では使われない。
+  17kの発火数でも追加0回を確認し、配線試作を撤回した。
+- MTP 3bit/group64対4bit/group64を短文3本×512 tokenのABBAで測り、3bitは
+  ms/round +0.6%、tok/round -15.1%、ms/token +18.4%。長文へ進まず棄却した。
+- 3bit/QSAの実験knobは削除済み。既定4bitを維持する。
+
+再開の1コマンド:
+
+```bash
+git status --short && rg -n "MTP|draft|採択|acceptance" docs/BACKLOG.md | tail -n 100
+```
