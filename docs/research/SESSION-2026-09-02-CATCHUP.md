@@ -4746,3 +4746,22 @@ GLMのdownは既存 `mlp.down_proj`、attention q/oも既存 `self_attn.q_proj/o
 既に対象だったため、新表には重複させていない。DeepSeek q_aと旧Qwen attention出力は
 遅かったので印を付けない。これは各射影の局所値で、モデル全体の改善率ではない。
 候補選択の契約testと正式集合769 passed / 3 skippedが通過した。
+
+### 2026-09-05 21:26 Qwen3.6のtoken-major MoE combineを品質で棄却
+
+Qwen3-Next／Qwen3.6、DeepSeek V2/V3、GLM4-MoEには、expert出力へrouter重みを掛けて
+top-k和を取る共通形がある。既存のFlash専用combine-foldはdown projection前へ重みを
+移すため、そのまま別族へは届かない。まずQwen3.6へ、expert出力後の重み掛けと和だけを
+fp32積和の1本のMetal kernelへ畳む最小試作を入れた。
+
+通常冷却、Qwen3.6-35B-A3B-4bit + 5bit MTP、4k相当3 prompt×64 tokenの同一process
+ABBAでは、cold prefillが4.513→4.292秒（4.9%短縮）だった。一方で3ケース中1ケースは
+生成5 token目で分岐した。そこで同じ4k promptの末尾8位置をteacher-forcedで比較すると、
+最初の2ケースのtop-256近似KLDは0.00562 / 0.00455、最大0.03098だった。受け入れ幅
++0.0005の約9〜11倍で、2ケース目はargmax一致率も0.875だったため、残り1ケースを待たず
+棄却した。試作kernel、Qwen用subclass、testは削除し、knobも残していない。
+
+併せて、既存の `enable_moe_combine_fold` が `switch_mlp` という名前だけでQwen3.6／
+DeepSeek／GLMも「有効」と数えていたが、実consumerはqwen4_expだけだったことを修正した。
+今後は共通部品名ではなく、実際に最適化を読むclassだけを有効件数へ数える。別族への展開は、
+この丸め差を払わずに既存の和と同じ順序を保てる方式が見つかった場合だけ再開する。

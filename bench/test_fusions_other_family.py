@@ -186,6 +186,16 @@ def test_structure_walkers_no_op_on_other_family():
             assert expect is None or got == expect, f"{name}: {got!r} != {expect!r}"
 
 
+def test_moe_combine_fold_does_not_report_unwired_switch_mlp():
+    """同名部品だけでは有効扱いにしない。別族にはconsumerが無い。"""
+    model = _StubOtherFamily(n_layers=1)
+    mlp = SimpleNamespace(switch_mlp=object())
+    model.language_model.model.layers[0].mlp = mlp
+
+    assert fused.enable_moe_combine_fold(model) == 0
+    assert not hasattr(mlp, "_combine_fold_min_s")
+
+
 def test_enable_default_fusions_other_family_does_not_raise():
     """回帰そのもの: 他の族に `enable_default_fusions` を当てても落ちない。"""
     for model in (_StubOtherFamily(n_layers=4), _StubNoLayers()):

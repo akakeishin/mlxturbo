@@ -2807,17 +2807,21 @@ def enable_moe_combine_fold(model) -> int:
     「既定 on、`=0` で無効化」の作法)。prefill に効く変更なので decode_ab
     の DECODE_ONLY には入れない。
 
-    戻り値は適用した層数 (MoE 層は全 48 層)。
+    戻り値は実際に ``_moe_combine_fold`` を読む qwen4_exp の
+    ``SparseMoeBlock`` へ適用した層数 (MoE 層は全 48 層)。同じ
+    ``switch_mlp`` 名を持っていても consumer が無い別族には印を付けない。
     """
     import os
 
     if os.environ.get("MLXTURBO_MOE_COMBINE_FOLD") == "0":
         return 0
+    import mlx_lm.models.qwen4_exp as Q
+
     min_s = int(os.environ.get("MLXTURBO_MOE_COMBINE_FOLD_MIN_S", "64"))
     n = 0
     for layer in _model_layers(model):
         mlp = getattr(layer, "mlp", None)
-        if mlp is not None and hasattr(mlp, "switch_mlp"):
+        if isinstance(mlp, Q.SparseMoeBlock):
             mlp._combine_fold_min_s = min_s
             n += 1
     return n

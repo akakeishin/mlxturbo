@@ -1402,3 +1402,20 @@ MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gemma4_mtp.py bench/test
 ```bash
 MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_dispatch_static.py bench/test_qmm_skinny_mma_static.py bench/test_gemma4_mtp.py
 ```
+
+## Qwen3.6の汎用MoE combineは品質超過で棄却 (2026-09-05 21:26 JST)
+
+- expert出力後のrouter重み掛け＋top-k和を1本へ畳む候補は、4k cold prefillで-4.9%。
+- 同じ4k promptのteacher-forced KLDは0.00562 / 0.00455で、許容+0.0005を約9〜11倍超過。
+  生成列も1/3 promptで5 token目から分岐したため棄却し、試作とknobを削除した。
+- 同形のDeepSeek／GLMへこのkernelを横展開しない。縮約順を変えない方式だけ再検討する。
+- Flash専用combine-foldが別族を「有効」と誤表示していた件は、実consumerを持つ
+  qwen4_expだけを数えるよう修正した。
+- 高速化の探索対象はGemmaに限定しない。Qwen／DeepSeek／GLMほかは、モデル名ではなく
+  shape・量子化条件・実consumerの契約で共通化し、未測定shapeへ速度を外挿しない。
+
+再開の1コマンド:
+
+```bash
+git diff --check && MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_fusions_other_family.py bench/test_moe_combine_fold.py
+```

@@ -1448,3 +1448,21 @@ M3/M4だけon。未測定のM1/M2/M5/NAX/M6以降はstockへ戻し、
 ```bash
 MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gemma4_mtp.py bench/test_server.py -k 'gemma4 or assistant'
 ```
+
+## 棄却: Qwen／DeepSeek／GLM共通のMoE出力後combine (2026-09-05 21:26 JST)
+
+- Qwen3.6のexpert出力後 `(y * scores).sum(-2)` をfp32積和の1 kernelへ畳む試作は、
+  4k cold prefillを4.513→4.292秒（-4.9%）まで短縮した。
+- ただし4k teacher-forced末尾8位置のtop-256 KLDは2 promptで0.00562 / 0.00455。
+  許容増分+0.0005の約9〜11倍で、argmaxも1 promptで8位置中1位置変わった。
+- 速度の取り分より品質の代金が大きいため棄却。試作kernel／subclass／knobは残さない。
+- Qwen3-Next、DeepSeek V2/V3、GLM4-MoEは同じ出力後combine形を持つが、このfp32積和を
+  横展開しない。既存と同じ縮約順を保てる方法が出た場合だけ共通helper＋族別の薄い接続で再開する。
+- 既存Flash専用combine-foldの有効件数は、実consumerを持つqwen4_expだけへ限定した。
+  `switch_mlp`名だけが同じQwen／DeepSeek／GLMを有効と誤表示しない。
+
+再開の1コマンド:
+
+```bash
+MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_fusions_other_family.py bench/test_moe_combine_fold.py
+```
