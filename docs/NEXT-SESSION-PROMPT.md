@@ -1090,6 +1090,18 @@ rg -n "LookupSpecRunner|_safe_draft_cap|async_eval" mlxturbo/lookup_spec.py docs
 tools/biglock.sh .venv/bin/python tools/qwen4_state_adapter_poc.py
 ```
 
+## Flash fixed-M4 Gate B1は部分通過、次はAttention出力 (2026-09-05 09:48 JST)
+
+実QSA layer 3のQKV/RoPEと固定5葉更新は、Python可変cacheを持たない同一compiled callableで
+連続offset・4位相・rollback 1/3/4＋継続まで最大差0。次はblock top-k、sparse SDPA、
+gate/o_projを同じ関数へ足し、実Attention出力を比較する。ここを通るまで134葉へ広げない。
+
+再開の1コマンド:
+
+```bash
+rg -n "_block_scores|_pooled_and_top|scaled_dot_product_attention|def pure_step" mlxturbo/_vendor/qwen4_exp.py tools/qwen4_qsa_pure_gate.py
+```
+
 ## 棄却: Flash prefill最終logitsのhost同期除去 (2026-09-05 07:32 JST)
 
 - 最終1行の全語彙logitsを`mx.eval`せず`mx.async_eval`だけにし、MTP primingのgraph構築を

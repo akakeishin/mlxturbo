@@ -184,7 +184,9 @@ class FixedStateAdapter:
         pooled_live = (
             indexer._pooled[:, :pooled_n, :]
             if pooled_n
-            else mx.zeros((k_live.shape[0], 0, k_live.shape[-1]), dtype=k_live.dtype)
+            else mx.zeros(
+                (raw_live.shape[0], 0, raw_live.shape[-1]), dtype=raw_live.dtype
+            )
         )
         leaves = (
             pad(k_live, 2, self.capacity),

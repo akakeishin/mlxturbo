@@ -4228,3 +4228,18 @@ full logitsはKLD 0・top-1 100%、5葉の論理cacheとrollback keep=1/3/4も�
 固定M4は完全受理でも45.6msなら87.7 tok/sなので、whole-model最初の絶対ゲートは40ms/round以下。
 graphbankがeager fixed-M4比10.5%以上縮まらなければ、短文で測ったdepth 3の+11.7%を回収できないため
 性能レーンを畳む。
+
+### 2026-09-05 09:48 実QSAの純関数component gateを部分通過
+
+`tools/qwen4_qsa_pure_gate.py`で、実QSA layer 3の重みだけを閉じ込め、mutable cache objectや
+Python整数offsetを入力境界から除いた。入力はhidden幅4と固定5葉
+`[K, V, array_offset, raw_index, pooled_index]`、出力はRoPE後Qと更新後5葉。同じ
+`mx.compile` callableを連続2 offsetと同形replayに再利用した。
+
+Q、K/V、raw/pooled indexは参照eager更新と最大差0。offset mod 4の全4位相、rollback
+keep=1/3/4とその後の幅4継続も全葉最大差0で通過した。途中で、pool未生成時の診断adapterが
+QSA index次元128ではなくKV head次元256の空poolを作る誤りを発見し修正した。修正後のGate B0も
+full logits KLD 0、rollback全件一致で再通過した。
+
+判定はGate B1の部分通過であり、Attention出力やlogitsの純関数化はまだ主張しない。次は同じ境界へ
+QSA block top-k選択とsparse SDPA・gate/o_projを入れ、実Attention出力をeagerと比較する。
