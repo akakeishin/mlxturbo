@@ -851,6 +851,33 @@ def disable_gdn_prework_kernel() -> None:
     Q.GatedDeltaNet._gdn_prework = False
 
 
+def enable_gdn_decode_all(model=None) -> int:
+    """Arm the exact-geometry full GDN kernel for plain AR S=1 only.
+
+    ``mlxturbo.kernels.gdn_decode_all`` performs admission on every call, so
+    this installer only arms the qwen4_exp seam.  It is enabled by default;
+    ``MLXTURBO_GDN_DECODE_ALL=0`` disables it for same-process A/B runs.
+    ``capture()`` replaces
+    ``GatedDeltaNet.__call__`` during speculative verification, and admission
+    separately rejects rollback, masks, ragged lengths, training, sharding,
+    missing state, and unsupported geometry.
+    """
+    import os
+
+    import mlx_lm.models.qwen4_exp as Q
+
+    enabled = os.environ.get("MLXTURBO_GDN_DECODE_ALL", "1") != "0"
+    Q.GatedDeltaNet._gdn_decode_all = enabled
+    return int(enabled)
+
+
+def disable_gdn_decode_all() -> None:
+    """Disarm the plain-AR full GDN seam without changing model parameters."""
+    import mlx_lm.models.qwen4_exp as Q
+
+    Q.GatedDeltaNet._gdn_decode_all = False
+
+
 # `enable_gdn_decode_fused` が差し替えた `RMSNormGated.__call__` の元
 _ORIG_RNG_DECODE = None
 
@@ -886,6 +913,11 @@ def enable_gdn_decode_fused(model=None) -> None:
     import os
 
     import mlx_lm.models.qwen4_exp as Q
+
+    # The full S=1 path is independent, but shares this
+    # existing default-fusion entry point so plain AR can opt in without a
+    # second model setup path.
+    enable_gdn_decode_all(model)
 
     mode = (os.environ.get("MLXTURBO_GDN_DECODE_FUSED") or "1").lower()  # 既定 on (2026-09-03 21:05)
     if mode in ("", "0", "off"):
@@ -4039,6 +4071,7 @@ __all__ = [
     "enable_gdn_blocked_kernel",
     "enable_gdn_metal_kernel",
     "enable_gdn_decode_fused",
+    "enable_gdn_decode_all",
     "enable_gdn_prework_kernel",
     "enable_gdn_port",
     "disable_gdn_port",
@@ -4049,6 +4082,7 @@ __all__ = [
     "disable_gdn_blocked_kernel",
     "disable_gdn_metal_kernel",
     "disable_gdn_decode_fused",
+    "disable_gdn_decode_all",
     "disable_gdn_prework_kernel",
     "disable_hc_write",
     "disable_hyper_connection",

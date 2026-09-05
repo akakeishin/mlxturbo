@@ -66,7 +66,7 @@ NOT_ROUTABLE = 64
 # in-process で走らせる道具 (`run_with_model(argv, bundle)` を持つもの)。
 # ここに名前があっても、その関数が無ければ worker が err に理由を書く。
 TOOL_JOBS = ("longctx_quality.py", "moe_split.py", "quant_eval.py",
-             "moe_decode_fused_ref_model.py")
+             "moe_decode_fused_ref_model.py", "gdn_ar_ab.py")
 # モデルを読まない道具。worker はモデルを抱えたまま GPU の番だけ渡す。
 # `tools/biglock.sh` が段 2 を自動で振るのと同じ集合。
 EXEC_RE = re.compile(

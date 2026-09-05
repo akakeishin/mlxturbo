@@ -1350,3 +1350,18 @@ rg -n "65 tok/s|80 tok/s|100 tok/s|同一pack" docs/NEXT-SESSION-PROMPT.md docs/
 ```bash
 rg -n "fused GDN|deferred PLE|compressed-key|coarse.*rerank" docs/BACKLOG.md docs/research/SESSION-2026-09-02-CATCHUP.md
 ```
+
+## Flash GDN全段融合: 非MTP採用、MTP版を継続 (2026-09-05 17:31 JST)
+
+- 非MTP S=1は短文AR 38.463→39.555 tok/s（+2.84%）、3条件全勝。
+- step=1 KLDは0.01832→0.01843（Δ+0.00011、許容内）、top-1一致率0.961→0.963。
+- `MLXTURBO_GDN_DECODE_ALL`は既定on、`=0`でoff。MTP capture、S>1、mask、ragged、
+  学習、sharding、未初期化cacheでは発火しない。関連44 test通過。
+- 次は同じ数式・Metal本体からS>1の中間状態を返し、既存rollbackへ接続する。
+  まずS=2..4の1層照合、その後Flash MTPの同一process A/B。全状態書き出しで遅ければ棄却する。
+
+再開の1コマンド:
+
+```bash
+MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gdn_decode_all.py && rg -n "def capture|states_all|rollback" mlxturbo/spec_flash.py
+```

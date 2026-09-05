@@ -1501,6 +1501,92 @@ class GatedDeltaNet(nn.Module):
             else mx.zeros((B, self.conv_kernel_size - 1, self.conv_dim), dtype=x.dtype)
         )
 
+        # Optional plain-AR S=1 path.  FlashSpec's capture() replaces this
+        # method while recording rollback states, so this branch is never
+        # reached by speculative verify.  The kernel also requires the
+        # already-advanced conv/recurrent state; an uninitialised cache stays
+        # on the stock path rather than silently inventing state.
+        if getattr(self, "_gdn_decode_all", False):
+            from mlxturbo.kernels import gdn_decode_all as gdna
+
+            cached_conv_state = cache[0] if cache is not None else None
+            state = cache[1] if cache is not None else None
+            cache_lengths = getattr(cache, "lengths", None)
+            record_rollback = bool(
+                getattr(self, "_gdn_decode_all_record_rollback", False)
+                or getattr(cache, "record_rollback", False)
+                or getattr(cache, "_record_rollback", False)
+                or getattr(cache, "states_all", None) is not None
+            )
+            sharded = any(
+                getattr(module, "sharding_group", None) is not None
+                for module in (
+                    self,
+                    self.in_proj_qkv,
+                    self.in_proj_z,
+                    self.in_proj_b,
+                    self.in_proj_a,
+                    self.conv1d,
+                    self.norm,
+                    self.out_proj,
+                )
+            )
+            admission = gdna.admit_qwen4_fused_gdn_decode(
+                qkv=mixed_qkv,
+                z=z.reshape(B, S, -1),
+                beta=b,
+                alpha=a,
+                conv_state=cached_conv_state,
+                recurrent_state=state,
+                conv_weight=self.conv1d.weight,
+                a_log=self.A_log,
+                dt_bias=self.dt_bias,
+                norm_weight=self.norm.weight,
+                mask=mask,
+                cache_lengths=cache_lengths,
+                record_rollback=record_rollback,
+                training=self.training,
+                sharded=sharded,
+                num_key_heads=self.n_k,
+                num_value_heads=self.n_v,
+                key_head_dim=self.dk,
+                value_head_dim=self.dv,
+                conv_kernel=self.conv_kernel_size,
+                gate_activation=self.norm.activation,
+            )
+            if admission.accepted:
+                try:
+                    threadgroup_y = (
+                        gdna.probe_qwen4_fused_gdn_decode(mixed_qkv.dtype)
+                        if gdna.fused_gdn_runtime_supported()
+                        else None
+                    )
+                except (RuntimeError, ValueError):
+                    threadgroup_y = None
+                if threadgroup_y is not None:
+                    try:
+                        fused_out, next_conv_state, next_state = gdna.qwen4_fused_gdn_decode(
+                            mixed_qkv,
+                            z.reshape(B, S, -1),
+                            b,
+                            a,
+                            conv_state,
+                            self.conv1d.weight,
+                            self.A_log,
+                            self.dt_bias,
+                            state,
+                            self.norm.weight,
+                            self.norm.eps,
+                            threadgroup_y=threadgroup_y,
+                        )
+                    except (RuntimeError, ValueError):
+                        pass
+                    else:
+                        cache[0] = next_conv_state
+                        cache[1] = next_state
+                        cache.advance(1)
+                        return self.out_proj(fused_out)
+
         # mlxturbo.fused.enable_gdn_prework_kernel が立てる。conv1d -> silu ->
         # q/k の rms_norm+スケール -> 次段 conv 状態の書き出し -> g -> beta を
         # 1 dispatch に畳んだ decode/verify 幅専用の経路 (mlxturbo/kernels/
