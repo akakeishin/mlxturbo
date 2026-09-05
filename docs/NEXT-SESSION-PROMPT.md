@@ -1323,3 +1323,16 @@ git status --short && rg -n "MTP|draft|採択|acceptance" docs/BACKLOG.md | tail
 ```bash
 BIGLOCK_NO_WORKER=1 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py --model /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46 --mtp /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-MTP-5bit/snapshots/998d26dc27cc06baf60ff6e27d673b15f877f0b3 --knob MLXTURBO_PRIOR_PROBE=A,B --ctx 0 --tokens 512 --reps 1 --round-trace --out bench/results/prior-probe-qwen35-short-normalcool-0905.json
 ```
+
+## Flash 65 tok/sは中間ゲート (2026-09-05 16:39 JST)
+
+- 短文65 tok/s持続で高速化を止めない。これは現行61〜62 tok/sからの小さな中間ゲート。
+- 公開時の速度訴求は、同一pack・prompt・出力長・sampling・冷却でmlx-serve / MTPLXと並べる。
+  速度だけなら80 tok/s級への接近を目安にし、100 tok/sは根拠のないstretchとして残す。
+- 強冷却へ切り替えた場合も数分休止し、ユーザーの開始確認を受けてから正式値を測る。
+
+再開の1コマンド:
+
+```bash
+rg -n "65 tok/s|80 tok/s|100 tok/s|同一pack" docs/NEXT-SESSION-PROMPT.md docs/research/SESSION-2026-09-02-CATCHUP.md
+```
