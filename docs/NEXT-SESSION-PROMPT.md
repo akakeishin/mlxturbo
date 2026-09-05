@@ -1275,3 +1275,18 @@ git show --stat --oneline HEAD && rg -n "未決|保留|調査継続" docs/BACKLO
 ```bash
 git status --short && rg -n "MTP|draft|採択|acceptance" docs/BACKLOG.md | tail -n 100
 ```
+
+## Flash QSA blocks=64を18k以下だけ採用 (2026-09-05 15:32 JST)
+
+- 一律64の50k品質低下を避け、QSA K2bだけをKV長2,049〜18,000で64 blocksにした。
+- 17kの3プロンプト×512 token再測はms/token -4.8%、round -1.0%、tok/round +4.1%。
+- 50kは3プロンプトで生成列・採択・round・発火数がA/B同一となり、従来表への復帰を確認した。
+- GPU参照16/16 bit一致、境界CPU 3件、関連13 test、vendor fingerprint通過。
+- 100 tok/sを埋める次の大口は現存runtime knobではなく、互換tokenizerの小型drafter artifact。
+  学習を始めるまでは、公開予備測定か既存Gemma 31B assistantのHTTP実運用確認へ進む。
+
+再開の1コマンド:
+
+```bash
+.venv/bin/python -m pytest bench/test_qsa_decode_blocks.py bench/test_fusions_other_family.py -q
+```

@@ -2795,6 +2795,16 @@ def _knob_qsa_decode_kernel(ctx):
     return apply
 
 
+def _knob_qsa_blocks64(ctx):
+    """A = QSAの18k以下だけblocks=64 / B = MLXのblocks表。"""
+    import os
+
+    def apply(variant):
+        os.environ["MLXTURBO_QSA_BLOCKS64"] = "1" if variant == "A" else "0"
+
+    return apply
+
+
 KNOBS = {
     # name: (setup(ctx) -> apply(variant), variants, 出力一致を要求するか,
     #        まとめで基準にする variant)
@@ -2865,6 +2875,7 @@ KNOBS = {
     # vector の写しなのでビット一致するはず (control_identical=True)。
     # **両側を MLXTURBO_QSA_TAIL=query にして走らせること。**判定は ms/round
     "qsa-decode-kernel": (_knob_qsa_decode_kernel, ["A", "B"], True, "B"),
+    "qsa-blocks64": (_knob_qsa_blocks64, ["A", "B"], False, "B"),
     "prefill-attn-min-kv": (
         _knob_prefill_attn_min_kv, ["8192", "12288"], False, "12288"),
     "wide": (_knob_wide, ["A", "B"], False, "B"),
@@ -3394,7 +3405,7 @@ def run_with_model(argv, bundle) -> int:
         # 2048、`mlxturbo/spec.py` の PREFILL_STEP_SIZE) は常にそれを越える
         # ので、on にしても prefill 幅の経路は 1 op も変わらない
         # (`indexer-lean` / `sdpa-split` と同じ理由)。
-        "qsa-decode-kernel",
+        "qsa-decode-kernel", "qsa-blocks64",
         # stub-qsa-attn は `Attention.__call__` に入った時点で S<=8 を見て
         # 分岐する (S>8 の prefill 幅は orig にそのまま逃がす、knob 自身の
         # docstring 参照)。prefill 幅は 1 op も変わらない。

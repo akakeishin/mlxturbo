@@ -4401,3 +4401,19 @@ dense attentionの範囲に収まるため、この配線はno-opとして試作
 3bitはround単価が+0.6%で、draft計算を速くできなかったうえ、tok/roundが-15.1%になり、
 最終的なms/tokenは+18.4%悪化した。旧teacher-forcedの単一点ではt+2的中率が同着圏でも、
 実生成の連続採択には移らなかった。長文へ進まず棄却し、実験knobを削除した。出荷既定は4bitを維持する。
+
+### 2026-09-05 15:32 QSA blocks=64を18k以下だけ採用、17k ms/token -4.8%
+
+14:01の一律blocks=64は50k長文課題のquoteを6/6→4/6へ落としたため棄却したが、17kは
+recall 8/8、quote 6/8で既定の8/8、5/8に対して非退行だった。そこでK2bのQSA decodeだけ、
+KV長2,049〜18,000では64 blocks、それより長い場合はMLXの機種別blocks表へ戻す最小分岐にした。
+
+同一process・3プロンプト×512 tokenのABBAで再測し、17kはms/token 19.790→18.850
+（-4.8%）、ms/round 38.823→38.450（-1.0%）、tok/round 1.964→2.045（+4.1%）。
+3/3プロンプトでms/tokenとroundが改善し、前回の-5.0% / -1.2%を再現した。
+
+50kは3プロンプト×128 tokenでA/Bの生成列、採択数、round数、kernel発火数が全件一致し、
+条件分岐が従来表へ戻ることを確認した。速度平均の+1.4%は同じ計算経路の位置・熱差で、採否には
+使わない。64 blocksを同じ参照SDPAへ設定したGPU検査は16/16でbit一致、境界CPU testは3件、
+関連testは13件通過。明示した`MLX_SDPA_BLOCKS`を最優先し、`MLXTURBO_QSA_BLOCKS64=0`で
+従来表だけへ戻せる。Flash MTPの512-token cacheにはQSA自体が発火しないため影響しない。

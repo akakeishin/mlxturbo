@@ -1346,3 +1346,17 @@ git show --stat --oneline HEAD && rg -n "未決|保留|調査継続" docs/BACKLO
 ```bash
 rg -n "MTP|draft|採択|acceptance" docs/BACKLOG.md docs/research/SESSION-2026-09-02-CATCHUP.md | tail -n 100
 ```
+
+## 採用: Flash QSA blocks=64を18k以下へ限定 (2026-09-05 15:32 JST)
+
+- 一律64は50k品質で棄却したが、17k品質はrecall 8/8、quote 6/8で非退行だった。
+- K2bだけをKV長2,049〜18,000で64 blocksにし、それより長い文脈はMLX表へ戻す。
+- 17k再測はms/token -4.8%、ms/round -1.0%、tok/round +4.1%、3/3プロンプト改善。
+- 50kは生成列・採択数・round数・発火数が3/3で同一。GPU参照16/16 bit一致、関連13 test通過。
+- `MLXTURBO_QSA_BLOCKS64=0`で従来表へ戻る。明示`MLX_SDPA_BLOCKS`は常に優先する。
+
+再開の1コマンド:
+
+```bash
+.venv/bin/python -m pytest bench/test_qsa_decode_blocks.py bench/test_fusions_other_family.py -q
+```

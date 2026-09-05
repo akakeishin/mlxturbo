@@ -1059,7 +1059,7 @@ class Attention(nn.Module):
             return None
         if keys.shape[3] != self.head_dim:
             return None
-        blocks = _k2b.mirror_blocks(kv_len, gqa, S)
+        blocks = _k2b.decode_blocks(kv_len, gqa, S)
         if blocks is None:
             return None
 

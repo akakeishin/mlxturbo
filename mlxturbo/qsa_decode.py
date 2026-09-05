@@ -8,7 +8,7 @@
 (`Attention._decode_qsa_forward`、`mlxturbo/_vendor/qwen4_exp.py`) を
 有効化・無効化するだけで、`gather_attn.py` / `indexer_lean.py` と同じ形。
 
-**出力はビット一致する。**選ぶ集合 (同点は添字の昇順) も演算の順 (逐次
+同じ``blocks``なら**出力はビット一致する。**選ぶ集合 (同点は添字の昇順) も演算の順 (逐次
 online softmax、`fast::exp`、bf16 partials、pass 2) も本家の写しで、
 `tools/verify_qsa_attn_decode.py` が S∈{1..6} × kv 2k〜50k × スコア 4 種の
 120 通りで `mx.array_equal` を取っている。取り分は消える op の本数 ---
@@ -30,6 +30,8 @@ argpartition (GPU では全ソート) とマスク組みで 25〜40 本、sdpa �
 既定 off。in-model A/B は `tools/decode_ab.py --knob qsa-decode-kernel`。
 17k の実測 (2026-09-03、`bench/results/qsa-decode-kernel-17k-v2.json`、
 depth 混合がそろった 10 行): ms/round -4.1%、ms/tok -4.5%、出力はビット一致。
+製品既定ではさらにKV長18,000以下だけ``blocks=64``へ縮めるため本家とは丸めが変わる。
+17kの長文課題は非退行、50kは従来表へ戻る。``MLXTURBO_QSA_BLOCKS64=0``で無効化できる。
 発火は
 `mlxturbo.kernels._fire.snapshot()` の ``qsa_decode_kernel``
 (選択側は ``qsa_select``、attention 側は ``qsa_attn_decode``)。

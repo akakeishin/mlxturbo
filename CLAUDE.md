@@ -104,6 +104,7 @@
   `MLXTURBO_QSA_TAIL` (既定 query、`=global` で旧規則) は QSA の端数 (tail) の可視範囲をクエリごと `[cr*floor((q+1)/cr), q]` にする本番の既定値
   (HF / mlx-serve / oMLX と同じ。global は prefill 幅の 3/4 の行が自分を見ていなかった。速度は中立、17k の正答率は recall 12/12、2026-09-03 17:25)。
   decode の QSA カーネル `MLXTURBO_QSA_DECODE_KERNEL` (既定 on、`=0` で off) は query が前提。K2a 選択 + K2b attention で本番の並びとビット一致、
+  `MLXTURBO_QSA_BLOCKS64` (既定 on、`=0` で off) はK2bだけをKV長18,000以下で64 blocksにする。17kでround -1.0% / ms-token -4.8%、50kは従来表へ戻す。
   17k で ms/round -4.1% (burn-in 付き、2026-09-03 18:15)。50k は確認中。MTP の draft 層には当たっていない (enable の順序、0.1 ms/round)。
   `MLXTURBO_PREFILL_TAIL_IN_GROUP` (既定 on、`=0` で off) は末尾 2048 チャンクを layer-major のグループに入れる本番の既定値
   (4k -4.9% / 8k -3.4% / 17k -0.6%、サーバー経路はビット一致、2026-09-03 15:35)。末尾書換えに備えるcheckpoint幅は8で、
