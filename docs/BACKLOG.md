@@ -1363,18 +1363,22 @@ rg -n "MTP|draft|採択|acceptance" docs/BACKLOG.md docs/research/SESSION-2026-0
 .venv/bin/python -m pytest bench/test_qsa_decode_blocks.py bench/test_fusions_other_family.py -q
 ```
 
-## 未決: Qwen 27B/35Bのdepth priorを実測較正 (2026-09-05 16:04 JST)
+## 一部棄却: Qwen 27B/35Bのdepth priorを実測較正 (2026-09-05 16:26 JST)
 
 - Fable 5.1 xhighの再監査で、学習なし・共通runtimeの第一候補になった。
 - 現行`_POS_ACCEPT_PRIOR={1:0.70,2:0.11,3:0.02}`は資料値で、このpackの実測ではない。
 - `decode_ab_generic`のJSONへ`accept_hist/accept_trace/src_hist`を保存する診断だけ追加した。
-- 次回の冷却後、凍結3プロンプト×512で`accept_trace`と`round_trace`から位置別採択率を出す。
-- priorとの差が各位置±0.05以内なら変更せず閉じる。差が大きい場合だけ定数候補をA/Bし、
-  ms/token -2%以上、全条件の退行+1%以内を採用線にする。
+- Qwen 27Bを通常冷却で10分休止後に診断した。位置別採択率は1〜3番目が
+  0.777 / 0.548 / 0.375で、現行0.70 / 0.11 / 0.02との差が大きかった。
+- 実測値をpriorにした候補は、凍結3プロンプト×512のABBAでms/token -1.6%、ms/round -2.2%、
+  tok/round -1.4%。採用線-2%に届かず、3本目はms/token +1.8%と退行したため棄却した。
+  実験wrapperは削除し、4k/17kと品質検査へは進まない。現行priorを維持する。
+- Qwen 35Bは別のMTPと条件付きdepth capを持つため、十分冷まして同じ診断を1回だけ行う。
+  差が大きい場合の候補A/B線は同じくms/token -2%以上、全条件の退行+1%以内。
 - 自作MTP・モデル固有drafter学習は当面優先しない。100 tok/sは必達線でなく将来architectureのstretch。
 
 再開の1コマンド:
 
 ```bash
-.venv/bin/python -m pytest bench/test_decode_ab_generic_reset.py -q
+BIGLOCK_NO_WORKER=1 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py --model /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46 --mtp /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-MTP-5bit/snapshots/998d26dc27cc06baf60ff6e27d673b15f877f0b3 --knob MLXTURBO_PRIOR_PROBE=A,B --ctx 0 --tokens 512 --reps 1 --round-trace --out bench/results/prior-probe-qwen35-short-normalcool-0905.json
 ```

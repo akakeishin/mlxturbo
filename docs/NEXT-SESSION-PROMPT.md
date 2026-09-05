@@ -1307,3 +1307,19 @@ git status --short && rg -n "MTP|draft|採択|acceptance" docs/BACKLOG.md | tail
 ```bash
 .venv/bin/python -m pytest bench/test_decode_ab_generic_reset.py -q
 ```
+
+## Qwen 27Bのdepth prior候補を棄却、35Bだけ未決 (2026-09-05 16:26 JST)
+
+- 通常冷却へ切替後10分休止し、Qwen 27Bの位置別採択率を取得した。1〜3番目は
+  0.777 / 0.548 / 0.375で、現行prior 0.70 / 0.11 / 0.02との差は大きかった。
+- 実測prior候補の短文ABBAはms/token -1.6%で採用線-2%に未達。3本目が+1.8%退行した。
+- 4k / 17k / KLDへは進まず、実験wrapperを削除した。Qwen 27Bの現行priorを維持する。
+- Qwen 35BはMTPと長文capが違うため、さらに冷まして同じ診断だけを1回行う。
+- 横並びの公開比較と強冷却はまだ開始しない。通常冷却で各走行の前に休止を置く。
+- 強冷却が必要になったら依頼を単独で明示し、ユーザーの確認が来るまで正式ベンチを開始しない。
+
+再開の1コマンド:
+
+```bash
+BIGLOCK_NO_WORKER=1 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py --model /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-4bit/snapshots/38740b847e4cb78f352aba30aa41c76e08e6eb46 --mtp /Users/ht/.cache/huggingface/hub/models--mlx-community--Qwen3.6-35B-A3B-MTP-5bit/snapshots/998d26dc27cc06baf60ff6e27d673b15f877f0b3 --knob MLXTURBO_PRIOR_PROBE=A,B --ctx 0 --tokens 512 --reps 1 --round-trace --out bench/results/prior-probe-qwen35-short-normalcool-0905.json
+```
