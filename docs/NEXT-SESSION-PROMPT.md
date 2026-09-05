@@ -1245,3 +1245,19 @@ rg -n "fixed-M4|graphbank|persistent decoder" docs/BACKLOG.md docs/research/SESS
 ```bash
 tools/biglock.sh .venv/bin/python bench/bench_http_engine.py --help
 ```
+
+## Gemma 4 31B assistant block 4を4k/17kで採用 (2026-09-05 14:54 JST)
+
+- 強冷却・3プロンプト×256 tokenでAR→assistantを比較し、decodeは4k
+  18.1→26.9 tok/s（+48.6%）、17k 16.0→18.7 tok/s（+17.0%）。17kも3/3改善した。
+- assistantの追記turnがsessionを使わず、4k温TTFT 23.67秒だった。生成前のprompt境界だけを
+  一時snapshotし、生成後にcacheを戻して公開する最小修正で4k 1.96秒、17k 2.19秒へ短縮した。
+- 4kの同一2ターン目はcacheあり0.83秒、slot追放後22.85秒で、62 tokenのID・本文が完全一致。
+- snapshotはsessionへ二重保持しない。対象4件＋server全体477 test、vendor fingerprint通過。
+- block 2/6/8の総当たりは行わない。短文一次測定と4k/17kで勝った既定block 4を維持する。
+
+再開の1コマンド:
+
+```bash
+git show --stat --oneline HEAD && rg -n "未決|保留|調査継続" docs/BACKLOG.md | tail -n 80
+```

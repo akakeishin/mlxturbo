@@ -9,7 +9,12 @@ except ImportError as exc:
 
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 
-from mlxturbo.gemma4_mtp import _rollback, _sample
+from mlxturbo.gemma4_mtp import (
+    _restore_prompt_boundary,
+    _rollback,
+    _sample,
+    _snapshot_prompt_boundary,
+)
 
 
 def _tokens(start, count):
@@ -50,3 +55,27 @@ def test_greedy_sample_skips_full_vocabulary_normalization():
         raise AssertionError("temperature-zero sampling must not call the sampler")
 
     assert _sample(mx.array([[1.0, 4.0, 2.0]]), stochastic_sampler, greedy=True) == 1
+
+
+def test_prompt_boundary_restores_full_and_wrapped_sliding_caches():
+    full = KVCache()
+    sliding = RotatingKVCache(max_size=4, keep=0)
+    full.update_and_fetch(*_tokens(0, 6))
+    sliding.update_and_fetch(*_tokens(0, 6))
+    boundary = _snapshot_prompt_boundary([full, sliding])
+
+    # Several later updates force the rotating cache to overwrite its ring;
+    # trim alone cannot recover the prompt boundary after this point.
+    for start in (6, 8, 10):
+        full.update_and_fetch(*_tokens(start, 2))
+        sliding.update_and_fetch(*_tokens(start, 2))
+
+    _restore_prompt_boundary([full, sliding], boundary)
+    full_keys, _ = full.state
+    sliding_keys = sliding._temporal_order(sliding.keys)
+    mx.eval(full_keys, sliding_keys)
+
+    assert full.offset == 6
+    assert full_keys.reshape(-1).tolist() == list(map(float, range(6)))
+    assert sliding.offset == 6
+    assert sliding_keys.reshape(-1).tolist() == list(map(float, range(6)))

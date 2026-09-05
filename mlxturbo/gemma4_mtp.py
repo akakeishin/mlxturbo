@@ -17,6 +17,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .runner import FallbackSession, PREFILL_STEP_SIZE
+from .spec import restore_untrimmable_caches, snapshot_untrimmable_caches
 
 
 GEMMA4_ASSISTANT_KIND = "gemma4_assistant_spec"
@@ -265,6 +266,55 @@ def _cache_offset(caches) -> int:
     return 0
 
 
+def _snapshot_prompt_boundary(caches):
+    """Capture one transient boundary so generated tokens need not be retained.
+
+    Gemma's sliding caches cannot be trimmed after their ring has wrapped. A
+    deep snapshot is therefore needed for those layers; ordinary full-attention
+    caches only need their logical offsets recorded. The snapshot is restored
+    before the request publishes its session, so it is never retained as a
+    second copy in the session pool.
+    """
+
+    snapshot = snapshot_untrimmable_caches(caches, deep=True)
+    snap_indices = {entry[0] for entry in snapshot}
+    offsets = {}
+    for index, cache in enumerate(caches):
+        if index in snap_indices:
+            continue
+        offset = getattr(cache, "offset", None)
+        if isinstance(offset, mx.array):
+            offset = int(offset.max().item())
+        if not isinstance(offset, int) or not callable(getattr(cache, "trim", None)):
+            raise RuntimeError(
+                f"Gemma target cache {type(cache).__name__} has no restorable boundary"
+            )
+        offsets[index] = offset
+    return offsets, snapshot
+
+
+def _restore_prompt_boundary(caches, boundary) -> None:
+    offsets, snapshot = boundary
+    trims = {}
+    for index, saved_offset in offsets.items():
+        cache = caches[index]
+        offset = getattr(cache, "offset", None)
+        if isinstance(offset, mx.array):
+            offset = int(offset.max().item())
+        if not isinstance(offset, int) or offset < saved_offset:
+            raise RuntimeError(
+                f"Gemma target cache {type(cache).__name__} moved before its prompt boundary"
+            )
+        trims[index] = offset - saved_offset
+
+    for index, count in trims.items():
+        if caches[index].trim(count) != count:
+            raise RuntimeError(
+                f"Gemma target cache {type(caches[index]).__name__} could not restore prompt boundary"
+            )
+    restore_untrimmable_caches(caches, snapshot)
+
+
 def _temporal_state(cache):
     state = getattr(cache, "state", None)
     if state is None or len(state) < 2:
@@ -508,10 +558,9 @@ class Gemma4AssistantRunner:
         ttft = time.perf_counter() - t0
         if bonus in eos_ids or max_tokens == 1:
             if session is not None:
-                if bonus in eos_ids:
-                    session.invalidate()
-                else:
-                    session.publish(cache, list(prompt_ids) + tokens[:-1])
+                # The cache contains exactly the prompt here; keep that useful
+                # boundary even when the first sampled token is EOS.
+                session.publish(cache, list(prompt_ids))
             return {
                 "tokens": tokens,
                 "ttft_s": ttft,
@@ -520,6 +569,10 @@ class Gemma4AssistantRunner:
                 "prefill_new": len(prompt_ids) - reused,
                 "tokens_per_step": 0.0,
             }
+
+        prompt_boundary = (
+            _snapshot_prompt_boundary(cache) if session is not None else None
+        )
 
         inner_hidden = norm_hidden[:, -1:, :]
         target_inner = _target_inner(self.model)[1]
@@ -588,7 +641,8 @@ class Gemma4AssistantRunner:
             history.extend(emitted)
             if eos_seen:
                 if session is not None:
-                    session.invalidate()
+                    _restore_prompt_boundary(cache, prompt_boundary)
+                    session.publish(cache, list(prompt_ids))
                 return {
                     "tokens": tokens,
                     "ttft_s": ttft,
@@ -602,7 +656,8 @@ class Gemma4AssistantRunner:
                 break
 
         if session is not None:
-            session.publish(cache, list(prompt_ids) + tokens[:-1])
+            _restore_prompt_boundary(cache, prompt_boundary)
+            session.publish(cache, list(prompt_ids))
         elapsed = time.perf_counter() - t0
         return {
             "tokens": tokens,

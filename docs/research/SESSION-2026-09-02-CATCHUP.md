@@ -4366,3 +4366,19 @@ quoteが6/6→4/6へ落ちた。partialsの再結合順を変える品質代償�
 製品実装を開始せず棄却する。既存のGate道具は正しさの再利用可能な検査器として残す。再開条件は、
 新しい同一条件whole-model診断が10.5%以上を示すこと。次は既に製品へ配線済みのGemma 4 31B
 assistantを、追加の専用基盤なしで既存HTTPベンチから4k検証する。
+
+### 2026-09-05 14:54 Gemma 4 31B assistantは4k +48.6%・17k +17.0%、温TTFTも修復
+
+強冷却、同じ3プロンプト×256 token、別processのAR→assistant順で、短文一次測定の勝者だった
+block 4だけを測った。4k decodeは18.1→26.9 tok/s、17kは16.0→18.7 tok/s。17kの個別値も
+16.36/16.01/15.78→18.74/18.75/18.55 tok/sで3/3改善した。cold TTFTは4k
+23.16→22.65秒、17k 105.27→106.65秒。17kの+1.3%は別process後段の熱を含む同着圏で、
+decodeの利得を打ち消さない。幅2/6/8の全幅掃引はせず、既定block 4を採用する。
+
+最初のassistant測定では4k追記turnのLCPが3,831 tokenあってもcheckpointが無く、全量を再prefillして
+温TTFTが23.67秒だった。Gemmaのsliding cacheは生成中にringを上書きするので、生成前のprompt境界を
+一時snapshotし、生成後に同じcacheへ復元してpromptだけをsessionへ公開するようにした。snapshotは
+session poolへ複製保持しない。修正後の温TTFTは4k 1.96秒、17k 2.19秒で、各3,831 / 16,831 tokenを
+再利用した。別の4k promptで同じ2ターン目をcacheありとslot追放後のcold再構築へ流すと、62 tokenの
+ID・本文が完全一致し、TTFTは22.85→0.83秒だった。`bench/test_gemma4_mtp.py`とserver全体は
+477 passed、vendor fingerprintも一致した。

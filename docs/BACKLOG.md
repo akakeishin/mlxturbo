@@ -709,7 +709,8 @@ mlx_lm の更新で写しが壊れる頻度が月 2 回を超えるなら、写�
   lookup / 小モデル draft / 自前の頭の学習を代用にはしない。対応表の「draft の種類」は MTP 頭 / KV 共有 drafter / なし、の 3 値。
   **2026-09-05の対象確定:** `/Users/ht/models/gemma4-31b-4bit` (dense q4/group64) と
   `/Users/ht/models/gemma4-31b-assistant` (4層BF16、shared KV) を正式なGemma投機レーンにする。
-  26B MoE assistantの棄却を31Bへ外挿しない。31Bはblock size 2/4/6/8を短文・4k・17kで測る。
+  26B MoE assistantの棄却を31Bへ外挿しない。31Bは短文一次測定で勝ったblock 4を先に
+  4k・17kへ通し、そこで退行した場合だけ別幅を調べる。全幅総当たりはしない。
 - **vision / 音声も追従の対象に含める** (BACKLOG 1 節「マルチモーダル対応」と同じ話)。Gemma 4 と Qwen の VL 系は mlx_lm 側が VLM ラッパ (`gemma4.py` + `gemma4_text.py` の形) なので、
   8〜9 割の追従はまず text 側の経路で取り、vision / 音声の encoder は別の adapter として足す。投機 decode 側で要るのは「画像 / 音声トークンを含む prefix の prefill と、
   その KV を持ったままの draft / verify」で、text だけの前提を置いている箇所 (prime 窓、n-gram の文脈、checkpoint の位置) を洗うのが先。
@@ -1306,4 +1307,28 @@ whole-model診断で10.5%以上が示された場合だけ再開する。Flash 1
 
 ```bash
 rg -n "10\.5%|40 ms/round|24\.4ms/round|persistent decoder" docs/BACKLOG.md docs/research/SESSION-2026-09-02-CATCHUP.md
+```
+
+## 採用: Gemma 4 31B assistantの4k/17kとprompt境界session (2026-09-05 14:54 JST)
+
+強冷却、同じ3プロンプト×256 token、別processのAR→assistant順でblock 4を測った。4k decodeは
+18.1→26.9 tok/s（+48.6%）、17kは16.0→18.7 tok/s（+17.0%）。17kの各runも
+16.36/16.01/15.78→18.74/18.75/18.55 tok/sで全勝した。cold TTFTは4k 23.16→22.65秒、
+17k 105.27→106.65秒で、後者の+1.3%は別process・後段の熱を含む同着圏。別幅の総当たりは行わず、
+既定block 4を維持する。
+
+測定でassistant経路だけ4k追記turnを全量再prefillし、温TTFTが23.67秒になっている穴を発見した。
+Gemmaのsliding cacheは生成中にringを上書きするため、生成前のprompt境界だけを一時snapshotし、
+生成後に同じcacheへ復元してprompt部分だけをsessionへ公開するようにした。snapshotはsession poolへ
+複製保持しない。修正後は4k温TTFT 1.96秒、17k 2.19秒で、それぞれ3,831 / 16,831 tokenを
+再利用した。4kの別promptで同じ2ターン目をcacheあり／slot追放後のcold再構築に流し、62 tokenの
+ID・本文が完全一致、TTFTは22.85→0.83秒だった。Gemma対象4件とserver全体を合わせて477 test、
+vendor fingerprintも通過した。
+
+次はこの採用済み経路へ新機構を足さず、Flash以外を含む未決の支配項目を速度上限から再順位付けする。
+
+再開の1コマンド:
+
+```bash
+git show --stat --oneline HEAD && rg -n "未決|保留|調査継続" docs/BACKLOG.md | tail -n 80
 ```
