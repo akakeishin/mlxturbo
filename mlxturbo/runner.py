@@ -2341,6 +2341,23 @@ def _build_base_runner(
             print(f"{log_prefix} {reason}; 通常生成にフォールバックします")
             return FallbackRunner(model, tokenizer, fallback_reason=reason)
 
+        # target の MoE compile は MTP を読む前に温めているため、後から
+        # 作った draft block だけは最初の要求まで未JITのまま残る。クラスの
+        # compile hook 自体は target 側で既に有効なので、同じ S=1..4 を
+        # MTP 1層にも通し、初回 draft の約20〜50msを起動時間へ移す。
+        if (
+            not getattr(args, "no_fused", False)
+            and os.environ.get("MLXTURBO_MOE_COMPILE_WARMUP", "1") != "0"
+        ):
+            _mtp_n_g, _mtp_warm_s, _mtp_warm_fire = (
+                fused_mod.warmup_moe_block_compile(mtp)
+            )
+            if _mtp_n_g:
+                print(
+                    f"{log_prefix} MTP MoE compile の温め: {_mtp_n_g} グラフ / "
+                    f"{_mtp_warm_s:.2f}s (発火 {_mtp_warm_fire})"
+                )
+
         # --mtp-depth の既定は None (未指定)。その場合はモジュールの既定を使う。
         depth = getattr(args, "mtp_depth", None) or spec_flash.MTP_DEPTH
         engine = spec_flash.FlashSpecEngine(model, mtp, depth=depth)

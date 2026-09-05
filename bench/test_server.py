@@ -7311,6 +7311,45 @@ def test_build_runner_routes_qwen4_exp_with_mtp_to_flash_spec(monkeypatch):
     assert captured["weights"] is None
 
 
+def test_build_runner_warms_flash_mtp_moe_after_loading(monkeypatch):
+    """target warm-up後に作るMTP自身も、初回要求より前にJITする。"""
+    import mlxturbo.fused as fused_module
+    import mlxturbo.mtp_flash as mtp_flash_module
+    import mlxturbo.runner as runner_module
+
+    class DummyMTP:
+        def parameters(self):
+            return {}
+
+    mtp = DummyMTP()
+    warmed = []
+    monkeypatch.setattr(
+        mtp_flash_module, "load_flash_mtp", lambda *args, **kwargs: mtp
+    )
+    monkeypatch.setattr(runner_module, "enable_default_fusions", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        fused_module,
+        "warmup_moe_block_compile",
+        lambda model: warmed.append(model) or (4, 0.02, {}),
+    )
+
+    args = SimpleNamespace(
+        model="fake-model",
+        original="fake-original",
+        mtp="fake-sidecar.safetensors",
+        mtp_bits=4,
+        no_mtp=False,
+        no_fused=False,
+    )
+    runner = runner_module.build_runner(
+        _fake_qwen4_exp_model(), tokenizer=object(), config={}, args=args
+    )
+
+    assert isinstance(runner, FlashSpecRunner)
+    assert len(warmed) == 2
+    assert warmed[-1] is mtp
+
+
 def _build_tiny_qwen4_exp_wide():
     """``_build_tiny_qwen4_exp`` の寸法だと hidden_size=16 なので lm_head の
     in_dims=16 になり、mlx の QuantizedLinear が受け付ける group_size

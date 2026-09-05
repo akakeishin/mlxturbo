@@ -4603,3 +4603,14 @@ preemption、QSA活性を含む全ケースがCPUで一致した。容量再利�
 `mx.eval(lg)` と、その直後の greedy argmax の `mx.eval` を別々に同期していることも確認した。
 serverが使う `generate_stream()` と同じく、target logits、argmax、draft viewを1回のevalへまとめた。
 draft無しの非投機経路は従来のまま。関連485 testsが通過した。
+
+### 2026-09-05 20:40 Flash MTP側のMoE compile温め漏れを修正
+
+`enable_default_fusions(model)` と target 48層のcompile warm-upはMTPサイドカーを読む前に
+終わる。その後に作られるMTPのMoE 1層にはクラス共通のcompile hook自体は効くが、S=1〜4の
+グラフは最初のdraftで初めてJITされていた。既存記録ではこの初回費用は約20〜50ms。
+
+MTPロードと重み評価が成功した直後に、同じ `warmup_moe_block_compile(mtp)` を通すようにした。
+定常時の演算と出力は変わらず、初回要求から起動時へ費用を移すだけ。`--no-fused` または
+`MLXTURBO_MOE_COMPILE_WARMUP=0` では従来どおり温めない。target→MTPの順で両方が呼ばれる
+配線testを追加し、server 474 testsが通過した。
