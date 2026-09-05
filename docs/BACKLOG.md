@@ -1389,20 +1389,21 @@ BIGLOCK_NO_WORKER=1 tools/biglock.sh .venv/bin/python tools/decode_ab_generic.py
 - 採用線を破ったので4k / 17k / KLDには進まない。現行priorを維持する。
 - Qwen 27B/35B共通のprior較正は完了。今後は共通化を優先しつつ、競合コードで大きな実測効果があるモデル固有最適化も、能力判定で隔離して実装対象にする。
 
-## 採用／継続: Flash GDN全段融合を非MTPとMTPに分ける (2026-09-05 17:31 JST)
+## 採用／棄却: Flash GDN全段融合を非MTPとMTPに分ける (2026-09-05 17:52 JST)
 
 - **非MTP S=1は採用**: 通常冷却・短文3本×256 tokenのABBAで38.463→39.555 tok/s
   （+2.84%）、全条件プラス。step=1 KLDは0.01832→0.01843（Δ+0.00011）、
   top-1一致率は0.961→0.963。`MLXTURBO_GDN_DECODE_ALL=0`で無効化できる。
 - exact qwen4_exp geometryだけをadmitし、mask、ragged batch、学習、sharding、未初期化cacheは
   素へ戻る。関連44 test通過。
-- **MTP S>1は継続**: 候補位置ごとの再帰状態とrollbackが必要なので、最終状態だけを返すS=1版を
-  そのまま流用しない。演算式とMetal本体は共有し、S>1だけ中間状態を返す別入口にする。
-- 採用線は、現行MTPの生成品質を維持し、全中間state書き出しの帯域を含めてもroundを短縮すること。
-  まず1層のS=2..4で状態・logits・rollbackを照合し、その後同一process A/Bへ進む。
+- **MTP S>1は棄却**: rollback用の各位置stateだけを返す試作はmicroでS=3 +16.3%だったが、
+  短文3本×256 tokenのABBAでms/round +0.4%（3/3退行）、tok/round -2.3%、
+  ms/token +2.9%。長文・KLDへ進まず、試作とknobを削除した。
+- 非MTPとMTPは別判定を維持する。MTP版を再開するのは、必須の全位置state書き出しを減らせる
+  rollback方式と一体で、whole-modelのround短縮を先に示せる場合だけ。
 
 再開の1コマンド:
 
 ```bash
-MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gdn_decode_all.py && rg -n "def capture|states_all|rollback" mlxturbo/spec_flash.py
+MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gdn_decode_all.py && rg -n "GDN全段融合|round \+0.4%" docs/research/SESSION-2026-09-02-CATCHUP.md
 ```

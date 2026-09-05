@@ -1351,17 +1351,19 @@ rg -n "65 tok/s|80 tok/s|100 tok/s|同一pack" docs/NEXT-SESSION-PROMPT.md docs/
 rg -n "fused GDN|deferred PLE|compressed-key|coarse.*rerank" docs/BACKLOG.md docs/research/SESSION-2026-09-02-CATCHUP.md
 ```
 
-## Flash GDN全段融合: 非MTP採用、MTP版を継続 (2026-09-05 17:31 JST)
+## Flash GDN全段融合: 非MTP採用、MTP版は棄却 (2026-09-05 17:52 JST)
 
 - 非MTP S=1は短文AR 38.463→39.555 tok/s（+2.84%）、3条件全勝。
 - step=1 KLDは0.01832→0.01843（Δ+0.00011、許容内）、top-1一致率0.961→0.963。
 - `MLXTURBO_GDN_DECODE_ALL`は既定on、`=0`でoff。MTP capture、S>1、mask、ragged、
   学習、sharding、未初期化cacheでは発火しない。関連44 test通過。
-- 次は同じ数式・Metal本体からS>1の中間状態を返し、既存rollbackへ接続する。
-  まずS=2..4の1層照合、その後Flash MTPの同一process A/B。全状態書き出しで遅ければ棄却する。
+- MTP S=2..4版はmicroで主要S=3 +16.3%だったが、実モデルはms/round +0.4%、
+  tok/round -2.3%、ms/token +2.9%で棄却し、試作とknobを削除した。
+- MTP再開条件は、rollback用の全位置state書き出しを減らす方式と一体でwhole roundの短縮を
+  先に示せること。S>1全段融合だけの再実装はしない。
 
 再開の1コマンド:
 
 ```bash
-MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gdn_decode_all.py && rg -n "def capture|states_all|rollback" mlxturbo/spec_flash.py
+MLX_DEVICE=cpu .venv/bin/python -m pytest -q bench/test_gdn_decode_all.py && rg -n "GDN全段融合|round \+0.4%" docs/research/SESSION-2026-09-02-CATCHUP.md
 ```
