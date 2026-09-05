@@ -17,11 +17,10 @@ block_starts (ブロック開始位置) だけで決まり、ブロックが確�
 raw キー (`_IndexerCache.update`) の末尾のみで、cache が `None` (キャッシュ
 無しの単発呼び出し) のときは従来どおり毎回全部作り直す。
 
-``_IndexerCache.keys`` の setter (trim / rollback / batch の filter・
-extend・extract・merge・state 復元がどれもここを通る) は、縮み・
-並べ替えのどちらもあり得るので pooled キャッシュを無条件で捨てる
-(古いブロックを静かに使い回すのが最悪という判断)。通常の追記
-(``update``) だけが増分で伸ばす。
+``_IndexerCache.keys`` の setter (任意trim、batchのfilter・extend・extract・
+merge、state復元) は縮み・並べ替えのどちらもあり得るため、pooled cacheを
+無条件に捨てる。通常の追記は ``update``、投機verify後の純粋なsuffix rollbackは
+事前snapshotを受ける ``restore_prefix`` で、安全な接頭辞だけを増分再利用する。
 
 ここは `gather_attn.py` と同じ形の有効化・無効化関数を置くだけ:
 

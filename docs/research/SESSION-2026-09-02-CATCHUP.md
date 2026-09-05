@@ -4673,3 +4673,17 @@ verify logits、rollback後のshared-KVは従来どおり。
 
 これは未評価graphの構築を除く変更で、数値演算を置き換えない。捨てる経路でnormと
 shared-KV helperが呼ばれない契約testを追加し、正式集合は762 passed / 3 skippedだった。
+
+### 2026-09-05 21:01 Flashの部分reject後もQSA pooled prefixを保持
+
+Flash投機verifyの部分rejectでは、full-attention KVとindexer raw keyの末尾だけを捨てる。
+従来はraw keyをproperty setterへ差し戻したため、reject前から確定済みだったQSA pooled keyと
+fp32 cacheまで全破棄し、次roundで17k全長を12層ぶん再構築していた。verify前のpooled prefixを
+snapshotし、suffix rollback時だけ同じ接頭辞へ復元するようにした。任意位置のtrim、batchの
+並べ替え、state復元は従来どおりsetterを通り、全無効化する。
+
+通常冷却、17k相当の凍結3 prompt×128 token、同一model・prefill-onceのABBAでは、
+ms/tokenが旧17.747→新17.645（0.6%短縮）、ms/roundが37.437→37.226（0.6%短縮）、
+tok/roundは2.125で不変。3条件すべて生成列が一致した。QSAが発火しない短文には影響しない。
+prefix objectと論理長を復元する契約test、旧来の任意trim後に再構築するbit一致検査も通過した。
+5%未満でも追加計算と品質差がない変更は採る方針に従い採用する。

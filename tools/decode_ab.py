@@ -1283,6 +1283,25 @@ def _knob_pooled_cache(ctx):
     return apply
 
 
+def _knob_pooled_rollback(ctx):
+    """A = rollback前のpooled prefixを復元 / B = 旧来の全無効化。
+
+    target verify後のsuffix trimだけを切り替える。どちらも次roundに同じ
+    pooled値を作るため出力はビット一致し、prefillには影響しない。
+    """
+    import mlx_lm.models.qwen4_exp as Q
+
+    restore = Q._IndexerCache.restore_prefix
+
+    def invalidate(self, length, _pooled_snapshot):
+        self.keys = self.keys[:, :length]
+
+    def apply(variant):
+        Q._IndexerCache.restore_prefix = restore if variant == "A" else invalidate
+
+    return apply
+
+
 def _knob_indexer_lean(ctx):
     """A = block_starts/block_end + pooled fp32 キャストをキャッシュ (既定 off、
     2026-09-03) / B = 毎回作り直し (現行既定)。
@@ -2854,6 +2873,7 @@ KNOBS = {
     "temp": (_knob_temp, ["0.0", "0.7"], False, "0.0"),
     "indexer-cache": (_knob_indexer_cache, ["A", "B"], True, "B"),
     "pooled-cache": (_knob_pooled_cache, ["A", "B"], True, "B"),
+    "pooled-rollback": (_knob_pooled_rollback, ["A", "B"], True, "B"),
     "indexer-lean": (_knob_indexer_lean, ["A", "B"], True, "B"),
     "stage-every": (_knob_stage_every, ["1", "2", "4"], True, "2"),
     "prefill-group": (_knob_prefill_group, ["2", "4", "8"], True, "4"),
@@ -3383,6 +3403,8 @@ def run_with_model(argv, bundle) -> int:
         # (`pooled-cache`/`indexer-cache` と違い、こちらは decode/verify 幅
         # 限定の枝を新設した knob なので prefill には触れようがない)。
         "indexer-lean",
+        # pooled-rollbackはverify後のsuffix trimだけを切り替える。
+        "pooled-rollback",
         # draft-rerank (`eng._rerank`) は `FlashSpecEngine._draft_argmax`
         # からしか読まれず、それを呼ぶのは `_draft_chain` (decode ループの
         # 中だけ) だけ。prefill の priming (`_prime_draft_cache`) は

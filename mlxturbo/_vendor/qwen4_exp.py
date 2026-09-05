@@ -2357,10 +2357,10 @@ class _IndexerCache(_BaseCache):
     段 X1 (``docs/research/KERNEL-PROGRAM.md``): rope 済み pooled キーも
     ここで持ち回る (``_pooled``、確定済みブロック数は ``_pooled_n``)。
     ``update`` (通常の追記) だけが増分で伸ばす。``keys`` の setter は
-    trim / rollback / batch の filter・extend・extract・merge・state 復元の
-    どれもが通る「外から論理配列を差し込む」経路で、縮み・並べ替えの
-    どちらもあり得るので、そこでは無条件に pooled を捨てて作り直す
-    (古いブロックを静かに使い回すよりは、作り直しの分だけ遅い方がまし)。
+    batch の filter・extend・extract・merge、任意位置へのtrim、state復元が通る
+    「外から論理配列を差し込む」経路で、縮み・並べ替えのどちらもあり得るため
+    pooledを無条件に捨てる。投機verify直後だけは、事前snapshotへ戻る純粋な
+    suffix rollbackなので ``restore_prefix`` が安全なpooled prefixを復元する。
     """
 
     step = 256
@@ -2407,6 +2407,33 @@ class _IndexerCache(_BaseCache):
         # 触らない (`block_grid` の docstring 参照)。
         self._pooled_f32 = None
         self._pooled_f32_n = 0
+
+    def pooled_snapshot(self):
+        """Return the immutable pooled prefix retained before speculation."""
+        return (
+            self._pooled,
+            self._pooled_n,
+            self._pooled_f32,
+            self._pooled_f32_n,
+        )
+
+    def restore_prefix(self, length: int, pooled_snapshot) -> None:
+        """Roll raw keys back to a prefix without discarding its pooled blocks.
+
+        Speculative verification only appends a suffix.  The snapshot was
+        taken before that append, so every pooled block in it is still valid.
+        Keeping the backing buffer also lets the next update overwrite the
+        rejected suffix without reallocating it.
+        """
+        if length < 0 or length > self.offset:
+            raise ValueError("indexer prefix is outside the current logical length")
+        self.offset = length
+        (
+            self._pooled,
+            self._pooled_n,
+            self._pooled_f32,
+            self._pooled_f32_n,
+        ) = pooled_snapshot
 
     def block_grid(self, n_blocks: int, compress_ratio: int):
         """``(block_starts, block_end)`` を返す (MLXTURBO_INDEXER_LEAN、

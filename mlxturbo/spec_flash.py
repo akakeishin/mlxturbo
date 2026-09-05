@@ -1167,7 +1167,14 @@ def snapshot_pre(model, caches) -> dict:
         if layer.layer_type == "full_attention":
             # _AttnCache derives from KVCache and is not an ArraysCache (it has no .cache)
             keys = c.indexer.keys
-            pre["kv"].append((c.offset, None if keys is None else keys.shape[1]))
+            pooled = (
+                c.indexer.pooled_snapshot()
+                if callable(getattr(c.indexer, "pooled_snapshot", None))
+                else None
+            )
+            pre["kv"].append(
+                (c.offset, None if keys is None else keys.shape[1], pooled)
+            )
             pre["ctx"].append(None)
         else:
             pre["kv"].append(None)
@@ -1199,7 +1206,12 @@ def rollback(model, caches, cap: Capture, pre: dict, keep: int, total: int,
         c.trim(drop)
         if _archmod.has_indexer(c):
             old_len = pre["kv"][i][1] or 0
-            c.indexer.keys = c.indexer.keys[:, : old_len + keep]
+            restore_prefix = getattr(c.indexer, "restore_prefix", None)
+            pooled = pre["kv"][i][2] if len(pre["kv"][i]) > 2 else None
+            if callable(restore_prefix) and pooled is not None:
+                restore_prefix(old_len + keep, pooled)
+            else:
+                c.indexer.keys = c.indexer.keys[:, : old_len + keep]
 
     # GDN 状態・conv 窓・PLE conv・n-gram 文脈の巻き戻しは
     # mlxturbo/arch.py の名前付きスロット経由の共通部品に畳んである
