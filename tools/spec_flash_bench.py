@@ -85,8 +85,6 @@ def main():
 
         # 1 反復の内訳を測る。深さを上げる価値はここで決まる:
         # draft が高いなら、深さを増やしても本体 forward の安さを活かせない
-        import mlx.core as mx as _mx  # noqa
-
         print(f"\n--- {text[:38]} ---")
         print(f"  出力一致 {same}/{len(g)}"
               + (f" (最初の相違 {first_diff} 文字目)" if first_diff is not None else " (完全一致)"))
