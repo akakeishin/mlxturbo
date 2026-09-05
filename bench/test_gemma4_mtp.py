@@ -22,6 +22,7 @@ from mlxturbo.gemma4_mtp import (
     _sample,
     _shared_kv_from_cache,
     _snapshot_prompt_boundary,
+    _target_forward,
 )
 
 
@@ -164,6 +165,46 @@ def test_single_latest_draft_skips_all_zero_attention_masks():
         dtype=mx.bfloat16,
     )
     assert older_query["sliding_attention"] is not None
+
+
+def test_target_forward_can_skip_discarded_shared_kv(monkeypatch):
+    class Embed:
+        def __call__(self, tokens):
+            return tokens.astype(mx.float32)[..., None]
+
+        def as_linear(self, hidden):
+            return hidden
+
+    class Layer:
+        layer_type = "full_attention"
+
+        def __call__(self, hidden, **_kwargs):
+            return hidden, None, None
+
+    inner = SimpleNamespace(
+        embed_tokens=Embed(),
+        embed_scale=1.0,
+        layers=[Layer()],
+        previous_kvs=[0],
+        norm=lambda _hidden: (_ for _ in ()).throw(AssertionError("norm evaluated")),
+        _make_masks=lambda _hidden, _caches: [None],
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(model=inner, final_logit_softcapping=None)
+    )
+    monkeypatch.setattr(
+        "mlxturbo.gemma4_mtp._shared_kv_from_cache",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("shared KV extracted")),
+    )
+
+    result = _target_forward(
+        target,
+        mx.array([[1]], dtype=mx.uint32),
+        [SimpleNamespace()],
+        return_logits=False,
+        return_shared_kv=False,
+    )
+    assert result[1:] == (None, None, None)
 
 
 def test_prompt_boundary_restores_full_and_wrapped_sliding_caches():

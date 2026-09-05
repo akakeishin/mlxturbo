@@ -396,7 +396,9 @@ def _target_logits(language_model, inner, hidden):
     return logits
 
 
-def _target_forward(target_model, tokens, caches):
+def _target_forward(
+    target_model, tokens, caches, *, return_logits=True, return_shared_kv=True
+):
     language_model, inner = _target_inner(target_model)
     h = inner.embed_tokens(tokens) * inner.embed_scale
     masks = inner._make_masks(h, caches)
@@ -414,8 +416,10 @@ def _target_forward(target_model, tokens, caches):
         )
         intermediates[idx] = (shared, offset)
     hidden = h
-    norm_hidden = inner.norm(hidden)
-    return hidden, norm_hidden, _target_logits(language_model, inner, norm_hidden), _shared_kv_from_cache(inner, caches)
+    norm_hidden = inner.norm(hidden) if return_logits else None
+    logits = _target_logits(language_model, inner, norm_hidden) if return_logits else None
+    shared_kv = _shared_kv_from_cache(inner, caches) if return_shared_kv else None
+    return hidden, norm_hidden, logits, shared_kv
 
 
 def _prefill(target_model, tokens, caches):
@@ -426,7 +430,13 @@ def _prefill(target_model, tokens, caches):
     pos = 0
     while len(ids) - pos > 1:
         end = min(pos + PREFILL_STEP_SIZE, len(ids) - 1)
-        _target_forward(target_model, mx.array([ids[pos:end]], dtype=mx.uint32), caches)
+        _target_forward(
+            target_model,
+            mx.array([ids[pos:end]], dtype=mx.uint32),
+            caches,
+            return_logits=False,
+            return_shared_kv=False,
+        )
         mx.eval([c.state for c in caches])
         mx.clear_cache()
         pos = end
@@ -652,6 +662,7 @@ class Gemma4AssistantRunner:
                     self.model,
                     mx.array([verify_input], dtype=mx.uint32),
                     cache,
+                    return_shared_kv=False,
                 )
             target_tokens = []
             accepted = 0

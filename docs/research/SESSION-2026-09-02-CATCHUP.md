@@ -4662,3 +4662,14 @@ full attentionと同じになる旨を明記している。
 post-projection出力と正規化hiddenの最大差は0。query長1、末尾位置、論理長内、window内を
 満たす場合だけmaskを `None` にし、将来のmulti-token queryや過剰確保cacheには従来の明示maskを
 残した。契約testを追加し、Gemma assistant 8 testsが通過した。
+
+### 2026-09-05 20:54 Gemma target forwardの捨てる3出力を省略
+
+Gemma assistantのtarget forwardは常に、最終norm、全語彙logits、shared-KV抽出までgraphを
+組み立てていた。しかし複数chunkのprefillでは3つとも捨て、verifyではshared-KVを捨てた後、
+rollback済みcacheから必要な値をもう一度取得していた。中間prefillでは3出力、verifyでは
+shared-KVだけを明示的に作らないようにした。layer計算とcache更新、最終prefill logits、
+verify logits、rollback後のshared-KVは従来どおり。
+
+これは未評価graphの構築を除く変更で、数値演算を置き換えない。捨てる経路でnormと
+shared-KV helperが呼ばれない契約testを追加し、正式集合は762 passed / 3 skippedだった。
