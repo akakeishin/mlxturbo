@@ -3,6 +3,26 @@ import pytest
 from tools import decode_ab_generic
 
 
+def test_result_row_preserves_acceptance_trace():
+    row = decode_ab_generic._result_row(
+        {
+            "tokens": [1, 2, 3, 4],
+            "steps": 2,
+            "accept_hist": {0: 1, 2: 1},
+            "accept_trace": [0, 2],
+            "src_hist": {"mtp": {0: 1, 2: 1}, "lookup": {}},
+            "ttft_s": 0.25,
+        },
+        wall=1.25,
+        resumed=False,
+    )
+
+    assert row["accepted"] == 2
+    assert row["accept_hist"] == {0: 1, 2: 1}
+    assert row["accept_trace"] == [0, 2]
+    assert row["src_hist"] == {"mtp": {0: 1, 2: 1}, "lookup": {}}
+
+
 def test_parse_args_accepts_three_long_cases():
     args, name, variants, baseline = decode_ab_generic.parse_args([
         "--model", "dummy", "--knob", "FLAG=1,0", "--ctx", "17000",

@@ -120,7 +120,7 @@
   `MLXTURBO_SMALL_M_ROUTE` (既定 auto = 非 NAX 機で `small_m`、`=off` で素、`=nocap` / `=mma` で固定) は 2026-09-04 13:05 に入れた本番の既定値:
   qwen3_5 (27B) の verify 幅 M=2..5 の量子化 dense 射影 (N, K ≥ 1024) を `kernels/qmv_small_m.py` に (各行が MLX の qmv とビット一致、fp32 参照への距離は素と同じ)。
   27B in-model (512 × 短 3 本 × 2 回文 + 4k、`ab-smallm-3way-*-0904.json`): small_m 短 -1.9% / 4k -4.6%、nocap 短 -1.9% / 4k +0.8%、mma 短 +3.1% / 4k +5.2% (fp32 から素の 1.3〜1.7 倍遠い)。
-  Flash-Next は `dispatch_scope` を通らないので未接続 (当てるなら fused.py に enable が 1 つ要る)。bits=8 / group_size≠64 は素に委譲。
+  Flash-Nextにも接続して6条件を測ったがms/round +0.26〜+0.70%で棄却し、製品配線は残していない。bits=8 / group_size≠64 は素に委譲。
   `MLXTURBO_DRAFT_RERANK` (既定 on、`=0` で exact head) は Flash-Next に加え、qwen3_5 の
   q4 affine / group64 headでもMTP proposalだけをq2全語彙top-32 + q4候補行再採点へ替える。
   target verifyと通常headはexactのまま。27Bはq2 recall@32 100% (1,677 proposal)、短 -2.0% /

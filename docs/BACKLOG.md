@@ -1362,3 +1362,19 @@ rg -n "MTP|draft|採択|acceptance" docs/BACKLOG.md docs/research/SESSION-2026-0
 ```bash
 .venv/bin/python -m pytest bench/test_qsa_decode_blocks.py bench/test_fusions_other_family.py -q
 ```
+
+## 未決: Qwen 27B/35Bのdepth priorを実測較正 (2026-09-05 16:04 JST)
+
+- Fable 5.1 xhighの再監査で、学習なし・共通runtimeの第一候補になった。
+- 現行`_POS_ACCEPT_PRIOR={1:0.70,2:0.11,3:0.02}`は資料値で、このpackの実測ではない。
+- `decode_ab_generic`のJSONへ`accept_hist/accept_trace/src_hist`を保存する診断だけ追加した。
+- 次回の冷却後、凍結3プロンプト×512で`accept_trace`と`round_trace`から位置別採択率を出す。
+- priorとの差が各位置±0.05以内なら変更せず閉じる。差が大きい場合だけ定数候補をA/Bし、
+  ms/token -2%以上、全条件の退行+1%以内を採用線にする。
+- 自作MTP・モデル固有drafter学習は当面優先しない。100 tok/sは必達線でなく将来architectureのstretch。
+
+再開の1コマンド:
+
+```bash
+.venv/bin/python -m pytest bench/test_decode_ab_generic_reset.py -q
+```

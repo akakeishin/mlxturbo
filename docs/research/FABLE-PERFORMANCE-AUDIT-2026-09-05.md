@@ -51,3 +51,32 @@ Fable 2 本は、事前に渡した B=1 88.3 tok/s、B=2 aggregate 88.5 tok/s �
 - 新しい attention kernel は micro だけで採らず、27B 17k と Qwen3.6 50k の in-model で非退行を確認する。
 - Gemma 31B assistant は greedy token 一致、rollback、block 掃引を通すまで既定化しない。
 - graphbank は state/logits/cache の一致ゲートを一段ずつ通し、巨大な一括移植にしない。
+
+## 16:04 再監査: 現存artifactの上限と棄却案の再審
+
+最新`c3efa83`を対象にFable 5.1 xhighを読み取り専用で3本走らせた。担当はFlash単体、
+全モデル共通、棄却案の再審。ユーザー判断により自作MTPやモデル固有drafterの学習は当面優先しない。
+
+- Flash単体: 強冷却の現行は35.26 ms/round、2.186 tok/round、61.4 tok/s。既存artifactだけで
+  100 tok/sへ届く大口は無い。理想proposal時の検証幅別round費用を測り、物理上限を先に確定する。
+- 全モデル共通: Qwen 27B/35Bの`_POS_ACCEPT_PRIOR`はFastMTP資料由来で、このpackの実測ではない。
+  現行NOSYNC経路の位置別採択率を保存し、priorとの差が±0.05以内なら閉じる。差が大きい場合だけ
+  prior較正を製品A/Bする。期待上限は3〜8%だが未実測。
+- 棄却再審: 追加で復活させる案は0件。木はGDN/PLEの逐次stateが兄弟行を表現できず、MoE compile
+  汎用化は0.5%級に対してgraph保持の代金があり、prefill chunk 4096の取り分はlayer-majorで回収済み。
+
+Fableが提案した旧`oracle-draft`の直接再利用は採らない。この道具は検証幅でtarget生成列が変わり、
+保存済みoracle位置がずれて受理されないことを既に2回確認している。代わりに通常のdepth掃引から
+`(depth+1) / ms_per_round(depth)`を計算し、完全受理時の上限だけを求める。
+
+速度目標は100 tok/s一律から、現行artifactの実測上限と同条件競合比へ変更する。
+
+| 対象 | 現在 | 第一目標 | 根拠 |
+|---|---:|---:|---|
+| Flash短文・強冷却 | 61.4 tok/s | 65 tok/s持続 | 残存runtime機構の実測上限がおおむね+5% |
+| Flash 17k・強冷却 | 53.1 tok/s | 55 tok/s | QSA採用後から約+3.6% |
+| Qwen 27B 4k | 32.1 tok/s | 同条件43.2 tok/sへ接近 | 同じMTPを使う比較先との差が投機制御側 |
+| Qwen 3.6 / Gemma 26B | 既に100前後以上の条件あり | 長文・aggregateの現行比+5%以上 | 絶対100より文脈別退行を減らす |
+
+100 tok/sは、将来の公式assistantや新architectureで受理率・round費用の上限が変わった場合の
+stretchとして残す。公開値は同一pack、prompt、出力長、sampling、冷却で競合を横並びにして決める。

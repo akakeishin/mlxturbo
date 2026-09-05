@@ -274,7 +274,8 @@ def _result_row(res: dict, wall: float, resumed: bool) -> dict:
     """
     out = list(res["tokens"])
     rounds = int(res["steps"])
-    accepted = sum(k * v for k, v in res["accept_hist"].items())
+    accept_hist = dict(res["accept_hist"])
+    accepted = sum(k * v for k, v in accept_hist.items())
     t_dec = max(wall - res["ttft_s"], 1e-9)
     return dict(
         n_out=len(out),
@@ -286,6 +287,12 @@ def _result_row(res: dict, wall: float, resumed: bool) -> dict:
         rounds=rounds,
         tok_per_round=len(out) / max(rounds, 1),
         head=out[:24],
+        accept_hist=accept_hist,
+        accept_trace=list(res.get("accept_trace") or []),
+        src_hist={
+            source: dict(hist)
+            for source, hist in (res.get("src_hist") or {}).items()
+        },
         # 生成列そのもの。挙動が変わる knob (draft の作り方など) では
         # 「head 一致」だけでは足りず、**何トークン目で分岐したか**が判定材料
         # になる。512 トークン x 数十行なので JSON も大きくならない。

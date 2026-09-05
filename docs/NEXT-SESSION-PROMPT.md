@@ -1292,3 +1292,18 @@ git status --short && rg -n "MTP|draft|採択|acceptance" docs/BACKLOG.md | tail
 ```bash
 .venv/bin/python -m pytest bench/test_qsa_decode_blocks.py bench/test_fusions_other_family.py -q
 ```
+
+## Fable再監査後の次手と速度目標 (2026-09-05 16:04 JST)
+
+- 過去棄却から復活させる案は0件。自作MTP・モデル固有drafter学習は当面優先しない。
+- 学習なしの第一候補はQwen 27B/35B共通のdepth prior較正。資料由来priorと実測位置別採択率を比べる。
+- `decode_ab_generic`は`accept_hist/accept_trace/src_hist`をJSONへ保存するようにした。
+- 次回は通常冷却で十分冷ましてから横並び測定する。強冷却の連続GPU実験はここで止めた。
+- Flash第一目標は短文61.4→65 tok/s持続、17k 53.1→55。100は将来architectureのstretch。
+- Qwen 27Bは4k 32.1から同条件比較先43.2への接近を優先する。
+
+再開の1コマンド:
+
+```bash
+.venv/bin/python -m pytest bench/test_decode_ab_generic_reset.py -q
+```
