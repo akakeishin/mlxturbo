@@ -16,6 +16,7 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlxturbo.gemma4_mtp import (
     Gemma4AssistantModel,
     Gemma4AssistantRunner,
+    _assistant_masks,
     _restore_prompt_boundary,
     _rollback,
     _sample,
@@ -136,6 +137,33 @@ def test_shared_kv_reads_only_last_bank_of_each_attention_type(monkeypatch):
         "full_attention": (4, 104),
     }
     assert seen == [5, 4]
+
+
+def test_single_latest_draft_skips_all_zero_attention_masks():
+    shared = {
+        "sliding_attention": (mx.zeros((1, 2, 8, 2)), None),
+        "full_attention": (mx.zeros((1, 1, 17, 2)), None),
+    }
+
+    masks = _assistant_masks(
+        shared,
+        query_len=1,
+        query_offset=16,
+        window=8,
+        valid_len=17,
+        dtype=mx.bfloat16,
+    )
+    assert masks == {"sliding_attention": None, "full_attention": None}
+
+    older_query = _assistant_masks(
+        shared,
+        query_len=1,
+        query_offset=15,
+        window=8,
+        valid_len=17,
+        dtype=mx.bfloat16,
+    )
+    assert older_query["sliding_attention"] is not None
 
 
 def test_prompt_boundary_restores_full_and_wrapped_sliding_caches():

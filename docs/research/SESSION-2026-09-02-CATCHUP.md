@@ -4649,3 +4649,16 @@ ABBA microでは、shared-KV取得の中央値が489.714→16.408µs（29.85倍�
 473.306µs削減）だった。これはモデル全体tok/sではなくPython/MLX graph構築部分の値。
 選択K/Vの完全一致と、末尾2cache以外へ触れない契約testを追加した。正式集合は
 760 passed / 3 skippedだった。
+
+### 2026-09-05 20:52 Gemma assistantの常時ゼロmaskを省略
+
+Gemma assistantのproduction draftは常にquery長1、target cacheの末尾位置を使う。
+shared full-attention bankは論理長まで、sliding bankは直近window内までに切られているため、
+この条件では両attention maskの全要素が0になる。公式Transformers実装もquery長1では
+full attentionと同じになる旨を明記している。
+
+実assistant重みと合成shared K/Vを使った同一process ABBAでは、4層forwardが4kで
+1.983→1.914ms（3.59%短縮）、17kで2.562→2.441ms（4.94%短縮）だった。両方とも
+post-projection出力と正規化hiddenの最大差は0。query長1、末尾位置、論理長内、window内を
+満たす場合だけmaskを `None` にし、将来のmulti-token queryや過剰確保cacheには従来の明示maskを
+残した。契約testを追加し、Gemma assistant 8 testsが通過した。

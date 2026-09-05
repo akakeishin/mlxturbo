@@ -221,6 +221,22 @@ class Gemma4AssistantModel(nn.Module):
 
 
 def _assistant_masks(shared_kv, *, query_len, query_offset, window, valid_len, dtype):
+    # The production drafter predicts one token from the target's last valid
+    # position.  Its shared banks contain no padded/future slots and the
+    # sliding bank is already capped to the window, so both additive masks
+    # would contain only zeroes.  Keep the explicit construction as a safe
+    # fallback for any future multi-token or over-allocated cache caller.
+    if query_len == 1 and query_offset == valid_len - 1:
+        all_visible = all(
+            int(keys.shape[-2]) <= valid_len
+            and (
+                kind == "full_attention"
+                or (kind == "sliding_attention" and int(keys.shape[-2]) <= window)
+            )
+            for kind, (keys, _) in shared_kv.items()
+        )
+        if all_visible:
+            return {kind: None for kind in shared_kv}
     masks = {}
     for kind, (keys, _) in shared_kv.items():
         kv_len = int(keys.shape[-2])
